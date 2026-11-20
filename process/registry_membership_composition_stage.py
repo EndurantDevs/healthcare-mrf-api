@@ -13,7 +13,7 @@ from process.network_approved_membership_source import (
     read_approved_membership_commands,
 )
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
-from process.network_membership_copy import COPY_COLUMNS, MembershipCopyTarget
+from process.network_membership_copy import COPY_COLUMNS
 from process.registry_source_retention import (
     SOURCE_TABLE,
     RegistrySourceRetentionError,
@@ -155,57 +155,6 @@ def _command_scope(candidate, command_stage):
     return receipt
 
 
-async def verify_registry_composition_rows(connection, copy_target, candidate, command_stage):
-    """Compare the complete effective multiset, including duplicate evidence."""
-    receipt = _command_scope(candidate, command_stage)
-    fields = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
-    if (
-        type(copy_target) is not MembershipCopyTarget
-        or not connection.is_in_transaction()
-        or any(str(candidate[field]) != getattr(copy_target, field) for field in fields)
-    ):
-        raise RegistrySourceRetentionError("registry_source_retention_scope_invalid")
-    namespace = '"' + copy_target.schema_name + '"'
-    expected = _allowed_source(namespace + "." + SOURCE_TABLE, command_stage)
-    expected += " UNION ALL SELECT * FROM " + _relation(command_stage.add_table)
-    from process.registry_typed_membership_parity import has_multiset_difference, is_typed_candidate
-
-    if is_typed_candidate(candidate):
-        from process.registry_typed_membership_parity import require_order_index
-
-        await require_order_index(connection, namespace + ".network_membership")
-        await require_order_index(connection, namespace + "." + SOURCE_TABLE)
-        counts_by_kind = dict(
-            await connection.fetchrow(
-                f"SELECT (SELECT count(*) FROM {_relation(command_stage.add_table)}) AS add_rows,(SELECT count(*) FROM {_relation(command_stage.remove_table)}) AS remove_rows,(SELECT count(*) FROM {namespace}.{SOURCE_TABLE}) AS source_rows,(SELECT count(*) FROM ({expected}) rows) AS effective_rows"
-            )
-        )
-        if any(counts_by_kind[name] != receipt[name] for name in counts_by_kind):
-            raise RegistrySourceRetentionError("registry_composition_effective_parity_invalid")
-        if counts_by_kind["remove_rows"] == 0:
-            expected = "SELECT * FROM " + namespace + "." + SOURCE_TABLE
-            if counts_by_kind["add_rows"] != 0:
-                expected += " UNION ALL SELECT * FROM " + _relation(command_stage.add_table)
-        elif counts_by_kind["add_rows"] == 0:
-            expected = _allowed_source(namespace + "." + SOURCE_TABLE, command_stage)
-        counts_by_kind["differs"] = await has_multiset_difference(
-            connection, "SELECT * FROM " + namespace + ".network_membership", expected
-        )
-    else:
-        counts_by_kind = await connection.fetchrow(f"""WITH expected AS MATERIALIZED ({expected}), differences AS (
-          (SELECT * FROM {namespace}.network_membership EXCEPT ALL SELECT * FROM expected)
-          UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM {namespace}.network_membership))
-          SELECT (SELECT count(*) FROM {_relation(command_stage.add_table)}) AS add_rows,
-            (SELECT count(*) FROM {_relation(command_stage.remove_table)}) AS remove_rows,
-            (SELECT count(*) FROM {namespace}.{SOURCE_TABLE}) AS source_rows,
-            (SELECT count(*) FROM expected) AS effective_rows,
-            EXISTS(SELECT 1 FROM differences) AS differs""")
-    if counts_by_kind["differs"] or any(
-        counts_by_kind[name] != receipt[name] for name in counts_by_kind.keys() if name != "differs"
-    ):
-        raise RegistrySourceRetentionError("registry_composition_effective_parity_invalid")
-
-
 async def materialize_registry_composition(connection, copy_target, command_stage, *, control_schema=None):
     """Set-insert effective output once; the caller seals and closes it atomically."""
     if not connection.is_in_transaction():
@@ -236,7 +185,6 @@ async def materialize_registry_composition(connection, copy_target, command_stag
         raise RegistrySourceRetentionError("registry_composition_command_accounting_invalid")
     if is_typed_candidate(candidate):
         await connection.execute(f"ANALYZE {table}")
-    await verify_registry_composition_rows(connection, copy_target, candidate, command_stage)
     await connection.execute(
         f"UPDATE {namespace}.network_membership_candidate SET accepted_rows=$2 WHERE candidate_id=$1",
         UUID(copy_target.candidate_id),

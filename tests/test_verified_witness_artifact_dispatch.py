@@ -67,5 +67,7 @@ def test_reused_witness_mapping_can_change_but_original_fact_identity_cannot():
     mapped.update(mapping_sha256="b" * 64, source_generation=store._digest([mapped["capture_sha256"], "b" * 64]))
     anchored = artifacts.anchored_source_fact_descriptor(mapped, artifact)
     assert anchored["fact_candidate_id"] == str(UUID(int=3)) and anchored["mapping_sha256"] == "b" * 64
+    recomputed = artifacts.anchored_source_fact_descriptor({**mapped, "fact_sha256": "c" * 64}, artifact)
+    assert recomputed["fact_sha256"] == descriptor["fact_sha256"]
     with pytest.raises(store.RegistrySourceContributionError, match="identity_changed"):
-        artifacts.anchored_source_fact_descriptor({**mapped, "fact_sha256": "c" * 64}, artifact)
+        artifacts.anchored_source_fact_descriptor({**mapped, "fact_rows": mapped["fact_rows"] + 1}, artifact)

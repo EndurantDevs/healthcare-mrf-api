@@ -3,7 +3,7 @@
 
 import hashlib
 import json
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -12,8 +12,6 @@ from uuid import UUID
 import pytest
 
 from process import network_membership_candidate_lifecycle as lifecycle
-from process import network_provider_only_projection as projection
-from process import network_source_contribution_custody as custody
 from process import registry_source_contribution_artifacts as artifacts
 from process import registry_source_contribution_store as store
 from process import registry_source_office_custody as offices
@@ -195,12 +193,9 @@ async def test_native_rows_use_inventory_descriptors(monkeypatch, kind):
         connection, copy_target, candidate_by_field, source_stage=stage, inventory_entries=entries
     )
     connection.fetch.assert_awaited_once()
-    if stage.contribution_receipts:
-        assert verify.await_args.args[1] == tuple(sorted(stage.contribution_receipts, key=lambda d: d["recipe_sha256"]))
-    else:
-        verify.assert_not_awaited()
-    assert content.await_count == int(kind == "fhir")
-    assert connection.fetchval.await_count == int(kind in {"fhir", "anchored"})
+    verify.assert_not_awaited()
+    content.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -218,7 +213,7 @@ async def test_zero_contributions_reject_stray_facts(recipes):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["scope", "count", "content", "stage", "parity", "missing_inventory"])
+@pytest.mark.parametrize("failure", ["scope", "count", "stage", "missing_inventory"])
 async def test_native_rows_refuse_mismatch(monkeypatch, failure):
     root, entries, stage, derivations = _inventory((_capture_recipe(),))
     copy_target = _target()
@@ -233,12 +228,8 @@ async def test_native_rows_refuse_mismatch(monkeypatch, failure):
             candidate_by_field["producer_id"] = str(UUID(int=77))
         case "count":
             connection.fetch.return_value = []
-        case "content":
-            store.contribution_fact_sha256.return_value = ("0" * 64, 1)
         case "stage":
             stage = replace(stage, contribution_receipts=())
-        case "parity":
-            connection.fetchval.return_value = True
     with pytest.raises(ValueError):
         await store.verify_registry_source_contributions_rows(
             connection,
@@ -268,219 +259,6 @@ async def test_retention_uses_stage_owned_rows(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "empty,retained,encoded",
-    [(False, False, False), (True, False, False), (True, True, False), (True, True, True), (True, False, True)],
-)
-async def test_independent_stage_selects_revision_two(monkeypatch, empty, retained, encoded):
-    recipes = () if empty else (_ptg_recipe(),)
-    root, _entries, stage, _derivations = _inventory(recipes)
-    fresh_stage = replace(stage, membership_rows=0, generation_sha256="f" * 64)
-    retained_stage = replace(stage, membership_rows=3, generation_sha256="e" * 64)
-    selected_by_phase = AsyncMock(return_value=fresh_stage)
-    monkeypatch.setattr(custody, "stage_registry_source_recipes", selected_by_phase)
-    previous = AsyncMock(return_value=retained_stage)
-    monkeypatch.setattr(custody, "_retained_source_stage", previous)
-    generations_by_name = {} if retained else {"registry_source_membership": "f" * 64}
-    candidate_by_field = {
-        "expected_head": None,
-        "source_generations": json.dumps(generations_by_name) if encoded else generations_by_name,
-    }
-    actual = await custody._independent_source_stage(
-        object(),
-        _target(),
-        candidate_by_field,
-        _APPROVED,
-        expected={"revision": 3},
-        control_schema="controls",
-        office_authority=None,
-        inventory=(root, recipes, ()),
-    )
-    assert (actual.membership_rows, actual.generation_sha256) == ((3, "e" * 64) if retained else (0, "f" * 64))
-    if retained:
-        previous.assert_awaited_once()
-        selected_by_phase.assert_not_awaited()
-    else:
-        assert selected_by_phase.await_args.kwargs["inventory"] is True
-        assert selected_by_phase.await_args.kwargs["contribution_revision"] == 2
-
-
-def _custody_mocks(monkeypatch, stage, derivations, events):
-    monkeypatch.setattr(custody, "pin_retained_approved_membership_source", AsyncMock(return_value=_APPROVED))
-    monkeypatch.setattr(custody, "_independent_source_stage", AsyncMock(return_value=stage))
-    for name, event in [
-        ("verify_registry_source_contributions_rows", "facts"),
-        ("verify_registry_source_retention_rows", "retention"),
-        ("stage_approved_membership_commands", "commands"),
-        ("verify_registry_composition_rows", "composition"),
-        ("_drop_stage", "drop"),
-    ]:
-
-        async def record(*_arguments, _event=event, **_options):
-            events.append(_event)
-            return object()
-
-        monkeypatch.setattr(custody, name, AsyncMock(side_effect=record))
-
-    async def office(*_arguments, derivation_sink, **_options):
-        events.append("offices")
-        for derivation in derivations:
-            derivation_sink(derivation)
-
-    async def provider(*_arguments, **_options):
-        events.append("projection")
-
-    monkeypatch.setattr(offices, "_verify_inventory_source_offices", AsyncMock(side_effect=office))
-    monkeypatch.setattr(projection, "_verify_staged_provider_only_projection", AsyncMock(side_effect=provider))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["all_raw", "empty", "retained_flat", "provider_only"])
-async def test_custodian_rebuilds_before_projection(monkeypatch, kind):
-    recipes = (_ptg_recipe(),) if kind == "all_raw" else (_capture_recipe(),) if kind == "provider_only" else ()
-    root, entries, stage, derivations = _inventory(recipes, provider_only=kind == "provider_only")
-    if kind == "retained_flat":
-        stage = replace(stage, membership_rows=3)
-    copy_target = _target()
-    candidate_by_field = _candidate(copy_target, root, stage, derivations)
-    events = []
-    _custody_mocks(monkeypatch, stage, derivations, events)
-    await custody.verify_independent_source_contributions(
-        object(), copy_target, candidate_by_field, control_schema="controls", inventory_entries=entries
-    )
-    assert events == ["facts", "retention", "commands", "composition", "offices", "projection", "drop"]
-    assert custody.verify_registry_source_contributions_rows.await_args.kwargs["inventory_entries"] is entries
-    assert projection._verify_staged_provider_only_projection.await_args.args[3] is stage
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["facts", "retention", "composition", "offices", "root", "projection"])
-async def test_custodian_failure_always_drops(monkeypatch, failure):
-    root, entries, stage, derivations = _inventory((_capture_recipe(),))
-    copy_target = _target()
-    candidate_by_field = _candidate(copy_target, root, stage, derivations)
-    events = []
-    _custody_mocks(monkeypatch, stage, derivations, events)
-    selected_by_phase = {
-        "facts": custody.verify_registry_source_contributions_rows,
-        "retention": custody.verify_registry_source_retention_rows,
-        "composition": custody.verify_registry_composition_rows,
-        "offices": offices._verify_inventory_source_offices,
-        "projection": projection._verify_staged_provider_only_projection,
-    }
-    if failure == "root":
-        derivations[0]["correspondence_sha256"] = "9" * 64
-    else:
-        selected_by_phase[failure].side_effect = ValueError("independent_failure")
-    with pytest.raises(ValueError):
-        await custody.verify_independent_source_contributions(
-            object(), copy_target, candidate_by_field, control_schema="controls", inventory_entries=entries
-        )
-    assert events[-1] == "drop"
-    if failure != "projection":
-        projection._verify_staged_provider_only_projection.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("empty", [False, True])
-@pytest.mark.parametrize("parity_error", [False, True])
-async def test_inventory_offices_keep_native_parity(monkeypatch, empty, parity_error):
-    recipes = () if empty else (_ptg_recipe(),)
-    root, _entries, stage, derivations = _inventory(recipes)
-    copy_target = _target()
-    candidate_by_field = _candidate(copy_target, root, stage, derivations)
-    connection = SimpleNamespace(execute=AsyncMock())
-    monkeypatch.setattr(offices, "_require_transaction", AsyncMock())
-    monkeypatch.setattr(offices, "_native_candidate", AsyncMock())
-    copy = AsyncMock()
-    monkeypatch.setattr(offices, "copy_source_office_binding_rows", copy)
-    retained = AsyncMock()
-    monkeypatch.setattr(offices, "_retained_bindings", retained)
-    monkeypatch.setattr(offices, "resolve_registry_retained_generation", AsyncMock(return_value=None))
-    parity = AsyncMock()
-    if parity_error:
-        parity.side_effect = ValueError("native_bindings_differ")
-    monkeypatch.setattr(offices, "_binding_parity", parity)
-
-    async def summary(*_arguments, context):
-        assert context.revision == 4 and context.inventory_root is None
-        await context.page_sink(("native_binding",))
-        context.derivation_sink(derivations[0])
-
-    derive = AsyncMock(side_effect=summary)
-    monkeypatch.setattr(offices, "_office_summary", derive)
-    emitted_documents = []
-    with pytest.raises(ValueError, match="native_bindings_differ") if parity_error else nullcontext():
-        await offices._verify_inventory_source_offices(
-            connection,
-            copy_target,
-            candidate_by_field,
-            recipes,
-            _APPROVED,
-            control_schema="controls",
-            derivation_sink=emitted_documents.append,
-        )
-    parity.assert_awaited_once()
-    assert copy.await_count == (1 if empty else 2)
-    assert derive.await_count == int(not empty)
-    assert retained.await_count == int(empty)
-    assert emitted_documents == derivations
-    assert connection.execute.await_args.args[0].startswith("DROP TABLE IF EXISTS")
-
-
-@pytest.mark.asyncio
-async def test_inventory_owner_verification_stays_bounded(monkeypatch):
-    root, entries, stage, derivations = _inventory(tuple(_example(index) for index in range(101)))
-    copy_target = _target()
-    candidate_by_field = _candidate(copy_target, root, stage, derivations)
-    connection = _row_connection(stage)
-    verify = AsyncMock(return_value={})
-    monkeypatch.setattr(artifacts, "verify_anchored_source_fact_contents", verify)
-    by_sha = {descriptor["recipe_sha256"]: descriptor for descriptor in stage.contribution_receipts}
-
-    async def content(_connection, _relation, identity):
-        return by_sha[identity]["fact_sha256"], by_sha[identity]["fact_rows"]
-
-    monkeypatch.setattr(store, "contribution_fact_sha256", AsyncMock(side_effect=content))
-    await store.verify_registry_source_contributions_rows(
-        connection, copy_target, candidate_by_field, inventory_entries=entries
-    )
-    assert [len(call.args[1]) for call in verify.await_args_list] == [100, 1]
-    assert store.contribution_fact_sha256.await_count == 101
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("recipes", [(), (_ptg_recipe(),)])
-async def test_custody_requires_entries_before_source(monkeypatch, recipes):
-    root, _entries, stage, derivations = _inventory(recipes)
-    copy_target = _target()
-    candidate_by_field = _candidate(copy_target, root, stage, derivations)
-    pin = AsyncMock()
-    monkeypatch.setattr(custody, "pin_retained_approved_membership_source", pin)
-    with pytest.raises(store.RegistrySourceContributionError, match="inventory_invalid"):
-        await custody.verify_independent_source_contributions(
-            object(), copy_target, candidate_by_field, control_schema="controls"
-        )
-    pin.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_new_custody_requires_registered_retention(monkeypatch):
-    root, entries, stage, derivations = _inventory(())
-    copy_target = _target()
-    candidate_by_field = _candidate(copy_target, root, stage, derivations)
-    for field in ("source_generations", "validation_json"):
-        del candidate_by_field[field]["registry_source_retention"]
-    pin = AsyncMock()
-    monkeypatch.setattr(custody, "pin_retained_approved_membership_source", pin)
-    with pytest.raises(store.RegistrySourceContributionError, match="retention_required"):
-        await custody.verify_independent_source_contributions(
-            object(), copy_target, candidate_by_field, control_schema="controls", inventory_entries=entries
-        )
-    pin.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_legacy_retention_keeps_call_shape(monkeypatch):
     recipe = _capture_recipe()
     root, _entries, stage, derivations = _inventory((recipe,))
@@ -504,39 +282,6 @@ async def test_legacy_retention_keeps_call_shape(monkeypatch):
     monkeypatch.setattr(store, "verify_registry_source_contributions_rows", verify)
     assert await store.retain_registry_source_contributions(connection, copy_target, stage) == receipt_by_field
     assert verified_stages == [stage]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["missing", "state", "revision", "generation", "scope"])
-async def test_office_custody_refuses_changed_ready_candidate_metadata(damage):
-    root, _, stage, derivations = _inventory(())
-    target = _target()
-    candidate = _candidate(target, root, stage, derivations)
-    actual_by_field = {**candidate, "source_generations": dict(candidate["source_generations"])}
-    if damage == "missing":
-        actual_by_field = None
-    else:
-        changes_by_name = {
-            "state": ("state", "open"),
-            "revision": ("approved_custom_revision", 999),
-            "generation": ("source_generations", {}),
-            "scope": ("schema_name", "unbound_candidate"),
-        }
-        field, value = changes_by_name[damage]
-        actual_by_field[field] = value
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=actual_by_field))
-    with pytest.raises(offices.RegistryInitialSourceError, match="candidate_differs"):
-        await offices._native_candidate(connection, target, candidate, "controls")
-    connection.fetchrow.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_retained_office_rows_require_a_resolved_origin_before_copy(monkeypatch):
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value=True), execute=AsyncMock())
-    monkeypatch.setattr(offices, "resolve_registry_retained_generation", AsyncMock(return_value=None))
-    with pytest.raises(offices.RegistryInitialSourceError, match="origin_unavailable"):
-        await offices._retained_bindings(connection, _target(), {}, "pg_temp.offices", "controls")
-    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

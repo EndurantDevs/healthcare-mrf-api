@@ -54,7 +54,9 @@ def test_mapping_changes_keep_original_capture_and_direct_owner():
         assert artifacts.source_fact_artifact_reference(current) == reference
     assert current["recipe_sha256"] == descriptor["recipe_sha256"]
     assert current["fact_sha256"] == descriptor["fact_sha256"]
-    for identity in ("capture_sha256", "fact_sha256", "fact_rows", "transform_version"):
+    recomputed = artifacts.anchored_source_fact_descriptor({**current, "fact_sha256": "f" * 64}, artifact)
+    assert recomputed["fact_sha256"] == descriptor["fact_sha256"]
+    for identity in ("capture_sha256", "fact_rows", "transform_version"):
         damaged_by_field = {**current, identity: 2 if identity == "fact_rows" else "f" * 64}
         with pytest.raises(RegistrySourceContributionError):
             artifacts.anchored_source_fact_descriptor(damaged_by_field, artifact)

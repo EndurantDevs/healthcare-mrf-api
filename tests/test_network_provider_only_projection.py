@@ -2,11 +2,10 @@
 """Private projection checks; no database privileges or native plan claims."""
 
 import hashlib
-import inspect
 import json
 import re
 import sqlite3
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -19,12 +18,9 @@ from process import network_provider_only_projection as projection
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_membership_copy import MembershipCopyTarget
-from process.registry_source_contribution_store import _COUNTERS, locally_owned_source_descriptor
 from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
-from tests.registry_source_recipe_support import _example
 from tests.test_network_fhir_retained_capture import pin, retained
-from tests.test_registry_ptg_office_membership_recipe import _recipe as ptg_recipe
 from tests.test_registry_source_contributions import _descriptor, _fact, _recipe
 
 
@@ -360,83 +356,6 @@ async def _entries(*entries):
         yield entry
 
 
-def _sqlite_evidence_ddl(query):
-    return query.replace("pg_temp.", "temp.").replace("evidence_id ~", "evidence_id REGEXP")
-
-
-def _coarse_unique_connection(database, evidence_rows):
-    observed_by_name = {}
-
-    async def execute(query, *_arguments):
-        assert "LIKE" not in query and "INCLUDING" not in query
-        if query.startswith("CREATE TEMP TABLE pg_temp."):
-            database.execute(_sqlite_evidence_ddl(query))
-            observed_by_name["expected_relation"] = query.split("(", 1)[0].split("TABLE ", 1)[1]
-        elif query.startswith("INSERT INTO pg_temp."):
-            destination = query.split("(", 1)[0].split("INTO ", 1)[1].replace("pg_temp.", "temp.")
-            database.executemany(f"INSERT OR IGNORE INTO {destination} VALUES(?,?,?,?)", evidence_rows)
-
-    async def fetchrow(query):
-        assert query.count("EXCEPT ALL") == 2
-        expected = observed_by_name["expected_relation"].replace("pg_temp.", "temp.")
-        actual_rows = database.execute(f"SELECT {projection.COLUMNS} FROM actual").fetchall()
-        expected_rows = database.execute(f"SELECT {projection.COLUMNS} FROM {expected}").fetchall()
-        observed_by_name["counts"] = (len(actual_rows), len(expected_rows))
-        differences = database.execute(
-            f"SELECT {projection.COLUMNS} FROM {expected} EXCEPT SELECT {projection.COLUMNS} FROM actual"
-        ).fetchall()
-        return {"actual_count": len(actual_rows), "expected_count": len(expected_rows), "differs": bool(differences)}
-
-    return SimpleNamespace(execute=execute, fetchrow=fetchrow), observed_by_name
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["raw", "staged"])
-async def test_extra_producer_unique_cannot_suppress_expected_evidence(monkeypatch, mode):
-    recipe = _recipe()
-    first_fact = _fact(recipe.source_pin)
-    first_fact["location_id"] = first_fact["evidence_basis"][-1] = None
-    second_fact_by_field = {
-        **first_fact,
-        "resource_id": "role-two",
-        "evidence_basis": first_fact["evidence_basis"].copy(),
-    }
-    second_fact_by_field["evidence_basis"][4] = "role-two"
-    binding_by_field = {"source_key": first_fact["source_key"], "source_scope_json": first_fact["source_scope_json"]}
-    selected_rows = _select_rows([("a", first_fact), ("a", second_fact_by_field)], [("a", 11, binding_by_field)])
-    evidence_rows = [(network, system, identity, digest) for system, identity, network, digest in selected_rows]
-    assert len(evidence_rows) == 2 and evidence_rows[0][3] != evidence_rows[1][3]
-    descriptor = _descriptor(recipe)
-    monkeypatch.setattr(projection, "_candidate", AsyncMock())
-    monkeypatch.setattr(projection, "_relation", lambda _: "actual")
-    monkeypatch.setattr(projection, "_rebuild_source", AsyncMock())
-    monkeypatch.setattr(projection, "map_fhir_facts", AsyncMock(return_value=descriptor))
-    receipt = AsyncMock()
-    monkeypatch.setattr(projection, "_receipt", receipt)
-    ddl = SimpleNamespace(execute=AsyncMock())
-    await projection._create_evidence_heap(ddl, "actual")
-    with _sqlite() as database:
-        database.execute(_sqlite_evidence_ddl(ddl.execute.await_args.args[0]))
-        database.execute("CREATE UNIQUE INDEX coarse_producer_key ON actual(network_id,provider_system,provider_id)")
-        database.executemany("INSERT OR IGNORE INTO actual VALUES(?,?,?,?)", evidence_rows)
-        connection, observed_by_name = _coarse_unique_connection(database, evidence_rows)
-        with pytest.raises(projection.ProviderOnlyProjectionError):
-            if mode == "raw":
-                await projection.verify_provider_only_projection(
-                    connection, _target(), _entries((recipe, descriptor)), ApprovedMembershipSource(3, "d" * 64)
-                )
-            else:
-                await projection._verify_staged_provider_only_projection(
-                    connection,
-                    _target(),
-                    (recipe,),
-                    _staged((locally_owned_source_descriptor(descriptor),)),
-                    ApprovedMembershipSource(3, "d" * 64),
-                )
-        assert observed_by_name["counts"] == (1, 2)
-    receipt.assert_not_awaited()
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", [None, "source_descriptor", "missing", "extra", "duplicate_recipe"])
 async def test_independent_verification_rebuilds_source_and_refuses_both_parity_directions(monkeypatch, damage):
@@ -564,155 +483,3 @@ def _staged(descriptors):
         contribution_receipts=tuple(descriptors),
         contribution_revision=2,
     )
-
-
-def _staged_descriptors(recipes, *, anchored=False, zero=False):
-    descriptors = [locally_owned_source_descriptor(_descriptor(recipe)) for recipe in recipes]
-    for descriptor in descriptors:
-        if anchored:
-            descriptor.update(
-                fact_candidate_id=str(uuid4()),
-                fact_schema_name="original",
-                fact_table_name="network_source_contribution",
-                fact_generation_id="c" * 64,
-            )
-        if zero:
-            descriptor.update(dict.fromkeys(_COUNTERS, 0))
-            descriptor["fact_sha256"] = hashlib.sha256(b"").hexdigest()
-    return descriptors
-
-
-def _staged_protocol(monkeypatch):
-    """Component flow mocks do not establish independent-stage provenance or native authority."""
-    for name in (
-        "_rebuild_source",
-        "map_fhir_facts",
-        "verify_anchored_source_fact_contents",
-        "create_contribution_stage",
-    ):
-        monkeypatch.setattr(projection, name, AsyncMock(side_effect=AssertionError("Staged path repeated SOURCE work")))
-    monkeypatch.setattr(projection, "_candidate", AsyncMock())
-    monkeypatch.setattr(projection, "_receipt", AsyncMock(return_value={"row_count": 0, "rows_sha256": "f" * 64}))
-    connection = SimpleNamespace(
-        execute=AsyncMock(),
-        fetchrow=AsyncMock(
-            return_value={
-                "differs": False,
-                "actual_count": 0,
-                "expected_count": 0,
-            }
-        ),
-    )
-    append = AsyncMock()
-    monkeypatch.setattr(projection, "_append", append)
-    return connection, append
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("anchored", [False, True])
-async def test_staged_relations_include_all_zero_evidence_fhir_identities(monkeypatch, anchored):
-    recipes = (_example(1), _example(2))
-    descriptors = _staged_descriptors(recipes, anchored=anchored, zero=True)
-    stage = _staged(descriptors)
-    connection, append = _staged_protocol(monkeypatch)
-    metadata = AsyncMock(
-        return_value={
-            descriptor["recipe_sha256"]: SimpleNamespace(relation='"original".facts') for descriptor in descriptors
-        }
-    )
-    monkeypatch.setattr(projection, "authenticate_anchored_source_fact_metadata", metadata)
-    receipt = await projection._verify_staged_provider_only_projection(
-        connection, _target(), (ptg_recipe(), *reversed(recipes)), stage, ApprovedMembershipSource(3, "d" * 64)
-    )
-    identities = sorted(descriptor["recipe_sha256"] for descriptor in descriptors)
-    assert receipt["source_count"] == 2 and receipt["row_count"] == 0
-    assert receipt["source_identities_sha256"] == hashlib.sha256("".join(identities).encode()).hexdigest()
-    assert metadata.await_count == int(anchored) and append.await_count == 2
-    expected_relation = '"original".facts' if anchored else 'pg_temp."' + stage.contribution_table_name + '"'
-    assert {call.args[2] for call in append.await_args_list} == {expected_relation}
-    assert "stage" not in inspect.signature(projection.verify_provider_only_projection).parameters
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("count", [101, 1000])
-async def test_staged_anchor_metadata_resolution_is_bounded(monkeypatch, count):
-    recipes = tuple(_example(index) for index in range(count))
-    descriptors = _staged_descriptors(recipes, anchored=True)
-    connection, append = _staged_protocol(monkeypatch)
-
-    async def metadata(_connection, selected, **_options):
-        assert 1 <= len(selected) <= 100
-        return {descriptor["recipe_sha256"]: SimpleNamespace(relation='"original".facts') for descriptor in selected}
-
-    resolver = AsyncMock(side_effect=metadata)
-    monkeypatch.setattr(projection, "authenticate_anchored_source_fact_metadata", resolver)
-    receipt = await projection._verify_staged_provider_only_projection(
-        connection, _target(), recipes, _staged(descriptors), ApprovedMembershipSource(3, "d" * 64)
-    )
-    assert receipt["source_count"] == count and append.await_count == count
-    assert resolver.await_count == (count + 99) // 100
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "duplicate_recipe",
-        "duplicate_descriptor",
-        "missing",
-        "orphan",
-        "capture",
-        "legacy_anchor",
-        "partial_anchor",
-        "stage_revision",
-        "stage_type",
-        "temp_name",
-    ],
-)
-async def test_staged_identity_inventory_refuses_incomplete_or_mismatched_inputs(monkeypatch, damage):
-    recipes = [_example(1), _example(2)]
-    descriptors = _staged_descriptors(recipes)
-    match damage:
-        case "duplicate_recipe":
-            recipes[1] = recipes[0]
-        case "duplicate_descriptor":
-            descriptors[1] = descriptors[0]
-        case "missing":
-            descriptors.pop()
-        case "orphan":
-            descriptors.extend(_staged_descriptors((_example(3),)))
-        case "capture":
-            descriptors[0]["capture_sha256"] = "f" * 64
-        case "legacy_anchor":
-            for key in projection.FACT_ANCHOR_FIELDS:
-                descriptors[0].pop(key)
-        case "partial_anchor":
-            descriptors[0]["fact_table_oid"] = 123
-    stage = _staged(descriptors)
-    if damage == "stage_revision":
-        stage = replace(stage, contribution_revision=1)
-    elif damage == "stage_type":
-        stage = SimpleNamespace(**asdict(stage))
-    elif damage == "temp_name":
-        stage = replace(stage, contribution_table_name="producer_schema.facts")
-    connection, append = _staged_protocol(monkeypatch)
-    with pytest.raises(ValueError):
-        await projection._verify_staged_provider_only_projection(
-            connection, _target(), recipes, stage, ApprovedMembershipSource(3, "d" * 64)
-        )
-    append.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["missing", "orphan"])
-async def test_staged_anchor_resolution_requires_exact_requested_identity_set(monkeypatch, damage):
-    recipe = _example()
-    descriptor = _staged_descriptors((recipe,), anchored=True)[0]
-    resolved = {} if damage == "missing" else {"f" * 64: SimpleNamespace(relation='"wrong".facts')}
-    monkeypatch.setattr(projection, "authenticate_anchored_source_fact_metadata", AsyncMock(return_value=resolved))
-    connection, append = _staged_protocol(monkeypatch)
-    with pytest.raises(projection.ProviderOnlyProjectionError):
-        await projection._verify_staged_provider_only_projection(
-            connection, _target(), (recipe,), _staged((descriptor,)), ApprovedMembershipSource(3, "d" * 64)
-        )
-    append.assert_not_awaited()

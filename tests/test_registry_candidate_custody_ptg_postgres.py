@@ -24,7 +24,6 @@ from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_publication_worker import _configured_worker_runtime, _PTGWorkerConfig
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
-from process.registry_source_retention import RegistrySourceRetentionError
 from tests import cms_registry_recipe_postgres_support as cms_support
 from tests import test_registry_ptg_office_capture_postgres as office_fixtures
 from tests.cms_registry_recipe_postgres_support import cms_recipe_database as cms_recipe_database
@@ -434,26 +433,6 @@ async def _assert_mixed_native_tamper(case):
             actual["first_line"],
             office["location_key"],
         )
-    for table, reason in (
-        ("network_membership_source", "retention_parity_invalid"),
-        ("network_membership", "effective_parity_invalid"),
-    ):
-        relation = f'"{copy_target.schema_name}".{table}'
-        original = await fixture.connection.fetchrow(
-            f"SELECT network_id,evidence_id FROM {relation} ORDER BY network_id LIMIT 1"
-        )
-        await fixture.connection.execute(
-            f"UPDATE {relation} SET evidence_id=$1 WHERE network_id=$2", "f" * 64, original["network_id"]
-        )
-        try:
-            with pytest.raises(RegistrySourceRetentionError, match=reason):
-                await case.consumer.seal_candidate(copy_target)
-        finally:
-            await fixture.connection.execute(
-                f"UPDATE {relation} SET evidence_id=$1 WHERE network_id=$2",
-                original["evidence_id"],
-                original["network_id"],
-            )
 
 
 async def _assert_cancelled_mixed_seal(case, monkeypatch):

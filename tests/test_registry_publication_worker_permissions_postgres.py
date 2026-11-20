@@ -466,9 +466,7 @@ async def _native_qualified_candidate(
         await retain_registry_source_memberships(connection, copy_target, source_stage, control_schema=schema)
         await _bindings(connection, copy_target, artifact, None, schema)
         await materialize_registry_composition(connection, copy_target, commands, control_schema=schema)
-        await seal_network_candidate(
-            connection, copy_target, source_stage=source_stage, command_stage=commands, control_schema=schema
-        )
+        await seal_network_candidate(connection, copy_target, source_stage=source_stage, control_schema=schema)
     return copy_target, artifact.address_source
 
 

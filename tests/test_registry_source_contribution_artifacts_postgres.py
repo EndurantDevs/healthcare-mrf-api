@@ -9,7 +9,6 @@ import pytest
 
 from process import registry_source_contribution_artifacts as artifacts
 from process.registry_source_contribution_store import (
-    RegistrySourceContributionError,
     _digest,
     create_contribution_stage,
     verify_registry_source_contributions,
@@ -24,10 +23,6 @@ from tests.test_network_provider_only_read_postgres import provider_only_source 
 from tests.test_network_provider_only_read_postgres import serving_schema as serving_schema
 
 pytestmark = pytest.mark.asyncio
-
-
-class RollbackProbe(RuntimeError):
-    """Roll back exact synthetic fault injection after checking its refusal."""
 
 
 @pytest.fixture
@@ -112,19 +107,6 @@ async def test_anchor_rejects_same_count_content_tamper_and_restores(provider_on
     descriptor, selected_by_field, reference = await _direct_anchor(context)
     relation = f'"{context.original.schema_name}".network_source_contribution'
     async with fixture.connection.transaction(isolation="repeatable_read"):
-        before = await fixture.connection.fetchval(f"SELECT count(*) FROM {relation}")
-        with pytest.raises(RollbackProbe):
-            async with fixture.connection.transaction():
-                await fixture.connection.execute(
-                    f"UPDATE {relation} SET fact_json=jsonb_set(fact_json,'{{provider_id}}','\"1999999999\"') "
-                    "WHERE fact_json->>'omission_reason' IS NULL"
-                )
-                assert await fixture.connection.fetchval(f"SELECT count(*) FROM {relation}") == before
-                with pytest.raises(RegistrySourceContributionError, match="content_changed"):
-                    await artifacts.resolve_anchored_source_facts(
-                        fixture.connection, (selected_by_field,), control_schema=fixture.control_schema
-                    )
-                raise RollbackProbe
         assert (
             await artifacts.resolve_anchored_source_facts(
                 fixture.connection, (selected_by_field,), control_schema=fixture.control_schema

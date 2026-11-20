@@ -71,7 +71,6 @@ async def test_final_validation_returns_checked_counts_without_control_writes(mo
         target,
         candidate,
         "control",
-        office_authority=None,
         inventory_entries=None,
         source_witness_runtime=None,
     )
@@ -100,13 +99,10 @@ async def test_final_validation_refuses_wrong_logical_snapshot_before_data_queri
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fresh", [False, True])
-async def test_final_data_path_rechecks_retention_source_offices_indexes_and_provider_inputs(monkeypatch, fresh):
+async def test_final_data_path_rechecks_retention_indexes_and_provider_inputs(monkeypatch, fresh):
     from process import network_compact_readiness as compact
     from process import network_em_provider_inputs as providers
     from process import network_membership_serving_indexes as indexes
-    from process import network_sampled_custody as sampled
-    from process import network_source_contribution_custody as contributions
-    from process import registry_source_office_custody as offices
 
     copy_target, candidate = _candidate()
     scope_by_field = {"candidate_id": copy_target.candidate_id}
@@ -126,10 +122,7 @@ async def test_final_data_path_rechecks_retention_source_offices_indexes_and_pro
     checks_by_name = {}
     for module, name, check_result in (
         (preservation, "has_fresh_carried_typed_data", fresh),
-        (sampled, "inherit_preserved_sampling", None),
         (validation, "verify_registry_source_retention_rows", None),
-        (contributions, "verify_independent_source_contributions", None),
-        (offices, "verify_independent_initial_source_offices", None),
         (indexes, "_matching_inputs", ({field: 0 for field in COUNT_FIELDS}, scope_by_field)),
         (indexes, "_source_semantics", None),
         (indexes, "_index_digest", "a" * 64),
@@ -141,9 +134,8 @@ async def test_final_data_path_rechecks_retention_source_offices_indexes_and_pro
     assert await validation._final_proof(object(), copy_target, candidate, "control") == {
         field: 0 for field in COUNT_FIELDS
     }
-    for name, mock in checks_by_name.items():
-        assert mock.await_count == (0 if fresh and name == "inherit_preserved_sampling" else 1)
-    assert checks_by_name["verify_independent_source_contributions"].await_args.kwargs["preservation"] is selected
+    for mock in checks_by_name.values():
+        assert mock.await_count == 1
     checks_by_name["_index_digest"].return_value = "b" * 64
     with pytest.raises(ValueError, match="index definitions changed"):
         await validation._final_proof(object(), copy_target, candidate, "control")
@@ -257,47 +249,7 @@ async def test_missing_previous_evidence_forces_fresh_source_and_mapping_with_cl
         cleanup.assert_not_awaited()
     else:
         rebuild.assert_awaited_once_with(connection, carry, (recipe,), previous_candidate_by_field, "control", None)
-        cleanup.assert_awaited_once_with(connection, stage, None, error if damage in {"mapping", "cancel"} else None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "revision", "generation", "address", "missing"])
-async def test_current_typed_offices_use_exact_logical_context_without_writer_metadata(monkeypatch, damage):
-    from copy import deepcopy
-
-    from process import registry_initial_source_composition as initial
-    from process.network_address_projection import PinnedAddressSource
-
-    _, candidate = _candidate()
-    address_by_field = deepcopy(candidate["validation_json"]["address_source"])
-    summary_by_field = {
-        "revision": 6,
-        "context": {"approved_revision": 7, "approved_generation_sha256": "a" * 64, "address_source": address_by_field},
-    }
-    approved = SimpleNamespace(approved_revision=7, generation_id="a" * 64)
-    if damage == "revision":
-        summary_by_field["context"]["approved_revision"] = 8
-    if damage == "generation":
-        summary_by_field["context"]["approved_generation_sha256"] = "b" * 64
-    if damage == "address":
-        address_by_field["schema_name"] = "different_addresses"
-    monkeypatch.setattr(
-        initial,
-        "verify_initial_source_office_receipt",
-        lambda candidate: None if damage == "missing" else summary_by_field,
-    )
-    connection = SimpleNamespace(fetch=AsyncMock(), fetchval=AsyncMock(), execute=AsyncMock())
-    if damage:
-        with pytest.raises(ValueError, match="source_changed"):
-            await preservation._current_office_inputs(connection, candidate, (_recipe(),), approved, "control")
-    else:
-        address, roles = await preservation._current_office_inputs(
-            connection, candidate, (_recipe(),), approved, "control"
-        )
-        assert address == PinnedAddressSource(**address_by_field) and roles == ()
-    connection.fetch.assert_not_awaited()
-    connection.fetchval.assert_not_awaited()
-    connection.execute.assert_not_awaited()
+        cleanup.assert_awaited_once_with(connection, stage, error if damage in {"mapping", "cancel"} else None)
 
 
 @pytest.mark.asyncio
@@ -327,3 +279,51 @@ async def test_ordinary_recipes_from_predecessor_before_upgrade_carry_after_cove
         assert await preservation.has_fresh_carried_typed_data(connection, carry, control_schema="control") is True
     assert connection.fetchval.await_args.args[1] == [preservation._canonical(preservation._slot(recipe))]
     rebuild.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("foreign_reference", [False, True])
+async def test_compact_final_checks_slice_data_and_returns_stored_accounting(monkeypatch, typed, foreign_reference):
+    from process import network_compact_validation as compact
+    from process import network_typed_membership_accounting as accounting
+    from process import network_typed_slice_native as native
+    from process.network_compact_layout import CompactAddressRelation
+    from process.network_compact_readiness import NetworkCompactReadinessError
+
+    copy_target, candidate = _candidate()
+    candidate.update(accepted_rows=3, expected_rows=3)
+    candidate["validation_json"].update({field: 3 for field in COUNT_FIELDS})
+    layout = SimpleNamespace(
+        artifacts=(SimpleNamespace(candidate_id=copy_target.candidate_id),),
+        base=CompactAddressRelation("addresses", "entity_address_unified"),
+        custom=None,
+    )
+    events = []
+    monkeypatch.setattr(compact, "compact_readiness", lambda *arguments: events.append("readiness"))
+    monkeypatch.setattr(compact, "_scope_report", lambda *arguments: {})
+    monkeypatch.setattr(compact, "published_network_layout", lambda actual: layout)
+    monkeypatch.setattr(
+        compact, "verify_compact_slice_contents", AsyncMock(side_effect=lambda *arguments: events.append("slices"))
+    )
+    monkeypatch.setattr(compact, "is_typed_candidate", lambda actual: typed)
+    monkeypatch.setattr(
+        compact, "_membership_sets_differ", AsyncMock(side_effect=lambda *arguments: events.append("sets") or False)
+    )
+    monkeypatch.setattr(
+        accounting, "prepare_accounting_work", AsyncMock(return_value=("pg_temp.work", {"membership_rows": 3}))
+    )
+    monkeypatch.setattr(native, "require_complete_facts", lambda *arguments: events.append("facts"))
+    monkeypatch.setattr(native, "verify_work_refs", AsyncMock(side_effect=lambda *arguments: events.append("refs")))
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=not foreign_reference), execute=AsyncMock())
+    if foreign_reference:
+        with pytest.raises(NetworkCompactReadinessError):
+            await compact.verify_compact_final_proof(connection, copy_target, candidate, control_schema="control")
+        assert events == ["readiness", "slices"]
+        return
+    report = await compact.verify_compact_final_proof(connection, copy_target, candidate, control_schema="control")
+    assert report is candidate["validation_json"]
+    assert connection.fetchval.await_args.args[1] == [copy_target.candidate_id]
+    assert events == ["readiness", "slices", *(["facts", "refs"] if typed else ["sets"])]
+    if typed:
+        connection.execute.assert_awaited_once_with("DROP TABLE pg_temp.work")

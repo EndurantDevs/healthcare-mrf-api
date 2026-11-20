@@ -1,8 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Bounded native preparation and content checks for typed membership slices."""
 
-from uuid import UUID
-
 from process.network_address_projection import _identifier
 from process.registry_typed_membership_parity import COLUMNS, ORDER, _last_page_key, require_order_index
 
@@ -160,32 +158,3 @@ async def verify_work_refs(connection, target, work):
         total += len(page)
         after = page[-1]["network_id"], page[-1]["office_bucket"]
     _require(total == await connection.fetchval(f"SELECT count(*) FROM {refs}"))
-
-
-async def verify_digests(connection, target):
-    """Check each new indexed slice's full bytes, count and native office bucket."""
-    from process.network_compact_readiness import _require
-
-    schema, current = _identifier(target.schema_name), UUID(target.candidate_id)
-    after = (0, -1)
-    while True:
-        page = await connection.fetch(
-            f"""WITH refs AS MATERIALIZED (
-          SELECT * FROM {schema}.network_slice_ref WHERE artifact_candidate_id=$4 AND (network_id,office_bucket)>($1,$2)
-          ORDER BY network_id,office_bucket LIMIT {_METADATA_ROWS})
-          SELECT refs.network_id,refs.office_bucket,refs.row_count,refs.content_sha256,facts.* FROM refs CROSS JOIN LATERAL (
-            SELECT count(*)::bigint AS actual_count,{_content_aggregate("location_key")} AS actual_digest,
-              coalesce(bool_and(length(location_key)>0 AND (get_byte(sha256(convert_to(location_key,'UTF8')),0)&63)=refs.office_bucket),false) AS valid_bucket
-            FROM {schema}.network_office_edge WHERE slice_id=refs.slice_id) facts ORDER BY refs.network_id,refs.office_bucket""",
-            *after,
-            _DOMAIN,
-            current,
-        )
-        if not page:
-            return
-        for entry in page:
-            _require(
-                entry["valid_bucket"] is True
-                and (entry["actual_count"], entry["actual_digest"]) == (entry["row_count"], entry["content_sha256"])
-            )
-        after = page[-1]["network_id"], page[-1]["office_bucket"]

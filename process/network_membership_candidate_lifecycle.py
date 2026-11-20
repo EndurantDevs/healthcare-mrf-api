@@ -459,7 +459,6 @@ async def seal_network_candidate(
     *,
     control_schema: str | None = None,
     source_stage=None,
-    command_stage=None,
     inventory_entries=None,
 ) -> dict:
     """Close new writes only after receipts, counter, expectation and raw rows agree."""
@@ -475,7 +474,7 @@ async def seal_network_candidate(
             )
         if candidate_record["state"] == "rejected":
             raise MembershipCandidateError("Rejected candidates cannot be sealed")
-        retention = await _seal_membership_accounting(connection, copy_target, candidate_record, namespace)
+        await _seal_membership_accounting(connection, copy_target, candidate_record, namespace)
         try:
             await verify_registry_source_retention_rows(
                 connection, copy_target, candidate_record, source_stage=source_stage
@@ -490,12 +489,6 @@ async def seal_network_candidate(
                 control_schema=namespace[1:-1],
                 **({"inventory_entries": inventory_entries} if inventory_entries is not None else {}),
             )
-            if retention is not None and candidate_record["state"] == "open":
-                if command_stage is None:
-                    raise MembershipCandidateError("Qualified candidate command stage is required")
-                from process.registry_membership_composition_stage import verify_registry_composition_rows
-
-                await verify_registry_composition_rows(connection, copy_target, candidate_record, command_stage)
         except ValueError as error:
             raise MembershipCandidateError(str(error)) from error
         if candidate_record["state"] == "open":

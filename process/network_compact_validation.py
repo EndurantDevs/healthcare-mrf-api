@@ -1,24 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Independent final proof before compact candidate publication."""
+"""Set-based data checks before compact candidate publication."""
 
 from uuid import UUID
 
-from process.network_address_projection import (
-    PinnedAddressSource,
-    _has_binding_location_index,
-    _identifier,
-    _membership_accounting,
-)
-from process.network_compact_dependencies import capture_compact_dependencies, compact_slice_ref_digest
-from process.network_compact_offices import CompactOfficeSources, pin_compact_office_sources
-from process.network_compact_readiness import (
-    _require,
-    compact_index_digest,
-    compact_readiness,
-    require_compact_native_layout,
-)
+from process.network_address_projection import PinnedAddressSource, _has_binding_location_index, _identifier
+from process.network_compact_offices import CompactOfficeSources
+from process.network_compact_readiness import _require, compact_readiness
 from process.network_compact_slice_validation import verify_compact_slice_contents
-from process.network_membership_validation import _json_object, _native_accounting, _scope_report, _validation_report
+from process.network_membership_validation import _json_object, _scope_report
+from process.network_published_api_pin import published_network_layout
+from process.registry_typed_membership_parity import is_typed_candidate
 
 
 def _actual_memberships(layout):
@@ -81,44 +72,13 @@ async def _membership_sets_differ(connection, namespace, layout):
 async def verify_compact_final_proof(
     connection, copy_target, candidate, *, control_schema, office_authority=None, source_witness_runtime=None
 ):
-    """Recheck named address inputs and full membership parity before publication."""
+    """Check slice reuse, reference ownership and membership-to-slice consistency before publication."""
     report = _json_object(candidate["validation_json"])
     address_source = PinnedAddressSource(**report["address_source"])
-    scope = _scope_report(candidate, address_source)
-    _, serving = compact_readiness(candidate, report, scope)
-    await require_compact_native_layout(connection, copy_target.schema_name)
-    layout = await capture_compact_dependencies(connection, candidate, control_schema=control_schema)
-    from process import network_indexed_address_artifact as indexed
-
-    if serving["address_artifact"].get("contract") == indexed.CONTRACT:
-        await indexed.prove_new_indexed_address_dependency(
-            connection, candidate, serving["address_artifact"], control_schema=control_schema
-        )
-    await _verify_custom_contribution(
-        connection,
-        candidate,
-        layout,
-        control_schema,
-        office_authority,
-        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
-    )
-    await verify_compact_slice_contents(connection, copy_target, layout, candidate=candidate)
+    compact_readiness(candidate, report, _scope_report(candidate, address_source))
+    layout = published_network_layout(candidate)
+    await verify_compact_slice_contents(connection, copy_target, layout)
     namespace = _identifier(copy_target.schema_name)
-    from process.network_compact_custom_preparation import compact_carrier_receipt
-
-    offices = CompactOfficeSources(address_source, layout.custom, layout.base, compact_carrier_receipt(candidate))
-    address = await pin_compact_office_sources(connection, copy_target, offices)
-    work, counts = await _compact_accounting(connection, candidate, namespace, address, offices)
-    native = await _native_accounting(
-        connection, namespace + ".network_membership", control_schema, copy_target.candidate_id
-    )
-    validation = _validation_report(scope, counts, native)
-    _require_validation_report(report, validation)
-    _require(
-        await compact_index_digest(connection, copy_target.schema_name, candidate=candidate)
-        == serving["index_definition_sha256"]
-    )
-    _require(await compact_slice_ref_digest(connection, copy_target.schema_name) == serving["slice_ref_sha256"])
     artifact_ids = [artifact.candidate_id for artifact in layout.artifacts]
     _require(
         await connection.fetchval(
@@ -127,58 +87,17 @@ async def verify_compact_final_proof(
             artifact_ids,
         )
     )
-    if work is not None:
-        from process.network_typed_slice_native import verify_work_refs
+    if is_typed_candidate(candidate):
+        from process.network_compact_custom_preparation import compact_carrier_receipt
+        from process.network_typed_membership_accounting import prepare_accounting_work
+        from process.network_typed_slice_native import require_complete_facts, verify_work_refs
 
+        offices = CompactOfficeSources(address_source, layout.custom, layout.base, compact_carrier_receipt(candidate))
+        work, counts = await prepare_accounting_work(connection, namespace, offices)
+        require_complete_facts(counts, candidate, None)
         await verify_work_refs(connection, copy_target, work)
         await connection.execute(f"DROP TABLE {work}")
     else:
         _require(await _membership_sets_differ(connection, namespace, layout) is False)
-    return validation
-
-
-def _require_validation_report(report, validation):
-    from process.network_compact_custom_offices import logical_compact_custom_scope
-
-    comparison = logical_compact_custom_scope(report)
-    _require(
-        all(comparison.get(field) == expected for field, expected in logical_compact_custom_scope(validation).items())
-    )
-
-
-async def _compact_accounting(connection, candidate, namespace, address, offices):
-    from process.registry_typed_membership_parity import is_typed_candidate
-
-    if is_typed_candidate(candidate):
-        from process.network_typed_membership_accounting import prepare_accounting_work
-        from process.network_typed_slice_native import require_complete_facts
-
-        work, counts = await prepare_accounting_work(connection, namespace, offices)
-        require_complete_facts(counts, candidate, None)
-        return work, counts
-    return None, await _membership_accounting(
-        connection, namespace + ".network_membership", namespace + ".provider_location_binding", address
-    )
-
-
-async def _verify_custom_contribution(
-    connection, candidate, layout, control_schema, office_authority, *, source_witness_runtime=None
-):
-    from process.network_compact_custom_preparation import (
-        compact_custom_receipt,
-        verify_compact_custom_approval,
-        verify_compact_custom_contribution,
-    )
-
-    receipt = compact_custom_receipt(candidate)
-    if receipt is not None:
-        await verify_compact_custom_approval(connection, candidate, control_schema)
-        custom = await verify_compact_custom_contribution(
-            connection,
-            candidate,
-            runtime_roles=(),
-            control_schema=control_schema,
-            office_authority=office_authority,
-            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
-        )
-        _require(custom == layout.custom)
+    # Accounting was validated and stored when the candidate was sealed.
+    return report

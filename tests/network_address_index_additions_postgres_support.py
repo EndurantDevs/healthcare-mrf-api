@@ -15,10 +15,8 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from db.models import EntityAddressUnified, NPIData
-from process import network_indexed_address_artifact as indexed
 from process.entity_address_unified import _post_publish_index_plan
 from process.network_address_artifact import (
-    NetworkAddressArtifactError,
     verify_network_address_artifact,
 )
 from process.network_bootstrap_sources import _copy_native_batch
@@ -223,13 +221,6 @@ async def _verify_restored_indexed_data(fixture, target, descriptor):
         await target.execute(f'SET LOCAL ROLE "{fixture.roles["reader"]}"')
         relation = await verify_network_address_artifact(target, descriptor)
         assert relation == CompactAddressRelation(**descriptor["table"])
-        assert await indexed.prove_indexed_address_equivalence(target, descriptor) == {
-            "source_rows": 1,
-            "address_rows": 1,
-            "missing_locations": 0,
-            "extra_locations": 0,
-            "changed_address_rows": 0,
-        }
     assert json.dumps(descriptor, sort_keys=True, separators=(",", ":")) == before
     schema = descriptor["namespace"]["name"]
     async with target.transaction():
@@ -237,11 +228,6 @@ async def _verify_restored_indexed_data(fixture, target, descriptor):
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             async with target.transaction():
                 await target.execute(f"UPDATE \"{schema}\".entity_address_unified SET first_line='Forbidden'")
-    await target.execute(f"UPDATE \"{schema}\".entity_address_unified SET first_line='Different office'")
-    async with target.transaction(isolation="repeatable_read", readonly=True):
-        await target.execute(f'SET LOCAL ROLE "{fixture.roles["reader"]}"')
-        with pytest.raises(NetworkAddressArtifactError, match="indexed_content_differs"):
-            await indexed.prove_indexed_address_equivalence(target, descriptor)
     assert json.dumps(descriptor, sort_keys=True, separators=(",", ":")) == before
 
 

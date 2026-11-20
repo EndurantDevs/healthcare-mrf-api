@@ -140,7 +140,7 @@ def _metadata_spies(monkeypatch, fixture):
     monkeypatch.setattr(artifacts, "_owner_sources", sources)
     monkeypatch.setattr(retention, "_retirement_inventory", AsyncMock(return_value=None))
     contents = AsyncMock(side_effect=AssertionError("Retirement read immutable fact payloads"))
-    monkeypatch.setattr(artifacts, "contribution_fact_sha256", contents)
+    monkeypatch.setattr("process.registry_source_contribution_store.contribution_fact_sha256", contents)
     return original_by_id, requested_pages, contents
 
 

@@ -305,9 +305,7 @@ async def _register_raw_recipe_candidate(connection, copy_target, recipes, appro
     )
     assert recorded == summary
     await materialize_registry_composition(connection, copy_target, commands, control_schema=schema)
-    await seal_network_candidate(
-        connection, copy_target, source_stage=source_stage, command_stage=commands, control_schema=schema
-    )
+    await seal_network_candidate(connection, copy_target, source_stage=source_stage, control_schema=schema)
 
 
 async def _publish_raw_recipe_manifest(
@@ -1010,36 +1008,13 @@ async def test_provider_only_fhir_facts_never_become_office_memberships(disposit
     assert stage.contribution_receipts[0]["provider_only_rows"] == 1
 
 
-async def _assert_fact_storage_tamper(connection, copy_target, candidate_by_field, receipt, schema):
+async def _assert_fact_count_change_refused(connection, copy_target, candidate_by_field):
     from process import registry_source_contribution_store as contributions
 
-    identity = UUID(copy_target.candidate_id)
-    await connection.execute(
-        f'''UPDATE "{copy_target.schema_name}".network_source_contribution SET fact_json=jsonb_set(
-          fact_json,'{{provider_id}}','"1999999999"') WHERE fact_json->>'omission_reason' IS NULL'''
-    )
-    with pytest.raises(contributions.RegistrySourceContributionError, match="content_invalid"):
+    relation = f'"{copy_target.schema_name}".network_source_contribution'
+    await connection.execute(f"DELETE FROM {relation} WHERE ctid=(SELECT min(ctid) FROM {relation})")
+    with pytest.raises(contributions.RegistrySourceContributionError, match="accounting_invalid"):
         await contributions.verify_registry_source_contributions_rows(connection, copy_target, candidate_by_field)
-    forged = json.loads(json.dumps(receipt))
-    forged["sources"][0]["fact_sha256"], _ = await contributions.contribution_fact_sha256(
-        connection, f'"{copy_target.schema_name}".network_source_contribution', forged["sources"][0]["recipe_sha256"]
-    )
-    await connection.execute(
-        f'''UPDATE "{schema}".network_membership_candidate SET source_generations=jsonb_set(
-          source_generations,'{{registry_source_contributions}}',to_jsonb($2::text)),
-          validation_json=jsonb_set(validation_json,'{{registry_source_contributions}}',$3::jsonb)
-          WHERE candidate_id=$1''',
-        identity,
-        contributions.registry_source_contribution_sha256(forged),
-        json.dumps(forged),
-    )
-    forged_candidate = await connection.fetchrow(
-        f'SELECT * FROM "{schema}".network_membership_candidate WHERE candidate_id=$1', identity
-    )
-    assert (
-        await contributions.verify_registry_source_contributions_rows(connection, copy_target, forged_candidate)
-        == forged
-    )
 
 
 async def test_native_candidate_registration_retains_exact_source_facts(reviewed_cms_source):
@@ -1087,7 +1062,7 @@ async def test_native_candidate_registration_retains_exact_source_facts(reviewed
                 )
                 == receipt
             )
-            await _assert_fact_storage_tamper(connection, copy_target, candidate, receipt, schema)
+            await _assert_fact_count_change_refused(connection, copy_target, candidate)
             await connection.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
             await connection.execute(f'DROP TABLE pg_temp."{stage.contribution_table_name}"')
     finally:

@@ -303,33 +303,6 @@ async def load_typed_source_read(connection, recipe, approved, control_schema, r
     return await load_typed_graph_capture(connection, pin.capture, expected_anchor=pin.anchor)
 
 
-async def _sampled_source_keys(connection, recipe, approved, control_schema, runtime):
-    """Resolve exact catalogue keys for the existing sampled raw-Source comparison."""
-    pin = recipe.source_pin
-    from process.network_fhir_typed_mapping import TypedGraphApproval, _approved_graph_keys, typed_graph_bindings
-
-    bindings = await typed_graph_bindings(
-        connection,
-        TypedGraphApproval(
-            approved,
-            recipe.binding_coordinates,
-            pin.catalog_descriptor,
-            catalog_generation=pin.catalog_generation,
-            catalog_bindings=runtime.catalog_bindings,
-        ),
-        control_schema=control_schema,
-    )
-    arguments = (approved.approved_revision, *recipe.binding_coordinates.sql_parameters, pin.catalog_generation)
-    keys = await _approved_graph_keys(
-        connection,
-        bindings,
-        arguments,
-        allow_empty=runtime.catalog_bindings is not None,
-        plan_tiers=pin.capture["graph"]["contract"] == "registry-fhir-typed-graph-v4",
-    )
-    return keys
-
-
 async def require_typed_source_read(
     connection, recipe, approved, control_schema, runtime, *, retained_approval=False, replay_stage=None
 ):
@@ -349,21 +322,6 @@ async def require_typed_source_read(
         if type(origin) is SourceWitnessCompletionOrigin
         else FHIRSourceMembershipInput
     )
-    if runtime.semantic_validation is not None:
-        from process.network_fhir_sampled_validation import SampledCaptureScope, verify_sampled_typed_capture
-
-        keys = await _sampled_source_keys(connection, recipe, approved, control_schema, runtime)
-        sampled = await verify_sampled_typed_capture(
-            runtime.source_export,
-            connection,
-            pin.capture,
-            policy=runtime.semantic_validation.policy,
-            scope=SampledCaptureScope(
-                profile, origin_type(**asdict(origin)), pin.anchor, tuple(sorted(keys)), replay_stage
-            ),
-        )
-        await runtime.semantic_validation.record(sampled, connection)
-        return sampled
     return await verify_typed_graph_capture(
         runtime.source_export,
         connection,

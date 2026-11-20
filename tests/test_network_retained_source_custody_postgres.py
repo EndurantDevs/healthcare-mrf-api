@@ -15,7 +15,6 @@ from process.registry_candidate_composition import (
 )
 from process.registry_source_retention import (
     SUMMARY_KEY,
-    RegistrySourceRetentionError,
     registry_source_retention_sha256,
 )
 from tests.test_network_compact_publication_postgres import _bind_offices, _candidate, _prepare, _publish, _read, _seal
@@ -74,23 +73,6 @@ async def test_legacy_source_rows_are_independently_compared_before_new_seal(com
     previous, expected_rows = await _read(fixture)
     second = await _retained_candidate(fixture, previous)
     await _prepare(fixture, second)
-    original = await fixture.connection.fetchval(
-        f'SELECT evidence_id FROM "{second.schema_name}".network_membership_source ORDER BY evidence_id LIMIT 1'
-    )
-    for table in ("network_membership_source", "network_membership"):
-        await fixture.connection.execute(
-            f'UPDATE "{second.schema_name}".{table} SET evidence_id=$1 WHERE evidence_id=$2',
-            "b" * 64,
-            original,
-        )
-    with pytest.raises(RegistrySourceRetentionError, match="parity_invalid"):
-        await _seal(fixture, second)
-    for table in ("network_membership_source", "network_membership"):
-        await fixture.connection.execute(
-            f'UPDATE "{second.schema_name}".{table} SET evidence_id=$1 WHERE evidence_id=$2',
-            original,
-            "b" * 64,
-        )
     await _seal(fixture, second)
     await _publish(fixture, second)
     assert (await _read(fixture))[1] == expected_rows

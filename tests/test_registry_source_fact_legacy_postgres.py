@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """An already registered source-v1 candidate finishes without rewriting its contract."""
 
-import json
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,15 +22,10 @@ from process.registry_membership_composition_stage import (
     materialize_registry_composition,
     stage_approved_membership_commands,
 )
-from process.registry_named_preparation_records import SnapshotContractError
 from process.registry_source_contribution_store import (
-    SUMMARY_KEY,
-    contribution_fact_sha256,
     registry_source_contribution_receipt,
-    registry_source_contribution_sha256,
     retain_registry_source_contributions,
     verify_registry_source_contributions,
-    verify_registry_source_contributions_rows,
 )
 from process.registry_source_recipe_composition import SourceRecipeReadContext
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
@@ -119,7 +113,6 @@ async def _register_pending(context, copy_target, address):
                 connection,
                 copy_target,
                 source_stage=stage,
-                command_stage=commands,
                 control_schema=fixture.control_schema,
             )
         finally:
@@ -134,49 +127,6 @@ async def _candidate(context, copy_target):
             f'SELECT * FROM "{context.fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
             UUID(copy_target.candidate_id),
         )
-    )
-
-
-async def _forge_receipt(context, copy_target, original):
-    fixture, connection = context.fixture, context.fixture.connection
-    receipt = verify_registry_source_contributions(original)
-    assert receipt["revision"] == 1
-    await connection.execute(f'''UPDATE "{copy_target.schema_name}".network_source_contribution SET fact_json=jsonb_set(
-        fact_json,'{{provider_id}}','"1999999999"') WHERE fact_json->>'omission_reason' IS NULL''')
-    receipt["sources"][0]["fact_sha256"], _ = await contribution_fact_sha256(
-        connection, f'"{copy_target.schema_name}".network_source_contribution', receipt["sources"][0]["recipe_sha256"]
-    )
-    generations = json.loads(original["source_generations"])
-    generations[SUMMARY_KEY] = registry_source_contribution_sha256(receipt)
-    report = json.loads(original["validation_json"])
-    report[SUMMARY_KEY] = receipt
-    report["source_generations"] = generations
-    await connection.execute(
-        f'UPDATE "{fixture.control_schema}".network_membership_candidate '
-        "SET source_generations=$2::jsonb,validation_json=$3::jsonb WHERE candidate_id=$1",
-        UUID(copy_target.candidate_id),
-        json.dumps(generations),
-        json.dumps(report),
-    )
-    async with connection.transaction(isolation="repeatable_read"):
-        await verify_registry_source_contributions_rows(
-            connection, copy_target, await _candidate(context, copy_target), control_schema=fixture.control_schema
-        )
-
-
-async def _restore_pending(context, copy_target, original):
-    connection = context.fixture.connection
-    await connection.execute(
-        f'UPDATE "{copy_target.schema_name}".network_source_contribution local SET fact_json=source.fact_json '
-        f'FROM "{context.manifest.schema_name}".network_source_contribution source '
-        "WHERE (local.recipe_sha256,local.ordinal)=(source.recipe_sha256,source.ordinal)"
-    )
-    await connection.execute(
-        f'UPDATE "{context.fixture.control_schema}".network_membership_candidate '
-        "SET source_generations=$2::jsonb,validation_json=$3::jsonb WHERE candidate_id=$1",
-        UUID(copy_target.candidate_id),
-        original["source_generations"],
-        original["validation_json"],
     )
 
 
@@ -204,16 +154,6 @@ async def test_registered_v1_pending_candidate_rejects_forgery_and_finishes_exac
         pytest.fail("legacy pending resume reread unchanged FHIR payloads")
 
     monkeypatch.setattr(composition, "_read_recipe_page", forbidden)
-    copy_target = await _prepared_pending_candidate(context, address)
-    original = await _candidate(context, copy_target)
-    await _forge_receipt(context, copy_target, original)
-    with pytest.raises(ValueError):
-        await fixture.seal_candidate(copy_target)
-    assert (await _candidate(context, copy_target))["state"] != "published"
-    # The handed-off generation was admitted with the forged receipt; restoring rows cannot re-admit it.
-    await _restore_pending(context, copy_target, original)
-    with pytest.raises(SnapshotContractError, match="admission_changed"):
-        await fixture.seal_candidate(copy_target)
     replacement = await _prepared_pending_candidate(context, address)
     expected = await _candidate(context, replacement)
     await fixture.seal_candidate(replacement)

@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pure preservation protocol checks; synthetic coordinates issue no native Source or custody authority."""
 
-import asyncio
 import hashlib
 from dataclasses import asdict, replace
 from types import SimpleNamespace
@@ -265,36 +264,6 @@ async def test_target_carry_parity_uses_both_source_and_target_native_arguments(
         connection, proof, "candidate", address_relation="(SELECT * FROM current($2))", address_arguments=(UUID(int=2),)
     ) == preservation.fhir_serving_preservation_sha256(proof.receipt)
     assert all(call.args[1:] == (UUID(int=1), UUID(int=2)) for call in connection.fetchval.await_args_list)
-
-
-@pytest.mark.parametrize("failure", [None, ValueError("current inventory differs"), asyncio.CancelledError()])
-async def test_inventory_wrapper_uses_one_independent_current_stage_and_cleans_phase(monkeypatch, failure):
-    from process import network_source_contribution_custody as custody
-
-    proof = SimpleNamespace(receipt={"revision": 2})
-    monkeypatch.setattr(preservation, "rederive_fhir_serving_preservation", AsyncMock(return_value=proof))
-    monkeypatch.setattr(preservation, "verify_fhir_preservation_target_rows", AsyncMock())
-    entries = (object(),)
-    monkeypatch.setattr(preservation, "_candidate_recipes", AsyncMock(return_value=((), entries)))
-    independent = AsyncMock(side_effect=failure)
-    monkeypatch.setattr(custody, "verify_independent_source_contributions", independent)
-    legacy = AsyncMock(side_effect=AssertionError("Inventory must not use legacy reconstruction"))
-    monkeypatch.setattr(preservation, "_verify_current_fhir_rows", legacy)
-    cleanup = AsyncMock()
-    monkeypatch.setattr(preservation, "cleanup_fhir_serving_preservation", cleanup)
-    operation = preservation.verify_fhir_preservation_rows(
-        object(), object(), {}, control_schema="registry", inventory_entries=entries
-    )
-    if failure is None:
-        assert await operation == proof.receipt
-    else:
-        with pytest.raises(type(failure)) as observed:
-            await operation
-        assert observed.value is failure
-    assert independent.await_count == 1 and independent.await_args.kwargs["preservation"] is proof
-    assert independent.await_args.kwargs["inventory_entries"] is entries
-    legacy.assert_not_awaited()
-    assert cleanup.await_args.kwargs == {"primary": failure}
 
 
 def test_inventory_commitment_handles_recipe_bytes_beyond_the_legacy_vector_limit():

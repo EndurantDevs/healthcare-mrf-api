@@ -157,8 +157,7 @@ async def test_initial_publication_refuses_before_manifest_sequence(monkeypatch)
             connection, SimpleNamespace(candidate_id="00000000-0000-0000-0000-000000000001"), '"control_example"'
         )
     gate.assert_awaited_once_with(connection, candidate_by_field, compact_layout=None)
-    connection.fetchval.assert_awaited_once()
-    assert connection.fetchval.await_args.args[1:] == (["candidate_example"], ["entity_address_unified"])
+    connection.fetchval.assert_not_awaited()
     insert.assert_not_awaited()
 
 

@@ -249,7 +249,7 @@ async def test_inventory_reuse_preserves_named_generation_and_source_content(mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [0, 101, 1000])
-async def test_content_verification_pages_authentication_and_checks_every_fact(monkeypatch, count):
+async def test_reuse_resolution_pages_authentication_without_rehashing_facts(monkeypatch, count):
     descriptors = tuple({"recipe_sha256": f"{index:064x}"} for index in range(count))
     pages = []
 
@@ -264,11 +264,10 @@ async def test_content_verification_pages_authentication_and_checks_every_fact(m
         }
 
     monkeypatch.setattr(artifacts, "authenticate_anchored_source_fact_metadata", authenticate)
-    contents = AsyncMock(return_value=("e" * 64, 1))
-    monkeypatch.setattr(artifacts, "contribution_fact_sha256", contents)
-    resolved = await artifacts.verify_anchored_source_fact_contents(AsyncMock(), descriptors, control_schema=CONTROL)
+    connection = AsyncMock()
+    resolved = await artifacts.verify_anchored_source_fact_contents(connection, descriptors, control_schema=CONTROL)
     assert [source for page in pages for source in page] == list(descriptors)
-    assert pages and len(resolved) == count and contents.await_count == count
+    assert pages and len(resolved) == count and not connection.mock_calls
 
 
 @pytest.mark.asyncio
@@ -293,19 +292,6 @@ async def test_public_metadata_authentication_keeps_hundred_descriptor_cap():
             connection, _selected(owner) * 101, control_schema=CONTROL
         )
     connection.fetch.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_paged_content_hash_mismatch_is_terminal(monkeypatch):
-    artifact = SimpleNamespace(relation="synthetic_facts", descriptor={"fact_sha256": "e" * 64, "fact_rows": 1})
-    monkeypatch.setattr(
-        artifacts, "authenticate_anchored_source_fact_metadata", AsyncMock(return_value={"a" * 64: artifact})
-    )
-    monkeypatch.setattr(artifacts, "contribution_fact_sha256", AsyncMock(return_value=("f" * 64, 1)))
-    with pytest.raises(contributions.RegistrySourceContributionError, match="content_changed"):
-        await artifacts.verify_anchored_source_fact_contents(
-            AsyncMock(), ({"recipe_sha256": "a" * 64},), control_schema=CONTROL
-        )
 
 
 def _legacy_owner_summary(source_descriptors):

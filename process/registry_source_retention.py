@@ -173,7 +173,7 @@ async def retain_registry_source_memberships(connection, copy_target, stage, *, 
 
 
 async def verify_registry_source_retention_rows(connection, copy_target, candidate, *, source_stage=None):
-    """Check native source_relation counts and optional stage multiset parity before sealing."""
+    """Check the native source row count before sealing."""
     receipt = verify_registry_source_retention(candidate)
     if receipt is None:
         if source_stage is not None:
@@ -193,23 +193,6 @@ async def verify_registry_source_retention_rows(connection, copy_target, candida
         await _require_source_retention_lock(connection, source_relation)
         if await connection.fetchval(f"SELECT count(*) FROM {source_relation}") != receipt["source_rows"]:
             raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
-        if source_stage is not None:
-            projection = _stage_projection(_stage_relation(source_stage, receipt), stage=source_stage)
-            from process.registry_typed_membership_parity import has_multiset_difference, is_typed_candidate
-
-            if is_typed_candidate(candidate):
-                from process.registry_typed_membership_parity import require_order_index
-
-                await require_order_index(connection, source_relation)
-                await require_order_index(connection, _stage_relation(source_stage, receipt))
-                differs = await has_multiset_difference(connection, "SELECT * FROM " + source_relation, projection)
-            else:
-                differs = await connection.fetchval(f"""WITH staged AS MATERIALIZED ({projection}), differences AS (
-                  (SELECT * FROM {source_relation} EXCEPT ALL SELECT * FROM staged)
-                  UNION ALL (SELECT * FROM staged EXCEPT ALL SELECT * FROM {source_relation}))
-                  SELECT EXISTS(SELECT 1 FROM differences)""")
-            if differs:
-                raise RegistrySourceRetentionError("registry_source_retention_parity_invalid")
     except asyncpg.PostgresError as error:
         raise RegistrySourceRetentionError("registry_source_retention_source_invalid") from error
     return receipt

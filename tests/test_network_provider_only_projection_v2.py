@@ -428,30 +428,3 @@ async def test_v2_rebuild_propagates_single_fact_stream_bounds_failure(monkeypat
     fallback.assert_awaited_once()
     assert fallback.await_args.kwargs["retained_read"] == "authenticated-read"
     connection.copy_records_to_table.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("zero", [False, True])
-async def test_v2_staged_identity_uses_exact_origin_without_reopening_source(monkeypatch, zero):
-    recipe, target = _recipe(), legacy._target()
-    descriptor = _descriptor(recipe, anchored=True)
-    if zero:
-        descriptor.update(dict.fromkeys(facts._WITNESS_COUNTERS_V2, 0))
-        descriptor["fact_sha256"] = hashlib.sha256(b"").hexdigest()
-    original = copy.deepcopy(descriptor)
-    monkeypatch.setattr(projection, "source_fact_artifact_reference", Mock(return_value=object()))
-    metadata = AsyncMock(return_value={descriptor["recipe_sha256"]: SimpleNamespace(relation='"original".facts')})
-    monkeypatch.setattr(projection, "authenticate_anchored_source_fact_metadata", metadata)
-    connection, append = legacy._staged_protocol(monkeypatch)
-    receipt = await projection._verify_staged_provider_only_projection(
-        connection,
-        target,
-        (recipe,),
-        legacy._staged((descriptor,)),
-        ApprovedMembershipSource(3, "d" * 64),
-        control_schema="controls",
-    )
-    assert receipt["source_count"] == 1 and descriptor == original
-    assert metadata.await_args.args[1] == [descriptor]
-    assert append.await_args.args[2] == '"original".facts'
-    assert append.await_args.kwargs == {"descriptor_version": 2}

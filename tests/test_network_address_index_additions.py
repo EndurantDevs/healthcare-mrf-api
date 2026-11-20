@@ -110,30 +110,6 @@ async def test_compact_recapture_distinguishes_indexes_from_data(monkeypatch, ch
     assert candidate_by_field == before
 
 
-@pytest.mark.asyncio
-async def test_index_changes_reuse_only_the_same_retained_data_proof(monkeypatch):
-    from process import registry_retained_generation
-
-    saved = _named_descriptor()
-    captured = _changed_diagnostic(saved)
-    previous = (
-        SimpleNamespace(compact_layout=object()),
-        {"validation_json": {"serving_readiness": {"address_artifact": saved}}},
-    )
-    monkeypatch.setattr(
-        registry_retained_generation, "resolve_registry_retained_generation", AsyncMock(return_value=previous)
-    )
-    proof = AsyncMock()
-    monkeypatch.setattr(indexed, "prove_indexed_address_equivalence", proof)
-
-    await indexed.prove_new_indexed_address_dependency(object(), {}, captured, control_schema="registry")
-
-    proof.assert_not_awaited()
-    previous[0].compact_layout = None
-    await indexed.prove_new_indexed_address_dependency(object(), {}, captured, control_schema="registry")
-    proof.assert_awaited_once()
-
-
 def _index_record(name, valid=True):
     return {
         "relname": name,

@@ -146,7 +146,8 @@ async def _wrong_office_refusal(context, target):
         f'UPDATE "{target.schema_name}".provider_location_binding SET location_key=$1', "b" * 64
     )
     try:
-        with pytest.raises(ValueError, match="registry_source_office_bindings_differ"):
+        # The membership-to-slice comparison refuses a changed office binding.
+        with pytest.raises(ValueError, match="Compact network readiness differs"):
             await fixture.seal_candidate(target)
         assert (
             await fixture.connection.fetchval(

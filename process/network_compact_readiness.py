@@ -156,39 +156,6 @@ async def compact_index_digest(connection, schema_name, *, candidate=None):
     return _digest([dict(index_record) for index_record in indexes])
 
 
-async def require_compact_native_layout(connection, schema_name):
-    """Require the declared compact heap columns, native types and ordinary non-null values."""
-    expected_by_table = {
-        "network_office_edge": (("slice_id", "uuid"), ("location_key", "character varying(64)")),
-        "network_slice_ref": (
-            ("network_id", "integer"),
-            ("office_bucket", "integer"),
-            ("artifact_candidate_id", "uuid"),
-            ("slice_id", "uuid"),
-            ("row_count", "bigint"),
-            ("content_sha256", "character varying(64)"),
-        ),
-    }
-    column_records = await connection.fetch(
-        "SELECT c.relname,a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull,"
-        "a.attgenerated='' AND a.attidentity='' AND d.oid IS NULL AS ordinary "
-        "FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid "
-        "JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped "
-        "LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum "
-        "WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind='r' ORDER BY c.relname,a.attnum",
-        schema_name,
-        sorted(expected_by_table),
-    )
-    _require(
-        [tuple(column_record) for column_record in column_records]
-        == [
-            (table, column, data_type, True, True)
-            for table, columns in sorted(expected_by_table.items())
-            for column, data_type in columns
-        ]
-    )
-
-
 def _require_index_paths(indexes, candidate):
     if candidate is not None:
         from process.network_geo_search import geo_search_receipt, require_geo_search_index_records

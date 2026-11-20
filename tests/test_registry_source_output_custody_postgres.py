@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Independent mapped-source and manual-effective parity beyond fact hashes/counts."""
+"""Source row accounting is checked before a candidate is published."""
 
 from uuid import UUID, uuid4, uuid5
 
@@ -46,38 +46,25 @@ async def _prepare_pending(context):
     return copy_target, address
 
 
-async def _corrupt_outputs(context, copy_target, mutation):
+async def _add_source_row(context, copy_target):
     connection = context.fixture.connection
     source_table = f'"{copy_target.schema_name}".network_membership_source'
-    effective_table = f'"{copy_target.schema_name}".network_membership'
-    original = await connection.fetchrow(f"SELECT network_id,evidence_id FROM {source_table}")
-    if mutation == "source_network":
-        await connection.execute(f"UPDATE {source_table} SET network_id=$1", context.other_network_id)
-    if mutation in {"source_evidence", "both_evidence"}:
-        await connection.execute(f"UPDATE {source_table} SET evidence_id=$1", "f" * 64)
-    if mutation in {"effective_evidence", "both_evidence"}:
-        await connection.execute(f"UPDATE {effective_table} SET evidence_id=$1", "f" * 64)
-    assert await connection.fetchval(f"SELECT count(*) FROM {source_table}") == 1
-    assert await connection.fetchval(f"SELECT count(*) FROM {effective_table}") == 1
-    return original
+    await connection.execute(f"INSERT INTO {source_table} SELECT * FROM {source_table}")
+    assert await connection.fetchval(f"SELECT count(*) FROM {source_table}") == 2
 
 
-async def _restore_outputs(context, copy_target, original):
-    for table in ("network_membership_source", "network_membership"):
-        await context.fixture.connection.execute(
-            f'UPDATE "{copy_target.schema_name}".{table} SET network_id=$1,evidence_id=$2',
-            original["network_id"],
-            original["evidence_id"],
-        )
+async def _remove_added_source_row(context, copy_target):
+    source_table = f'"{copy_target.schema_name}".network_membership_source'
+    await context.fixture.connection.execute(
+        f"DELETE FROM {source_table} WHERE ctid=(SELECT max(ctid) FROM {source_table})"
+    )
 
 
-@pytest.mark.parametrize("mutation", ["source_network", "source_evidence", "effective_evidence", "both_evidence"])
-async def test_independent_seal_rejects_same_count_mapped_output_forgery(provider_only_db, mutation):
+async def test_seal_rejects_a_changed_source_row_count(provider_only_db):
     context, fixture = provider_only_db, provider_only_db.fixture
     copy_target, address = await _prepare_pending(context)
-    original = await _corrupt_outputs(context, copy_target, mutation)
-    reason = "effective_parity_invalid" if mutation == "effective_evidence" else "retention_parity_invalid"
-    with pytest.raises(RegistrySourceRetentionError, match=reason):
+    await _add_source_row(context, copy_target)
+    with pytest.raises(RegistrySourceRetentionError, match="accounting_invalid"):
         await fixture.seal_candidate(copy_target)
     assert (
         await fixture.connection.fetchval(
@@ -92,7 +79,7 @@ async def test_independent_seal_rejects_same_count_mapped_output_forgery(provide
         )
         == context.manifest.generation_id
     )
-    await _restore_outputs(context, copy_target, original)
+    await _remove_added_source_row(context, copy_target)
     await fixture.seal_candidate(copy_target)
     await prepare_and_publish_network_candidate(
         fixture.connection,

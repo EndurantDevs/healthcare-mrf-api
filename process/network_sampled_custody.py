@@ -259,39 +259,3 @@ def _merge_sampled_networks(previous, current):
     }
     merged_by_field["receipt_sha256"] = digest(merged_by_field)
     return validate_sampled_semantic_receipt(merged_by_field)
-
-
-async def inherit_preserved_sampling(connection, preservation, runtime, control_schema):
-    """Keep sampled ancestry through repeated carry; current full checks cannot upgrade historical data."""
-    if preservation is None or not preservation.receipt["carried_rows"]:
-        return
-    from process.registry_source_contribution_artifacts import (
-        _published_artifact_candidates,
-        load_published_artifact_validation,
-    )
-
-    predecessor = preservation.predecessor
-    candidates = await _published_artifact_candidates(connection, control_schema, {predecessor.candidate_id})
-    evidence = await load_published_artifact_validation(
-        connection, candidates[predecessor.candidate_id], control_schema
-    )
-    require(evidence["validation"] is not None, "preserved_source_validation_required")
-    if evidence["semantic_validation"] is None:
-        return
-    semantic = validate_sampled_custody(evidence["semantic_validation"], candidate_id=predecessor.candidate_id)
-    if semantic["preserved_lineage"] is None and all(
-        source_evidence["method"] == "exhaustive-retained" for source_evidence in semantic["sources"]
-    ):
-        return
-    run = None if runtime is None else runtime.semantic_validation
-    require(type(run) is SampledValidationRun, "sampled_preservation_requires_policy")
-    # shortcut: keep the predecessor's sampled status for any carry; refine only with source-attributed lineage.
-    lineage_by_field = {
-        "candidate_id": predecessor.candidate_id,
-        "generation_id": evidence["generation_id"],
-        "semantic_sha256": semantic["sha256"],
-    }
-    require(
-        run._preserved_lineage is None or run._preserved_lineage == lineage_by_field, "sampled_preservation_changed"
-    )
-    run._preserved_lineage = lineage_by_field

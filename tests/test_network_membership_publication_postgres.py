@@ -630,20 +630,6 @@ async def test_projection_row_count_does_not_add_publication_queries(publication
     assert report["candidate_readiness"]["address_rows"] == 20004
 
 
-@pytest.mark.parametrize("change", ["ENABLE", "FORCE"])
-async def test_publication_refuses_row_filtered_address_heap(publication_db, change):
-    """Served heaps are frozen once published, so publication itself refuses row filtering."""
-    fixture = publication_db
-    table = f'"{fixture.copy_target.schema_name}".entity_address_unified'
-    await fixture.connection.execute(f"ALTER TABLE {table} {change} ROW LEVEL SECURITY")
-    before, sequence_before = await _snapshot(fixture), await _sequence_state(fixture)
-    async with fixture.connection.transaction():
-        with pytest.raises(NetworkPublicationError, match="row filtered"):
-            await _publish(fixture)
-    assert await _snapshot(fixture) == before
-    assert await _sequence_state(fixture) == sequence_before
-
-
 @pytest.mark.asyncio
 async def test_publication_pins_nonzero_approved_revision(publication_db):
     fixture = publication_db

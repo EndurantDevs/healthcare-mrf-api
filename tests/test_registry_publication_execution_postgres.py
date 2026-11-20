@@ -24,7 +24,6 @@ from process.network_custom_address_source import (
 from process.network_custom_address_source import (
     _from_document as _custom_address_receipt,
 )
-from process.network_legacy_membership_source import LegacyMembershipSourceError
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import (
@@ -32,7 +31,6 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
 )
 from process.registry_company_approval_fence import _fence_key
-from process.registry_named_preparation_records import PREPARATION, digest
 from process.registry_publication_queue import (
     RegistryReactivationCommand,
     claim_registry_publication_request,
@@ -1162,8 +1160,8 @@ async def test_source_preview_fault_keeps_closed_candidate_and_head_then_resumes
         "cancel": asyncio.CancelledError,
         "revoke": PermissionError,
         "lease": RegistryApprovalConflict,
-        # The configured preparation step validates sources against the moved approval first.
-        "approval": LegacyMembershipSourceError,
+        # Publication controls refuse the moved approved revision before any head change.
+        "approval": RegistryApprovalConflict,
     }[fault]
     with pytest.raises(expected):
         await _complete_source_preview(source_preview, _reactivation_authority(calls, revoke=fault == "revoke"))
@@ -1471,37 +1469,6 @@ async def test_source_publication_refuses_changed_review_pins_and_closure(source
         )
         == "ready"
     )
-
-
-async def test_source_publication_rejects_stale_named_validation_and_preserves_generation(source_publication):
-    history, _command, _actor, _queued, lease, preview = source_publication
-    fixture = history.fixture
-    connection, schema = fixture.connection, fixture.control_schema
-    candidate_id = UUID(preview["candidate_id"])
-    preparation_sql = f"SELECT state,claim_attempt,validation FROM {PREPARATION} WHERE preparation_id=$1"
-    prepared = await connection.fetchrow(preparation_sql, candidate_id)
-    assert prepared["state"] == "validated"
-    prior_rows = await _rollback_members(connection, history.second)
-    stale = json.loads(prepared["validation"])
-    stale["evidence"]["data"]["validation_sha256"] = "0" * 64
-    await connection.execute(
-        f"UPDATE {PREPARATION} SET validation=$2,validation_sha256=$3 WHERE preparation_id=$1",
-        candidate_id,
-        json.dumps(stale),
-        digest(stale),
-    )
-
-    with pytest.raises(ValueError, match="^Stored network data validation changed$"):
-        await _complete_source_publication(source_publication, _reactivation_authority([]))
-
-    current = await connection.fetchrow(preparation_sql, candidate_id)
-    assert (current["state"], current["claim_attempt"]) == ("validated", prepared["claim_attempt"])
-    async with connection.transaction(isolation="repeatable_read", readonly=True):
-        assert await resolve_network_serving_manifest(connection, control_schema=schema) == history.second
-        assert await _rollback_members(connection, history.second) == prior_rows
-    status = await read_registry_publication_request(connection, lease["request_id"], control_schema=schema)
-    assert status["state"] == "running" and status["result"] is None
-    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_serving_manifest') == 2
 
 
 async def test_source_publication_competing_native_head_preserves_reviewed_ready_candidate(source_publication):

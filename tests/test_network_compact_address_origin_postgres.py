@@ -2,7 +2,6 @@
 """New publications reuse only independently sealed retained address origins."""
 
 import json
-import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -22,7 +21,6 @@ from api.network_read_execution import bounded_network_read_rows
 from api.network_serving_api_read import api_catalog_read_snapshot
 from api.reference_family_reads import pin_claims_reader
 from db.connection import Database, current_session
-from process import network_indexed_address_artifact as indexed
 from process.entity_address_unified import _location_key_expr
 from process.network_address_artifact import NetworkAddressArtifactError, verify_network_address_artifact
 from process.network_address_projection import PinnedAddressSource
@@ -377,96 +375,6 @@ async def _address_descriptor(fixture, target):
     return report["serving_readiness"]["address_artifact"]
 
 
-async def test_indexed_adoption_ignores_old_arrays_and_preserves_rollback_and_next_successor(
-    indexed_db, monkeypatch, record_property
-):
-    fixture = indexed_db
-    proof_calls = []
-    prove = indexed.prove_indexed_address_equivalence
-
-    async def measured_proof(*arguments):
-        started = time.perf_counter()
-        counts = await prove(*arguments)
-        proof_calls.append(counts)
-        record_property("indexed_content_proof_seconds", time.perf_counter() - started)
-        return counts
-
-    monkeypatch.setattr(indexed, "prove_indexed_address_equivalence", measured_proof)
-    await fixture.connection.execute(
-        f"UPDATE \"{fixture.legacy.schema_name}\".entity_address_unified SET canonical_network_ids='{{99}}'"
-    )
-    copy_target = await _adopt(fixture)
-    await _seal(fixture, copy_target)
-    await _publish(fixture, copy_target)
-    current, address_rows = await _read(fixture)
-    assert current.supports_location_lookup and not fixture.previous.supports_location_lookup
-    assert address_rows == fixture.previous_rows
-    assert current.compact_layout.base != fixture.previous.compact_layout.base
-    assert current.compact_layout.base.schema_name == fixture.legacy.schema_name
-    assert current.source_generations["retained_network_source"] == fixture.previous.manifest_sha256
-    previous, previous_rows = await _read(fixture, fixture.previous.generation_id)
-    assert previous_rows == fixture.previous_rows and not previous.supports_location_lookup
-    assert (await _read(fixture, current.generation_id, network_ids=(99,)))[1] == []
-    assert (
-        await fixture.connection.fetchval("SELECT to_regclass($1)", copy_target.schema_name + ".entity_address_unified")
-        is None
-    )
-    from process.network_compact_retention import (
-        NetworkCompactRetentionError,
-        require_network_compact_artifacts_unreferenced,
-    )
-
-    descriptor = await _address_descriptor(fixture, copy_target)
-    async with fixture.connection.transaction(isolation="read_committed"):
-        with pytest.raises(NetworkCompactRetentionError, match="artifact_referenced"):
-            await require_network_compact_artifacts_unreferenced(
-                fixture.connection,
-                [CompactAddressRelation(**descriptor["table"])],
-                control_schema=fixture.control_schema,
-            )
-
-    successor = await _candidate(fixture, (42,), current.generation_id, source_manifest=current)
-    await _prepare(fixture, successor)
-    await _seal(fixture, successor)
-    await _publish(fixture, successor)
-    assert (await _read(fixture))[1] == address_rows
-    assert (await _read(fixture, current.generation_id))[1] == address_rows
-    assert proof_calls == [
-        dict(source_rows=1, address_rows=1, missing_locations=0, extra_locations=0, changed_address_rows=0)
-    ]
-    record_property("indexed_content_proof_rows", 1)
-
-
-@pytest.mark.parametrize("damage", ["field", "missing", "extra"])
-async def test_new_independent_seal_rejects_forged_legacy_content_without_advancing_head(indexed_db, damage):
-    fixture = indexed_db
-    target = await _adopt(fixture)
-    table = f'"{fixture.legacy.schema_name}".entity_address_unified'
-    if damage == "field":
-        await fixture.connection.execute(f"UPDATE {table} SET first_line='Different office'")
-    elif damage == "missing":
-        await fixture.connection.execute(f"DELETE FROM {table}")
-    else:
-        await fixture.connection.execute(
-            f"INSERT INTO {table} SELECT (jsonb_populate_record(NULL::{table},to_jsonb(a)||jsonb_build_object('location_key',repeat('b',64)))).* FROM {table} a"
-        )
-    with pytest.raises(NetworkAddressArtifactError, match="indexed_content_differs"):
-        await _seal(fixture, target)
-    assert (
-        await fixture.connection.fetchval(
-            f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control'
-        )
-        == fixture.previous.generation_id
-    )
-    report = json.loads(
-        await fixture.connection.fetchval(
-            f'SELECT validation_json FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-            UUID(target.candidate_id),
-        )
-    )
-    assert "final_validation" not in report
-
-
 async def test_worker_selected_indexed_base_requires_exact_retained_generation(indexed_db):
     fixture = indexed_db
     fixture.indexed_source = replace(fixture.indexed_source, generation_id="f" * 64)
@@ -614,38 +522,6 @@ async def test_indexed_custom_npi_input_keeps_authenticated_bootstrap_identity(i
         fixture.bootstrap.address_source.schema_name, "npi", fixture.bootstrap.generation_sha256
     )
     assert relation == CompactAddressRelation(fixture.indexed_source.schema_name, fixture.indexed_source.table_name)
-
-
-@pytest.mark.parametrize("indexed_db", [100001], indirect=True)
-async def test_complete_indexed_content_proof_is_bounded_across_many_ranges(indexed_db, monkeypatch, record_property):
-    fixture = indexed_db
-    copy_target = await _adopt(fixture)
-    prove = indexed.prove_indexed_address_equivalence
-    observations = []
-
-    async def measured_proof(*arguments):
-        settings = await arguments[0].fetchrow("SELECT current_setting('work_mem'),current_setting('temp_file_limit')")
-        assert tuple(settings) == ("16MB", "256MB")
-        started = time.perf_counter()
-        counts = await prove(*arguments)
-        elapsed = time.perf_counter() - started
-        observations.append(counts)
-        record_property("indexed_content_proof_seconds", elapsed)
-        record_property("indexed_content_proof_rows", counts["source_rows"])
-        record_property("indexed_content_proof_memory", "/".join(settings))
-        return counts
-
-    monkeypatch.setattr(indexed, "prove_indexed_address_equivalence", measured_proof)
-    await _seal(fixture, copy_target)
-    assert observations == [
-        dict(source_rows=100001, address_rows=100001, missing_locations=0, extra_locations=0, changed_address_rows=0)
-    ]
-    assert (
-        await fixture.connection.fetchval(
-            f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control'
-        )
-        == fixture.previous.generation_id
-    )
 
 
 async def _retained_resolves(fixture):

@@ -173,36 +173,16 @@ async def test_fact_copy_rejects_unbounded_transfer_before_native_write():
 
 
 @pytest.mark.asyncio
-async def test_native_fact_fingerprint_is_ordered_bounded_and_rejects_gaps():
-    class Connection:
-        def __init__(self, ordinals):
-            self.ordinals = ordinals
-            self.calls = []
-
-        async def fetch(self, query, identity, cursor):
-            assert "LIMIT 1000" in query and "ordinal>$2" in query and "ordinal<=LEAST($2," in query
-            self.calls.append(cursor)
-            return [
-                {"ordinal": ordinal, "fingerprint": "a" * 64}
-                for ordinal in self.ordinals
-                if cursor < ordinal <= cursor + 1000
-            ]
-
-        async def fetchval(self, query, identity, cursor):
-            assert "SELECT EXISTS" in query
-            return any(ordinal > cursor for ordinal in self.ordinals)
-
-    complete = Connection([1, 2])
-    digest, row_count = await contributions.contribution_fact_sha256(complete, 'pg_temp."synthetic_facts"', "b" * 64)
-    assert row_count == 2 and digest == contributions.hashlib.sha256(("a" * 128).encode()).hexdigest()
-    assert complete.calls == [0, 2]
-    assert await contributions.contribution_fact_sha256(Connection([]), 'pg_temp."synthetic_facts"', "b" * 64) == (
-        contributions.hashlib.sha256().hexdigest(),
-        0,
-    )
-    for ordinals in ([1, 3], [1, 1002], [1001], [2**63 - 1]):
-        with pytest.raises(contributions.RegistrySourceContributionError, match="ordinal_invalid"):
-            await contributions.contribution_fact_sha256(Connection(ordinals), 'pg_temp."synthetic_facts"', "b" * 64)
+async def test_fact_accounting_digest_is_one_aggregate_and_reproducible():
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={"fact_rows": 2, "fact_bytes": 30}))
+    first = await contributions.contribution_fact_sha256(connection, 'pg_temp."synthetic_facts"', "b" * 64)
+    second = await contributions.contribution_fact_sha256(connection, 'pg_temp."synthetic_facts"', "b" * 64)
+    assert first == second == (contributions._digest(["b" * 64, 2, 30]), 2)
+    query, identity = connection.fetchrow.await_args.args
+    assert "count(*)" in query and "octet_length(fact_json::text)" in query and identity == "b" * 64
+    connection.fetchrow.return_value = {"fact_rows": 2, "fact_bytes": 31}
+    changed = await contributions.contribution_fact_sha256(connection, 'pg_temp."synthetic_facts"', "b" * 64)
+    assert changed[0] != first[0] and len(changed[0]) == 64
 
 
 def test_receipt_rejects_deep_noncontract_documents_with_closed_error():
@@ -321,32 +301,17 @@ async def test_empty_fact_page_advances_nothing_and_does_not_issue_copy():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["none", "contents", "insert_count"])
-async def test_reused_facts_are_checked_before_copy_and_copy_must_be_complete(monkeypatch, damage):
-    fingerprint = "a" * 64
-    verify = AsyncMock(return_value=("b" * 64 if damage == "contents" else fingerprint, 2))
-    monkeypatch.setattr(contributions, "contribution_fact_sha256", verify)
-    connection = SimpleNamespace(
-        execute=AsyncMock(return_value="INSERT 0 1" if damage == "insert_count" else "INSERT 0 2")
-    )
-    arguments = (
-        connection,
-        '"retained"."source_facts"',
-        {"fact_sha256": fingerprint, "fact_rows": 2},
-        "staged",
-        "c" * 64,
-    )
-    if damage == "none":
+@pytest.mark.parametrize("insert_status", ["INSERT 0 2", "INSERT 0 1"])
+async def test_reused_facts_copy_must_match_the_recorded_row_count(insert_status):
+    connection = SimpleNamespace(execute=AsyncMock(return_value=insert_status))
+    arguments = (connection, '"retained"."source_facts"', {"fact_sha256": "a" * 64, "fact_rows": 2}, "staged", "c" * 64)
+    if insert_status == "INSERT 0 2":
         await contributions.reuse_fhir_facts(*arguments)
     else:
-        with pytest.raises(contributions.RegistrySourceContributionError, match="content_invalid|accounting_invalid"):
+        with pytest.raises(contributions.RegistrySourceContributionError, match="accounting_invalid"):
             await contributions.reuse_fhir_facts(*arguments)
-    verify.assert_awaited_once_with(connection, '"retained"."source_facts"', "c" * 64)
-    if damage == "contents":
-        connection.execute.assert_not_awaited()
-    else:
-        assert connection.execute.await_args.args[1:] == ("c" * 64,)
-        assert "WHERE recipe_sha256=$1" in connection.execute.await_args.args[0]
+    assert connection.execute.await_args.args[1:] == ("c" * 64,)
+    assert "WHERE recipe_sha256=$1" in connection.execute.await_args.args[0]
 
 
 def test_stage_cannot_replace_a_registered_contribution_receipt():

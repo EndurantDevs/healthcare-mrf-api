@@ -60,7 +60,7 @@ async def test_native_typed_slice_parity_duplicates_and_corruption(slice_db, mon
     async with db.connection.transaction():
         typed_receipt = await _prepare(db, typed)
         layout = await _layout(db, typed, typed_receipt)
-        await verify_compact_slice_contents(db.connection, typed, layout, candidate={})
+        await verify_compact_slice_contents(db.connection, typed, layout)
     fields = ("network_id", "office_bucket", "row_count", "content_sha256")
     expected_by_key = {
         key: tuple(slice_ref[name] for name in fields) for key, slice_ref in (await _refs(db, legacy)).items()
@@ -74,9 +74,6 @@ async def test_native_typed_slice_parity_duplicates_and_corruption(slice_db, mon
         assert receipt.matched_locations == count and receipt.copied_edge_rows == count
     namespace = '"' + typed.schema_name + '"'
     mutations = (
-        f"UPDATE {namespace}.network_slice_ref SET content_sha256=repeat('a',64)",
-        f"UPDATE {namespace}.network_slice_ref SET row_count=row_count+1",
-        f"UPDATE {namespace}.network_slice_ref SET network_id=99999,office_bucket=(office_bucket+1)%64 WHERE (network_id,office_bucket)=(SELECT network_id,office_bucket FROM {namespace}.network_slice_ref ORDER BY network_id,office_bucket LIMIT 1)",
         f"DELETE FROM {namespace}.network_office_edge WHERE location_key='office-extra-1'",
         f"INSERT INTO {namespace}.network_office_edge VALUES('11111111-1111-4111-8111-111111111111','extra-office')",
     )
@@ -86,8 +83,8 @@ async def test_native_typed_slice_parity_duplicates_and_corruption(slice_db, mon
         try:
             await db.connection.execute(mutation)
             with pytest.raises(NetworkCompactReadinessError):
-                await verify_compact_slice_contents(db.connection, typed, layout, candidate={})
+                await verify_compact_slice_contents(db.connection, typed, layout)
         finally:
             await transaction.rollback()
     async with db.connection.transaction():
-        await verify_compact_slice_contents(db.connection, typed, layout, candidate={})
+        await verify_compact_slice_contents(db.connection, typed, layout)

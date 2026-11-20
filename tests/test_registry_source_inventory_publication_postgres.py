@@ -56,9 +56,6 @@ from tests.test_registry_fhir_empty_carry_postgres import (
     test_empty_carry_upper_bound_never_scans_predecessor as test_empty_carry_upper_bound_never_scans_predecessor,
 )
 from tests.test_registry_source_inventory_schema_postgres import _migration
-from tests.test_registry_typed_office_parity_postgres import (
-    test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption as test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption,
-)
 
 pytestmark = pytest.mark.asyncio
 _HEAPS = {

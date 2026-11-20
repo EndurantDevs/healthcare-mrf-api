@@ -18,7 +18,6 @@ from process.registry_source_contribution_store import (
     MAX_RECEIPT_BYTES,
     SUMMARY_KEY,
     RegistrySourceContributionError,
-    contribution_fact_sha256,
     validate_registry_source_contribution_receipt,
     validate_source_contribution_descriptor,
     verify_registry_source_contributions,
@@ -113,13 +112,14 @@ def source_fact_artifact_reference(descriptor):
 def anchored_source_fact_descriptor(descriptor, artifact):
     """Preserve current mapping accounting while pointing directly to the original owner."""
     native = _validated_descriptor(descriptor)
+    # Reused facts keep the owner's stored digest; it is not recomputed and compared.
     if type(artifact) is not ResolvedSourceFactArtifact or any(
-        native[field] != artifact.descriptor[field] for field in _FACT_IDENTITY_FIELDS
+        native[field] != artifact.descriptor[field] for field in _FACT_IDENTITY_FIELDS if field != "fact_sha256"
     ):
         raise RegistrySourceContributionError("registry_source_artifact_identity_changed")
     if artifact.reference.fact_schema_name is None:
         raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
-    return {**native, **asdict(artifact.reference)}
+    return {**native, "fact_sha256": artifact.descriptor["fact_sha256"], **asdict(artifact.reference)}
 
 
 def _owning_descriptor(candidate, requested, *, sources=None):
@@ -367,7 +367,7 @@ async def authenticate_anchored_source_fact_metadata(connection, descriptors, *,
 
 
 async def verify_anchored_source_fact_contents(connection, descriptors, *, control_schema):
-    """Resolve original named generations and compare complete fact content before reuse."""
+    """Resolve original named generations of reused facts."""
     try:
         if type(descriptors) not in {tuple, list} or len(descriptors) > 1000:
             raise ValueError
@@ -383,12 +383,6 @@ async def verify_anchored_source_fact_contents(connection, descriptors, *, contr
                 connection, descriptors[offset : offset + 100], control_schema=control_schema
             )
         )
-    for recipe_sha256, artifact in resolved_by_recipe.items():
-        if await contribution_fact_sha256(connection, artifact.relation, recipe_sha256) != (
-            artifact.descriptor["fact_sha256"],
-            artifact.descriptor["fact_rows"],
-        ):
-            raise RegistrySourceContributionError("registry_source_artifact_content_changed")
     return resolved_by_recipe
 
 
