@@ -1219,13 +1219,68 @@ def test_signed_cms_purpose_has_precedence_without_ordinary_credentials(admitted
     )
 
 
-def test_source_policy_path_uses_deployment_value_only(admitted, monkeypatch):
+@pytest.mark.parametrize(
+    "mount,expected",
+    [
+        pytest.param(None, False, id="absent"),
+        pytest.param({"mountPath": "/synthetic-readonly/source-roles.json", "subPath": "roles.json"}, True, id="file"),
+        pytest.param({"mountPath": "/synthetic-readonly"}, True, id="directory"),
+        pytest.param({"mountPath": "/synthetic-readonly", "subPath": "."}, True, id="directory-subpath"),
+        pytest.param({"mountPath": "/synthetic-readonly", "subPath": "./"}, True, id="directory-subpath-alias"),
+        pytest.param({"mountPath": "/synthetic-readonly/source-roles.json"}, False, id="directory-root"),
+        pytest.param({"mountPath": "/synthetic-readonly", "subPath": "roles.json"}, False, id="file-parent"),
+        pytest.param({"mountPath": "/elsewhere"}, False, id="mismatch"),
+        pytest.param({"mountPath": "/synthetic-readonly", "workerClasses": ["process.NPI"]}, False, id="unselected"),
+        pytest.param({"mountPath": "/synthetic-read"}, False, id="prefix"),
+        pytest.param({"mountPath": "/synthetic-readonly/source-roles.json/../other"}, False, id="traversal"),
+    ],
+)
+def test_source_policy_path_uses_selected_mount(admitted, monkeypatch, mount, expected):
     setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
     monkeypatch.setenv(setting, "/synthetic-readonly/source-roles.json")
     admitted[setting] = "/untrusted/roles.json"
-    environment, _ = workers._worker_job_environment(SPEC, admitted)
+    if mount is None:
+        monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "synthetic-work")
+        monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "/synthetic-readonly")
+    mounts = (
+        [] if mount is None else [{"secretName": "synthetic-policy", "workerClasses": [SPEC.worker_class], **mount}]
+    )
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", json.dumps(mounts))
+    manifest = workers._worker_job_manifest(SPEC, admitted, ORDINARY_IMAGE)
+    environment = manifest["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert [entry for entry in environment if entry["name"] == setting] == (
+        [{"name": setting, "value": "/synthetic-readonly/source-roles.json"}] if expected else []
+    )
+
+
+@pytest.mark.parametrize(
+    "mount_path,expected", [("/synthetic-readonly", False), ("/synthetic-readonly/profiles", True)]
+)
+def test_nested_policy_requires_its_own_secret_mount(admitted, monkeypatch, mount_path, expected):
+    setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
+    policy_path = "/synthetic-readonly/profiles/source-roles.json"
+    monkeypatch.setenv(setting, policy_path)
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON",
+        json.dumps([{"secretName": "synthetic-policy", "mountPath": mount_path}]),
+    )
+    manifest = workers._worker_job_manifest(SPEC, admitted, ORDINARY_IMAGE)
+    environment = manifest["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert [entry for entry in environment if entry["name"] == setting] == (
+        [{"name": setting, "value": policy_path}] if expected else []
+    )
+
+
+def test_source_policy_keeps_explicit_secret_reference(admitted, secret_selection, monkeypatch):
+    setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
+    monkeypatch.setenv(setting, "/unmounted/roles.json")
+    selection_by_field = {**secret_selection, "name": setting, "key": "policy_path"}
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", json.dumps([selection_by_field]))
+    monkeypatch.delenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", raising=False)
+    manifest = workers._worker_job_manifest(SPEC, admitted, ORDINARY_IMAGE)
+    environment = manifest["spec"]["template"]["spec"]["containers"][0]["env"]
     assert [entry for entry in environment if entry["name"] == setting] == [
-        {"name": setting, "value": "/synthetic-readonly/source-roles.json"}
+        {"name": setting, "valueFrom": {"secretKeyRef": {"name": "synthetic-publisher", "key": "policy_path"}}}
     ]
 
 

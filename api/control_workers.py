@@ -1434,7 +1434,35 @@ def _worker_job_container(
     ]
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
-    return container_dict, volumes, run_id
+    return _worker_source_policy_container(container_dict, volumes, fhir_launch), volumes, run_id
+
+
+def _worker_source_policy_container(container_dict, volumes, fhir_source_launch):
+    if fhir_source_launch is not None:
+        container_dict["env"] = [
+            entry
+            for entry in container_dict["env"]
+            if entry["name"] != "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
+            or "value" not in entry
+            or _is_worker_policy_path_mounted(entry["value"], volumes)
+        ]
+    return container_dict
+
+
+def _is_worker_policy_path_mounted(path: str, volumes: list[dict[str, Any]]) -> bool:
+    """Match files in the builder's flat Secret projection, including root subPaths."""
+    policy_path = Path(os.path.normpath(path))
+    for volume in volumes:
+        if "secret" not in volume["volume"]:
+            continue
+        mount = volume["volumeMount"]
+        mount_path = Path(os.path.normpath(mount["mountPath"]))
+        if os.path.normpath(mount.get("subPath") or ".") != ".":
+            if policy_path == mount_path:
+                return True
+        elif policy_path.parent == mount_path:
+            return True
+    return False
 
 
 def _worker_job_spec(
