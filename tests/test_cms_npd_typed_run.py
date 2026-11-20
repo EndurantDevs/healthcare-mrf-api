@@ -8,6 +8,7 @@ from sqlalchemy.engine import URL
 
 from process import cms_npd_typed_import as typed_import
 from process import cms_npd_typed_release as release_sql
+from process.cms_npd_typed_addresses import BUILD_VERSION
 from process.cms_npd_typed_schema import TABLE_STATEMENTS, release_schema_name
 from process.cms_npd_typed_stage import CmsNpdTypedImportError
 from tests.test_cms_npd_typed_import import LocalSource, write_release
@@ -18,10 +19,10 @@ OLD_ID, OLDER_ID = "c" * 64, "d" * 64
 class FakeConnection:
     """Records normalized statements; answers the few reads the importer makes."""
 
-    def __init__(self, *, locked=True, releases=(), dropped=None, address_table=True):
+    def __init__(self, *, locked=True, releases=(), dropped=None, address_table=True, grantees=()):
         self.locked, self.releases, self.dropped = locked, list(releases), dropped
-        self.address_table = address_table
-        self.statements, self.closed = [], False
+        self.address_table, self.grantees = address_table, [{"rolname": name} for name in grantees]
+        self.statements, self.closed, self.reader_relations = [], False, []
 
     def _record(self, sql, args=()):
         self.statements.append(" ".join(sql.split()))
@@ -42,8 +43,11 @@ class FakeConnection:
     async def execute(self, sql, *args):
         self._record(sql, args)
 
-    async def fetch(self, sql):
-        self._record(sql)
+    async def fetch(self, sql, *args):
+        if "aclexplode" in sql:  # the reader lookup is kept apart so statement sequences stay unchanged
+            self.reader_relations.append(args[0])
+            return self.grantees
+        self._record(sql, args)
         return self.releases
 
     async def fetchrow(self, sql, *args):
@@ -184,7 +188,9 @@ async def test_busy_lock_refuses_and_closes(harness):
 
 async def test_current_release_is_unchanged_without_download(harness):
     current = recorded(
-        harness["observed"].vector_sha256, "current", {"provider_address": 1, "provider_address_refresh": 1}
+        harness["observed"].vector_sha256,
+        "current",
+        {"provider_address": 1, "provider_address_refresh": 1, "provider_address_build": BUILD_VERSION},
     )
     lock = FakeConnection(releases=[current])
     summary = await run_import(harness, lock)
@@ -339,5 +345,54 @@ async def test_release_table_creation_skips_the_grant_without_a_reader(monkeypat
     monkeypatch.delenv("HLTHPRT_DB_READER_USER", raising=False)
     connection = FakeConnection()
     await release_sql.ensure_release_table(connection, "mrf")
-    assert len(connection.statements) == 1
     assert connection.statements[0].startswith('CREATE TABLE IF NOT EXISTS "mrf".cms_npd_release')
+    assert _grants(connection) == []
+
+
+def _grants(connection):
+    return [statement for statement in connection.statements if statement.startswith("GRANT")]
+
+
+async def test_readers_are_copied(harness):
+    lock = FakeConnection(grantees=["api_reader", "web_reader", None])  # the env reader is listed once
+    await run_import(harness, lock)
+    schema = release_schema_name(harness["observed"].vector_sha256)
+    readers = '"api_reader", "web_reader", PUBLIC'
+    assert _grants(lock) == [
+        f'GRANT SELECT ON "mrf".cms_npd_release TO {readers}',
+        f'GRANT USAGE ON SCHEMA "{schema}" TO {readers}',
+        f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO {readers}',
+        f'GRANT SELECT ON "mrf".cms_npd_address TO {readers}',
+    ]
+    assert lock.reader_relations and set(lock.reader_relations) == {'"mrf".entity_address_unified'}
+
+
+async def test_env_reader_is_added(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_READER_USER", "api_reader")
+    connection = FakeConnection(grantees=["web_reader"])
+    assert await release_sql.api_readers(connection, "mrf") == ['"web_reader"', '"api_reader"']
+
+
+@pytest.mark.parametrize(("address_table", "granted"), [(True, 3), (False, 2)])
+async def test_unchanged_repairs_grants(harness, address_table, granted):
+    release_id = harness["observed"].vector_sha256
+    current_by_field = {
+        **recorded(release_id, "current"),
+        "row_counts": {"provider_address": 1, "provider_address_refresh": 1, "provider_address_build": BUILD_VERSION},
+    }
+    lock = FakeConnection(releases=[current_by_field], address_table=address_table, grantees=["web_reader"])
+    summary = await typed_import._unchanged(lock, "mrf", current_by_field, {})
+    readers, schema = '"web_reader", "api_reader"', release_schema_name(release_id)
+    statements = [
+        f'GRANT USAGE ON SCHEMA "{schema}" TO {readers}',
+        f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO {readers}',
+        f'GRANT SELECT ON "mrf".cms_npd_address TO {readers}',
+    ]
+    assert _grants(lock) == statements[:granted]
+    assert summary["addresses_pending"] is not address_table
+
+
+async def test_catalog_names_are_quoted(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_READER_USER", "web-reader")  # already granted: not validated again
+    connection = FakeConnection(grantees=["web-reader", 'odd"name'])
+    assert await release_sql.api_readers(connection, "mrf") == ['"web-reader"', '"odd""name"']

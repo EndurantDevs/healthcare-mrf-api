@@ -31,7 +31,9 @@ This importer does not fetch an external website directly. It materializes from 
 
 The `cms-npd` importer builds `mrf.cms_npd_address` (control schema `HLTHPRT_DB_SCHEMA`) from the
 current typed release: practitioner and NPI-organization addresses with `use = work` and type `physical`
-or `both`, plus every practitioner role location (with the location's coordinates, phone and fax). Each
+or `both`, plus every practitioner role location (with the location's coordinates, phone and fax). A
+practitioner's or organization's first phone and fax are kept on its address only when that NPI has exactly
+one such work address; with several, they stay empty because the source does not tie them to one. Each
 NPI and normalized address (street, city, state, ZIP5 and country) appears once; a row with coordinates
 is preferred. `source_record_id` is `cms_npd:<npi>:<md5 of the normalized address>`, stable across releases.
 

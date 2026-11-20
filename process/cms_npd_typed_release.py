@@ -50,6 +50,15 @@ UNRESOLVED_QUERIES = {
 }
 
 
+# The same grantee read as the geo search projection; a NULL rolname is PUBLIC.
+_ADDRESS_READERS = """SELECT DISTINCT r.rolname
+     FROM pg_class AS c
+    CROSS JOIN LATERAL aclexplode(c.relacl) AS a
+     LEFT JOIN pg_roles AS r ON r.oid = a.grantee
+    WHERE c.oid = to_regclass($1) AND a.privilege_type = 'SELECT' AND a.grantee <> c.relowner
+    ORDER BY 1"""
+
+
 def quoted(identifier):
     """A validated, double-quoted SQL identifier."""
     if not _IDENTIFIER.fullmatch(identifier):
@@ -66,9 +75,20 @@ async def ensure_release_table(connection, control):
     """Create the release table where the deployment has not migrated it yet; the API reader may read it."""
     for statement in release_table_statements(control):
         await connection.execute(statement)
-    reader = os.getenv("HLTHPRT_DB_READER_USER", "").strip()
-    if reader:
-        await connection.execute(f"GRANT SELECT ON {quoted(control)}.{RELEASE_TABLE} TO {quoted(reader)}")
+    if readers := await api_readers(connection, control):
+        await connection.execute(f"GRANT SELECT ON {quoted(control)}.{RELEASE_TABLE} TO {', '.join(readers)}")
+
+
+async def api_readers(connection, control):
+    """Quoted SELECT grantees of the address table the API already reads, plus ``HLTHPRT_DB_READER_USER``."""
+    rows = await connection.fetch(_ADDRESS_READERS, f"{quoted(control)}.entity_address_unified")
+    names = [grant["rolname"] for grant in rows]
+    # Catalog role names are trusted but may be any identifier; only the configured name is validated.
+    readers = ["PUBLIC" if name is None else '"' + name.replace('"', '""') + '"' for name in names]
+    configured = os.getenv("HLTHPRT_DB_READER_USER", "").strip()
+    if configured and configured not in names:
+        readers.append(quoted(configured))
+    return readers
 
 
 async def release_rows(connection, control):
@@ -131,16 +151,15 @@ def assert_publishable(row_counts, current):
         raise CmsNpdTypedImportError("cms_npd_typed_table_shrunk", ",".join(shrunk))
 
 
-async def grant_api_read(connection, schema):
-    """Read-only access for the configured API reader login (``HLTHPRT_DB_READER_USER``), when one is set.
+async def grant_api_read(connection, control, schema):
+    """Read-only access for the API readers (see ``api_readers``); idempotent, so it also repairs a release.
 
     The importer itself owns the schema; no other role gets any privilege on it.
     """
-    reader = os.getenv("HLTHPRT_DB_READER_USER", "").strip()
-    if not reader:
+    if not (readers := await api_readers(connection, control)):
         return
-    await connection.execute(f"GRANT USAGE ON SCHEMA {quoted(schema)} TO {quoted(reader)}")
-    await connection.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {quoted(schema)} TO {quoted(reader)}")
+    await connection.execute(f"GRANT USAGE ON SCHEMA {quoted(schema)} TO {', '.join(readers)}")
+    await connection.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {quoted(schema)} TO {', '.join(readers)}")
 
 
 async def publish(connection, control, release):
