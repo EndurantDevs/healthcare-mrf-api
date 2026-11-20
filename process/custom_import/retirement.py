@@ -495,8 +495,8 @@ async def _physical_drop(session, quoted, family):
         ]
         if not ready_oids:
             raise SnapshotRetirementRefused("snapshot retirement routine dependencies are cyclic")
-        for oid in ready_oids:
-            await session.execute(text(f"DROP FUNCTION {signatures_by_oid.pop(oid)} RESTRICT"))
+        signatures = ",".join(signatures_by_oid.pop(oid) for oid in ready_oids)
+        await session.execute(text(f"DROP FUNCTION {signatures} RESTRICT"))
     names = [*snapshot_tables(family.family_id), *await _optional_relation_names(session, family.family_id)]
     if await session.scalar(select(exists().where(CustomImportQueryProjection.family_id == family.family_id))):
         names.extend(("custom_import_derived_root", "custom_import_derived_child"))
