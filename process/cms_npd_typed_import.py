@@ -149,7 +149,7 @@ async def _import_locked(connection, observed, downloads, connect, scanner, run_
     try:
         row_counts, unresolved = await _build_candidate(connection, schema, plans, connect, scanner, run_id, seconds)
         release_sql.assert_publishable(row_counts, current)
-        await release_sql.grant_api_read(connection, schema)
+        await release_sql.grant_api_read(connection, control, schema)
     except BaseException:
         await _drop_candidate(connect, schema)
         raise
@@ -184,13 +184,16 @@ async def _import_locked(connection, observed, downloads, connect, scanner, run_
 
 
 async def _unchanged(connection, control, current, seconds):
-    """The current release again: report whether its address table or refresh is still owed."""
+    """The current release again: re-apply its read grants and report whether addresses or refresh are owed."""
+    await release_sql.grant_api_read(connection, control, current["schema_name"])
+    address_table = await addresses.table_exists(connection, control)
+    if address_table:
+        await addresses.grant_api_read(connection, control)
     return {
         "status": "unchanged",
         "release_id": current["release_id"],
         "schema": current["schema_name"],
-        "addresses_pending": addresses.has_pending_addresses(current)
-        or not await addresses.table_exists(connection, control),
+        "addresses_pending": addresses.has_pending_addresses(current) or not address_table,
         "refresh_pending": addresses.has_pending_refresh(current),
         "seconds": seconds,
     }

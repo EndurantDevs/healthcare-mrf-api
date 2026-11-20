@@ -17,6 +17,7 @@ from tests.test_cms_npd_typed_run import OLD_ID, FakeConnection, recorded, run_i
 native = importlib.import_module("process.entity_address_unified")
 harness = run_tests.harness
 REFRESH = addresses.REFRESH_KEY
+BUILT = {addresses.BUILD_KEY: addresses.BUILD_VERSION}
 
 
 class CountingConnection(FakeConnection):
@@ -67,7 +68,8 @@ async def test_build_stages_resolves_indexes_swaps_and_records_in_order(monkeypa
         'ALTER INDEX IF EXISTS "mrf".cms_npd_address_stage_address_key RENAME TO cms_npd_address_address_key',
         'GRANT SELECT ON "mrf".cms_npd_address TO "api_reader"',
         "UPDATE \"mrf\".cms_npd_release SET row_counts = (row_counts - 'provider_address_refresh') || "
-        "jsonb_build_object('provider_address', $1::bigint) WHERE status = 'current' AND release_id = $2",
+        f"jsonb_build_object('provider_address', $1::bigint, 'provider_address_build', {addresses.BUILD_VERSION}) "
+        "WHERE status = 'current' AND release_id = $2",
         "COMMIT",
     ]
     assert connection.last_args == (3, "a" * 64)
@@ -107,7 +109,9 @@ def test_has_pending_refresh_until_admitted():
 def test_has_pending_addresses_until_the_row_count_is_recorded():
     assert addresses.has_pending_addresses({"row_counts": {"practitioner": 1}})
     assert addresses.has_pending_addresses({"row_counts": None})
-    assert not addresses.has_pending_addresses({"row_counts": {"provider_address": 0}})
+    assert not addresses.has_pending_addresses({"row_counts": {"provider_address": 0, **BUILT}})
+    assert addresses.has_pending_addresses({"row_counts": {"provider_address": 0}})  # built before versions
+    assert addresses.has_pending_addresses({"row_counts": {"provider_address": 0, addresses.BUILD_KEY: 1}})
 
 
 async def test_archive_resolution_follows_the_canon_source_switch(monkeypatch):
@@ -209,7 +213,7 @@ def phase(monkeypatch):
 
 async def test_current_release_with_addresses_is_unchanged(harness, phase):
     release_id = harness["observed"].vector_sha256
-    lock = FakeConnection(releases=[recorded(release_id, "current", {"provider_address": 2, REFRESH: 1})])
+    lock = FakeConnection(releases=[recorded(release_id, "current", {"provider_address": 2, REFRESH: 1, **BUILT})])
     summary = await run_import(harness, lock)
     assert summary["status"] == "unchanged" and "address_rows" not in summary
     assert set(summary["seconds"]) == {"observe"} and phase == []
@@ -217,7 +221,7 @@ async def test_current_release_with_addresses_is_unchanged(harness, phase):
 
 async def test_missing_table_is_rebuilt(harness, phase):
     release_id = harness["observed"].vector_sha256
-    current = recorded(release_id, "current", {"provider_address": 2, REFRESH: 1})
+    current = recorded(release_id, "current", {"provider_address": 2, REFRESH: 1, **BUILT})
     lock = FakeConnection(releases=[current], address_table=False)
     summary = await run_import(harness, lock)
     assert summary["address_rows"] == 4 and [call[0] for call in phase] == ["build", "enqueue"]
@@ -226,7 +230,7 @@ async def test_missing_table_is_rebuilt(harness, phase):
 
 async def test_unadmitted_refresh_retries_only_enqueue(harness, phase):
     release_id = harness["observed"].vector_sha256
-    lock = FakeConnection(releases=[recorded(release_id, "current", {"provider_address": 2})])
+    lock = FakeConnection(releases=[recorded(release_id, "current", {"provider_address": 2, **BUILT})])
     summary = await run_import(harness, lock)
     assert summary["address_refresh"] == {"status": "queued"} and "address_rows" not in summary
     assert set(summary["seconds"]) == {"observe"} and phase == [("enqueue", release_id)]
@@ -234,7 +238,7 @@ async def test_unadmitted_refresh_retries_only_enqueue(harness, phase):
 
 async def test_opt_out_leaves_refresh_pending(harness, phase):
     release_id = harness["observed"].vector_sha256
-    lock = FakeConnection(releases=[recorded(release_id, "current", {"provider_address": 2})])
+    lock = FakeConnection(releases=[recorded(release_id, "current", {"provider_address": 2, **BUILT})])
     summary = await typed_import.run(
         {},
         {"refresh_addresses": False},
@@ -337,7 +341,7 @@ def test_serving_provenance_maps_the_label_to_its_source_id():
 
 
 def test_release_rows_keep_the_recorded_address_count():
-    row = recorded(OLD_ID, "current", {"provider_address": 7})
+    row = recorded(OLD_ID, "current", {"provider_address": 7, **BUILT})
     assert not addresses.has_pending_addresses({**row, "row_counts": json.loads(row["row_counts"])})
 
 
@@ -345,3 +349,20 @@ def test_role_locations_skip_inactive_and_ended_roles():
     role_part = addresses._CANDIDATES.split("UNION ALL")[1]
     assert "r.active IS NOT FALSE" in role_part
     assert "r.period_end IS NULL OR r.period_end >= CURRENT_DATE" in role_part
+
+
+def test_provider_phones_need_one_address():
+    practitioner_part, _, organization_part = addresses._CANDIDATES.split("UNION ALL")
+    for part, alias, npi in ((practitioner_part, "p", "a.npi"), (organization_part, "o", "o.npi")):
+        single = f"count(*) OVER (PARTITION BY {npi}) = 1"
+        assert f"CASE WHEN {single} THEN {alias}.phones[1] END" in part
+        assert f"CASE WHEN {single} THEN {alias}.faxes[1] END" in part
+        assert "btrim(coalesce(a.line1, '')) <> ''" in part  # blank streets never count as an address
+
+
+async def test_old_build_is_rebuilt(harness, phase):
+    release_id = harness["observed"].vector_sha256
+    counts_by_field = {"provider_address": 2, REFRESH: 1, addresses.BUILD_KEY: addresses.BUILD_VERSION - 1}
+    summary = await run_import(harness, FakeConnection(releases=[recorded(release_id, "current", counts_by_field)]))
+    assert summary["status"] == "unchanged" and summary["address_rows"] == 4
+    assert [call[0] for call in phase] == ["build", "enqueue"]

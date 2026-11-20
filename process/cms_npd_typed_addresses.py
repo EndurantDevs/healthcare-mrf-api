@@ -10,15 +10,15 @@ set, every run retries only the enqueue.
 
 from __future__ import annotations
 
-import os
-
-from process.cms_npd_typed_release import quoted
+from process.cms_npd_typed_release import api_readers, quoted
 from process.cms_npd_typed_schema import RELEASE_TABLE
 
 ADDRESS_TABLE = "cms_npd_address"
 STAGE_TABLE = ADDRESS_TABLE + "_stage"
 OLD_TABLE = ADDRESS_TABLE + "_old"
 ROW_COUNT_KEY = "provider_address"  # key on the release row's row_counts once the table is built
+BUILD_KEY = "provider_address_build"  # BUILD_VERSION the table was built with, recorded next to the count
+BUILD_VERSION = 2  # bump when the staged rows change shape or content: an older table is rebuilt once
 REFRESH_KEY = "provider_address_refresh"  # set to 1 once the refresh run for this release was admitted
 ARCHIVE_SOURCE = "cms_npd"  # name in HLTHPRT_ADDRESS_CANON_SOURCES
 ARCHIVE_SOURCE_BIT = 256
@@ -53,12 +53,15 @@ CREATE_STAGE = """CREATE TABLE {stage} (
 )"""
 
 # Work/physical addresses of practitioners and NPI organizations, and the locations of roles that are
-# not inactive or ended.
+# not inactive or ended. A practitioner's or organization's phone and fax belong to the provider, not to an
+# address, so they are kept only when that NPI has exactly one such address (blank streets do not count).
 _CANDIDATES = """SELECT a.npi, 'practitioner' AS source_kind, 1 AS kind_rank, a.line1, a.line2, a.city, a.state,
-       a.postal_code, a.country, NULL::text AS phone, NULL::text AS fax, NULL::float8 AS latitude,
-       NULL::float8 AS longitude, p.updated_at
+       a.postal_code, a.country,
+       CASE WHEN count(*) OVER (PARTITION BY a.npi) = 1 THEN p.phones[1] END AS phone,
+       CASE WHEN count(*) OVER (PARTITION BY a.npi) = 1 THEN p.faxes[1] END AS fax,
+       NULL::float8 AS latitude, NULL::float8 AS longitude, p.updated_at
 FROM {release}.practitioner_address a JOIN {release}.practitioner p ON p.npi = a.npi
-WHERE a.use = 'work' AND a.type IN ('physical', 'both')
+WHERE a.use = 'work' AND a.type IN ('physical', 'both') AND btrim(coalesce(a.line1, '')) <> ''
 UNION ALL
 SELECT r.practitioner_npi, 'role_location', 0, l.line1, l.line2, l.city, l.state, l.postal_code, l.country,
        l.phones[1], l.faxes[1], l.latitude, l.longitude, l.updated_at
@@ -68,9 +71,11 @@ WHERE r.practitioner_npi IS NOT NULL AND r.active IS NOT FALSE
   AND (r.period_end IS NULL OR r.period_end >= CURRENT_DATE)
 UNION ALL
 SELECT o.npi, 'organization', 2, a.line1, a.line2, a.city, a.state, a.postal_code, a.country,
-       NULL, NULL, NULL, NULL, o.updated_at
+       CASE WHEN count(*) OVER (PARTITION BY o.npi) = 1 THEN o.phones[1] END,
+       CASE WHEN count(*) OVER (PARTITION BY o.npi) = 1 THEN o.faxes[1] END, NULL, NULL, o.updated_at
 FROM {release}.organization_address a JOIN {release}.organization o ON o.id = a.organization_id
-WHERE o.npi IS NOT NULL AND a.use = 'work' AND a.type IN ('physical', 'both')"""
+WHERE o.npi IS NOT NULL AND a.use = 'work' AND a.type IN ('physical', 'both')
+  AND btrim(coalesce(a.line1, '')) <> ''"""
 
 
 def _norm(column):
@@ -103,7 +108,7 @@ INDEX_STAGE = (
     "ANALYZE {stage}",
 )
 RECORD_COUNT = f"""UPDATE {{control}}.{RELEASE_TABLE}
-SET row_counts = (row_counts - '{REFRESH_KEY}') || jsonb_build_object('{ROW_COUNT_KEY}', $1::bigint)
+SET row_counts = (row_counts - '{REFRESH_KEY}') || jsonb_build_object('{ROW_COUNT_KEY}', $1::bigint, '{BUILD_KEY}', {BUILD_VERSION})
 WHERE status = 'current' AND release_id = $2"""
 RECORD_REFRESH = f"""UPDATE {{control}}.{RELEASE_TABLE}
 SET row_counts = row_counts || jsonb_build_object('{REFRESH_KEY}', 1)
@@ -111,8 +116,9 @@ WHERE status = 'current' AND release_id = $1"""
 
 
 def has_pending_addresses(release):
-    """A recorded release whose address table has not been built from it yet."""
-    return ROW_COUNT_KEY not in (release.get("row_counts") or {})
+    """A recorded release whose address table has not been built from it yet, or was built by an older build."""
+    counts = release.get("row_counts") or {}
+    return ROW_COUNT_KEY not in counts or counts.get(BUILD_KEY) != BUILD_VERSION
 
 
 def has_pending_refresh(release):
@@ -123,6 +129,12 @@ def has_pending_refresh(release):
 async def table_exists(connection, control):
     """A recorded count does not prove the table is still there."""
     return await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", f"{quoted(control)}.{ADDRESS_TABLE}")
+
+
+async def grant_api_read(connection, control):
+    """The API readers may read the live address table; idempotent, so it also repairs an older build."""
+    if readers := await api_readers(connection, control):
+        await connection.execute(f"GRANT SELECT ON {quoted(control)}.{ADDRESS_TABLE} TO {', '.join(readers)}")
 
 
 async def resolve_archive(stage_table, schema):
@@ -160,12 +172,10 @@ async def build(connection, control, release_schema, release_id, *, resolve=reso
     for statement in INDEX_STAGE:
         await connection.execute(statement.format(stage=stage, stage_name=STAGE_TABLE))
     rows = await connection.fetchval(f"SELECT count(*) FROM {stage}")
-    reader = os.getenv("HLTHPRT_DB_READER_USER", "").strip()
     async with connection.transaction():
         for statement in swap_statements(control):
             await connection.execute(statement)
-        if reader:
-            await connection.execute(f"GRANT SELECT ON {schema}.{ADDRESS_TABLE} TO {quoted(reader)}")
+        await grant_api_read(connection, control)
         await connection.execute(RECORD_COUNT.format(control=schema), rows, release_id)
     return rows
 

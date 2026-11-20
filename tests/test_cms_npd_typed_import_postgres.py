@@ -8,7 +8,7 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
-from process.cms_npd_typed_addresses import enqueue_refresh
+from process.cms_npd_typed_addresses import BUILD_VERSION, enqueue_refresh
 from process.cms_npd_typed_import import LOCK_KEY, run
 from process.cms_npd_typed_stage import CmsNpdTypedImportError
 from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
@@ -16,6 +16,7 @@ from tests.test_cms_npd_typed_import import LocalSource, write_release
 
 DSN_ENV = "HLTHPRT_CMS_NPD_TYPED_IMPORT_TEST_DSN"
 SCANNER = _ptg2_rust_scanner_binary()
+BUILT = {"provider_address_build": BUILD_VERSION}
 pytestmark = [
     pytest.mark.skipif(not os.getenv(DSN_ENV), reason=f"{DSN_ENV} names a disposable PostgreSQL database"),
     pytest.mark.skipif(
@@ -102,7 +103,7 @@ async def test_releases_publish_roll_and_retire(control, tmp_path):
         "2026-01-01",
     )
     assert json.loads(recorded["files"])["06-Practitioner.ndjson"]["etag"] == '"etag-06-Practitioner.ndjson"'
-    assert json.loads(recorded["row_counts"]) == {**published["row_counts"], "provider_address": 0}
+    assert json.loads(recorded["row_counts"]) == {**published["row_counts"], "provider_address": 0, **BUILT}
     assert first.kept == {first_id}
 
     unchanged = await _import(first)
@@ -293,3 +294,70 @@ async def test_country_splits_addresses_and_missing_table_rebuilds(control, tmp_
     assert (await enqueue_refresh(admin, control_schema, release_id, create_run=admitted))["status"] == "queued"
     recorded = await admin.fetchval(f'SELECT row_counts FROM "{control_schema}".cms_npd_release')
     assert json.loads(recorded)["provider_address_refresh"] == 1
+
+
+async def _privileges(admin, role, control_schema, schema):
+    return await admin.fetchrow(
+        """SELECT has_schema_privilege($1::text, $3::text, 'USAGE') AS release_schema,
+                  has_table_privilege($1::text, format('%I.practitioner', $3::text), 'SELECT') AS release_table,
+                  has_table_privilege($1::text, format('%I.cms_npd_release', $2::text), 'SELECT') AS releases,
+                  has_table_privilege($1::text, format('%I.cms_npd_address', $2::text), 'SELECT') AS addresses""",
+        role,
+        control_schema,
+        schema,
+    )
+
+
+async def test_readers_of_unified_addresses_can_read(control, tmp_path):
+    admin, control_schema = control
+    role = "cms_npd_reader_" + uuid4().hex[:12]
+    await admin.execute(f'CREATE ROLE "{role}" NOLOGIN')
+    try:
+        await admin.execute(f'CREATE TABLE "{control_schema}".entity_address_unified (npi bigint)')
+        await admin.execute(f'GRANT SELECT ON "{control_schema}".entity_address_unified TO "{role}"')
+        source = LocalSource(tmp_path / "g1", write_release(tmp_path / "g1", 1))
+        published = await _import(source)
+        assert dict(await _privileges(admin, role, control_schema, published["schema"])) == dict.fromkeys(
+            ("release_schema", "release_table", "releases", "addresses"), True
+        )
+        await admin.execute(f'REVOKE USAGE ON SCHEMA "{published["schema"]}" FROM "{role}"')
+        await admin.execute(f'REVOKE SELECT ON "{control_schema}".cms_npd_address FROM "{role}"')
+        assert (await _import(source))["status"] == "unchanged"
+        assert all((await _privileges(admin, role, control_schema, published["schema"])).values())
+    finally:
+        await admin.execute(f'DROP OWNED BY "{role}"')
+        await admin.execute(f'DROP ROLE "{role}"')
+
+
+def _phones(kind, phone):
+    return [{"system": "phone", "value": phone}, {"system": "fax", "value": kind}]
+
+
+def _with_provider_phones(resource_type, index, record):
+    """Practitioner 1 has one work address (plus a blank one), practitioner 2 two; each organization one."""
+    if resource_type == "Practitioner":
+        lines = ["70 Pine St", " "] if index == 1 else ["70 Pine St", "80 Cedar Ct"]
+        address_list = [_address(line) for line in lines]
+        return {**record, "address": address_list, "telecom": _phones("555-0201", "555-0200")}
+    if resource_type == "Organization" and record["id"] != "Organization-net-1":
+        record = _with_addresses(resource_type, index, record)
+        return {**record, "telecom": _phones("555-0301", "555-0300")}
+    return _with_addresses(resource_type, index, record)
+
+
+async def test_provider_phones_need_one_address(control, tmp_path):
+    admin, control_schema = control
+    await _import(LocalSource(tmp_path / "p1", write_release(tmp_path / "p1", 2, patch=_with_provider_phones)))
+    rows = await admin.fetch(
+        f"""SELECT npi, source_kind, first_line, telephone_number, fax_number
+            FROM "{control_schema}".cms_npd_address ORDER BY npi, first_line"""
+    )
+    assert [tuple(address.values()) for address in rows] == [
+        (1000000001, "role_location", "10 Main St", "555-0100", "555-0101"),
+        (1000000001, "organization", "30 Elm Rd", "555-0300", "555-0301"),
+        (1000000001, "practitioner", "70 Pine St", "555-0200", "555-0201"),
+        (1000000002, "role_location", "10 Main St", "555-0100", "555-0101"),
+        (1000000002, "organization", "30 Elm Rd", "555-0300", "555-0301"),
+        (1000000002, "practitioner", "70 Pine St", None, None),
+        (1000000002, "practitioner", "80 Cedar Ct", None, None),
+    ]
