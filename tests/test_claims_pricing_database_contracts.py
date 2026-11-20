@@ -7,17 +7,25 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from process.provider_quality_parts import state as provider_quality_state
-from tests.claims_pricing_contract_fakes import AsyncTransaction
-
+from tests.claims_pricing_contract_fakes import AsyncTransaction, RecordingRedis
 
 claims_pricing = importlib.import_module("process.claims_pricing")
 
 
+@pytest.fixture
+def publication_driver(monkeypatch):
+    driver = object()
+    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
+    transaction = AsyncTransaction()
+    transaction.connection = AsyncMock(return_value=connection)
+    monkeypatch.setattr(claims_pricing.db, "transaction", lambda: transaction)
+    preserve = AsyncMock()
+    monkeypatch.setattr(claims_pricing, "preserve_publication_reads", preserve)
+    return driver, preserve
+
+
 def test_finalize_reuses_shared_import_mutex():
-    assert (
-        claims_pricing._has_global_finalize_lock
-        is provider_quality_state._has_global_finalize_lock
-    )
+    assert claims_pricing._has_global_finalize_lock is provider_quality_state._has_global_finalize_lock
     assert (
         claims_pricing._release_global_finalize_lock_safely
         is provider_quality_state._release_global_finalize_lock_safely
@@ -27,9 +35,7 @@ def test_finalize_reuses_shared_import_mutex():
 @pytest.mark.asyncio
 async def test_finalize_waits_for_shared_import_mutex(monkeypatch):
     redis = object()
-    finalize_spec = claims_pricing._ClaimsFinalizeSpec(
-        "i", "r", False, "mrf", "s", 0, "lock-token"
-    )
+    finalize_spec = claims_pricing._ClaimsFinalizeSpec("i", "r", False, "mrf", "s", 0, "lock-token")
     acquire_global_lock = AsyncMock(return_value=False)
     release_claims_lock = AsyncMock()
     materialize = AsyncMock()
@@ -58,6 +64,53 @@ async def test_finalize_waits_for_shared_import_mutex(monkeypatch):
     )
     materialize.assert_not_awaited()
     release_claims_lock.assert_awaited_once_with(redis, finalize_spec)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sqlstate", "operation"),
+    [
+        (None, "_publish_by_table_rename"),
+        ("42501", "_publish_by_table_rename"),
+        ("57014", "_publish_by_table_rename"),
+        ("40P01", "_publish_by_table_rename"),
+        ("55P03", "_materialize_cost_level_rows"),
+    ],
+)
+async def test_publication_does_not_retry_unrelated_failures(monkeypatch, sqlstate, operation):
+    redis = RecordingRedis()
+    finalize_spec = claims_pricing._ClaimsFinalizeSpec("i", "r", False, "mrf", "s", 0, "lock-token")
+    redis.values_by_key["claims_pricing:r:finalize_lock"] = "lock-token"
+    monkeypatch.setattr(claims_pricing, "_claims_finalize_spec", lambda *_args: finalize_spec)
+    monkeypatch.setattr(claims_pricing, "ensure_database", AsyncMock())
+    monkeypatch.setattr(claims_pricing, "_validate_claims_finalize_manifest", Mock())
+    monkeypatch.setattr(claims_pricing, "_wait_for_claims_finalize_turn", AsyncMock(return_value=None))
+    monkeypatch.setattr(claims_pricing, "_staging_classes", lambda *_args: {})
+    cleanup = Mock()
+    monkeypatch.setattr(claims_pricing, "_cleanup_claims_work_dir", cleanup)
+    for name in (
+        "_ensure_live_code_tables",
+        "_materialize_code_and_crosswalk_rows",
+        "_materialize_procedure_provider_counts",
+        "_materialize_procedure_taxonomy_signals",
+        "_materialize_cost_level_rows",
+        "_collect_cost_level_diagnostics",
+        "_build_staging_indexes",
+    ):
+        monkeypatch.setattr(claims_pricing, name, AsyncMock())
+    failure = RuntimeError("publication refused")
+    failure.sqlstate = sqlstate
+    failing_operation = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(claims_pricing, operation, failing_operation)
+    with pytest.raises(RuntimeError) as refused:
+        await claims_pricing.claims_pricing_finalize({"redis": redis}, {})
+    assert refused.value is failure
+    failing_operation.assert_awaited_once_with({}, "mrf")
+    assert "imports:finalize_mutex" not in redis.values_by_key
+    assert "claims_pricing:r:finalize_lock" not in redis.values_by_key
+    assert "claims_pricing:r:finalized" not in redis.values_by_key
+    assert redis.jobs == []
+    cleanup.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -96,9 +149,7 @@ async def test_ensure_indexes_normalizes_long_staging_names(monkeypatch):
     staged_model = SimpleNamespace(
         __tablename__=table_name,
         __main_table__="procedure_taxonomy_signal",
-        __my_additional_indexes__=[
-            {"index_elements": ["year"], "staging_name": "taxonomy_lookup"}
-        ],
+        __my_additional_indexes__=[{"index_elements": ["year"], "staging_name": "taxonomy_lookup"}],
     )
 
     await claims_pricing._ensure_indexes(staged_model, "mrf")
@@ -213,10 +264,9 @@ async def test_cost_diagnostics_return_query_rows(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_publish_renames_tables_and_owned_indexes(monkeypatch):
+async def test_publish_renames_tables_and_owned_indexes(monkeypatch, publication_driver):
     status = AsyncMock()
     monkeypatch.setattr(claims_pricing.db, "status", status)
-    monkeypatch.setattr(claims_pricing.db, "transaction", lambda: AsyncTransaction())
     final_classes = (
         claims_pricing.PricingProvider,
         claims_pricing.PricingProcedure,
@@ -258,22 +308,24 @@ async def test_publish_renames_tables_and_owned_indexes(monkeypatch):
         for final_cls in final_classes
     }
     await claims_pricing._publish_by_table_rename(classes_by_name, "mrf")
+    driver, preserve = publication_driver
+    assert [call.args for call in preserve.await_args_list] == [(driver,)] * 8
+    assert [call.kwargs for call in preserve.await_args_list] == [
+        dict(schema="mrf", live_table=cls.__main_table__, stage_table=classes_by_name[cls.__name__].__tablename__)
+        for cls in final_classes
+    ]
     sql_text = "\n".join(status_call.args[0] for status_call in status.await_args_list)
     assert "DROP TABLE IF EXISTS" in sql_text
     assert "ALTER TABLE mrf." in sql_text
     assert "ALTER TABLE IF EXISTS" not in sql_text
     assert "state_idx" in sql_text
-    assert (
-        "pricing_provider_procedure_stage_amt_page "
-        "RENAME TO pricing_provider_proc_amount_page_idx"
-    ) in sql_text
+    assert ("pricing_provider_procedure_stage_amt_page RENAME TO pricing_provider_proc_amount_page_idx") in sql_text
 
 
 @pytest.mark.asyncio
-async def test_publish_normalizes_long_staging_index_names(monkeypatch):
+async def test_publish_normalizes_long_staging_index_names(monkeypatch, publication_driver):
     status = AsyncMock()
     monkeypatch.setattr(claims_pricing.db, "status", status)
-    monkeypatch.setattr(claims_pricing.db, "transaction", lambda: AsyncTransaction())
     final_classes = (
         claims_pricing.PricingProvider,
         claims_pricing.PricingProcedure,
@@ -303,11 +355,7 @@ async def test_publish_normalizes_long_staging_index_names(monkeypatch):
     long_table = f"procedure_taxonomy_signal_{'x' * 30}"
     classes_by_name = {
         final_cls.__name__: SimpleNamespace(
-            __tablename__=(
-                long_table
-                if final_cls is final_classes[-1]
-                else f"{final_cls.__main_table__}_stage"
-            )
+            __tablename__=(long_table if final_cls is final_classes[-1] else f"{final_cls.__main_table__}_stage")
         )
         for final_cls in final_classes
     }
