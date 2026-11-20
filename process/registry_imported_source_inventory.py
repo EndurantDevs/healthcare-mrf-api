@@ -155,13 +155,25 @@ async def current_imported_source_inventory():
 
 
 async def _observe_current_inventory(runtime):
+    from process.registry_fhir_catalog_observed_source import known_fhir_catalog_families
+
     async with native_imported_source_reader() as connection:
-        observed = await observe_imported_source_inventory(
-            connection,
-            config=runtime.config,
-            catalog_export=runtime.catalog_export,
-            effective_date=runtime.effective_date,
+        # Take the read locks before the first data read fixes this transaction's snapshot.
+        await lock_aca_source_tables(
+            connection, runtime.config.aca_source_schema, ("plan_npi_raw", "plan", "plan_networktier", "issuer")
         )
+        known = (
+            {}
+            if runtime.control_schema is None
+            else await published_catalog_families(connection, runtime.control_schema)
+        )
+        with known_fhir_catalog_families(known):
+            observed = await observe_imported_source_inventory(
+                connection,
+                config=runtime.config,
+                catalog_export=runtime.catalog_export,
+                effective_date=runtime.effective_date,
+            )
         if runtime.control_schema is None:
             return observed
         from process.registry_aca_company_catalog import enrich_aca_company_sources
@@ -171,6 +183,33 @@ async def _observe_current_inventory(runtime):
             connection, document["native_sources"], control_schema=runtime.control_schema
         )
         return ImportedSourceInventory(json.dumps(document, sort_keys=True, separators=(",", ":")))
+
+
+async def published_catalog_families(connection, control_schema):
+    """Content families admitted by the latest published catalog, keyed by (dataset id, dataset sha256)."""
+    schema = await connection.fetchval(
+        f"SELECT schema_name FROM {storage_identifier(control_schema)}.registry_fhir_catalog_snapshot "
+        "WHERE published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1"
+    )
+    if schema is None:
+        return {}
+    rows = await connection.fetch(
+        f"SELECT descriptor_json::text AS descriptor FROM {storage_identifier(schema)}.registry_fhir_catalog_source "
+        f"WHERE profile='published_normalized' LIMIT {MAX_SOURCES + 1}"
+    )
+    families_by_dataset = {}
+    for row in rows:
+        descriptor = json.loads(row["descriptor"])
+        admission = descriptor.get("admission")
+        if (
+            descriptor.get("complete") is True
+            and type(admission) is dict
+            and admission.get("kind") == "catalog_observation"
+        ):
+            families_by_dataset[(descriptor["coordinates"]["dataset_id"], descriptor["dataset_sha256"])] = admission[
+                "families"
+            ]
+    return families_by_dataset
 
 
 @asynccontextmanager

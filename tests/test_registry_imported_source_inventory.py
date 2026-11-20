@@ -380,3 +380,37 @@ async def test_catalogue_policy_change_invalidates_inventory_token(inventory_cas
     assert before.token != after.token
     assert before.fhir_descriptors == after.fhir_descriptors
     assert before.native_sources == after.native_sources
+
+
+@pytest.mark.asyncio
+async def test_published_catalog_families_key_complete_observations_by_dataset_and_digest():
+    from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor
+
+    admitted = observed_descriptor()
+    incomplete_by_field = {**observed_descriptor(dataset="other-dataset"), "complete": False}
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value="published_catalog"),
+        fetch=AsyncMock(
+            return_value=[{"descriptor": json.dumps(admitted)}, {"descriptor": json.dumps(incomplete_by_field)}]
+        ),
+    )
+    families_by_dataset = await inventory.published_catalog_families(connection, "registry")
+    key = (admitted["coordinates"]["dataset_id"], admitted["dataset_sha256"])
+    assert families_by_dataset == {key: admitted["admission"]["families"]}
+    connection.fetchval.return_value = None
+    assert await inventory.published_catalog_families(connection, "registry") == {}
+
+
+@pytest.mark.asyncio
+async def test_known_families_replace_scans_of_unchanged_datasets(monkeypatch):
+    from process import registry_fhir_catalog_observed_source as observed
+
+    scan = AsyncMock(return_value={"scanned": True})
+    monkeypatch.setattr(observed, "_facts", scan)
+    known_by_dataset = {("dataset", "a" * 64): {"InsurancePlan": {"rows": 1}}}
+    with observed.known_fhir_catalog_families(known_by_dataset):
+        reused = await observed._observed_families(object(), object(), ("dataset", "a" * 64), {}, "uri")
+        changed = await observed._observed_families(object(), object(), ("dataset", "b" * 64), {}, "uri")
+    assert reused == {"InsurancePlan": {"rows": 1}} and reused is not known_by_dataset[("dataset", "a" * 64)]
+    assert changed == {"scanned": True} and scan.await_count == 1
+    assert await observed._observed_families(object(), object(), ("dataset", "a" * 64), {}, "uri") == {"scanned": True}
