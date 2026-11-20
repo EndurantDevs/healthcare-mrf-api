@@ -301,6 +301,232 @@ def test_row_lines_fall_back_per_line_and_stop_at_batch_errors():
             assert_row_lines_parity(case_lines, strict=strict_mode)
 
 
+@pytest.mark.parametrize(
+    "resource_fields",
+    [
+        {"practitioner": {"reference": ["Practitioner/p"]}},
+        {"organization": {"reference": ["Organization/o"]}},
+        {"location": [{"reference": ["Location/l"]}]},
+        {"healthcareService": [{"reference": ["HealthcareService/s"]}]},
+        {"network": [{"reference": ["Organization/n"]}]},
+        {"insurancePlan": [{"reference": ["InsurancePlan/i"]}]},
+        {"endpoint": [{"reference": ["Endpoint/e"]}]},
+        {"period": {"start": ["2026-01-01"]}},
+        {"period": {"end": ["2026-12-31"]}},
+        {"meta": {"lastUpdated": ["2026-01-01T00:00:00Z"]}},
+        {"meta": {"security": [{"version": ["v1"]}]}},
+        {"meta": {"tag": [{"code": ["tag"]}]}},
+        {"meta": {"tag": [{"display": ["Tag"]}]}},
+        {"specialty": {"coding": [{"system": ["urn:taxonomy"]}]}},
+        {"code": {"coding": [{"display": ["Primary care"]}]}},
+        {"identifier": [{"use": ["official"], "value": "role-1"}]},
+        {"identifier": [{"period": {"start": ["2026-01-01"]}, "value": "role-1"}]},
+        {"identifier": [{"assigner": {"display": ["Assigner"]}, "value": "role-1"}]},
+    ],
+)
+def test_array_in_text_field_falls_back_without_losing_neighboring_rows(resource_fields):
+    malformed = json.dumps({"resourceType": "PractitionerRole", "id": "fallback", **resource_fields}).encode()
+    first = b'{"resourceType":"PractitionerRole","id":"first","active":true}'
+    last = b'{"resourceType":"PractitionerRole","id":"last","active":false}'
+    assert assert_batch_parity([malformed], CONTRACTS[0], False) == "text_repr"
+    assert assert_row_lines_parity([first, malformed, last]) == {"text_repr": 1}
+
+
+@pytest.mark.parametrize(
+    "resource_fields",
+    [
+        {"availableTime": True},
+        {"notAvailable": 1},
+        {"identifier": [{"value": "role-1", "type": {"coding": True}}]},
+        {"specialty": {"coding": 1}},
+        {"extension": [{"url": cases.PLAN_NET + "/newpatients", "extension": True}]},
+        {
+            "extension": [
+                {
+                    "url": cases.PLAN_NET + "/delivery-method",
+                    "extension": [{"url": "type", "valueCodeableConcept": {"coding": True}}],
+                },
+            ],
+        },
+    ],
+)
+def test_scalar_collection_uses_python_failure_without_emitting_a_group_row(resource_fields):
+    line = json.dumps({"resourceType": "PractitionerRole", "id": "bad-collection", **resource_fields}).encode()
+    native = _compiled_export(seam.ROW_LINES_EXPORT)
+    assert native([line], "PractitionerRole", _native_context_by_name()) == ("lines", ["not_iterable"], None)
+    assert assert_batch_parity([line], CONTRACTS[0], False) == "python_raises"
+    assert assert_row_lines_parity([line]) == {"python_raises": 1}
+
+
+@pytest.mark.parametrize(
+    ("label", "reason"),
+    [(False, None), (0, None), (-1, None), ({}, "text_repr"), (2.5, "float_truthiness")],
+)
+def test_identifier_label_preserves_python_scalar_and_empty_value_rules(label, reason):
+    role_fields_by_name = {
+        "resourceType": "PractitionerRole",
+        "id": "identifier-label",
+        "identifier": [{"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567893", "type": {"text": label}}],
+        "availableTime": 0,
+    }
+    line = json.dumps(role_fields_by_name).encode()
+    assert assert_batch_parity([line], CONTRACTS[0], False) == reason
+    assert assert_row_lines_parity([line]) == ({} if reason is None else {reason: 1})
+    [prepared] = seam.prepare_directory_rows([line], _context(CONTRACTS[0], False)).rows
+    assert prepared["payload_json"]["npi"] == 1234567893
+    assert prepared["payload_json"]["available_time"] == []
+
+
+def test_grouped_role_projection_preserves_meaning_of_partial_plan_net_extensions():
+    role_fields_by_name = {"resourceType": "PractitionerRole", "id": "mixed-extensions"}
+    role_fields_by_name["network"] = [
+        {"reference": "Organization/net-a"},
+        {"reference": "https://example.test/fhir/Organization/net-a"},
+    ]
+    role_fields_by_name["specialty"] = [None, {"coding": [None, {"code": "207Q00000X"}]}]
+    role_fields_by_name["identifier"] = [None, {}, {"system": "npi", "value": "123"}]
+    role_fields_by_name["meta"] = {"tag": [None, {}]}
+    medicaid = "https://healthporta.com/fhir/provider-directory/accepting-medicaid"
+    role_fields_by_name["extension"] = [
+        None,
+        {"url": medicaid, "valueBoolean": True},
+        {"url": medicaid, "valueBoolean": False},
+        {"url": cases.PLAN_NET + "/newpatients", "extension": [None, {"url": "acceptingPatients"}]},
+        {
+            "url": cases.PLAN_NET + "/newpatients",
+            "extension": [
+                {"url": "acceptingPatients", "valueCodeableConcept": {"coding": [None, {"code": "NewPt"}]}},
+                {"url": "unrecognized"},
+            ],
+        },
+        {
+            "url": cases.PLAN_NET + "/delivery-method",
+            "extension": [
+                None,
+                {"url": "type", "valueCodeableConcept": {"coding": [{"code": "in-person"}]}},
+                {"url": "note"},
+            ],
+        },
+    ]
+    line = json.dumps(role_fields_by_name).encode()
+    assert assert_batch_parity([line], CONTRACTS[0], False) is None
+    assert assert_row_lines_parity([line]) == {}
+    [prepared] = seam.prepare_directory_rows([line], _context(CONTRACTS[0], False)).rows
+    projected_role = prepared["payload_json"]
+    assert projected_role["accepting_medicaid"] is None
+    assert projected_role["accepting_patients"] == [{"code": "newpt"}]
+    assert projected_role["network_refs"] == ["Organization/net-a"]
+    assert projected_role["telehealth"] == []
+    assert projected_role["npi"] is None
+
+
+def test_role_network_reference_accepts_singleton_extension_with_sanitized_metadata():
+    role_fields_by_name = {
+        "resourceType": "PractitionerRole",
+        "id": "single-extension",
+        "extension": {
+            "url": cases.PLAN_NET + "/network-reference",
+            "valueReference": {"reference": "Organization/net-a"},
+        },
+        "meta": {"source": "https://Directory.Example.test:0000/fhir?omit=me", "profile": "x" * 65_537},
+    }
+    line = json.dumps(role_fields_by_name).encode()
+    assert assert_batch_parity([line], CONTRACTS[0], False) is None
+    assert assert_row_lines_parity([line]) == {}
+    [prepared] = seam.prepare_directory_rows([line], _context(CONTRACTS[0], False)).rows
+    payload = prepared["payload_json"]
+    assert payload["network_refs"] == ["Organization/net-a"]
+    assert payload["fhir_meta"] == {"source": "https://directory.example.test:0/fhir"}
+
+
+def test_batch_keeps_deterministic_role_identity_when_newer_sighting_comes_first():
+    def observation(role_id, network, last_updated):
+        return json.dumps(
+            {
+                "resourceType": "PractitionerRole",
+                "id": role_id,
+                "meta": {"lastUpdated": last_updated},
+                "network": [{"reference": f"Organization/{network}"}],
+            }
+        ).encode()
+
+    newer = observation("role-1", "net-a", "2026-05-01T00:00:00Z")
+    stale = observation("role-1", "net-a", "2026-01-01T00:00:00Z")
+    sibling = observation("role-2", "net-b", "2026-03-01T00:00:00Z")
+    for lines in ([newer, stale, sibling], [sibling, stale, newer]):
+        assert assert_batch_parity(lines, CONTRACTS[0], True) is None
+        [row] = seam.prepare_directory_rows(lines, _context(CONTRACTS[0], True)).rows
+        assert row["payload_json"]["fhir_meta"]["lastUpdated"] == "2026-05-01T00:00:00Z"
+        assert row["payload_json"]["network_refs"] == ["Organization/net-a", "Organization/net-b"]
+
+
+def test_native_batch_defers_duplicate_hash_shaped_resource_id():
+    line = json.dumps({"resourceType": "PractitionerRole", "id": "ab12" * 16}).encode()
+    assert assert_batch_parity([line], CONTRACTS[0], True) is None
+    assert assert_batch_parity([line, line], CONTRACTS[0], True) == "hash_shaped_duplicate_id"
+    assert assert_row_lines_parity([line, line]) == {}
+
+
+def test_native_batch_preserves_role_content_hash():
+    context = _context(CONTRACTS[0], True)
+    role_fields_by_name = {
+        "resourceType": "PractitionerRole",
+        "id": "native",
+        "network": [{"reference": "Organization/net-a"}],
+    }
+    [merged] = seam.prepare_directory_rows([json.dumps(role_fields_by_name).encode()], context).rows
+    line = json.dumps({**role_fields_by_name, "id": merged["resource_id"]}).encode()
+    assert assert_batch_parity([line], CONTRACTS[0], False) is None
+    [prepared] = seam.prepare_directory_rows([line], _context(CONTRACTS[0], False)).rows
+    assert (prepared["resource_id"], prepared["payload_hash"]) == (merged["resource_id"], merged["payload_hash"])
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        rb'{"resourceType":"PractitionerRole","id":"\x22"}',
+        rb'{"resourceType":"PractitionerRole","id":"\u123"}',
+        b'{"resourceType":"PractitionerRole","active":truX}',
+        b'{"resourceType":"PractitionerRole","telecom":[{} {}]}',
+        b'{"resourceType":"PractitionerRole","meta":{"source" "invalid"}}',
+    ],
+)
+def test_malformed_json_stops_grouped_loads_after_retaining_the_prefix(malformed):
+    first = b'{"resourceType":"PractitionerRole","id":"first","active":true}'
+    last = b'{"resourceType":"PractitionerRole","id":"last","active":false}'
+    lines = [first, malformed, last]
+    for strict in (False, True):
+        assert assert_row_lines_parity(lines, strict=strict) == {"invalid_json": 1}
+        prepared = seam.prepare_directory_row_lines(lines, _context(CONTRACTS[0], True, strict=strict))
+        assert (prepared.rows_fetched, len(prepared.encoded_lines), prepared.error) == (1, 1, "invalid_ndjson")
+
+
+def test_native_group_line_reports_context_errors_and_preserves_wide_integers():
+    wide = 18_446_744_073_709_551_616
+    telecom_entries = [{"rank": wide, "value": "first\rsecond"}]
+    line = json.dumps({"resourceType": "PractitionerRole", "id": "wide", "telecom": telecom_entries}).encode()
+    native = _compiled_export(seam.ROW_LINES_EXPORT)
+    context = _native_context_by_name()
+    assert native([line], "Practitioner", context) == ("unsupported", "resource_type_not_ported")
+    assert native([line], "PractitionerRole", {**context, "resource_hash_contract": "unknown"}) == (
+        "unsupported",
+        "hash_contract",
+    )
+    assert native([line], "PractitionerRole", {**context, "dataset_id": None}) == ("lines", ["dataset_missing"], None)
+    assert assert_batch_parity([line], CONTRACTS[0], False) is None
+    assert assert_row_lines_parity([line]) == {}
+    [group_line] = seam.prepare_directory_row_lines([line], _context(CONTRACTS[0], True)).encoded_lines
+    assert json.loads(group_line)["payload_json"]["telecom"] == telecom_entries
+
+
+@pytest.mark.parametrize("url_field", ["resource_url", "self_url", "fetch_url"])
+def test_native_group_line_refuses_context_url_that_needs_python_normalization(url_field):
+    native = _compiled_export(seam.ROW_LINES_EXPORT)
+    context_by_name = {**_native_context_by_name(), url_field: "https://[2001:db8::1]/directory"}
+    line = b'{"resourceType":"PractitionerRole","id":"role-1"}'
+    assert native([line], "PractitionerRole", context_by_name) == ("unsupported", "url_network_location")
+
+
 def _reduced(tmp_path, name, prepared_batches):
     """Group prepared batches the way the grouped load does, then reduce every partition."""
 
