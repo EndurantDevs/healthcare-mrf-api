@@ -7,6 +7,7 @@ import importlib
 import json
 import threading
 import time
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -497,24 +498,24 @@ async def _run_grouped(session, source_record, identity, manifest, checkpoints, 
     return await asyncio.gather(*streams, return_exceptions=True)
 
 
-def _crash_once(monkeypatch, owner, name, call_number, should_crash=lambda *arguments: True):
+def _crash_once(monkeypatch, owner, name, call_number, should_crash=lambda *arguments: True, *, failure=RuntimeError):
     original, calls = getattr(owner, name), []
 
     def crashing(*arguments, **keywords):
         if should_crash(*arguments):
             calls.append(arguments)
             if len(calls) == call_number:
-                raise RuntimeError("injected crash")
+                raise failure("injected crash")
         return original(*arguments, **keywords)
 
     monkeypatch.setattr(owner, name, crashing)
 
 
-def _inject_crash(monkeypatch, stage):
+def _inject_crash(monkeypatch, stage, failure):
     if stage == "mid_group":  # the second output's first batch: the first output is grouped, the second is not
-        _crash_once(monkeypatch, grouped_load, "_prepare_batch", 4)
+        _crash_once(monkeypatch, grouped_load, "_prepare_batch", 4, failure=failure)
     elif stage == "before_load":
-        _crash_once(monkeypatch, grouping, "reduce_partition", 1)
+        _crash_once(monkeypatch, grouping, "reduce_partition", 1, failure=failure)
     elif stage == "mid_load":  # the second partition's rows are committed, its marker is not: it is replayed
         _crash_once(monkeypatch, grouping, "mark_loaded", 2)
     elif stage == "before_finish":
@@ -528,8 +529,12 @@ def _merged_rows(ledger):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", CRASH_STAGES)
-async def test_grouped_load_resumes_after_a_crash_at_each_stage(grouped_source, monkeypatch, stage):
+@pytest.mark.parametrize(
+    ("stage", "failure"),
+    [(stage, RuntimeError) for stage in CRASH_STAGES]
+    + [("mid_group", BrokenProcessPool), ("before_load", BrokenProcessPool)],
+)
+async def test_grouped_load_resumes_after_a_crash_at_each_stage(grouped_source, monkeypatch, stage, failure):
     requests = []
     async with _output_server(requests) as server, aiohttp.ClientSession() as session:
         manifest, checkpoints = _two_output_export(monkeypatch, str(server.make_url("/output")), ("streaming",) * 2)
@@ -546,11 +551,16 @@ async def test_grouped_load_resumes_after_a_crash_at_each_stage(grouped_source, 
         ledger = _Ledger()
         _grouped_fakes(monkeypatch, ledger)
         with monkeypatch.context() as crash:
-            _inject_crash(crash, stage)
+            _inject_crash(crash, stage, failure)
             crashed_streams = await _run_grouped(
                 session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger
             )
         assert crashed_streams and all(isinstance(error, RuntimeError) for error in crashed_streams)
+        if failure is BrokenProcessPool:
+            assert all(
+                str(error) == "bulk_export_group_worker_lost" and isinstance(error.__cause__, BrokenProcessPool)
+                for error in crashed_streams
+            )
         assert len(requests) == 2  # every copy was saved before grouping began
         assert await _run_grouped(session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) in (
             [None, None],
