@@ -148,6 +148,8 @@ class PartitionFetchState:
     next_url_remaining: bool = False
     seen_urls: set[str] = field(default_factory=set)
     completed_partition_identities: set[str] = field(default_factory=set)
+    retry_leaf_urls: dict[str, str] = field(default_factory=dict)
+    active_chain_count: int = 0
     pending_partition_checkpoint_rows: list[dict[str, Any]] = field(default_factory=list)
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     writer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -187,6 +189,7 @@ class PartitionPageRequest:
     is_residual_only: bool
     pending_resource_rows: list[dict[str, Any]]
     fetch_options: PartitionFetchOptions
+    page_identities: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -199,6 +202,7 @@ class PartitionChainRequest:
     state: PartitionFetchState
     request_url: str
     fetch_options: PartitionFetchOptions
+    page_identities: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

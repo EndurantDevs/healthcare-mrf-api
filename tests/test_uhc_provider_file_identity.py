@@ -10,7 +10,6 @@ import pytest
 from process import uhc_provider_file_identity as identity
 from process import uhc_provider_file_source_identity as source_identity
 
-
 CS_PRODUCT_TOKENS = (
     "AZDC",
     "AZLTC",
@@ -100,17 +99,13 @@ def _descriptor(family, collection_kind, file_name):
 
 def _scope(file_name="JSON_Providers_AZDC.json"):
     family = "ifp" if "IEX" in file_name or "UHCEX" in file_name else "cs"
-    return identity.logical_scope_for_file(
-        _descriptor(family, identity.PROVIDER_MEMBERSHIP, file_name)
-    )
+    return identity.logical_scope_for_file(_descriptor(family, identity.PROVIDER_MEMBERSHIP, file_name))
 
 
 def _mutate_cs_product_token(census_document):
     product_by_token = dict(census_document["cs_provider_products"])
     product_by_token["AZDX"] = product_by_token.pop("AZDC")
-    census_document["cs_provider_products"] = dict(
-        sorted(product_by_token.items())
-    )
+    census_document["cs_provider_products"] = dict(sorted(product_by_token.items()))
 
 
 def _replace_ifp_paired_state(census_document):
@@ -128,29 +123,21 @@ def test_corporate_source_identity_is_distinct_from_louisiana_manifest_entry():
         ).read_text()
     )
     uhc_entry = next(entry for entry in manifest["entries"] if entry["entry_id"] == "uhc")
-    official_entry = next(
-        entry
-        for entry in manifest["entries"]
-        if entry["entry_id"] == "uhc-provider-files"
-    )
+    official_entry = next(entry for entry in manifest["entries"] if entry["entry_id"] == "uhc-provider-files")
 
     assert official_files.entry_id == "uhc-provider-files"
     assert official_files.display_name == "UnitedHealthcare Official Provider Files"
     assert official_files.owner_id == "unitedhealthcare"
     assert official_files.portal_base != uhc_entry["canonical_base"]
     assert official_files.catalog_base != uhc_entry["canonical_base"]
-    assert official_files.registered_source_id == (
-        source_identity.UHC_PROVIDER_FILE_SOURCE_ID
-    )
+    assert official_files.registered_source_id == (source_identity.UHC_PROVIDER_FILE_SOURCE_ID)
     assert official_files.acquisition_manifest_entry_id == (
         source_identity.UHC_PROVIDER_FILE_ACQUISITION_MANIFEST_ENTRY_ID
     )
     assert official_files.acquisition_runnable is True
     assert official_files.profile_eligible is True
     assert official_files.publication_ready is True
-    assert official_entry["source_ids"] == [
-        source_identity.UHC_PROVIDER_FILE_SOURCE_ID
-    ]
+    assert official_entry["source_ids"] == [source_identity.UHC_PROVIDER_FILE_SOURCE_ID]
     assert official_entry["classification"] == "acquisition"
     assert official_entry["canonical_base"] == official_files.catalog_base
     assert uhc_entry == {
@@ -159,10 +146,17 @@ def test_corporate_source_identity_is_distinct_from_louisiana_manifest_entry():
         "owner_id": "unitedhealthcare-community-plan-louisiana",
         "source_ids": ["pdfhir_0b5cfd565c53364a73981dcb"],
         "canonical_base": "https://flex.optum.com/fhirpublic/R4",
-        "classification": "probe_only",
+        "classification": "acquisition",
         "launch_mode": "create",
-        "resource_profile": "NONE",
-        "resources": [],
+        "resource_profile": "A6",
+        "resources": [
+            "InsurancePlan",
+            "Location",
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        ],
     }
 
 
@@ -181,25 +175,17 @@ def test_reviewed_census_contains_the_exact_102_official_filenames_once():
     assert len({scope.source_file.source_file_id for scope in scopes}) == 102
     assert len({scope.logical_scope_id for scope in scopes}) == 78
     assert sum(scope.family == "cs" for scope in scopes) == 53
-    assert sum(
-        scope.family == "ifp" and scope.collection_kind == identity.PROVIDER_MEMBERSHIP
-        for scope in scopes
-    ) == 25
+    assert (
+        sum(scope.family == "ifp" and scope.collection_kind == identity.PROVIDER_MEMBERSHIP for scope in scopes) == 25
+    )
     assert sum(scope.collection_kind == identity.PLAN_REFERENCE for scope in scopes) == 24
     census_document = json.loads(identity.UHC_CENSUS_PATH.read_text())
-    assert (
-        identity._sha256_json(census_document)
-        == identity.UHC_CENSUS_SEMANTIC_SHA256
-    )
+    assert identity._sha256_json(census_document) == identity.UHC_CENSUS_SEMANTIC_SHA256
 
 
 def test_ifp_state_pairs_share_scope_and_exception_is_retained_only():
-    scopes = identity.logical_scopes_for_current_census(
-        identity.current_census_source_files()
-    )
-    paired_scopes = [
-        scope for scope in scopes if scope.pairing_status == identity.PAIRING_PAIRED
-    ]
+    scopes = identity.logical_scopes_for_current_census(identity.current_census_source_files())
+    paired_scopes = [scope for scope in scopes if scope.pairing_status == identity.PAIRING_PAIRED]
     scope_ids_by_state = {
         state: {scope.logical_scope_id for scope in paired_scopes if scope.jurisdiction == state}
         for state in IFP_STATE_CODES
@@ -211,8 +197,7 @@ def test_ifp_state_pairs_share_scope_and_exception_is_retained_only():
 
     assert all(len(scope_ids) == 1 for scope_ids in scope_ids_by_state.values())
     assert all(
-        kinds == {identity.PROVIDER_MEMBERSHIP, identity.PLAN_REFERENCE}
-        for kinds in collection_kinds_by_state.values()
+        kinds == {identity.PROVIDER_MEMBERSHIP, identity.PLAN_REFERENCE} for kinds in collection_kinds_by_state.values()
     )
     exceptional = next(scope for scope in scopes if scope.product == "UHCEX_HIX")
     assert exceptional.jurisdiction is None
@@ -270,7 +255,10 @@ def test_cs_products_remain_product_scoped_without_inferred_jurisdiction():
         (lambda registry: registry["entries"][0].update({"registered_source_id": "pdfhir_" + "a" * 24}), "gates"),
         (lambda registry: registry["entries"][0].update({"profile_eligible": False}), "gates"),
         (lambda registry: registry["entries"][0].update({"enabling_gate": "later"}), "gates"),
-        (lambda registry: registry["entries"][0].update({"owner_id": "unitedhealthcare-community-plan-louisiana"}), "identity"),
+        (
+            lambda registry: registry["entries"][0].update({"owner_id": "unitedhealthcare-community-plan-louisiana"}),
+            "identity",
+        ),
     ],
 )
 def test_source_registry_rejects_binding_or_capability_drift(tmp_path, mutation, message):
@@ -285,9 +273,7 @@ def test_source_registry_rejects_binding_or_capability_drift(tmp_path, mutation,
 
 def test_source_registry_has_no_public_path_override():
     with pytest.raises(TypeError):
-        source_identity.source_identity_from_registry(
-            source_identity.SOURCE_NEUTRAL_REGISTRY_PATH
-        )
+        source_identity.source_identity_from_registry(source_identity.SOURCE_NEUTRAL_REGISTRY_PATH)
 
 
 @pytest.mark.parametrize(
@@ -300,15 +286,9 @@ def test_source_registry_has_no_public_path_override():
         _mutate_cs_product_token,
         lambda census: census["ifp_paired_states"].append("CA"),
         _replace_ifp_paired_state,
-        lambda census: census["ifp_unpaired_provider_products"][0].update(
-            {"product": "UHCEX_HIX2"}
-        ),
-        lambda census: census["ifp_unpaired_provider_products"][0].update(
-            {"retention_policy": "publish"}
-        ),
-        lambda census: census["census_counts"].update(
-            {"catalog_file_count": 101}
-        ),
+        lambda census: census["ifp_unpaired_provider_products"][0].update({"product": "UHCEX_HIX2"}),
+        lambda census: census["ifp_unpaired_provider_products"][0].update({"retention_policy": "publish"}),
+        lambda census: census["census_counts"].update({"catalog_file_count": 101}),
     ],
 )
 def test_census_spec_rejects_header_shape_metadata_and_count_drift(
@@ -354,9 +334,7 @@ def test_scope_collection_validator_rejects_types_and_forged_pairing():
     scopes = identity.logical_scopes_for_current_census(source_files)
     cs_scope = next(scope for scope in scopes if scope.family == "cs")
     paired_scope = next(
-        scope
-        for scope in scopes
-        if scope.family == "ifp" and scope.pairing_status == identity.PAIRING_PAIRED
+        scope for scope in scopes if scope.family == "ifp" and scope.pairing_status == identity.PAIRING_PAIRED
     )
     exceptional = next(scope for scope in scopes if scope.product == "UHCEX_HIX")
     census = identity.provider_file_census_from_spec()
@@ -393,9 +371,7 @@ def test_census_validators_reject_noncanonical_internal_shapes():
     non_text_product_by_token[1] = non_text_product_by_token.pop("AZDC")
     with pytest.raises(identity.UHCProviderFileIdentityError, match="CS product"):
         identity._validated_cs_products(non_text_product_by_token)
-    reversed_product_by_token = dict(
-        reversed(census_document["cs_provider_products"].items())
-    )
+    reversed_product_by_token = dict(reversed(census_document["cs_provider_products"].items()))
     with pytest.raises(identity.UHCProviderFileIdentityError, match="CS product"):
         identity._validated_cs_products(reversed_product_by_token)
     invalid_product_by_token = dict(census_document["cs_provider_products"])
@@ -406,9 +382,7 @@ def test_census_validators_reject_noncanonical_internal_shapes():
     with pytest.raises(identity.UHCProviderFileIdentityError, match="paired-state"):
         identity._validated_ifp_states([])
     with pytest.raises(identity.UHCProviderFileIdentityError, match="paired-state"):
-        identity._validated_ifp_states(
-            list(reversed(census_document["ifp_paired_states"]))
-        )
+        identity._validated_ifp_states(list(reversed(census_document["ifp_paired_states"])))
     with pytest.raises(identity.UHCProviderFileIdentityError, match="unpaired-product"):
         identity._validated_unpaired_product([])
 

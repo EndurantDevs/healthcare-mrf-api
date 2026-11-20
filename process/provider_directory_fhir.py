@@ -125,6 +125,7 @@ from process import provider_directory_serving_recovery as serving_recovery
 from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
 from process import provider_directory_time_partition as time_partition
+from process import provider_directory_uhc_scan as uhc_scan
 from process import vsp_directory_integration as vsp_directory
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
@@ -3837,12 +3838,9 @@ SCAN_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 # for apostrophes. Space, hyphen, and period work after a nonempty prefix.
 UHC_NAME_ROOT_ALPHABET = tuple(string.ascii_uppercase + string.digits)
 UHC_TEXT_SEARCH_ALPHABET = tuple(string.ascii_uppercase + string.digits + " -.")
-UHC_POSTAL_SEARCH_ALPHABET = tuple("0123456789")
 UHC_POSTAL_ROOT_ALPHABET = tuple("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 UHC_ADAPTIVE_PARTITION_TOTAL_CAP = 10000
 UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH = 4
-UHC_CITY_PARTITION_DEFAULT_MAX_PREFIX_LENGTH = 8
-UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH = 5
 UHC_ROLE_POSTAL_CHECKPOINT_TYPE = "PractitionerRolePostalPrefix"
 UHC_PARTITION_CHECKPOINT_TYPE = "UHCPartition"
 UHC_PLAN_GRAPH_STRATEGY_VERSION = "provider-directory-uhc-plan-graph-v1"
@@ -3875,10 +3873,8 @@ def _uhc_provider_directory_partition_values(resource_type: str) -> tuple[tuple[
         return tuple(("family", prefix) for prefix in UHC_NAME_ROOT_ALPHABET)
     if resource_type == "Organization":
         return tuple(("name", prefix) for prefix in UHC_NAME_ROOT_ALPHABET)
-    if resource_type == "Location":
-        return tuple(("address-state", state) for state in US_STATE_ABBRS)
-    if resource_type == "PractitionerRole":
-        return tuple(("location.address-postalcode", prefix) for prefix in UHC_POSTAL_ROOT_ALPHABET)
+    if postal_param := uhc_scan.POSTAL_SEARCH_PARAMS.get(resource_type):
+        return tuple((postal_param, prefix) for prefix in UHC_POSTAL_ROOT_ALPHABET)
     return ()
 
 
@@ -3935,18 +3931,6 @@ def _insurance_plan_network_references(resource: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(references))
 
 
-def _uhc_adaptive_partition_max_prefix_length(resource_type: str) -> int:
-    if resource_type == "Location":
-        return _env_int(
-            "HLTHPRT_PROVIDER_DIRECTORY_UHC_CITY_MAX_PREFIX_LENGTH",
-            UHC_CITY_PARTITION_DEFAULT_MAX_PREFIX_LENGTH,
-        )
-    return _env_int(
-        "HLTHPRT_PROVIDER_DIRECTORY_UHC_MAX_PREFIX_LENGTH",
-        UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH,
-    )
-
-
 def _uhc_adaptive_partition_child_urls(
     source_record: dict[str, Any],
     resource_type: str,
@@ -3960,37 +3944,22 @@ def _uhc_adaptive_partition_child_urls(
     query_by_name = dict(query_items)
     if _has_fhir_continuation_query(url):
         return []
-    search_param = {
-        "Practitioner": "family",
-        "Organization": "name",
-        "PractitionerRole": "location.address-postalcode",
-    }.get(resource_type)
-    if resource_type == "Location" and query_by_name.get("address-state"):
-        search_param = "address-city"
-    if not search_param:
-        return []
-    total = _bundle_total(bundle_payload)
-    if total is None or total < UHC_ADAPTIVE_PARTITION_TOTAL_CAP:
-        return []
-    prefix = _uhc_query_prefix(query_by_name, search_param)
-    if resource_type != "Location" and not prefix:
-        return []
-    max_prefix_length = (
-        UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH
-        if resource_type == "PractitionerRole"
-        else _uhc_adaptive_partition_max_prefix_length(resource_type)
+    search_param = {"Practitioner": "family", "Organization": "name", **uhc_scan.POSTAL_SEARCH_PARAMS}.get(
+        resource_type
     )
-    if len(prefix or "") >= max_prefix_length:
+    total = _bundle_total(bundle_payload)
+    prefix = _uhc_query_prefix(query_by_name, search_param or "")
+    if not search_param or total is None or total < UHC_ADAPTIVE_PARTITION_TOTAL_CAP or not prefix:
         return []
-    if resource_type == "PractitionerRole":
-        search_alphabet = UHC_POSTAL_SEARCH_ALPHABET
-    elif prefix:
-        search_alphabet = UHC_TEXT_SEARCH_ALPHABET
+    if resource_type in uhc_scan.POSTAL_SEARCH_PARAMS:
+        child_prefixes = uhc_scan.postal_child_prefixes(prefix)
+    elif len(prefix) < _env_int(
+        "HLTHPRT_PROVIDER_DIRECTORY_UHC_MAX_PREFIX_LENGTH", UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH
+    ):
+        child_prefixes = [prefix + character for character in UHC_TEXT_SEARCH_ALPHABET]
     else:
-        search_alphabet = UHC_NAME_ROOT_ALPHABET
-    return [
-        _url_with_replaced_query_item(url, search_param, (prefix or "") + character) for character in search_alphabet
-    ]
+        child_prefixes = []
+    return [_url_with_replaced_query_item(url, search_param, child_prefix) for child_prefix in child_prefixes]
 
 
 def _uhc_location_partition_predicate_error(
@@ -4036,11 +4005,7 @@ def _uhc_exact_partition_entries(
             keep_blank_values=True,
         )
     )
-    search_param = {
-        "Practitioner": "family",
-        "Organization": "name",
-        "Location": "address-city",
-    }.get(resource_type)
+    search_param = {"Practitioner": "family", "Organization": "name"}.get(resource_type)
     if not search_param:
         return None
     expected_value = _uhc_query_prefix(query_by_name, search_param)
@@ -4054,14 +4019,11 @@ def _uhc_exact_partition_entries(
             candidate_values = [
                 _clean_text(name.get("family")) for name in resource.get("name", []) if isinstance(name, dict)
             ]
-        elif resource_type == "Organization":
+        else:
             candidate_values = [
                 _clean_text(resource.get("name")),
                 *[_clean_text(alias) for alias in resource.get("alias", []) if isinstance(alias, str)],
             ]
-        else:
-            address = resource.get("address")
-            candidate_values = [_clean_text(address.get("city")) if isinstance(address, dict) else None]
         if expected_value is None:
             is_exact_match = any(not candidate_value for candidate_value in candidate_values)
         else:
@@ -4089,7 +4051,7 @@ def _is_uhc_role_zip_cap_hit(
     prefix = _clean_text(query_by_name.get("location.address-postalcode"))
     return bool(
         prefix
-        and len(prefix) >= UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH
+        and not uhc_scan.postal_child_prefixes(prefix)
         and (_bundle_total(payload) or 0) >= UHC_ADAPTIVE_PARTITION_TOTAL_CAP
     )
 
@@ -4158,6 +4120,7 @@ def _uhc_partition_checkpoint_type(
         "PractitionerRole",
         "Organization",
         "Location",
+        "OrganizationAffiliation",
     }:
         return None
     if resource_type == "PractitionerRole" and not _is_uhc_role_postal_partition_enabled(source_record):
@@ -4187,7 +4150,8 @@ def _uhc_partition_identity(
     partition_params = {
         "Practitioner": ("family",),
         "Organization": ("name",),
-        "Location": ("address-state", "address-city"),
+        "Location": ("address-postalcode",),
+        "OrganizationAffiliation": ("location.address-postalcode",),
     }.get(resource_type)
     if not partition_params:
         return None
@@ -5684,7 +5648,7 @@ def _molina_provider_directory_override(
 def _uhc_provider_directory_override_metadata(
     source_row: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build fail-closed metadata for the public Optum FLEX endpoint."""
+    """Build acquisition metadata for the public Optum FLEX endpoint."""
     return {
         "provider_directory_override": "uhc_flex_optum_fhirpublic_r4",
         "provider_directory_override_reason": (
@@ -5697,15 +5661,10 @@ def _uhc_provider_directory_override_metadata(
         "provider_directory_confirmed_metadata_url": UHC_PROVIDER_DIRECTORY_METADATA_URL,
         "provider_directory_resource_page_count_caps": {"InsurancePlan": 1},
         "provider_directory_supported_resources": list(UHC_SUPPORTED_RESOURCES),
-        "provider_directory_fully_enumerable_resources": [],
-        "provider_directory_coverage_mode": "probe_only",
-        "provider_directory_acquisition_enabled": False,
-        "provider_directory_blocked_reason": (PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON),
-        "provider_directory_acquisition_blocked_reason": (
-            "The public Optum FLEX endpoint caps core collections at 10,000 rows, "
-            "does not expose a complete residual partition, and cannot prove a "
-            "complete product-scoped provider directory."
-        ),
+        "provider_directory_fully_enumerable_resources": list(UHC_SUPPORTED_RESOURCES),
+        "provider_directory_coverage_mode": "carrier_directory",
+        "provider_directory_directory_scope": "carrier",
+        "provider_directory_acquisition_enabled": True,
         "provider_directory_expected_nonempty_resources": sorted(STATE_EXPECTED_NONEMPTY_RESOURCES),
     }
 
@@ -5713,7 +5672,7 @@ def _uhc_provider_directory_override_metadata(
 def _uhc_provider_directory_override(
     source_row: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Normalize UHC portal and stale hosts to the probe-only FLEX base."""
+    """Normalize UHC portal and stale hosts to the public FLEX base."""
     api_base = _canonical_base(source_row.get("api_base"))
     portal_url = (_clean_text(source_row.get("portal_url")) or "").lower()
     source_url = (_clean_text(source_row.get("source_url")) or "").lower()
@@ -47281,6 +47240,8 @@ async def _partition_page_bounded_outcome(
     ):
         return "split"
     if _is_uhc_partition_cap_exhausted(source_record, current_url, fhir_payload):
+        if resource_type in uhc_scan.BEST_EFFORT_TYPES:
+            return None  # name prefixes are a bulk pass; referenced rows are read by id afterwards
         await _mark_partition_fetch_error(
             state,
             f"uhc_{resource_type.lower()}_partition_cap_exhausted",
@@ -47299,10 +47260,10 @@ async def _fetch_valid_partition_bundle(
         timeout=request.fetch_options.timeout,
     )
     if status_code != 200 or fetch_error:
-        await _mark_partition_fetch_error(
-            request.state,
-            fetch_error or f"http_{status_code}",
-        )
+        if uhc_scan.is_source(sys.modules[__name__], request.source_record):
+            uhc_scan.defer_failed_leaf(sys.modules[__name__], request, fetch_error or f"http_{status_code}")
+        else:
+            await _mark_partition_fetch_error(request.state, fetch_error or f"http_{status_code}")
         return None
     if not _is_bundle_payload(fhir_payload):
         await _mark_partition_fetch_error(request.state, "non_bundle_payload")
@@ -47316,6 +47277,8 @@ async def _split_partition_page_result(
     fhir_payload: dict[str, Any],
 ) -> PartitionPageFetchResult:
     """Retain exact parent rows and continue its capped residual cursor."""
+    if guard_error := await uhc_scan.split_guard_error(sys.modules[__name__], request):
+        await _mark_partition_fetch_error(request.state, guard_error)
     residual_entries = _uhc_exact_partition_entries(
         request.resource_type,
         request.partition_start_url,
@@ -47419,11 +47382,10 @@ async def _should_continue_partition_chain(
         request.state.next_url_remaining = True
         request.state.stop_event.set()
         return False
-    return await _can_fetch_partition_url(
-        request.state,
-        current_url,
-        max_pages=request.fetch_options.max_pages,
-    )
+    if not await _can_fetch_partition_url(request.state, current_url, max_pages=request.fetch_options.max_pages):
+        return False
+    request.page_identities.append(_pagination_url_identity(current_url))
+    return True
 
 
 async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
@@ -47455,6 +47417,7 @@ async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
                 is_residual_only=is_residual_only,
                 pending_resource_rows=pending_resource_rows,
                 fetch_options=request.fetch_options,
+                page_identities=request.page_identities,
             )
         )
         current_url = page_fetch_result.next_url
@@ -47492,7 +47455,12 @@ async def _run_partition_fetch_worker(
         try:
             request_url = start_url_queue.get_nowait()
         except asyncio.QueueEmpty:
-            return
+            if not state.active_chain_count:
+                return
+            await asyncio.sleep(0.05)
+            continue
+        state.active_chain_count += 1
+        cursor_token = uhc_scan.enter_proxy_cursor(sys.modules[__name__], source_record, resource_type, request_url)
         try:
             await _fetch_partition_url_chain(
                 PartitionChainRequest(
@@ -47505,6 +47473,8 @@ async def _run_partition_fetch_worker(
                 )
             )
         finally:
+            source_proxy.PARTITION_CURSOR_KEY.reset(cursor_token)
+            state.active_chain_count -= 1
             start_url_queue.task_done()
 
 
@@ -47587,14 +47557,15 @@ async def _fetch_partitioned_resource_rows(
         fetch_options,
         len(start_urls),
     )
-    is_partition_scan_complete = (
+    await uhc_scan.retry_failed_leaves(
+        sys.modules[__name__], source_record, resource_type, start_url_queue, state, fetch_options
+    )
+    is_complete = (
         not state.error_message
         and not state.hard_page_limit_reached
         and not state.deadline_reached
         and start_url_queue.empty()
     )
-    residual_error = _uhc_partition_residual_error(source_record, resource_type) if is_partition_scan_complete else None
-    is_complete = is_partition_scan_complete and not residual_error
     checkpoint_type = _uhc_partition_checkpoint_type(source_record, resource_type)
     if is_complete and checkpoint_type:
         await _clear_reverse_lookup_checkpoints(
@@ -47613,9 +47584,14 @@ async def _fetch_partitioned_resource_rows(
         page_limit_reached=False,
         hard_page_limit_reached=state.hard_page_limit_reached,
         next_url_remaining=state.next_url_remaining or not start_url_queue.empty(),
-        error=state.error_message or ("deadline_reached" if state.deadline_reached else None) or residual_error,
+        error=state.error_message or ("deadline_reached" if state.deadline_reached else None),
         fetch_mode="partitioned_paged",
         deadline_reached=state.deadline_reached,
+        fetch_diagnostic=(
+            uhc_scan.unenumerable_residual(sys.modules[__name__], source_record, resource_type, start_urls)
+            if is_complete
+            else None
+        ),
     )
 
 
@@ -54294,6 +54270,7 @@ def _should_use_uhc_plan_graph(
     selected_resources = set(resource_types).intersection(UHC_PLAN_GRAPH_RESOURCE_TYPES)
     return bool(
         api_base == UHC_PROVIDER_DIRECTORY_BASE
+        and not _is_uhc_role_postal_partition_enabled(source_record)
         and per_resource_limit <= 0
         and page_limit <= 0
         and "InsurancePlan" in selected_resources
@@ -66335,6 +66312,16 @@ async def _import_resources(
                 rows_written=written_total,
             )
             await mark_resource_stale_cleanup_ready("PractitionerRole", fetch_result)
+        if per_resource_limit <= 0 and page_limit <= 0:
+            await uhc_scan.close_references(
+                sys.modules[__name__],
+                partition_source,
+                persist_resource_rows,
+                resource_diagnostic_by_type,
+                source_count_by_resource,
+                timeout=timeout,
+                run_id=run_id,
+            )
         if linked_resource_limit > 0 and rows_by_resource:
             async with progress_lock:
                 active_group_by_key[group_key]["current_resource"] = "Linked resources"
@@ -66473,6 +66460,7 @@ async def _import_resources(
                     request_concurrency=max(
                         resource_scan_concurrency,
                         min(100, max(1, linked_resource_concurrency)) if linked_resource_limit > 0 else 1,
+                        uhc_scan.request_concurrency(sys.modules[__name__], source_records),
                     ),
                 ),
             ):

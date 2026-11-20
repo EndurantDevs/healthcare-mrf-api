@@ -12,6 +12,7 @@ from process import provider_directory_profile_source_inputs as inputs
 from process import provider_directory_published_replacement_inputs as serving_inputs
 from process import provider_directory_published_source_replacement as replacement
 from process import provider_directory_serving_recovery as recovery
+from process import provider_directory_uhc_scan as uhc_scan
 from process import vsp_directory_integration as vsp_directory
 from process.provider_directory_artifact_scratch_inputs import (
     _loading_projection,
@@ -242,6 +243,7 @@ async def import_resources_with_source_session(directory, source_records, rest_p
                     min(100, max(1, options.get("linked_resource_concurrency", 5)))
                     if options.get("linked_resource_limit", 0) > 0
                     else 1,
+                    uhc_scan.request_concurrency(directory, source_records),
                 ),
                 source_concurrency=max(1, min(len(source_records), options.get("source_concurrency", 1))),
             ):

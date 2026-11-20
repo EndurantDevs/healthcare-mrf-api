@@ -4744,14 +4744,17 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (59, 45, 46)
+    ) == (59, 46, 46)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 45
-    assert {entry["entry_id"] for entry in runnable_items if not entry["profile_enabled"]} == {"vsp-provider-directory"}
+    assert len(runnable_items) == 46
+    assert {entry["entry_id"] for entry in runnable_items if not entry["profile_enabled"]} == {
+        "uhc",
+        "vsp-provider-directory",
+    }
     assert all(entry["supported_resources"] == entry["resources"] for entry in runnable_items)
-    assert len(nonrunnable_items) == 14
+    assert len(nonrunnable_items) == 13
     probe_items = [entry for entry in nonrunnable_items if entry["classification"] == "probe_only"]
-    assert len(probe_items) == 13
+    assert len(probe_items) == 12
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
     assert runnable_by_id["anthem-provider-directory"]["resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE[:-1]
@@ -4763,6 +4766,7 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     assert len(runnable_by_id["san-mateo-county-bhrs"]["resources"]) == 8
     assert runnable_by_id["uhc-provider-files"]["resource_profile"] == "A6"
     assert runnable_by_id["uhc-provider-files"]["resources"] == _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE
+    assert runnable_by_id["uhc"]["resources"] == _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     michigan = runnable_by_id["michigan"]
     assert michigan["resource_profile"] == "M5"
     assert (
@@ -4798,22 +4802,21 @@ def test_provider_directory_catalog_enables_cms_profile_source():
     assert cms["runnable"] is True
 
 
-def test_uhc_catalog_reports_supported_resources_without_enabling_import():
-    """Show the verified UHC surface while its census remains incomplete."""
+def test_uhc_catalog_enables_postal_partition_import():
+    """The postal ZIP+4 partition route makes the six UHC families runnable."""
     uhc_entry = next(entry for entry in provider_directory_source_catalog()["items"] if entry["entry_id"] == "uhc")
-
-    assert uhc_entry["resources"] == []
-    assert uhc_entry["runnable"] is False
-    assert uhc_entry["supported_resources"] == [
+    six_families = [
         "InsurancePlan",
-        "PractitionerRole",
-        "Practitioner",
-        "Organization",
         "Location",
-        "HealthcareService",
+        "Organization",
         "OrganizationAffiliation",
-        "Endpoint",
+        "Practitioner",
+        "PractitionerRole",
     ]
+
+    assert uhc_entry["resources"] == six_families
+    assert uhc_entry["runnable"] is True
+    assert uhc_entry["supported_resources"] == six_families
 
 
 @pytest.mark.asyncio

@@ -331,7 +331,7 @@ def requires_verified_session(directory, source_record):
     return bool(
         vsp_directory.is_source(source_record)
         or directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-        == bcbs_minnesota.API_BASE
+        in {bcbs_minnesota.API_BASE, directory.UHC_PROVIDER_DIRECTORY_BASE}
         or directory.current_version_census_contract(source_record) is not None
         or directory.capped_partition.enabled(directory, source_record)
         or uses_census_retry_policy(directory, source_record)
@@ -1026,6 +1026,8 @@ async def fetch_unpaced_source_json(directory, source_record, url, *, timeout):
         return await fetch_same_collection(directory, source_record, url, timeout=timeout)
     if directory.source_selection.is_credentialed_rest_source(directory, source_record):
         return await fetch_credentialed_rest_json(directory, source_record, url, timeout=timeout)
+    if directory.uhc_scan.is_source(directory, source_record):
+        return await fetch_gzip_source_json(directory, source_record, url, timeout=timeout)
     pinned_session = directory._SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
     if pinned_session is not None:
         return await directory._fetch_json_with_source_session(
@@ -1040,11 +1042,27 @@ async def fetch_unpaced_source_json(directory, source_record, url, *, timeout):
     if not options["headers"] and not options["query_params"]:
         return await directory._fetch_json(url, timeout=timeout)
     return await directory._fetch_json_with_options(
-        url,
-        timeout=timeout,
-        extra_headers=options["headers"],
-        query_params_by_name=options["query_params"],
+        url, timeout=timeout, extra_headers=options["headers"], query_params_by_name=options["query_params"]
     )
+
+
+async def fetch_gzip_source_json(directory, source_record, url, *, timeout):
+    """Ask for gzip, keeping configured credentials; the decoder keeps the existing size limits."""
+    options = await directory.source_selection.resolve_probe_credentials(
+        directory._credential_request_options_for_source, source_record, url
+    )
+    if options["headers"] or options["query_params"]:
+        return await directory._fetch_json_with_options(
+            url,
+            timeout=timeout,
+            extra_headers=options["headers"],
+            query_params_by_name=options["query_params"],
+            allow_gzip=True,
+        )
+    session = directory._SOURCE_HTTP_SESSION.get()
+    if session is None or session.closed:
+        return await directory._fetch_json(url, timeout=timeout)
+    return await directory._fetch_json_with_source_session(session, url, timeout=timeout, allow_gzip=True)
 
 
 def uses_credentialed_rest_transport(directory, source_record):
