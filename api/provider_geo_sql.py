@@ -14,7 +14,7 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import BigInteger, bindparam, column, select, table, text
 
 from api.custom_import_provider_sql import ProviderImportQuery
-from api.provider_list_sql import _provider_list_connection, _provider_list_parameters
+from api.provider_list_sql import _address_zip5_filter, _provider_list_connection, _provider_list_parameters
 from db.tiger_models import Zip_zcta5
 
 _IMPORT_RELATION = "custom_import_provider_relation"
@@ -529,12 +529,20 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
           hydrated_geo.address_key ASC"""
 
     legacy_initial_clause, _ = legacy_page_clauses or (None, None)
+    extra_clause = nearby.extra_clause if legacy_initial_clause is None else legacy_initial_clause
+    if re.fullmatch(r"[a-z_][a-z_0-9]*\.entity_address_unified", nearby.address_table_sql):
+        zip_filter = _address_zip5_filter("a", nearby.address_table_sql, any_array=True)
+        if f"AND {zip_filter}" in map(str.strip, extra_clause.splitlines()):
+            # Let a custom single-ZIP plan intersect both indexes without steering generic plans.
+            extra_clause += (
+                "\n          AND (cardinality(:zip_codes) <> 1 OR a.zip5 = ANY (:zip_codes) OR a.zip5 IS NULL)"
+            )
     taxonomy_where = _taxonomy_filter_where(nearby)
     return _NATIVE_NEARBY_SQL_TEMPLATE.format(
         taxonomy_where=taxonomy_where,
         geo_precision_clause=nearby.geo_precision_clause,
         geo_type_clause=nearby.geo_type_clause,
-        extra_clause=nearby.extra_clause if legacy_initial_clause is None else legacy_initial_clause,
+        extra_clause=extra_clause,
         ilike_clause=nearby.ilike_clause,
         cursor_clause=cursor_clause,
         row_tiebreaker=nearby_row_tiebreaker(nearby.address_table_sql),
