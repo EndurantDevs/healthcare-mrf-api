@@ -52,7 +52,6 @@ async def catalog_publication(metadata_custody, monkeypatch, request):
     namespace = '"' + fixture.control_schema + '"'
     await fixture.connection.execute(f"""CREATE TABLE {namespace}.registry_revision_control(id integer PRIMARY KEY,approved_revision bigint NOT NULL);
       INSERT INTO {namespace}.registry_revision_control VALUES(1,6);
-      CREATE TABLE {namespace}.network_serving_control(id integer PRIMARY KEY,generation_id bigint,metadata_generation text);
       INSERT INTO {namespace}.network_serving_control VALUES(1,9,NULL)""")
     queue_table = RegistryPublicationRequest.__table__.to_metadata(MetaData(), schema=fixture.control_schema)
     await fixture.connection.execute(str(CreateTable(queue_table).compile(dialect=postgresql.dialect())))

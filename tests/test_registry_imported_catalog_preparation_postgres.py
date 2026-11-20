@@ -112,7 +112,7 @@ async def test_real_prepared_native_accounting_resolves_after_persistence(prepar
     assert result.metadata_generation == case.selected["metadata_generation"]
     assert result.schema_name == case.candidate.schema_name
     assert result.accounting == case.selected["accounting_json"]
-    assert set(result.accounting) == {*validation._KEYS, "imported_source_inventory"}
+    assert set(result.accounting) == {*validation._TABLES, "imported_source_inventory"}
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ import copy
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -157,7 +157,6 @@ async def test_refused_validation_stays_primary_when_candidate_abandonment_canno
     monkeypatch.setattr(worker, "admit_catalog_preparation", admit)
     monkeypatch.setattr(worker, "fhir_catalog_reference_workspace", workspace)
     monkeypatch.setattr(worker, "fhir_catalog_registry_reads", reads)
-    monkeypatch.setattr(worker, "build_fhir_catalog_observation_verifier", Mock(return_value=AsyncMock()))
     monkeypatch.setattr(worker, "validate_fhir_catalog_snapshot_data", AsyncMock(side_effect=refusal))
     original_snapshot = copy.deepcopy(snapshot)
     with pytest.raises(ValueError) as failure:

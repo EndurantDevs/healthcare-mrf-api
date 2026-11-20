@@ -37,7 +37,6 @@ from process.registry_fhir_catalog_fingerprints import (
     select_fhir_catalog_mapping,
 )
 from process.registry_fhir_catalog_grant import (
-    build_fhir_catalog_observation_verifier,
     build_fhir_catalog_publication_runtime,
     fhir_catalog_admitted_current_sources,
     fhir_catalog_admitted_retained_sources,
@@ -294,9 +293,7 @@ async def _prepare_fhir_catalog_snapshot(
                 control_schema=config.grant.control_schema,
             )
     staged["checkpointed"] = True
-    accounting_by_phase["preparation_state"] = await _seal_catalog_snapshot(
-        config, copy_target, snapshot, sealer_pool, source_pool=source_pool, **producer_options
-    )
+    accounting_by_phase["preparation_state"] = await _seal_catalog_snapshot(config, copy_target, snapshot, sealer_pool)
     accounting_by_phase["prepare_seconds"] = perf_counter() - started
     return snapshot, previous, accounting_by_phase
 
@@ -1095,9 +1092,7 @@ def _source_catalog_export(descriptor, exports_by_profile):
     return export
 
 
-async def _seal_catalog_snapshot(
-    config, copy_target, snapshot, sealer_pool, *, source_pool=None, source_export=None, source_companies_only=False
-):
+async def _seal_catalog_snapshot(config, copy_target, snapshot, sealer_pool):
     """Validate frozen candidate data before recording completion through its existing claim."""
     async with sealer_pool.acquire() as connection, connection.transaction():
         store, preparation_record, claim = await admit_catalog_preparation(
@@ -1114,28 +1109,13 @@ async def _seal_catalog_snapshot(
             raise ValueError("registry_fhir_catalog_preparation_state_invalid")
     preparation = catalog_snapshot_preparation(snapshot)
     try:
-        async with (
-            sealer_pool.acquire() as registry_reader,
-            fhir_catalog_reference_workspace(registry_reader) as registry_workspace,
-            registry_reader.transaction(isolation="repeatable_read", readonly=True),
-            sealer_pool.acquire() as sealer,
-            fhir_catalog_registry_reads(sealer, registry_reader),
-            sealer.transaction(),
-        ):
+        async with sealer_pool.acquire() as sealer, fhir_catalog_registry_reads(sealer), sealer.transaction():
             receipt = await validate_fhir_catalog_snapshot_data(
                 sealer,
                 copy_target,
                 expected_snapshot=snapshot,
                 control_schema=config.grant.control_schema,
                 standing_grant=config.grant,
-                observation_verifier=build_fhir_catalog_observation_verifier(
-                    config.grant,
-                    source_pool,
-                    registry_reader=registry_reader,
-                    registry_workspace=registry_workspace,
-                    **({"source_export": source_export} if source_export is not None else {}),
-                    **({"source_companies_only": True} if source_companies_only else {}),
-                ),
             )
             snapshot.update(
                 custody_json={**receipt, "preparation": preparation},

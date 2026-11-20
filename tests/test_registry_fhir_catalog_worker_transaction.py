@@ -588,7 +588,6 @@ async def test_catalog_waits_for_freeze_then_records_only_completed_data_validat
     monkeypatch.setattr(worker, "admit_catalog_preparation", admit)
     monkeypatch.setattr(worker, "fhir_catalog_reference_workspace", workspace)
     monkeypatch.setattr(worker, "fhir_catalog_registry_reads", reads)
-    monkeypatch.setattr(worker, "build_fhir_catalog_observation_verifier", Mock(return_value=AsyncMock()))
     monkeypatch.setattr(worker, "validate_fhir_catalog_snapshot_data", validate)
     if frozen and validation_failure:
         with pytest.raises(validation_failure):

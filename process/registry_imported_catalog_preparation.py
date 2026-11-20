@@ -138,30 +138,6 @@ def imported_catalog_accounting(inventory):
     }
 
 
-async def require_native_catalog_inputs(snapshot, descriptors):
-    """Independently reobserve native inputs; source metadata alone never establishes freshness."""
-    from process.registry_imported_source_inventory import current_imported_source_inventory
-
-    accounting = snapshot["accounting_json"]
-    accounting = json.loads(accounting) if type(accounting) is str else accounting
-    expected = accounting.get(INPUT_KEY)
-    current = await current_imported_source_inventory()
-    if expected != imported_catalog_accounting(current)[INPUT_KEY]:
-        raise ValueError("registry_imported_catalog_sources_changed")
-    by_generation = {
-        digest(native_catalog_descriptor(source)): native_catalog_descriptor(source)
-        for source in current.native_sources
-    }
-    vector = snapshot["source_vector_json"]
-    vector = json.loads(vector) if type(vector) is str else vector
-    for entry in vector:
-        if entry["status"] == "current" and entry["source_generation"] in by_generation:
-            if descriptors.get(entry["source_generation"]) != by_generation[entry["source_generation"]]:
-                raise ValueError("registry_imported_catalog_sources_changed")
-    if not set(by_generation) <= descriptors.keys():
-        raise ValueError("registry_imported_catalog_sources_changed")
-
-
 async def prepare_imported_catalog_snapshot(config, loader, source_pool, sealer_pool, *, source_export, inventory):
     """Use existing isolated preparation, native validation and freeze; publication remains with the caller."""
     from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot

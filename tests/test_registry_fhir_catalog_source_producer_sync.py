@@ -280,7 +280,7 @@ def _preparation(monkeypatch, case):
     async def seal(*_args, **options):
         assert case.events == [("enter", read_profile()), ("exit",)]
         assert case.probe_events[-2:] == [("commit",), "release"]
-        assert options == {"source_pool": None, "source_export": case.factory}
+        assert options == {}  # sealing reads only the candidate, never the source
         if report := reporting.current_fhir_catalog_report():
             assert report.document["phase"] == "sealing"
         return "validated"

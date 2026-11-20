@@ -143,12 +143,12 @@ async def prepare_network_import_catalog(catalog, runtime, cleanup):
                 source_export=runtime.catalog_export,
                 inventory=inventory,
             )
-            return await _finish_import_catalog(catalog, runtime, prepared, source_pool, sealer_pool)
+            return await _finish_import_catalog(catalog, runtime, prepared, sealer_pool)
         finally:
             await loader.execute("SELECT pg_advisory_unlock(hashtextextended($1,0))", key)
 
 
-async def _finish_import_catalog(catalog, runtime, prepared, source_pool, sealer_pool):
+async def _finish_import_catalog(catalog, runtime, prepared, sealer_pool):
     from process.registry_fhir_catalog_custody import FHIRCatalogTarget
     from process.registry_fhir_catalog_store import (
         catalog_snapshot_preparation,
@@ -164,9 +164,7 @@ async def _finish_import_catalog(catalog, runtime, prepared, source_pool, sealer
         runtime.freeze_preparation, handoff, named_catalog_preparation_roles(catalog)
     )
     target = FHIRCatalogTarget(**catalog_snapshot_preparation(prepared.snapshot)["target"])
-    state = await _seal_catalog_snapshot(
-        catalog, target, prepared.snapshot, sealer_pool, source_pool=source_pool, source_export=runtime.catalog_export
-    )
+    state = await _seal_catalog_snapshot(catalog, target, prepared.snapshot, sealer_pool)
     if state != "validated":
         raise ValueError("registry_imported_catalog_preparation_incomplete")
     return replace(prepared, accounting={**prepared.accounting, "preparation_state": state})

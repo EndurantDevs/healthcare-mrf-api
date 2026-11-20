@@ -12,11 +12,8 @@ from uuid import UUID
 import pytest
 
 from process import registry_fhir_catalog_products as products
-from process import registry_fhir_catalog_projection_validation as validation
-from process import registry_fhir_catalog_registry_reader as registry_reads
 from process import registry_fhir_catalog_sync as sync
 from process.registry_fhir_catalog_retained import _descriptor
-from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
 from tests.test_registry_fhir_catalog_products import ClosedInputs, _binding_document
 from tests.test_registry_fhir_catalog_retained import recipe_fixture
 
@@ -176,50 +173,6 @@ async def test_valid_selector_with_no_approved_products_stays_empty():
     assert await selected(connection, (connection.generation,)) == {}
     assert await output(connection, (connection.generation,)) == []
     assert any("'descriptor',descriptor_json" in sql for sql, _ in connection.calls)
-
-
-@pytest.mark.asyncio
-async def test_product_replay_uses_the_same_selected_generation_as_the_iterator():
-    connection = GenerationInputs()
-    grant = standing_grant()
-    replay = validation._ProjectionReplay(
-        connection, snapshot(grant, source_vector_json=connection.snapshot["source_vector_json"]), grant, None
-    )
-    replay.maps = {"company": (), "group": ()}
-    await replay.products((connection.generation,))
-    written_documents = [
-        document
-        for call in connection.execute.await_args_list
-        if call.args[0].startswith("INSERT INTO")
-        for document in json.loads(call.args[1])
-    ]
-    relationships = [document for document in written_documents if "relationship_id" in document]
-    assert len(relationships) == 22
-    assert {document["source_generation"] for document in relationships} == {connection.generation}
-
-
-@pytest.mark.asyncio
-async def test_replay_resolves_active_generations_once_and_passes_them_to_products(monkeypatch):
-    connection = GenerationInputs()
-    grant = standing_grant()
-    replay = validation._ProjectionReplay(
-        connection, snapshot(grant, source_vector_json=connection.snapshot["source_vector_json"]), grant, None
-    )
-    replay.sources = {source["generation"]: source for source in connection.sources}
-    active = (connection.generation,)
-    resolver = AsyncMock(return_value=active)
-    monkeypatch.setattr(registry_reads, "catalog_projection_generations", resolver)
-    for method in ("inputs", "create", "manual", "networks", "relationships", "products", "compare"):
-        monkeypatch.setattr(replay, method, AsyncMock())
-    await replay.replay_projection()
-    resolver.assert_awaited_once_with(
-        replay.registry_reader,
-        replay.snapshot,
-        grant=grant,
-        descriptors={generation: source["descriptor"] for generation, source in replay.sources.items()},
-    )
-    replay.products.assert_awaited_once_with(active)
-    replay.compare.assert_awaited_once_with(active)
 
 
 @pytest.mark.asyncio

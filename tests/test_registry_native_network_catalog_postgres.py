@@ -9,7 +9,6 @@ import pytest
 
 from process import registry_fhir_catalog_validation as validation
 from process.network_fhir_source_witness_contract import digest
-from process.registry_fhir_catalog_projection_validation import _ProjectionReplay
 from process.registry_imported_catalog_preparation import stage_native_catalog_source
 from process.registry_native_network_catalog import native_catalog_descriptor
 from tests.test_registry_fhir_catalog_grant import standing_grant
@@ -80,23 +79,6 @@ async def test_native_family_catalogue_uses_real_candidates_and_rejects_tampered
             validation.snapshot_inputs(selected),
             fixture.control,
         )
-        grant = SimpleNamespace(control_schema=fixture.control)
-        replay = _ProjectionReplay(fixture.connection, selected, grant, None, fixture.connection)
-        await replay.create()
-        replay.sources = {
-            digest(descriptor): {"descriptor": descriptor, "accepted_at": accepted_at} for descriptor in descriptors
-        }
-        for generation in replay.sources:
-            await replay.native(generation, "current")
-        await replay.compare(tuple(replay.sources))
-        await fixture.connection.execute(
-            f"UPDATE \"{candidate.schema_name}\".registry_fhir_catalog_binding SET document_json=jsonb_set(document_json,'{{evidence_sha256}}',to_jsonb($1::text))",
-            "f" * 64,
-        )
-        with pytest.raises(ValueError, match="projection"):
-            await replay.compare(tuple(replay.sources))
-        for relation in reversed(tuple(replay.targets.values())):
-            await fixture.connection.execute("DROP TABLE " + relation)
     assert (
         await fixture.connection.fetchval(
             f'SELECT count(*) FROM "{candidate.schema_name}".registry_fhir_catalog_network'

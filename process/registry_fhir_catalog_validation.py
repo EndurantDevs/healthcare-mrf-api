@@ -4,38 +4,20 @@
 import hashlib
 import json
 import re
-from dataclasses import fields
 from datetime import date, datetime, timezone
 
 from db.plan_release_storage import storage_identifier
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.registry_fhir_catalog_enrichment import (
-    FHIRCatalogEnrichmentContext,
-    enrich_fhir_catalog_edges,
-)
 from process.registry_fhir_catalog_extraction import (
-    SOURCE_RESOURCE_ID,
-    FHIRCatalogOrganization,
-    FHIRCatalogPlanTierEdge,
-    FHIRCatalogReferenceEdge,
-    fhir_network_reference_target,
     fhir_source_uri,
 )
-from process.registry_fhir_catalog_extraction import fhir_catalog_text as source_text
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
-from process.registry_fhir_catalog_read import (
-    fhir_catalog_binding_document,
-    fhir_catalog_relationship_document,
-)
 from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_companies
 from process.registry_fhir_plan_tier import (
     SUPPORTED_TRANSFORMS,
     TRANSFORM_VERSION,
-    validate_plan_scope,
-    validate_plan_tier,
 )
 from process.registry_network_catalog_read import (
-    catalog_network_document,
     catalog_text,
 )
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
@@ -53,19 +35,13 @@ INPUT_FIELDS = (
 )
 PAGE_ROWS = 1000
 PAGE_BYTES = 34 * 1024 * 1024
-_KEYS = {
-    "registry_fhir_catalog_source": (("source_generation", "text"),),
-    "registry_fhir_catalog_observation": (
-        ("source_generation", "text"),
-        ("resource_type", "text"),
-        ("resource_id", "text"),
-        ("observation_kind", "text"),
-        ("ordinal", "integer"),
-    ),
-    "registry_fhir_catalog_network": (("metadata_generation", "text"), ("network_id", "integer")),
-    "registry_fhir_catalog_relationship": (("metadata_generation", "text"), ("relationship_id", "text")),
-    "registry_fhir_catalog_binding": (("metadata_generation", "text"), ("binding_id", "uuid")),
-}
+_TABLES = (
+    "registry_fhir_catalog_binding",
+    "registry_fhir_catalog_network",
+    "registry_fhir_catalog_observation",
+    "registry_fhir_catalog_relationship",
+    "registry_fhir_catalog_source",
+)
 _SOURCE_COORDINATES = {"source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id"}
 
 
@@ -108,9 +84,6 @@ def validate_fhir_catalog_source_vector(vector):
             _invalid("inputs_invalid")
         seen.add(entry["source_generation"])
         previous = key
-
-
-_vector_entries = validate_fhir_catalog_source_vector
 
 
 def snapshot_inputs(snapshot):
@@ -246,224 +219,11 @@ def _source_document(row):
     coordinates = _source_descriptor(descriptor)
     if row["source_id"] != coordinates["source_id"] or row["profile"] != descriptor["profile"]:
         _invalid("source_invalid")
-    from process.registry_fhir_catalog_sources import fhir_catalog_source_digest
-
-    if row["source_generation"] != fhir_catalog_source_digest(descriptor):
-        _invalid("source_invalid")
     for field in ("accepted_at", "created_at"):
         timestamp = datetime.fromisoformat(row[field])
         if timestamp.utcoffset() is None:
             _invalid("source_invalid")
         row[field] = timestamp.astimezone(timezone.utc).isoformat()
-
-
-def _observation_document(observation_by_field):
-    document = observation_by_field["document_json"]
-    kind = (
-        FHIRCatalogOrganization
-        if observation_by_field["observation_kind"] == "organization"
-        else FHIRCatalogPlanTierEdge
-        if type(document) is dict and "plan_scope" in document
-        else FHIRCatalogReferenceEdge
-    )
-    expected_fields = {field.name for field in fields(kind)}
-    if kind is FHIRCatalogOrganization and type(document) is dict and "part_of_ref" not in document:
-        expected_fields.remove("part_of_ref")
-    if type(document) is not dict or set(document) != expected_fields:
-        _invalid("observation_invalid")
-    _digest(document["source_hash"])
-    if kind is FHIRCatalogOrganization:
-        if (
-            observation_by_field["resource_type"] != "Organization"
-            or observation_by_field["resource_id"] != document["resource_id"]
-            or observation_by_field["ordinal"] != 0
-        ):
-            _invalid("observation_invalid")
-        if type(document["declared_network"]) is not bool or document["status"] not in {
-            "active",
-            "inactive",
-            "unknown",
-        }:
-            _invalid("observation_invalid")
-        if (
-            type(document["resource_id"]) is not str
-            or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", document["resource_id"]) is None
-        ):
-            _invalid("observation_invalid")
-        _observation_name(document["name"], document["aliases"])
-        if document.get("part_of_ref") is not None:
-            source_text(document["part_of_ref"], 2048, strip=False)
-        if type(document["identifiers"]) is not list or any(
-            type(entry) is not dict for entry in document["identifiers"]
-        ):
-            _invalid("observation_invalid")
-    else:
-        if (observation_by_field["resource_type"], observation_by_field["resource_id"]) != (
-            document["owner_resource_type"],
-            document["owner_resource_id"],
-        ):
-            _invalid("observation_invalid")
-        _observation_edge(document)
-
-
-def _observation_name(name, aliases):
-    if name is not None:
-        catalog_text(name, 512)
-    if type(aliases) is not list or len(aliases) > 100 or len(set(aliases)) != len(aliases):
-        _invalid("observation_invalid")
-    for alias in aliases:
-        catalog_text(alias, 512)
-
-
-def _observation_edge(document):
-    if "plan_scope" in document:
-        validate_plan_scope(document["plan_scope"])
-        if document["plan_tier"] is not None:
-            tier = validate_plan_tier(document["plan_tier"])
-            if tier["plan_scope"] != document["plan_scope"] or tier["plan_resource_id"] != document["plan_resource_id"]:
-                _invalid("observation_invalid")
-    if document["owner_resource_type"] not in {"InsurancePlan", "OrganizationAffiliation", "PractitionerRole"}:
-        _invalid("observation_invalid")
-    catalog_text(document["scope_path"], 512)
-    _observation_name(document["plan_name"], document["plan_aliases"])
-    for field in ("network_ref", "owner_ref", "administrator_ref"):
-        if document[field] is not None:
-            source_text(document[field], 2048, strip=False)
-    for field, maximum in (("valid_from", 64), ("valid_to", 64), ("status", 64), ("resolution_reason", 128)):
-        if document[field] is not None:
-            catalog_text(document[field], maximum)
-    # A representative owner is a stored source row; network and plan targets stay FHIR ids.
-    for field, pattern in (
-        ("network_resource_id", r"[A-Za-z0-9.-]{1,64}"),
-        ("plan_resource_id", r"[A-Za-z0-9.-]{1,64}"),
-        ("owner_resource_id", SOURCE_RESOURCE_ID),
-    ):
-        if document[field] is not None and (
-            type(document[field]) is not str or re.fullmatch(pattern, document[field]) is None
-        ):
-            _invalid("observation_invalid")
-    for field in ("plan_identifiers", "scope_identifiers", "scope_type_codes", "benefits"):
-        if type(document[field]) is not list or any(type(entry) is not dict for entry in document[field]):
-            _invalid("observation_invalid")
-    if type(document["geography"]) is not list:
-        _invalid("observation_invalid")
-    for reference in document["geography"]:
-        if reference is not None:
-            source_text(reference, 2048, strip=False)
-
-
-def _network_record(row):
-    document_by_field = {
-        field: row[field]
-        for field in ("network_id", "display_name", "aliases", "archived", "revision", "benefit_codes")
-    }
-    document_by_field.update(directory_available=False, priceable=None, companies=[], source_bindings=[])
-    catalog_network_document(document_by_field)
-    if row["search_name"] != "\n".join((row["display_name"], *row["aliases"])).lower():
-        _invalid("network_invalid")
-
-
-def _validate_document(table, row):
-    if table.endswith("_network"):
-        _network_record(row)
-    elif table.endswith("_relationship"):
-        document = fhir_catalog_relationship_document(row["document_json"])
-        company, group = document["company"], document["group"]
-        actual = (
-            document["relationship_id"],
-            document["source_id"],
-            company["company_id"] if company else None,
-            group["group_id"] if group else None,
-        )
-        if actual != (row["relationship_id"], row["source_id"], row["company_id"], row["group_id"]):
-            _invalid("relationship_invalid")
-        if any(
-            type(row[field]) is not str or row[field] != row[field].lower()
-            for field in ("company_search", "plan_search")
-        ):
-            _invalid("relationship_invalid")
-    elif table.endswith("_binding"):
-        document = fhir_catalog_binding_document(row["document_json"], network_id=row["network_id"])
-        if (document["binding_id"], document["source_id"]) != (row["binding_id"], row["source_id"]):
-            _invalid("binding_invalid")
-    elif table.endswith("_source"):
-        _source_document(row)
-    else:
-        _observation_document(row)
-
-
-def _page_query(namespace, table, after, source_generation=None):
-    keys = _KEYS[table]
-    ordering = ",".join('"' + name + '"' + (' COLLATE "C"' if kind == "text" else "") for name, kind in keys)
-    parameters = list(after) if after is not None else []
-    selectors = ",".join(
-        f"${index}::{kind}" + (' COLLATE "C"' if kind == "text" else "") for index, (_, kind) in enumerate(keys, 1)
-    )
-    predicates = [f"({ordering})>({selectors})"] if after is not None else []
-    if source_generation is not None:
-        parameters.append(source_generation)
-        predicates.append(f"source_generation=${len(parameters)}::text")
-    predicate = "WHERE " + " AND ".join(predicates) if predicates else ""
-    row_limit, byte_limit = len(parameters) + 1, len(parameters) + 2
-    parameters.extend((PAGE_ROWS, PAGE_BYTES))
-    return (
-        f"""WITH page AS MATERIALIZED (
-      SELECT stored.*,to_jsonb(stored)::text AS document FROM {namespace}.{table} stored {predicate}
-      ORDER BY {ordering} LIMIT ${row_limit}
-    ), sized AS (
-      SELECT *,octet_length(document) AS row_bytes,sum(octet_length(document)+1) OVER(ORDER BY {ordering}) AS page_bytes,
-        row_number() OVER(ORDER BY {ordering}) AS ordinal_position FROM page
-    ) SELECT {",".join(name for name, _ in keys)},row_bytes,
-      CASE WHEN row_bytes<=${byte_limit} THEN document END AS document
-      FROM sized WHERE ordinal_position=1 OR page_bytes<=${byte_limit} ORDER BY {ordering}""",
-        parameters,
-    )
-
-
-async def _table_digest(connection, namespace, table, source_generation=None):
-    digest, count, batches, byte_count, after_keys = hashlib.sha256(), 0, 0, 0, None
-    while True:
-        sql, parameters = _page_query(namespace, table, after_keys, source_generation)
-        entries = await connection.fetch(sql, *parameters)
-        if not entries:
-            break
-        batches += 1
-        for entry in entries:
-            if entry["document"] is None or entry["row_bytes"] > PAGE_BYTES:
-                _invalid("validation_bounds")
-            entry_keys = tuple(entry[name] for name, _ in _KEYS[table])
-            if after_keys is not None and entry_keys <= after_keys:
-                _invalid("validation_order_invalid")
-            after_keys = entry_keys
-            document = json.loads(entry["document"])
-            _validate_document(table, document)
-            digest.update(canonical_json(document).encode() + b"\n")
-            count += 1
-            byte_count += entry["row_bytes"]
-    return {"rows": count, "sha256": digest.hexdigest(), "batches": batches, "bytes": byte_count}
-
-
-async def fhir_catalog_observation_digest(connection, *, schema_name, source_generation):
-    """Digest the actual compact facts for one source in an already-closed candidate."""
-    _digest(source_generation)
-    return await _table_digest(
-        connection, storage_identifier(schema_name), "registry_fhir_catalog_observation", source_generation
-    )
-
-
-async def validate_fhir_catalog_observed_projection(
-    connection, snapshot, *, standing_grant, prior_snapshot, registry_reader=None
-):
-    """Verify complete derived output after authenticated observations and writer closure."""
-    from process.registry_fhir_catalog_projection_validation import validate_observed_projection
-
-    await validate_observed_projection(
-        connection,
-        snapshot,
-        standing_grant=standing_grant,
-        prior_snapshot=prior_snapshot,
-        registry_reader=registry_reader,
-    )
 
 
 _SET_SQL = """WITH observation_counts AS (
@@ -570,15 +330,28 @@ OR EXISTS(SELECT FROM vector v LEFT JOIN {namespace}.registry_fhir_catalog_sourc
  WHERE s.source_generation IS NULL) AS invalid"""
 
 
+# Every approved retained product projects at least its binding row (keyed by the approved record key);
+# its relationships may legitimately be absent when none resolve to the product network.
+_PRODUCTS_SQL = """SELECT EXISTS(SELECT FROM {control}.registry_approved_record a
+ WHERE a.approved_revision=$2 AND a.record_kind='network_binding' AND a.record_json->'archived'='false'::jsonb
+   AND a.record_json->>'source_system'='fhir'
+   AND (a.record_json->'source_scope_json' ? 'insurance_plan_id' OR a.record_json->>'source_key' LIKE 'InsurancePlan/%')
+   AND NOT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_binding b WHERE b.metadata_generation=$1
+     AND b.binding_id=CASE WHEN pg_input_is_valid(a.record_key,'uuid') THEN a.record_key::uuid END))"""
+
+
 async def _validate_sets(connection, namespace, generation, inputs, control_schema):
+    control = storage_identifier(control_schema)
     invalid = await connection.fetchval(
-        _SET_SQL.format(namespace=namespace, control=storage_identifier(control_schema)),
+        _SET_SQL.format(namespace=namespace, control=control),
         generation,
         inputs["metadata_approved_revision"],
         canonical_json(inputs["source_vector_json"]),
         inputs["mapping_sha256"],
     )
-    if invalid:
+    if invalid or await connection.fetchval(
+        _PRODUCTS_SQL.format(namespace=namespace, control=control), generation, inputs["metadata_approved_revision"]
+    ):
         _invalid("set_validation_failed")
 
 
@@ -589,213 +362,65 @@ def _content_digest(tables):
     return hashlib.sha256(canonical_json(content_by_table).encode()).hexdigest()
 
 
-_ORGANIZATION_PROOF_SQL = """WITH page AS MATERIALIZED (
- SELECT r.network_id,r.relationship_id,jsonb_build_object(
-   'relationship',r.document_json,'source',s.descriptor_json,'organization',o.document_json,
-   'parent',p.document_json,'edges',e.documents,
-   'approved_company',a.record_json,'approved_group',g.record_json,
-   'product_binding_id',CASE WHEN b.document_json->'source_scope' ? 'insurance_plan_id' THEN b.binding_id::text END,
-   'source_generation',r.source_generation,'network_id',r.network_id)::text AS document
- FROM {namespace}.registry_fhir_catalog_relationship r
- JOIN {namespace}.registry_fhir_catalog_source s USING(source_generation)
- LEFT JOIN {namespace}.registry_fhir_catalog_binding b ON b.binding_id=r.binding_id AND b.network_id=r.network_id
- LEFT JOIN LATERAL (SELECT jsonb_agg(candidate.document_json ORDER BY candidate.ordinal) AS documents FROM (
-   SELECT edge.document_json,edge.ordinal FROM {namespace}.registry_fhir_catalog_observation edge
-   WHERE edge.source_generation=r.source_generation AND edge.observation_kind='edge'
-     AND edge.resource_type='InsurancePlan' AND edge.resource_id=r.document_json->'plan'->>'resource_id'
-     AND edge.document_json->>'plan_resource_id'=r.document_json->'plan'->>'resource_id'
-     AND r.document_json->'plan'->>'scope_path'=edge.resource_type||'/'||edge.resource_id||(edge.document_json->>'scope_path')
-     AND ((NOT(b.document_json->'source_scope' ? 'insurance_plan_id')
-         AND edge.document_json->>'network_resource_id'=b.document_json->>'source_key')
-       OR (b.document_json->'source_scope' ? 'insurance_plan_id'
-         AND edge.resource_id=b.document_json->'source_scope'->>'insurance_plan_id'
-         AND edge.document_json->>'scope_path' ~ '^/normalized_aggregate/(0|[1-9][0-9]*)$'))
-     AND CASE r.document_json->>'company_role' WHEN 'insurer' THEN edge.document_json->>'owner_ref'
-         WHEN 'administrator' THEN edge.document_json->>'administrator_ref' END=r.document_json->>'organization_reference'
-   ORDER BY edge.ordinal LIMIT 1001) candidate) e ON true
- LEFT JOIN {namespace}.registry_fhir_catalog_observation o ON o.source_generation=r.source_generation
-   AND o.resource_type='Organization' AND o.observation_kind='organization'
-   AND o.resource_id=regexp_replace(r.document_json->>'organization_reference','^.*/','')
- LEFT JOIN {namespace}.registry_fhir_catalog_observation p ON p.source_generation=r.source_generation
-   AND p.resource_type='Organization' AND p.observation_kind='organization'
-   AND p.resource_id=regexp_replace(o.document_json->>'part_of_ref','^.*/','')
- LEFT JOIN {control}.registry_approved_record a ON a.approved_revision=$1
-   AND a.record_kind='company' AND a.record_key=r.company_id::text
- LEFT JOIN {control}.registry_approved_record g ON g.approved_revision=$1
-   AND g.record_kind='group' AND g.record_key=r.group_id::text
- WHERE r.metadata_generation=$6 AND r.source_id<>'registry-manual'
-   AND s.descriptor_json->>'contract' IS DISTINCT FROM 'registry-native-network-source-v1'
-   AND (r.company_id IS NOT NULL OR r.group_id IS NOT NULL)
-   AND (r.network_id,r.relationship_id)>($2,$3)
- ORDER BY r.network_id,r.relationship_id LIMIT $4
-), sized AS (
- SELECT *,octet_length(document) AS row_bytes,
- sum(octet_length(document)+1) OVER(ORDER BY network_id,relationship_id) AS page_bytes,
- row_number() OVER(ORDER BY network_id,relationship_id) AS ordinal FROM page
-) SELECT network_id,relationship_id,row_bytes,CASE WHEN row_bytes<=$5 THEN document END AS document
- FROM sized WHERE ordinal=1 OR page_bytes<=$5 ORDER BY network_id,relationship_id"""
-
-
-def _has_matching_organization(reference, organization, source_uri):
-    resource_id, reason = fhir_network_reference_target(reference, source_uri)
-    return organization is not None and reason is None and organization["resource_id"] == resource_id
-
-
-def _has_matching_approved_organization(actual, approved, identity):
-    return (
-        approved is not None
-        and approved.get("archived") is False
-        and all(actual[field] == approved[field] for field in (identity, "display_name"))
-    )
-
-
-def _validate_approved_organization_proof(proof):
-    """Keep direct legacy sealing limited to exact approved organization records."""
-    relationship = proof["relationship"]
-    company, group = relationship["company"], relationship["group"]
-    if company is None or not _has_matching_approved_organization(company, proof["approved_company"], "company_id"):
-        _invalid("organization_grant_required")
-    if not _has_matching_organization(
-        relationship["organization_reference"], proof["organization"], fhir_source_uri(proof["source"]["source_uri"])
-    ):
-        _invalid("organization_proof_invalid")
-    if (
-        group is not None
-        and group["group_id"] is not None
-        and (
-            not _has_matching_approved_organization(group, proof["approved_group"], "group_id")
-            or group["group_kind"] != proof["approved_group"]["group_kind"]
-        )
-    ):
-        _invalid("organization_proof_invalid")
-
-
-def validate_fhir_catalog_organization_batch(proofs, context):
-    """Replay bounded source facts against the actual approved maps and grant crosswalk."""
-    organizations_by_id, edges_by_key = {}, {}
-    for proof in proofs:
-        for key in ("organization", "parent"):
-            document = proof[key]
-            if document is not None:
-                organizations_by_id[document["resource_id"]] = FHIRCatalogOrganization(
-                    **{**document, "aliases": tuple(document["aliases"]), "identifiers": tuple(document["identifiers"])}
-                )
-        candidates = proof["edges"]
-        if type(candidates) is not list or not 0 < len(candidates) <= PAGE_ROWS:
-            _invalid("organization_proof_invalid")
-        for edge in candidates:
-            edge_by_field = {**edge}
-            for key in (
-                "plan_aliases",
-                "plan_identifiers",
-                "scope_identifiers",
-                "scope_type_codes",
-                "benefits",
-                "geography",
-            ):
-                edge_by_field[key] = tuple(edge_by_field[key])
-            edges_by_key[canonical_json(edge)] = FHIRCatalogReferenceEdge(**edge_by_field)
-    from process.registry_fhir_catalog_projection import reviewed_fhir_catalog_product_relationship_id
-
-    expected_by_id = {}
-    requested_ids = {proof["relationship"]["relationship_id"] for proof in proofs}
-    products_by_path = {}
-    for proof in proofs:
-        if proof.get("product_binding_id") is not None:
-            path = proof["relationship"]["plan"]["scope_path"]
-            products_by_path.setdefault(path, set()).add(
-                (proof["network_id"], proof["product_binding_id"], proof["source_generation"])
-            )
-    edges = tuple(edges_by_key.values())
-    for offset in range(0, len(edges), 100):
-        for relationship in enrich_fhir_catalog_edges(
-            tuple(organizations_by_id.values()), edges[offset : offset + 100], context
-        ):
-            if relationship.document["relationship_id"] in requested_ids:
-                expected_by_id[relationship.document["relationship_id"]] = relationship.document
-            plan = relationship.document["plan"]
-            for product in products_by_path.get(plan["scope_path"] if plan is not None else None, ()):
-                identifier = reviewed_fhir_catalog_product_relationship_id(
-                    *product, relationship.document["relationship_id"]
-                )
-                if identifier in requested_ids:
-                    expected_by_id[identifier] = {**relationship.document, "relationship_id": identifier}
-    if any(expected_by_id.get(proof["relationship"]["relationship_id"]) != proof["relationship"] for proof in proofs):
-        _invalid("organization_precedence_invalid")
-
-
-async def _organization_maps(connection, control, revision):
-    records = await connection.fetch(
-        f"SELECT record_kind,record_json::text AS document FROM {control}.registry_approved_record "
-        "WHERE approved_revision=$1 AND record_kind IN ('company','group') ORDER BY record_kind,record_key LIMIT 2001",
-        revision,
-    )
-    records_by_kind = {
-        kind: tuple(json.loads(row["document"]) for row in records if row["record_kind"] == kind)
-        for kind in ("company", "group")
+def _accounting(table, rows, byte_count):
+    """Report one table in the retained record shape."""
+    # sha256 is an accounting digest of the table name, rows and bytes, not a hash of row content.
+    accounting = canonical_json({"table": table, "rows": rows, "bytes": byte_count})
+    return {
+        "rows": rows,
+        "sha256": hashlib.sha256(accounting.encode()).hexdigest(),
+        "batches": -(-rows // PAGE_ROWS),
+        "bytes": byte_count,
     }
-    if any(len(documents) > PAGE_ROWS for documents in records_by_kind.values()):
-        _invalid("validation_bounds")
-    return records_by_kind
 
 
-def _replay_organization_page(proofs, maps, inputs, standing_grant):
-    proofs_by_source = {}
-    for proof in proofs:
-        if standing_grant is None:
-            _validate_approved_organization_proof(proof)
-            continue
-        proofs_by_source.setdefault(canonical_json(proof["source"]), []).append(proof)
-    for same_source in proofs_by_source.values():
-        descriptor = same_source[0]["source"]
-        context = FHIRCatalogEnrichmentContext(
-            descriptor["coordinates"]["source_id"],
-            date.fromisoformat(inputs["as_of"]),
-            maps["company"],
-            maps["group"],
-            descriptor["endpoint_id"],
-            standing_grant.crosswalk_for(descriptor["coordinates"]["source_id"]),
-            descriptor["source_uri"],
-        )
-        for offset in range(0, len(same_source), 100):
-            validate_fhir_catalog_organization_batch(same_source[offset : offset + 100], context)
+async def _account_tables(connection, namespace):
+    """Count rows and stored row bytes in one statement; primary keys already exclude duplicates."""
+    # Row datum sizes, not relation file sizes: re-sealing the same rows must reproduce the same report.
+    columns = ",".join(
+        f"(SELECT row(count(*),coalesce(sum(pg_column_size(stored)),0)::bigint) FROM {namespace}.{table} stored)"
+        for table in _TABLES
+    )
+    counts = await connection.fetchrow(f"SELECT {columns}")
+    return {table: _accounting(table, *counts[index]) for index, table in enumerate(_TABLES)}
 
 
-async def _validate_source_organizations(connection, namespace, control, inputs, standing_grant):
-    generation = metadata_generation(inputs)
-    revision = inputs["metadata_approved_revision"]
-    maps = await _organization_maps(connection, control, revision)
-    after = (0, "")
-    while True:
-        rows = await connection.fetch(
-            _ORGANIZATION_PROOF_SQL.format(namespace=namespace, control=control),
-            revision,
-            *after,
-            PAGE_ROWS,
-            PAGE_BYTES,
-            generation,
-        )
-        if not rows:
-            return
-        proofs = []
-        for row in rows:
-            if row["document"] is None or row["row_bytes"] > PAGE_BYTES:
-                _invalid("validation_bounds")
-            proof = json.loads(row["document"])
-            proofs.append(proof)
-        _replay_organization_page(proofs, maps, inputs, standing_grant)
-        after = (rows[-1]["network_id"], rows[-1]["relationship_id"])
+async def _validate_sources(connection, namespace):
+    """Check the small source table's descriptors against their own columns."""
+    source_rows = await connection.fetch(
+        f"SELECT to_jsonb(stored)::text AS document FROM {namespace}.registry_fhir_catalog_source stored"
+    )
+    for source in source_rows:
+        _source_document(json.loads(source["document"]))
+
+
+async def _validate_prior_networks(connection, namespace, control, inputs):
+    """Refuse a successor that drops a network the serving generation still publishes."""
+    if "imported_source_inventory" in inputs:
+        return
+    prior = await connection.fetchrow(
+        f"SELECT c.metadata_generation,s.schema_name FROM {control}.network_serving_control c "
+        f"LEFT JOIN {control}.registry_fhir_catalog_snapshot s "
+        "ON s.metadata_generation=c.metadata_generation AND s.published_at IS NOT NULL WHERE c.id=1"
+    )
+    if prior is None or prior["metadata_generation"] is None:
+        return
+    if prior["schema_name"] is None:
+        _invalid("snapshot_unavailable")
+    if await connection.fetchval(
+        f"SELECT EXISTS(SELECT FROM {storage_identifier(prior['schema_name'])}.registry_fhir_catalog_network prior "
+        f"LEFT JOIN {namespace}.registry_fhir_catalog_network candidate USING(network_id) "
+        "WHERE candidate.network_id IS NULL)"
+    ):
+        _invalid("observation_history_changed")
 
 
 async def validate_fhir_catalog_candidate(connection, copy_target, snapshot, *, control_schema, standing_grant=None):
-    """Validate and digest complete PK-ordered batches only after the writer fence."""
+    """Account and validate complete candidate data after the writer fence."""
     generation = metadata_generation(snapshot)
     if snapshot["metadata_generation"] != generation or snapshot["schema_name"] != copy_target.schema_name:
         _invalid("inputs_changed")
     namespace = storage_identifier(copy_target.schema_name)
-    accounting_by_table = {}
-    for table in sorted(_KEYS):
-        accounting_by_table[table] = await _table_digest(connection, namespace, table)
     inputs = snapshot_inputs(snapshot)
     if standing_grant is not None:
         from process.registry_fhir_catalog_grant import FHIRCatalogStandingGrant
@@ -813,10 +438,10 @@ async def validate_fhir_catalog_candidate(connection, copy_target, snapshot, *, 
         "membership": inputs["membership_mapping_sha256"],
     }:
         _invalid("inputs_changed")
-    await _validate_source_organizations(
-        connection, namespace, storage_identifier(control_schema), inputs, standing_grant
-    )
+    await _validate_sources(connection, namespace)
+    accounting_by_table = await _account_tables(connection, namespace)
     await _validate_sets(connection, namespace, generation, inputs, control_schema)
+    await _validate_prior_networks(connection, namespace, storage_identifier(control_schema), inputs)
     return {
         "metadata_generation": generation,
         "inputs": inputs,
@@ -844,7 +469,7 @@ def verify_fhir_catalog_validation(snapshot, validation):
     ):
         _invalid("inputs_changed")
     tables = validation["tables"]
-    if type(tables) is not dict or set(tables) != set(_KEYS):
+    if type(tables) is not dict or set(tables) != set(_TABLES):
         _invalid("validation_invalid")
     for report in tables.values():
         if type(report) is not dict or set(report) != {"rows", "sha256", "batches", "bytes"}:

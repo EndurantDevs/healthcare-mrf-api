@@ -2,18 +2,16 @@
 """Persisted catalog facts must retain source identity and closed-candidate pins."""
 
 import copy
+import hashlib
 import json
-from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from process import registry_fhir_catalog_validation as validation
-from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_sources import fhir_catalog_source_digest
 from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
-from tests.test_registry_fhir_catalog_read import relationship_document
 from tests.test_registry_fhir_catalog_source_companies import source_company
 from tests.test_registry_fhir_catalog_sources import descriptor
 
@@ -30,37 +28,10 @@ def _source_row():
     }
 
 
-def _observation_row(kind):
-    resources = (
-        ("Organization", "network", {"name": "Example Network", "aliases": ["Example PPO"]}),
-        (
-            "InsurancePlan",
-            "plan-one",
-            {"name": "Example Plan", "network_refs": ["Organization/network"]},
-        ),
-    )
-    batch = extract_fhir_catalog_batch(
-        tuple(
-            {"resource_type": resource, "resource_id": key, "payload_hash": "a" * 64, "payload_json": payload}
-            for resource, key, payload in resources
-        ),
-        profile="retained_normalized",
-    )
-    fact = batch.organizations[0] if kind == "organization" else batch.edges[0]
-    document = json.loads(json.dumps(asdict(fact)))
-    return {
-        "observation_kind": kind,
-        "resource_type": "Organization" if kind == "organization" else fact.owner_resource_type,
-        "resource_id": fact.resource_id if kind == "organization" else fact.owner_resource_id,
-        "ordinal": 0,
-        "document_json": document,
-    }
-
-
 def test_source_rows_normalize_aware_timestamps_without_changing_descriptor_identity():
     row = _source_row()
     original = copy.deepcopy(row["descriptor_json"])
-    validation._validate_document("registry_fhir_catalog_source", row)
+    validation._source_document(row)
     assert row["accepted_at"] == row["created_at"] == "2026-01-01T00:00:00+00:00"
     assert row["descriptor_json"] == original
     assert row["source_generation"] == fhir_catalog_source_digest(original)
@@ -71,7 +42,6 @@ def test_source_rows_normalize_aware_timestamps_without_changing_descriptor_iden
     [
         ("source_id", "another-source"),
         ("profile", "raw_fhir"),
-        ("source_generation", "f" * 64),
         ("accepted_at", "2026-01-01T00:00:00"),
         ("created_at", "2026-01-01T00:00:00"),
     ],
@@ -80,7 +50,7 @@ def test_serialized_source_row_rejects_identity_drift_and_naive_times(field, val
     row = _source_row()
     row[field] = value
     with pytest.raises(ValueError, match="registry_fhir_catalog_source_invalid"):
-        validation._validate_document("registry_fhir_catalog_source", row)
+        validation._source_document(row)
 
 
 @pytest.mark.parametrize(
@@ -109,94 +79,7 @@ def test_source_row_refuses_missing_or_non_document_descriptor(replacement):
     row = _source_row()
     row["descriptor_json"] = replacement
     with pytest.raises(ValueError, match="registry_fhir_catalog_source_invalid"):
-        validation._validate_document("registry_fhir_catalog_source", row)
-
-
-@pytest.mark.parametrize("kind", ["organization", "edge"])
-def test_serialized_extracted_facts_roundtrip_through_final_candidate_validation(kind):
-    row = _observation_row(kind)
-    original = copy.deepcopy(row)
-    validation._validate_document("registry_fhir_catalog_observation", row)
-    assert row == original
-    if kind == "organization":
-        row["document_json"].pop("part_of_ref")
-        validation._validate_document("registry_fhir_catalog_observation", row)
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("declared_network", 1),
-        ("status", "deleted"),
-        ("resource_id", "network/foreign"),
-        ("aliases", ["same", "same"]),
-        ("identifiers", ["not-an-identifier"]),
-        ("part_of_ref", "Organization/parent\n"),
-        ("source_hash", "a" * 63),
-        ("extra", "unreviewed"),
-    ],
-)
-def test_final_organization_document_rejects_forged_or_ambiguous_facts(field, value):
-    row = _observation_row("organization")
-    row["document_json"][field] = value
-    with pytest.raises(ValueError):
-        validation._validate_document("registry_fhir_catalog_observation", row)
-
-
-@pytest.mark.parametrize("field,value", [("resource_type", "InsurancePlan"), ("resource_id", "other"), ("ordinal", 1)])
-def test_organization_fact_must_match_its_stored_resource_key(field, value):
-    row = _observation_row("organization")
-    row[field] = value
-    with pytest.raises(ValueError, match="registry_fhir_catalog_observation_invalid"):
-        validation._validate_document("registry_fhir_catalog_observation", row)
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("owner_resource_type", "Location"),
-        ("network_ref", "Organization/network\n"),
-        ("network_resource_id", "network/foreign"),
-        ("status", "active\n"),
-        ("plan_identifiers", ["not-an-identifier"]),
-        ("geography", "Location/one"),
-        ("geography", ["Location/one\n"]),
-    ],
-)
-def test_final_edge_document_rejects_unbounded_or_malformed_relationship_evidence(field, value):
-    row = _observation_row("edge")
-    row["document_json"][field] = value
-    if field == "owner_resource_type":
-        row["resource_type"] = value
-    with pytest.raises(ValueError):
-        validation._validate_document("registry_fhir_catalog_observation", row)
-
-
-@pytest.mark.parametrize(
-    "field,length,accepted",
-    [("owner_resource_id", 256, True), ("owner_resource_id", 257, False), ("network_resource_id", 65, False)],
-)
-def test_edge_owner_keeps_stored_source_id_while_targets_stay_fhir_ids(field, length, accepted):
-    row = _observation_row("edge")
-    row["document_json"]["owner_resource_type"] = row["resource_type"] = "PractitionerRole"
-    row["document_json"]["plan_resource_id"] = None
-    row["document_json"][field] = "r" * length
-    if field == "owner_resource_id":
-        row["resource_id"] = "r" * length
-    if accepted:
-        validation._validate_document("registry_fhir_catalog_observation", row)
-    else:
-        with pytest.raises(ValueError, match="registry_fhir_catalog_observation_invalid"):
-            validation._validate_document("registry_fhir_catalog_observation", row)
-
-
-def test_edge_observation_cannot_move_to_another_resource_and_keeps_unknown_geography():
-    row = _observation_row("edge")
-    row["document_json"]["geography"] = [None, "Location/one"]
-    validation._validate_document("registry_fhir_catalog_observation", row)
-    row["resource_id"] = "another-plan"
-    with pytest.raises(ValueError, match="registry_fhir_catalog_observation_invalid"):
-        validation._validate_document("registry_fhir_catalog_observation", row)
+        validation._source_document(row)
 
 
 @pytest.mark.parametrize(
@@ -300,88 +183,6 @@ def test_registered_label_changes_metadata_generation_without_changing_source_ge
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing_document", [False, True])
-async def test_oversized_candidate_row_refuses_without_validation_or_second_page(missing_document):
-    connection = SimpleNamespace(
-        fetchval=AsyncMock(return_value=validation.canonical_json(validation._KEYS["registry_fhir_catalog_network"])),
-        fetch=AsyncMock(
-            return_value=[{"document": None if missing_document else "{}", "row_bytes": validation.PAGE_BYTES + 1}]
-        ),
-    )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_bounds"):
-        await validation._table_digest(connection, '"catalog_snapshot"', "registry_fhir_catalog_network")
-    connection.fetch.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("record_kind", ["company", "group"])
-async def test_approved_organization_map_refuses_complete_oversized_family(record_kind):
-    connection = SimpleNamespace(
-        fetch=AsyncMock(return_value=[{"record_kind": record_kind, "document": "{}"}] * (validation.PAGE_ROWS + 1))
-    )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_bounds"):
-        await validation._organization_maps(connection, '"catalog_control"', 6)
-    connection.fetch.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("missing_document", [False, True])
-async def test_organization_proof_page_refuses_oversized_rows_before_replay(missing_document):
-    connection = SimpleNamespace(
-        fetch=AsyncMock(
-            side_effect=[
-                [],
-                [{"document": None if missing_document else "{}", "row_bytes": validation.PAGE_BYTES + 1}],
-            ]
-        )
-    )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_bounds"):
-        await validation._validate_source_organizations(
-            connection,
-            '"catalog_snapshot"',
-            '"catalog_control"',
-            validation.snapshot_inputs(snapshot(standing_grant())),
-            None,
-        )
-    assert connection.fetch.await_count == 2
-
-
-def _approved_organization_proof():
-    relationship = relationship_document()
-    return {
-        "relationship": relationship,
-        "organization": {"resource_id": "insurer-one"},
-        "source": {"source_uri": "https://example.test/fhir/"},
-        "approved_company": {**relationship["company"], "archived": False},
-        "approved_group": {**relationship["group"], "archived": False},
-    }
-
-
-def test_legacy_organization_proof_accepts_exact_approved_same_source_identity():
-    validation._validate_approved_organization_proof(_approved_organization_proof())
-
-
-@pytest.mark.parametrize(
-    "path,value",
-    [
-        (("approved_company",), None),
-        (("approved_company", "archived"), True),
-        (("organization",), None),
-        (("relationship", "organization_reference"), "https://foreign.test/Organization/insurer-one"),
-        (("approved_group", "group_kind"), "another-kind"),
-    ],
-)
-def test_legacy_organization_proof_requires_exact_approved_identity_and_same_source(path, value):
-    proof = _approved_organization_proof()
-    parent_by_field = proof
-    for field in path[:-1]:
-        parent_by_field = parent_by_field[field]
-    parent_by_field[path[-1]] = value
-    with pytest.raises(ValueError, match="registry_fhir_catalog_organization_"):
-        validation._validate_approved_organization_proof(proof)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["generation", "schema"])
 async def test_candidate_input_mismatch_refuses_before_any_heap_or_authority_read(change):
     selected = snapshot(standing_grant())
@@ -395,30 +196,6 @@ async def test_candidate_input_mismatch_refuses_before_any_heap_or_authority_rea
     connection.fetchval.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changed_pin", ["grant", "approved_records"])
-async def test_candidate_rechecks_approval_pins_before_replaying_organization_authority(monkeypatch, changed_pin):
-    grant = standing_grant()
-    selected = snapshot(grant)
-    empty_report_by_field = {"rows": 0, "sha256": "a" * 64, "batches": 0, "bytes": 0}
-    monkeypatch.setattr(validation, "_table_digest", AsyncMock(return_value=empty_report_by_field))
-    fingerprints = AsyncMock(return_value={6: {"metadata": "f" * 64, "membership": "b" * 64}})
-    monkeypatch.setattr(validation, "approved_fhir_catalog_fingerprints", fingerprints)
-    organization_replay = AsyncMock(side_effect=AssertionError("changed approval must not reach replay"))
-    monkeypatch.setattr(validation, "_validate_source_organizations", organization_replay)
-    configured_grant = standing_grant(version=2) if changed_pin == "grant" else grant
-    with pytest.raises(ValueError, match="registry_fhir_catalog_inputs_changed"):
-        await validation.validate_fhir_catalog_candidate(
-            object(),
-            SimpleNamespace(schema_name="catalog_snapshot"),
-            selected,
-            control_schema="catalog_control",
-            standing_grant=configured_grant,
-        )
-    organization_replay.assert_not_awaited()
-    assert fingerprints.await_count == int(changed_pin == "approved_records")
-
-
 @pytest.mark.parametrize("attestation", [None, {}, {"metadata_generation": "a" * 64, "unknown": True}])
 def test_retained_validation_refuses_incomplete_or_unknown_content_fields(attestation):
     with pytest.raises(ValueError, match="registry_fhir_catalog_validation_invalid"):
@@ -428,7 +205,7 @@ def test_retained_validation_refuses_incomplete_or_unknown_content_fields(attest
 def test_retained_validation_refuses_incomplete_table_accounting():
     selected = snapshot(standing_grant())
     selected["accounting_json"] = None
-    tables_by_name = {table: {"rows": 0, "sha256": "a" * 64, "batches": 0, "bytes": 0} for table in validation._KEYS}
+    tables_by_name = {table: {"rows": 0, "sha256": "a" * 64, "batches": 0, "bytes": 0} for table in validation._TABLES}
     attestation_by_field = {
         "metadata_generation": selected["metadata_generation"],
         "inputs": validation.snapshot_inputs(selected),
@@ -442,10 +219,86 @@ def test_retained_validation_refuses_incomplete_table_accounting():
 
 
 @pytest.mark.asyncio
-async def test_candidate_digest_refuses_duplicate_data_keys_within_page(monkeypatch):
-    network_row_by_field = {"metadata_generation": "a" * 64, "network_id": 1, "document": "{}", "row_bytes": 2}
-    connection = SimpleNamespace(fetch=AsyncMock(return_value=[network_row_by_field, dict(network_row_by_field)]))
-    monkeypatch.setattr(validation, "_validate_document", lambda *args: None)
-    with pytest.raises(ValueError, match="validation_order_invalid"):
-        await validation._table_digest(connection, '"catalog_snapshot"', "registry_fhir_catalog_network")
-    connection.fetch.assert_awaited_once()
+@pytest.mark.parametrize("changed_pin", ["grant", "approved_records"])
+async def test_candidate_rechecks_approval_pins_before_reading_candidate_tables(monkeypatch, changed_pin):
+    grant = standing_grant()
+    selected = snapshot(grant)
+    fingerprints = AsyncMock(return_value={6: {"metadata": "f" * 64, "membership": "b" * 64}})
+    monkeypatch.setattr(validation, "approved_fhir_catalog_fingerprints", fingerprints)
+    sources = AsyncMock(side_effect=AssertionError("changed approval must not read candidate tables"))
+    monkeypatch.setattr(validation, "_validate_sources", sources)
+    configured_grant = standing_grant(version=2) if changed_pin == "grant" else grant
+    with pytest.raises(ValueError, match="registry_fhir_catalog_inputs_changed"):
+        await validation.validate_fhir_catalog_candidate(
+            object(),
+            SimpleNamespace(schema_name="catalog_snapshot"),
+            selected,
+            control_schema="catalog_control",
+            standing_grant=configured_grant,
+        )
+    sources.assert_not_awaited()
+    assert fingerprints.await_count == int(changed_pin == "approved_records")
+
+
+def _receipt(selected, tables_by_name):
+    return {
+        "metadata_generation": selected["metadata_generation"],
+        "inputs": validation.snapshot_inputs(selected),
+        "tables": tables_by_name,
+        "content_sha256": validation._content_digest(tables_by_name),
+    }
+
+
+@pytest.mark.parametrize("rows,byte_count", [(0, 0), (1, 8192), (1000, 90112), (1001, 90112)])
+def test_accounting_digest_keeps_the_retained_record_shape(rows, byte_count):
+    report = validation._accounting("registry_fhir_catalog_network", rows, byte_count)
+    assert set(report) == {"rows", "sha256", "batches", "bytes"}
+    assert (report["rows"], report["bytes"], report["batches"]) == (rows, byte_count, -(-rows // 1000))
+    assert report["sha256"] != validation._accounting("registry_fhir_catalog_source", rows, byte_count)["sha256"]
+
+
+def test_records_with_content_or_accounting_digests_both_verify_unchanged():
+    selected = snapshot(standing_grant())
+    selected["accounting_json"] = None
+    content_by_table = {
+        table: {"rows": 3, "sha256": hashlib.sha256(table.encode()).hexdigest(), "batches": 1, "bytes": 90}
+        for table in validation._TABLES
+    }
+    accounting_by_table = {table: validation._accounting(table, 3, 8192) for table in validation._TABLES}
+    for tables_by_name in (content_by_table, accounting_by_table):
+        validation.verify_fhir_catalog_validation(selected, _receipt(selected, tables_by_name))
+        accounted_by_field = {**selected, "accounting_json": json.dumps(tables_by_name)}
+        validation.verify_fhir_catalog_validation(accounted_by_field, _receipt(selected, tables_by_name))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prior,missing,expected",
+    [
+        (None, False, None),
+        ({"metadata_generation": None, "schema_name": None}, False, None),
+        ({"metadata_generation": "a" * 64, "schema_name": None}, False, "snapshot_unavailable"),
+        ({"metadata_generation": "a" * 64, "schema_name": "fhir_catalog_" + "b" * 32}, False, None),
+        (
+            {"metadata_generation": "a" * 64, "schema_name": "fhir_catalog_" + "b" * 32},
+            True,
+            "observation_history_changed",
+        ),
+    ],
+)
+async def test_published_networks_must_survive_in_the_successor(prior, missing, expected):
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=prior), fetchval=AsyncMock(return_value=missing))
+    check = validation._validate_prior_networks(connection, '"candidate"', '"control"', {})
+    if expected is None:
+        await check
+    else:
+        with pytest.raises(ValueError, match="registry_fhir_catalog_" + expected):
+            await check
+    assert connection.fetchval.await_count == int(bool(prior and prior["schema_name"]))
+
+
+@pytest.mark.asyncio
+async def test_imported_inventory_successor_skips_the_published_network_check():
+    connection = SimpleNamespace(fetchrow=AsyncMock(), fetchval=AsyncMock())
+    await validation._validate_prior_networks(connection, '"candidate"', '"control"', {"imported_source_inventory": {}})
+    connection.fetchrow.assert_not_awaited()

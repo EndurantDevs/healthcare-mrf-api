@@ -17,9 +17,6 @@ from process.registry_fhir_catalog_enrichment import (
     fhir_company_scope,
 )
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
-from process.registry_fhir_catalog_validation import (
-    validate_fhir_catalog_organization_batch,
-)
 
 COMPANY = "11111111-1111-4111-8111-111111111111"
 ADMINISTRATOR = "22222222-2222-4222-8222-222222222222"
@@ -469,95 +466,6 @@ def test_imported_company_and_parent_are_immediately_usable_with_stable_source_i
     inactive = replace(renamed, organizations=tuple(replace(org, status="inactive") for org in renamed.organizations))
     retained = next(row.document for row in project(inactive, source_context) if row.document["group"]["group_id"])
     assert retained["company"] == updated["company"] and retained["group"] == updated["group"]
-
-
-@pytest.mark.parametrize("tamper", [None, "company_id", "parent_id", "foreign_reference", "parent_name"])
-def test_imported_organization_proof_rejects_forged_identity_or_parent(tamper):
-    batch = imported_parent_case()
-    source_context = context(companies=[], groups=[], crosswalk=[])
-    relationship = next(row.document for row in project(batch, source_context) if row.document["group"]["group_id"])
-    proof_by_field = {
-        "relationship": relationship,
-        "edges": [asdict(batch.edges[0])],
-        "source": {"endpoint_id": "example-endpoint", "source_uri": None},
-        "organization": asdict(batch.organizations[1]),
-        "parent": asdict(batch.organizations[-1]),
-        "approved_company": None,
-        "approved_group": None,
-    }
-    if tamper == "company_id":
-        relationship["company"]["company_id"] = COMPANY
-    elif tamper == "parent_id":
-        relationship["group"]["group_id"] = GROUP
-    elif tamper == "foreign_reference":
-        relationship["organization_reference"] = "https://foreign.test/Organization/insurer"
-    elif tamper == "parent_name":
-        relationship["group"]["display_name"] = "Invented Parent"
-    if tamper is None:
-        validate_fhir_catalog_organization_batch([proof_by_field], source_context)
-    else:
-        with pytest.raises(ValueError, match="organization_precedence_invalid"):
-            validate_fhir_catalog_organization_batch([proof_by_field], source_context)
-
-
-@pytest.mark.parametrize("override", ["company", "parent"])
-def test_imported_identity_cannot_bypass_approved_company_or_manual_parent(override):
-    batch = imported_parent_case()
-    source_context = context(companies=[], groups=[], crosswalk=[])
-    relationship = next(
-        projected.document for projected in project(batch, source_context) if projected.document["group"]["group_id"]
-    )
-    proof_by_field = {
-        "relationship": relationship,
-        "edges": [asdict(batch.edges[0])],
-        "organization": asdict(batch.organizations[1]),
-        "parent": asdict(batch.organizations[-1]),
-    }
-    if override == "company":
-        authoritative = context()
-    else:
-        company_id = relationship["company"]["company_id"]
-        assertion_by_field = {
-            **group_assertion(group_id=None, relationship="verified_no_affiliation"),
-            "company_id": company_id,
-        }
-        authoritative = context(
-            companies=[
-                {
-                    "company_id": company_id,
-                    "display_name": "Example Insurance",
-                    "group_assertions": [assertion_by_field],
-                }
-            ],
-            groups=[],
-            crosswalk=[("insurer", company_id)],
-        )
-    with pytest.raises(ValueError, match="organization_precedence_invalid"):
-        validate_fhir_catalog_organization_batch([proof_by_field], authoritative)
-
-
-def test_equivalent_reference_candidates_survive_proof_chunk_boundaries():
-    batch = imported_parent_case()
-    source_context = replace(context(companies=[], groups=[], crosswalk=[]), source_uri="https://example.test/fhir/")
-    proofs = []
-    for number in range(51):
-        relative = replace(batch.edges[0], owner_resource_id=f"plan-{number}", plan_resource_id=f"plan-{number}")
-        absolute = replace(relative, network_ref="https://example.test/fhir/Organization/network")
-        pair = replace(batch, edges=(relative, absolute))
-        for projected in project(pair, source_context):
-            if projected.document["group"]["group_id"] is not None:
-                proofs.append(
-                    {
-                        "relationship": projected.document,
-                        "edges": [asdict(relative), asdict(absolute)],
-                        "organization": asdict(batch.organizations[1]),
-                        "parent": asdict(batch.organizations[-1]),
-                    }
-                )
-    assert len(proofs) == 102
-    for size in (1, 100):
-        for offset in range(0, len(proofs), size):
-            validate_fhir_catalog_organization_batch(proofs[offset : offset + size], source_context)
 
 
 def test_unverifiable_source_dates_stay_reviewable_without_inventing_affiliation():
