@@ -5,6 +5,7 @@ import asyncio
 import datetime
 import importlib
 import json
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -708,6 +709,38 @@ async def test_spawned_worker_groups_loads_and_finishes(grouped_source, monkeypa
 
     assert set(ledger.completions) == {"o0", "o1"} and len(requests) == 2
     assert len(_merged_rows(ledger)) == 7 and sum(ledger.completions.values()) == len(ledger.staged_rows)
+
+
+def _lose_group_worker(*_arguments):
+    os._exit(1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["group", "load"])
+async def test_lost_group_worker_resumes_from_saved_output(grouped_source, monkeypatch, stage):
+    requests = []
+    async with _output_server(requests) as server, aiohttp.ClientSession() as session:
+        manifest, checkpoints = _two_output_export(monkeypatch, str(server.make_url("/output")), ("streaming",))
+        ledger = _Ledger()
+        _grouped_fakes(monkeypatch, ledger)
+        with monkeypatch.context() as crash:
+            crash.setenv(grouped_load.WORKERS_ENV, "1")
+            if stage == "group":
+                crash.setattr(grouped_load, "group_output", _lose_group_worker)
+            else:
+                crash.setattr(grouping, "reduce_partition", _lose_group_worker)
+            (error,) = await _run_grouped(session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger)
+        assert isinstance(error, RuntimeError) and str(error) == "bulk_export_group_worker_lost"
+        assert not ledger.staged_rows and not ledger.completions
+        root = spool.group_directory(CHECKPOINT_ID)
+        assert grouping.is_grouped(root, 0) == (stage == "load")
+        assert not any(grouping.is_loaded(root, partition) for partition in range(grouping.PARTITIONS))
+
+        monkeypatch.setenv(grouped_load.WORKERS_ENV, "2")
+        assert await _run_grouped(session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) == [None]
+
+    assert len(requests) == 1
+    assert ledger.completions == {"o0": 7} and len(_merged_rows(ledger)) == len(ledger.staged_rows) == 7
 
 
 async def _grouped_run_with_markers(session, url, grouped_source, monkeypatch, identity):

@@ -38,9 +38,17 @@ def _compiled_export(name):
     return export
 
 
-def _context(contract, merge_roles, strict=False, resource_type="PractitionerRole", dataset_id="dataset-1"):
+def _context(
+    contract,
+    merge_roles,
+    strict=False,
+    resource_type="PractitionerRole",
+    dataset_id="dataset-1",
+    *,
+    source_id="synthetic-source",
+):
     return bulk_prepare.PrepareContext(
-        source_id="synthetic-source",
+        source_id=source_id,
         resource_type=resource_type,
         run_id="run-1",
         log_identity=LOG_IDENTITY,
@@ -138,6 +146,68 @@ def test_plan_net_batch_with_network_siblings_stays_native():
     ]
 
 
+@pytest.mark.parametrize(("source_id", "expected_npi"), [("cms-npd", 1234567893), ("synthetic-source", 1234567890)])
+def test_npi_checksum_applies_to_cms_roles(source_id, expected_npi):
+    """CMS rejects an invalid declared NPI and keeps looking for a valid identifier."""
+    resource_by_field = cases._plan_net_role("role-1", "net-a")
+    resource_by_field["identifier"] = [
+        {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567890"},
+        {"system": "urn:npi", "value": "1-234-567-893"},
+    ]
+    lines = [json.dumps(resource_by_field).encode()]
+    context = _context(CONTRACTS[0], False, source_id=source_id)
+    expected = bulk_prepare.prepare_lines(lines, context)
+    prepared = seam.prepare_directory_rows(lines, context, payload_text=True)
+    assert prepared.unsupported_reason is None and prepared.payload_texts is not None
+    assert _typed(prepared.rows) == _typed(expected.rows)
+    assert prepared.rows[0]["payload_json"]["npi"] == expected_npi
+
+
+def test_plan_net_delivery_and_conflicting_medicaid_flags():
+    """Preserve meaningful modality-only entries and refuse to infer conflicting eligibility."""
+    resource_by_field = cases._plan_net_role("role-1", "net-a")
+    delivery_url = f"{cases.PLAN_NET}/delivery-method"
+    medicaid_url = "https://healthporta.com/fhir/provider-directory/accepting-medicaid"
+    telehealth_url = "https://healthporta.com/fhir/provider-directory/telehealth"
+    resource_by_field["extension"] = [
+        None,
+        {
+            "url": delivery_url,
+            "extension": [None, {"url": "type", "valueCodeableConcept": {"coding": [{"code": "physical"}]}}],
+        },
+        {
+            "url": delivery_url,
+            "extension": [{"url": "virtualModalities", "valueCodeableConcept": {"coding": [{"code": "video"}]}}],
+        },
+        {"url": telehealth_url, "valueBoolean": "false"},
+        {"url": telehealth_url, "valueBoolean": False},
+        {"url": medicaid_url, "valueBoolean": True},
+        {"url": medicaid_url, "valueBoolean": False},
+        {
+            "url": f"{cases.PLAN_NET}/newpatients",
+            "extension": [
+                None,
+                {"url": "acceptingPatients", "valueCodeableConcept": []},
+                {"url": "acceptingPatients", "valueCodeableConcept": {"coding": [None, {"code": "ExistPtOnly"}]}},
+            ],
+        },
+    ]
+    lines = [json.dumps(resource_by_field).encode()]
+    assert assert_batch_parity(lines, CONTRACTS[0], False) is None
+    prepared = seam.prepare_directory_rows(lines, _context(CONTRACTS[0], False))
+    payload_by_field = prepared.rows[0]["payload_json"]
+    assert payload_by_field["telehealth"] == [
+        {
+            "supported": True,
+            "type_codes": [],
+            "virtual_modalities": [{"system": None, "code": "video", "display": None}],
+        },
+        {"supported": False},
+    ]
+    assert payload_by_field["accepting_medicaid"] is None
+    assert payload_by_field["accepting_patients"] == [{"code": "existptonly"}]
+
+
 def test_generated_batches_match_python_byte_for_byte():
     reason_counts_by_name: dict[str, int] = {}
     rng = random.Random(7)
@@ -159,6 +229,12 @@ EXACT_LINES = (
     b'{"resourceType": "PractitionerRole", "practitioner": [{"reference": "\\u001cPractitioner/1\\u001f"}]}',
     b'{"resourceType": "PractitionerRole", "id": "zero", "identifier": [{"system": "npi", "value": "0000000000"}]}',
     b'{"resourceType": "PractitionerRole", "id": "port", "meta": {"source": "http://host:0443/x"}}',
+    b'{"resourceType":"PractitionerRole","id":"meta","meta":{"source":"http://host:0000/a/%zz",'
+    b'"security":[null,{}, {"version":" v2 ","userSelected":"true"}]}}',
+    b'{"resourceType":"PractitionerRole","id":"escaped","telecom":[{"value":"a\\rb","rank":-42}]}',
+    b'{"resourceType":"PractitionerRole","id":"bounded-url","meta":{"source":"https://example.test/'
+    + b"a" * 65_536
+    + b'"}}',
     b'{"resourceType": "PractitionerRole", "id": "wide", "x": ' + b"1" * 640 + b"}",
 )
 
@@ -172,6 +248,10 @@ HAZARDS = (
     ([b'{"resourceType": "PractitionerRole", "id": NaN}'], "non_finite_number"),
     ([b'{"resourceType": "PractitionerRole", "x": -Infinity}'], "non_finite_number"),
     ([b'{"resourceType": "PractitionerRole", "id": "\\ud800"}'], "lone_surrogate"),
+    ([b'{"resourceType":"PractitionerRole","id":"\\ud800\\u0041"}'], "lone_surrogate"),
+    ([b'{"resourceType":"PractitionerRole","id":"\\u0xz2"}'], "invalid_json"),
+    ([b'{"resourceType":"PractitionerRole","id":"\\k"}'], "invalid_json"),
+    ([b'{"resourceType":"PractitionerRole","network":[{"reference":"Organization/a"},]}'], "invalid_json"),
     ([b'{"resourceType": "PractitionerRole", "id": "bad\xff"}'], "invalid_utf8"),
     ([b'{"resourceType": "PractitionerRole"} x'], "invalid_json"),
     ([b"[1]"], "line_not_object"),
@@ -180,6 +260,25 @@ HAZARDS = (
     ([b'{"resourceType": "PractitionerRole", "id": 1e2}'], "text_repr"),
     ([b'{"resourceType": "PractitionerRole", "id": ["a"]}'], "text_repr"),
     ([b'{"resourceType": "PractitionerRole", "telecom": 5}'], "not_iterable"),
+    ([b'{"resourceType":"PractitionerRole","specialty":{"coding":true}}'], "not_iterable"),
+    ([b'{"resourceType":"PractitionerRole","location":[{"reference":[]}]}'], "text_repr"),
+    ([b'{"resourceType":"PractitionerRole","identifier":[{"assigner":{"display":{}}}]}'], "text_repr"),
+    ([b'{"resourceType":"PractitionerRole","period":{"start":"2026-01-01","end":[]}}'], "text_repr"),
+    ([b'{"resourceType":"PractitionerRole","meta":{"security":[{"version":{}}]}}'], "text_repr"),
+    (
+        [
+            f'{{"resourceType":"PractitionerRole","extension":[{{"url":"{cases.PLAN_NET}/delivery-method",'
+            '"extension":true}]}'.encode()
+        ],
+        "not_iterable",
+    ),
+    (
+        [
+            f'{{"resourceType":"PractitionerRole","extension":[{{"url":"{cases.PLAN_NET}/newpatients",'
+            '"extension":true}]}'.encode()
+        ],
+        "not_iterable",
+    ),
     ([b'{"resourceType": "PractitionerRole", "meta": {"source": "http://[::1]/x"}}'], "url_network_location"),
     ([b'{"resourceType": "PractitionerRole", "meta": {"source": "https://h/\\u212aey/v"}}'], "unicode_lowercase"),
     (
@@ -193,6 +292,7 @@ HAZARDS = (
         ],
         "payload_conflict",
     ),
+    ([b'{"resourceType":"PractitionerRole","id":"' + b"a" * 64 + b'"}'] * 2, "hash_shaped_duplicate_id"),
     # Past the lowest digit limit an interpreter can be given, Python decides.
     ([b'{"resourceType": "PractitionerRole", "id": "wide", "x": ' + b"1" * 641 + b"}"], "integer_digits"),
     (
@@ -211,6 +311,58 @@ def test_hazards_are_refused_and_python_result_returned(lines, reason, strict):
     assert assert_batch_parity(lines, CONTRACTS[0], False, strict=strict) in {reason, "python_raises"}
 
 
+@pytest.mark.parametrize(
+    ("resource_by_field", "reason"),
+    [
+        *(
+            ({field_name: {"reference": []}}, "text_repr")
+            for field_name in (
+                "practitioner",
+                "organization",
+                "healthcareService",
+                "network",
+                "insurancePlan",
+                "endpoint",
+            )
+        ),
+        *(({"identifier": [{field_name: []}]}, "text_repr") for field_name in ("use", "system")),
+        *(({"identifier": [{"period": {field_name: []}}]}, "text_repr") for field_name in ("start", "end")),
+        *(({"code": {"coding": [{field_name: []}]}}, "text_repr") for field_name in ("system", "display")),
+        *(({"meta": {"tag": [{field_name: []}]}}, "text_repr") for field_name in ("code", "display")),
+        *(({field_name: True}, "not_iterable") for field_name in ("availableTime", "notAvailable")),
+        ({"identifier": [{"type": {"coding": True}}]}, "not_iterable"),
+        ({"identifier": [{"assigner": {"reference": []}}]}, "text_repr"),
+        ({"period": {"start": []}}, "text_repr"),
+        ({"meta": {"lastUpdated": []}}, "text_repr"),
+        ({"network": {"reference": "https://[::1]/fhir/Organization/a"}}, "url_network_location"),
+        (
+            {
+                "extension": [
+                    {"extension": {"url": f"{cases.PLAN_NET}/network-reference", "valueReference": {"reference": []}}}
+                ]
+            },
+            "text_repr",
+        ),
+    ],
+)
+def test_nested_role_fields_keep_the_python_fallback(resource_by_field, reason):
+    """Preserve each Python fallback at the batch and individual-row boundaries."""
+    line = json.dumps({"resourceType": "PractitionerRole", "id": "role-1", **resource_by_field}).encode()
+    assert assert_batch_parity([line], CONTRACTS[0], False) in {reason, "python_raises"}
+    native = _compiled_export("prepare_provider_directory_row_lines_v1")
+    assert native([line], "PractitionerRole", _native_context_by_name()) == ("lines", [reason], None)
+
+
+@pytest.mark.parametrize("url_field", ["resource_url", "self_url", "fetch_url"])
+def test_native_transport_context_refuses_lossy_url(url_field):
+    """Both compiled entry points defer URL normalization when Python would rewrite the input."""
+    context_by_field = {**_native_context_by_name(), url_field: "https://example.test/fhir/a\tb"}
+    lines = [b'{"resourceType":"PractitionerRole","id":"role-1"}']
+    for export in ("prepare_provider_directory_rows_v1", "prepare_provider_directory_row_lines_v1"):
+        result = _compiled_export(export)(lines, "PractitionerRole", context_by_field)
+        assert tuple(result) == ("unsupported", "url_shape")
+
+
 def test_unported_resource_type_uses_python_chain():
     lines = [b'{"resourceType": "Practitioner", "id": "p1", "name": [{"family": "Doe"}]}']
     assert assert_batch_parity(lines, CONTRACTS[0], False, resource_type="Practitioner") == "not_native"
@@ -225,6 +377,11 @@ def test_missing_dataset_and_bad_contract_follow_python():
     assert (prepared.rows, prepared.rows_fetched, prepared.unsupported_reason) == ([], 1, None)
     with pytest.raises(ValueError, match="provider_directory_resource_hash_contract_invalid"):
         seam.prepare_directory_rows([line], _context("unknown_contract", False))
+    native = _compiled_export("prepare_provider_directory_row_lines_v1")
+    context_by_field = {**_native_context_by_name(), "dataset_id": None}
+    assert native([line], "PractitionerRole", context_by_field) == ("lines", ["dataset_missing"], None)
+    assert native([line], "PractitionerRole", _native_context_by_name("unknown")) == ("unsupported", "hash_contract")
+    assert native([line], "Practitioner", _native_context_by_name()) == ("unsupported", "resource_type_not_ported")
 
 
 def test_version_mismatch_raises_instead_of_falling_back(monkeypatch):
@@ -325,6 +482,21 @@ def _role_line(role_id, network, last_updated="2026-03-04T05:06:07Z"):
     role["meta"]["lastUpdated"] = last_updated
     role["identifier"][1]["value"] = "shared"
     return json.dumps(role).encode()
+
+
+def test_existing_canonical_role_id_keeps_its_composed_hash():
+    """An incoming role already named by its semantic identity still uses its network composition."""
+    resource_by_field = cases._plan_net_role("role-1", "net-a")
+    context = _context(CONTRACTS[0], False)
+    original = bulk_prepare.prepare_lines([json.dumps(resource_by_field).encode()], context)
+    role_id = role_merge.merged_role_id(original.rows[0]["payload_json"])
+    resource_by_field["id"] = role_id
+    lines = [json.dumps(resource_by_field).encode()]
+    assert assert_batch_parity(lines, CONTRACTS[0], False) is None
+    prepared = seam.prepare_directory_rows(lines, context)
+    payload_by_field = prepared.rows[0]["payload_json"]
+    assert prepared.rows[0]["resource_id"] == role_id
+    assert prepared.rows[0]["payload_hash"] == role_merge.merged_role_hash_components(payload_by_field)[2]
 
 
 def test_single_line_union_equals_batch_path_union(tmp_path):
