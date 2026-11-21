@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
 
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, func, inspect, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -984,6 +984,11 @@ def _materialization_model(models, canonical_model):
     return canonical_model if models is None else models[canonical_model]
 
 
+def _materialization_pack_alias(pack, name):
+    # Re-aliasing a snapshot ORM model can select the base pack table.
+    return aliased(CustomImportPack, inspect(pack).selectable.alias(name), adapt_on_names=True)
+
+
 def _materialization_resolver(generation, sealed):
     """Sealed rereads use immutable read authority, never a renewed writer lease."""
 
@@ -1624,8 +1629,8 @@ def _family_child_material_statement(generation: CustomImportGeneration, *, mode
     family_child = _materialization_model(models, CustomImportFamilyChild)
     generation_family = _materialization_model(models, CustomImportGenerationFamily)
 
-    root_pack = aliased(pack)
-    child_pack = aliased(pack)
+    root_pack = _materialization_pack_alias(pack, "root_pack")
+    child_pack = _materialization_pack_alias(pack, "child_pack")
     statement = select(
         generation_family,
         family_child,
@@ -1816,7 +1821,7 @@ def _root_scalar_material_statement(generation: CustomImportGeneration, *, model
     generation_family = _materialization_model(models, CustomImportGenerationFamily)
     root_scalar = _materialization_model(models, CustomImportRootScalar)
 
-    root_pack = aliased(pack)
+    root_pack = _materialization_pack_alias(pack, "root_pack")
     statement = select(
         generation_family,
         family_revision,
@@ -1918,8 +1923,8 @@ def _child_scalar_material_statement(generation: CustomImportGeneration, *, mode
     generation_family = _materialization_model(models, CustomImportGenerationFamily)
     child_scalar = _materialization_model(models, CustomImportChildScalar)
 
-    root_pack = aliased(pack)
-    child_pack = aliased(pack)
+    root_pack = _materialization_pack_alias(pack, "root_pack")
+    child_pack = _materialization_pack_alias(pack, "child_pack")
     statement = select(
         generation_family,
         family_child,
@@ -2124,8 +2129,8 @@ def _winner_material_statement(generation: CustomImportGeneration, *, models=Non
     winner = _materialization_model(models, CustomImportWinner)
     entity_binding = _materialization_model(models, CustomImportEntityBinding)
 
-    root_pack = aliased(pack)
-    context_pack = aliased(pack)
+    root_pack = _materialization_pack_alias(pack, "root_pack")
+    context_pack = _materialization_pack_alias(pack, "context_pack")
     statement = select(
         winner,
         entity_binding,

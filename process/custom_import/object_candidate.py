@@ -44,6 +44,7 @@ class ObjectCandidateRequest:
     timeout_seconds: float
     complete_scope: bool
     maximum_dataset_retained_bytes: int
+    preserve_child_order: bool = False
 
 
 def _checked_request(request):
@@ -53,6 +54,11 @@ def _checked_request(request):
     if not isinstance(request.objects, tuple) or not all(type(item) is expected_type for item in request.objects):
         raise ObjectCandidateError("object_request_invalid")
     request = https_candidate._checked_request_fields(request)
+    if type(request.preserve_child_order) is not bool or (
+        request.preserve_child_order
+        and (request.source_kind != "upload" or request.definition.refresh_mode != "snapshot")
+    ):
+        raise ObjectCandidateError("object_request_invalid")
     for item, stream in zip(request.objects, request.definition.source_streams, strict=True):
         if request.source_kind == "s3":
             s3.validate_s3_object(item, stream, limits=request.limits, timeout_seconds=request.timeout_seconds)
@@ -81,6 +87,8 @@ def object_request_identity_sha256(request: ObjectCandidateRequest) -> bytes:
             "maximum_dataset_retained_bytes": request.maximum_dataset_retained_bytes,
             "objects": [item.hex() if isinstance(item, bytes) else item for item in objects],
         }
+        if request.preserve_child_order:
+            document_by_key["preserve_child_order"] = True
         encoded = json.dumps(document_by_key, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(contract.encode("ascii") + b"\0request\0" + encoded).digest()
     except Exception:

@@ -62,6 +62,7 @@ class CandidateRunRequest:
     roots: Sequence[Mapping[str, Any]]
     children_by_collection: Mapping[str, Sequence[Mapping[str, Any]]]
     complete_scope: bool = False
+    preserve_child_order: bool = False
 
 
 @dataclass(frozen=True)

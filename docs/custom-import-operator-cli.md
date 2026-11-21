@@ -634,6 +634,11 @@ signatures and signing timestamps are excluded from the stable request identity.
 
 ### Staged uploads
 
+Set the optional `preserve_child_order` field to `true` on a complete staged
+snapshot to retain each child collection's input order. The option is part of
+the execution identity. It publishes the requested ordering even when the
+typed values match the current generation.
+
 Use `--source upload`. Each object contains exactly `stream_id`, `object_id`,
 `expected_sha256` and `expected_bytes`. The operator stages an unchanged regular
 file named by `object_id` under `/var/lib/custom-import-operator/uploads`.
