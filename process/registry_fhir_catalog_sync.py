@@ -267,19 +267,19 @@ async def _prepare_fhir_catalog_snapshot(
 ):
     """Pin source and registry reads, prepare privately, then register the validated candidate."""
     started = perf_counter()
-    producer_options = {"source_export": source_export} if source_export is not None else {}
-    if source_companies_only:
-        if source_export is None:
-            raise ValueError("registry_fhir_catalog_source_companies_unavailable")
-        producer_options["source_companies_only"] = True
+    if source_companies_only and source_export is None:
+        raise ValueError("registry_fhir_catalog_source_companies_unavailable")
     async with _catalog_source_reads(source_pool, sealer_pool, config.grant, source_export) as source_reads:
         dispositions = await _preparation_source_inventory(config, source_reads, source_companies_only)
         async with fhir_catalog_registry_reads(loader), loader.transaction(isolation="repeatable_read"):
             snapshot, previous, accounting_by_phase, copy_target = await _stage_catalog_candidate(
-                config, loader, source_reads, sealer_pool, staged, dispositions, **producer_options
+                config, loader, source_reads, staged, dispositions, source_companies_only=source_companies_only
             )
-        if copy_target is None:
-            return snapshot, previous, accounting_by_phase
+    if copy_target is None:
+        if accounting_by_phase.get("resumed_snapshot"):
+            # The Source export may have a single-slot pool, so release discovery before rechecking labels.
+            await _verify_reused_source_companies(loader, config.grant, snapshot, sealer_pool, source_export)
+        return snapshot, previous, accounting_by_phase
     if report := current_fhir_catalog_report():
         report.progress("sealing")
     async with sealer_pool.acquire() as sealer, sealer.transaction():
@@ -357,9 +357,7 @@ async def _admit_native_catalog_sources(loader, accepted):
     return imported_inventory
 
 
-async def _stage_catalog_candidate(
-    config, loader, source_reads, sealer_pool, staged, dispositions, *, source_export=None, source_companies_only=False
-):
+async def _stage_catalog_candidate(config, loader, source_reads, staged, dispositions, *, source_companies_only=False):
     """Stage one isolated postimage under Loader RR and reuse matching logical content."""
     accepted, unavailable = dispositions
     head, manifest, previous = await _catalog_registry_head(loader, config.grant)
@@ -402,7 +400,6 @@ async def _stage_catalog_candidate(
         )
         if preparation_target is not None:
             return retained, previous, accounting_by_phase, preparation_target
-        await _verify_reused_source_companies(loader, config.grant, retained, sealer_pool, source_export)
         accounting_by_phase["resumed_snapshot"] = True
         return retained, previous, accounting_by_phase, None
     build_accounting_by_phase, copy_target = await _stage_new_catalog_candidate(
@@ -473,7 +470,8 @@ async def _verify_reused_source_companies(loader, grant, snapshot, sealer_pool, 
     vector = snapshot["source_vector_json"]
     if not any(entry["status"] == "current" and "source_companies" in entry for entry in vector):
         return
-    descriptors = await load_fhir_catalog_source_descriptors(loader, snapshot, vector)
+    async with loader.transaction(isolation="repeatable_read", readonly=True):
+        descriptors = await load_fhir_catalog_source_descriptors(loader, snapshot, vector)
     async with (
         sealer_pool.acquire() as registry_reader,
         registry_reader.transaction(isolation="repeatable_read", readonly=True),

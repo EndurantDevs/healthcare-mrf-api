@@ -665,7 +665,8 @@ async def control_start(ctx, task):
         await watcher
     except asyncio.CancelledError, ImportCancelledError:
         raise
-    except Exception:
+    except Exception as error:
+        _error("worker_failed", causes=_failure_causes(error))
         raise RuntimeError("registry_membership_refresh_worker_failed") from None
     finally:
         for owned in (work, watcher):

@@ -79,7 +79,7 @@ async def test_label_refresh_validates_source_labels_before_writer_commit(monkey
 
     async def stage_candidate(*arguments, **options):
         assert arguments[0] is source_case.config and arguments[1] is source_case.loader
-        assert options == {"source_export": source_case.factory, "source_companies_only": True}
+        assert options == {"source_companies_only": True}
         events.append("source-verify")
         if fail_verification:
             raise ValueError("registry_fhir_catalog_source_companies_invalid")
@@ -467,6 +467,15 @@ async def test_reused_labeled_candidate_still_gets_an_independent_fresh_label_re
         ]
     )
     source_case.export["source_companies"] = callback
+    original_factory = source_case.factory.side_effect
+
+    @asynccontextmanager
+    async def single_slot_export(**options):
+        assert not source_case.events or source_case.events[-1] == ("exit",)
+        async with original_factory(**options) as export:
+            yield export
+
+    source_case.factory.side_effect = single_slot_export
     if drift:
         with pytest.raises(ValueError, match="source_companies_changed"):
             await sync.prepare_fhir_catalog_snapshot(
