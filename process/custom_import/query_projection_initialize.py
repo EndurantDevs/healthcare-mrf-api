@@ -6,6 +6,7 @@ import hmac
 
 from sqlalchemy import and_, select, text
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 from db.models.custom_import import CustomImportDefinitionRevision, CustomImportGeneration
 from db.models.custom_import_query_projection import CustomImportQueryProjection
@@ -13,7 +14,8 @@ from db.models.custom_import_storage import CustomImportSnapshotFamily, CustomIm
 from process.custom_import.build_source import _flush_page, _prepare_statement
 from process.custom_import.continuation_runtime import producer_token_sha256
 from process.custom_import.query_projection_binding import lock_projection_tables, validate_projection_table
-from process.custom_import.query_projection_sources import capability_sha256
+from process.custom_import.query_projection_default_roots import DEFAULT_ROOTS, default_root_table
+from process.custom_import.query_projection_sources import capability_sha256, has_default_roots, supports_default_roots
 from process.custom_import.query_projection_storage import QUERY_PROJECTION_CONTRACT, query_projection_load_statements
 from process.custom_import.runner_types import CandidateRunnerError
 from process.custom_import.storage_layout import snapshot_schema
@@ -26,7 +28,8 @@ _ROOT_LAYOUT = text(
 )
 _RELATIONS = text(
     "SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
-    "WHERE n.nspname=:schema_name AND c.relname IN ('custom_import_derived_root','custom_import_derived_child')"
+    "WHERE n.nspname=:schema_name AND c.relname IN "
+    f"('custom_import_derived_root','custom_import_derived_child','{DEFAULT_ROOTS}')"
 )
 _ACL = text(
     """
@@ -151,8 +154,8 @@ async def _close_and_copy_acl(session, parent, table_name, readers, *, prepare=N
             await _execute(session, text(f"GRANT SELECT ON TABLE {target} TO {_grantee(reader)}"), prepare=prepare)
 
 
-async def _create_cells(session, parent, root_relation, definition, *, prepare=None):
-    """Apply the existing reader permissions to the two fresh qualified tables."""
+async def _create_cells(session, parent, root_relation, definition, *, prepare=None, default_roots=False):
+    """Apply the existing reader permissions to fresh qualified projection leaves."""
 
     existing = await _execute(session, _RELATIONS, {"schema_name": snapshot_schema(parent.family_id)}, prepare=prepare)
     if existing.first() is not None:
@@ -175,8 +178,15 @@ async def _create_cells(session, parent, root_relation, definition, *, prepare=N
     )
     for statement in query_projection_load_statements(parent.family_id, definition):
         await _execute(session, text(statement), prepare=prepare)
-    for scope in ("root", "child"):
-        name = f"custom_import_derived_{scope}"
+    names = ["custom_import_derived_root", "custom_import_derived_child"]
+    if default_roots:
+        table = default_root_table(parent.family_id)
+        dialect = postgresql.dialect()
+        await _execute(session, text(str(CreateTable(table).compile(dialect=dialect))), prepare=prepare)
+        for index in table.indexes:
+            await _execute(session, text(str(CreateIndex(index).compile(dialect=dialect))), prepare=prepare)
+        names.append(DEFAULT_ROOTS)
+    for name in names:
         await (prepare or _prepare_statement)(session)
         if prepare is None:
             await validate_projection_table(session, parent.family_id, name, definition)
@@ -189,17 +199,20 @@ async def initialize_projection(session, request, build):
     """Create only absent cells, or replay the existing logical projection binding."""
 
     parent, root_relation = await _parent(session, request, build)
-    return await initialize_projection_parent(session, request.definition, parent, root_relation)
+    return await initialize_projection_parent(
+        session, request.definition, parent, root_relation, default_roots=supports_default_roots(request.definition)
+    )
 
 
-async def initialize_projection_parent(session, definition, parent, root_relation, *, prepare=None, flush=None):
+async def initialize_projection_parent(
+    session, definition, parent, root_relation, *, prepare=None, flush=None, default_roots=False
+):
     """Apply native permissions and initialize the manifest after logical parent validation."""
 
     layout = await _execute(session, _ROOT_LAYOUT, {"schema_name": snapshot_schema(parent.family_id)}, prepare=prepare)
     if layout.scalar_one_or_none() is not True:
         raise CandidateRunnerError("query projection root relation model shape differs")
     expected_definition = bytes.fromhex(definition.digest)
-    expected_capability = capability_sha256(definition)
     manifest = (
         await _execute(
             session,
@@ -210,6 +223,8 @@ async def initialize_projection_parent(session, definition, parent, root_relatio
         )
     ).scalar_one_or_none()
     if manifest is not None:
+        has_companion = has_default_roots(definition, manifest.capability_sha256)
+        expected_capability = capability_sha256(definition, default_roots=has_companion)
         if not hmac.compare_digest(bytes(manifest.definition_sha256), expected_definition) or not hmac.compare_digest(
             bytes(manifest.capability_sha256), expected_capability
         ):
@@ -220,8 +235,18 @@ async def initialize_projection_parent(session, definition, parent, root_relatio
         else:
             await lock_projection_tables(session, manifest, definition, require_complete=False, prepare=prepare)
         return manifest
-    await _create_cells(session, parent, root_relation, definition, prepare=prepare)
-    manifest = CustomImportQueryProjection(
+    if default_roots:
+        await _create_cells(session, parent, root_relation, definition, prepare=prepare, default_roots=True)
+    else:
+        await _create_cells(session, parent, root_relation, definition, prepare=prepare)
+    manifest = _new_manifest(definition, parent, default_roots=default_roots)
+    session.add(manifest)
+    await (flush or _flush_page)(session)
+    return manifest
+
+
+def _new_manifest(definition, parent, *, default_roots):
+    return CustomImportQueryProjection(
         **{
             name: getattr(parent, name)
             for name in (
@@ -236,14 +261,11 @@ async def initialize_projection_parent(session, definition, parent, root_relatio
             )
         },
         projection_contract=QUERY_PROJECTION_CONTRACT,
-        definition_sha256=expected_definition,
-        capability_sha256=expected_capability,
+        definition_sha256=bytes.fromhex(definition.digest),
+        capability_sha256=capability_sha256(definition, default_roots=default_roots),
         phase="root",
         after_entity_binding_id=0,
         root_count=0,
         child_count=0,
         index_count=0,
     )
-    session.add(manifest)
-    await (flush or _flush_page)(session)
-    return manifest

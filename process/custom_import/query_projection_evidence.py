@@ -17,7 +17,7 @@ from db.models.custom_import import CustomImportGeneration, CustomImportGenerati
 from db.models.custom_import_query_projection import QUERY_PROJECTION_CONTRACT, CustomImportQueryProjection
 from process.custom_import.definition import CustomImportDefinition, canonical_json
 from process.custom_import.query_projection_binding import QueryProjectionUnavailable, _digest, lock_projection_tables
-from process.custom_import.query_projection_sources import capability_sha256
+from process.custom_import.query_projection_sources import capability_sha256, has_default_roots
 from process.custom_import.query_projection_storage import query_projection_index_count
 from process.custom_import.query_projection_values import configured_fields
 
@@ -125,15 +125,18 @@ def completed_projection_evidence(manifest, *, generation, definition, seal=None
             manifest.root_count,
             manifest.child_count,
         )
+        has_companion = has_default_roots(definition, evidence.capability_sha256)
         if not hmac.compare_digest(
             _digest(manifest.definition_sha256, "manifest definition"), expected_definition
-        ) or not hmac.compare_digest(evidence.capability_sha256, capability_sha256(definition)):
+        ) or not hmac.compare_digest(
+            evidence.capability_sha256, capability_sha256(definition, default_roots=has_companion)
+        ):
             raise QueryProjectionUnavailable("projection definition or capability differs")
         if (evidence.root_count and not any(field.collection is None for field in fields)) or (
             evidence.child_count and not any(field.collection is not None for field in fields)
         ):
             raise QueryProjectionUnavailable("projection unconfigured scope contains rows")
-        _completed_digest(manifest, definition, evidence)
+        _completed_digest(manifest, definition, evidence, default_roots=has_companion)
         if seal is not None:
             _verify_producer(seal, generation, sealed=True)
             if read_seal_projection_evidence(seal) != evidence:
@@ -143,7 +146,7 @@ def completed_projection_evidence(manifest, *, generation, definition, seal=None
     return evidence
 
 
-def _completed_digest(manifest, definition, evidence):
+def _completed_digest(manifest, definition, evidence, *, default_roots):
     for scope in ("root", "child"):
         expected = getattr(evidence, f"{scope}_count")
         for prefix in ("verified", "digested"):
@@ -158,7 +161,7 @@ def _completed_digest(manifest, definition, evidence):
         manifest.digest_after_selected_value,
         manifest.digest_after_child_key,
     )
-    if ProjectionDigest(definition, state=state).finish() != evidence:
+    if ProjectionDigest(definition, state=state, default_roots=default_roots).finish() != evidence:
         raise QueryProjectionUnavailable("projection completed content chain differs")
 
 
@@ -298,9 +301,9 @@ class ProjectionDigestState:
 class ProjectionDigest:
     """Hash ordered roots then children, with page-independent retained checkpoints."""
 
-    def __init__(self, definition, *, state=None):
+    def __init__(self, definition, *, state=None, default_roots=False):
         definition_digest = _definition_digest(definition)
-        self._capability = capability_sha256(definition)
+        self._capability = capability_sha256(definition, default_roots=default_roots)
         fields = configured_fields(definition)
         self._fields = tuple(
             tuple(field for field in fields if (field.collection is not None) == child) for child in (False, True)

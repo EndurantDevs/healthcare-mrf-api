@@ -6,11 +6,13 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.models.custom_import import (
     CustomImportChildRevision,
     CustomImportChildScalar,
+    CustomImportEntityBinding,
     CustomImportFamilyChild,
     CustomImportFamilyRevision,
     CustomImportGenerationFamily,
@@ -18,6 +20,8 @@ from db.models.custom_import import (
     CustomImportRootScalar,
     CustomImportWinner,
 )
+from process.custom_import.grouped_read import _profile_context_digest
+from process.custom_import.query_projection_default_roots import default_root_source
 from process.custom_import.query_projection_sources import child_hash_collision_statement, child_source, root_source
 from tests.custom_import_postgres_support import _database_url
 from tests.test_custom_import_query_projection_sources import _context, _definition, _hash_source, _owner_rows
@@ -56,6 +60,52 @@ async def test_candidate_sources_keep_all_explicit_values_and_null_nonpositive_c
         excluded, _ = root_source(context, entity_ids)
         assert (await values_connection.execute(select(excluded))).all() == []
     assert set(root_values) == {"score", "weight", "period", "segment"}
+
+
+def _default_root_fixture(mode):
+    definition = _definition()
+    rows_by_model = _owner_rows(definition)
+    rows_by_model[CustomImportEntityBinding] = [
+        dict(entity_binding_id=10, dataset_id=1, adapter_id="npi", canonical_value="1234567893"),
+    ]
+    winners = rows_by_model[CustomImportWinner]
+    for winner in winners:
+        winner["context_key_sha256"] = b"synthetic".ljust(32, b"\0")
+    selection = definition.query.entity_selection
+    context = _context(definition, rows_by_model)
+    helper_key = _profile_context_digest(context, selection.default_profile, {})
+    helper_by_column = dict(winners[-1], profile_slot=2, context_key_sha256=helper_key)
+    if mode != "missing":
+        winners.append(helper_by_column)
+    if mode == "duplicate":
+        winners.append(dict(winners[0], profile_slot=2, context_key_sha256=helper_key))
+    if mode == "foreign":
+        helper_by_column["dataset_id"] = 99
+    if mode == "null":
+        field = definition.fields_by_id[selection.field_id]
+        scalar = next(
+            item
+            for item in rows_by_model[CustomImportRootScalar]
+            if item["root_revision_id"] == 302 and item["field_slot"] == field.field_slot
+        )
+        scalar["integer_value"] = None
+    return _context(definition, rows_by_model)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("selected", "missing", "null", "foreign", "duplicate"))
+async def test_default_roots_use_one_exact_owned_default_or_fail_closed(values_connection, mode):
+    """Exercise candidate winner authority, the typed scalar, and scalar-subquery cardinality."""
+
+    statement = default_root_source(_default_root_fixture(mode), [10])
+    if mode == "duplicate":
+        with pytest.raises(DBAPIError) as failure:
+            await values_connection.execute(statement)
+        assert getattr(failure.value.orig, "sqlstate", None) == "21000"
+        return
+    rows = (await values_connection.execute(statement)).all()
+    expected = [(102, 202, 302, 10, "1234567893", 2025, "segment_a")] if mode == "selected" else []
+    assert rows == expected
 
 
 _ROOT_OWNERS = [

@@ -34,6 +34,7 @@ class GroupedReadPlan:
     fingerprint: str
     projection: str = "query_projection"
     require_match: bool = True
+    use_default_roots: bool = False
 
 
 async def bind_default_profile(session, context):
@@ -322,7 +323,7 @@ def _child_predicates(plan):
     )
 
 
-def prepare_relation(context, query, scope, *, native_entity_scope=None):
+def prepare_relation(context, query, scope, *, native_entity_scope=None, use_default_roots=False):
     """Return one deduplicated NPI and one explicit-group ordering tuple."""
 
     from process.custom_import.grouped_query import relation_statement
@@ -331,6 +332,8 @@ def prepare_relation(context, query, scope, *, native_entity_scope=None):
     entity_values = query.entity_values
     if native_entity_scope is not None:
         entity_values = core._native_entity_values(native_entity_scope, entity_values)
+        if use_default_roots and plan.selected_value is None and query.require_match:
+            plan = replace(plan, use_default_roots=True)
     return core.PreparedNpiEntityRelation(
         relation_statement(context, plan, entity_values),
         plan.order_terms,

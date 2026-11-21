@@ -583,6 +583,7 @@ class CustomImportReadService:
         prepared: PreparedNpiEntityRelation,
         query: NpiEntityRelationQuery,
         native_entity_scope: Select | CTE,
+        use_default_roots: bool = False,
     ) -> PreparedNpiEntityRelation:
         """Intersect a prepared request with its complete trusted native eligibility."""
 
@@ -608,7 +609,13 @@ class CustomImportReadService:
             if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
                 from process.custom_import.grouped_read import prepare_relation
 
-                scoped = prepare_relation(context, query, authorization_scope, native_entity_scope=native_entity_scope)
+                scoped = prepare_relation(
+                    context,
+                    query,
+                    authorization_scope,
+                    native_entity_scope=native_entity_scope,
+                    use_default_roots=use_default_roots,
+                )
             else:
                 scoped = _prepare_single_family_relation(
                     context, query, authorization_scope, native_entity_scope=native_entity_scope

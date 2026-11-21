@@ -9,7 +9,12 @@ from sqlalchemy.dialects import postgresql
 
 from db.models.custom_import import CustomImportDefinitionRevision, CustomImportGeneration
 from db.models.custom_import_storage import CustomImportSnapshotFamily
-from process.custom_import.query_projection_sources import capability_sha256
+from process.custom_import.query_projection_default_roots import (
+    DEFAULT_ROOTS,
+    DEFAULT_ROOTS_ENTITY_INDEX,
+    default_root_table,
+)
+from process.custom_import.query_projection_sources import capability_sha256, has_default_roots
 from process.custom_import.query_projection_storage import (
     QUERY_PROJECTION_BINDING_INDEX,
     QUERY_PROJECTION_CONTRACT,
@@ -115,9 +120,11 @@ def _expected_columns(table):
 async def validate_projection_table(session, family_id, name, definition, *, prepare=None):
     """Require the defined columns and native keys at the qualified table name."""
 
-    tables = query_projection_tables(family_id, definition)
-    if type(name) is not str or name not in QUERY_PROJECTION_TABLE_NAMES:
+    if type(name) is not str or name not in (*QUERY_PROJECTION_TABLE_NAMES, DEFAULT_ROOTS):
         raise QueryProjectionUnavailable("projection relation name is invalid")
+    table = (
+        default_root_table(family_id) if name == DEFAULT_ROOTS else query_projection_tables(family_id, definition)[name]
+    )
     if prepare is not None:
         await prepare(session)
     table_identity = (
@@ -137,8 +144,8 @@ async def validate_projection_table(session, family_id, name, definition, *, pre
         or table_identity["inherited"]
         or table_identity["foreign_keys"]
         or table_identity["triggers"]
-        or table_identity["columns"] != _expected_columns(tables[name])
-        or table_identity["primary_key"] != list(tables[name].primary_key.columns.keys())
+        or table_identity["columns"] != _expected_columns(table)
+        or table_identity["primary_key"] != list(table.primary_key.columns.keys())
     ):
         raise QueryProjectionUnavailable("projection relation model shape differs")
 
@@ -210,9 +217,12 @@ def _proof_shape(manifest):
 
 
 def _definition_binding(manifest, definition):
+    has_companion = has_default_roots(definition, manifest.capability_sha256)
     if not hmac.compare_digest(
         bytes(manifest.definition_sha256), bytes.fromhex(definition.digest)
-    ) or not hmac.compare_digest(bytes(manifest.capability_sha256), capability_sha256(definition)):
+    ) or not hmac.compare_digest(
+        bytes(manifest.capability_sha256), capability_sha256(definition, default_roots=has_companion)
+    ):
         raise QueryProjectionUnavailable("projection definition or capability differs")
     if manifest.phase == "complete" and manifest.index_count != query_projection_index_count(definition):
         raise QueryProjectionUnavailable("projection index coverage differs")
@@ -248,6 +258,9 @@ async def validate_projection_indexes(session, manifest, definition, *, prepare=
         ["dataset_id", "adapter_id", "canonical_value", "entity_binding_id"],
         [None, "pg_catalog.default", "pg_catalog.C", None],
     )
+    if has_default_roots(definition, manifest.capability_sha256):
+        # The fixed companion index is created with its table, outside the resumable field-index count.
+        expected_by_name[DEFAULT_ROOTS_ENTITY_INDEX] = (DEFAULT_ROOTS, ["entity_value"], ["pg_catalog.default"])
     if prepare is not None:
         await prepare(session)
     index_records = (
@@ -351,15 +364,17 @@ async def lock_projection_tables(session, manifest, definition, *, require_compl
     _manifest_shape(manifest, require_complete)
     _definition_binding(manifest, definition)
     await _validate_parent(session, manifest, require_complete, prepare)
-    tables = query_projection_tables(manifest.family_id, definition)
+    tables_by_name = query_projection_tables(manifest.family_id, definition)
+    if has_default_roots(definition, manifest.capability_sha256):
+        tables_by_name = {**tables_by_name, DEFAULT_ROOTS: default_root_table(manifest.family_id)}
     preparer = postgresql.dialect().identifier_preparer
-    names = ",".join(preparer.format_table(table) for table in tables.values())
+    names = ",".join(preparer.format_table(table) for table in tables_by_name.values())
     if prepare is not None:
         await prepare(session)
     await session.execute(text(f"LOCK TABLE {names} IN ACCESS SHARE MODE"))
     await _validate_parent(session, manifest, require_complete, prepare)
-    for name in QUERY_PROJECTION_TABLE_NAMES:
+    for name in tables_by_name:
         await validate_projection_table(session, manifest.family_id, name, definition, prepare=prepare)
     if require_complete or manifest.phase == "complete":
         await validate_projection_indexes(session, manifest, definition, prepare=prepare)
-    return tables
+    return tables_by_name

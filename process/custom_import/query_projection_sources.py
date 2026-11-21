@@ -3,6 +3,7 @@
 """Typed input relations from finalized candidate winners, before generation seal."""
 
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -17,7 +18,7 @@ from db.models.custom_import import (
     CustomImportWinner,
 )
 from db.models.custom_import_query_projection import QUERY_PROJECTION_CONTRACT
-from process.custom_import.definition import CustomImportDefinition, canonical_json
+from process.custom_import.definition import ROOTED_CHILD_TEXT_STORAGE_PROFILE, CustomImportDefinition, canonical_json
 from process.custom_import.query_projection_values import configured_fields
 
 
@@ -39,16 +40,35 @@ class ProjectionSource:
         return self.storage_models[canonical]
 
 
-def capability_sha256(definition):
+def supports_default_roots(definition):
+    """Limit the additional projection to grouped, projected child queries on NPIs."""
+
+    return bool(
+        definition.storage_profile == ROOTED_CHILD_TEXT_STORAGE_PROFILE
+        and definition.query.entity_selection is not None
+        and any(field.collection is not None for field in configured_fields(definition))
+        and json.loads(definition.schema_canonical)["root"]["entity"]["adapter"] == "npi"
+    )
+
+
+def capability_sha256(definition, *, default_roots=False):
     """Bind the capability to the full saved definition and enabled declarations."""
 
     capability_by_name = {
         "definition_sha256": definition.digest,
         "fields": [field.field_id for field in configured_fields(definition)],
     }
+    if default_roots:
+        capability_by_name["default_root_selection"] = "v1"
     return hashlib.sha256(
         QUERY_PROJECTION_CONTRACT.encode("ascii") + b"\0" + canonical_json(capability_by_name).encode("utf-8")
     ).digest()
+
+
+def has_default_roots(definition, capability):
+    """Recognize the new capability while keeping old generations readable."""
+
+    return supports_default_roots(definition) and capability == capability_sha256(definition, default_roots=True)
 
 
 def field_slots(definition):
@@ -101,23 +121,28 @@ def _value_relation(statement, values_by_field, name):
     return relation, {field_id: relation.c[f"field_{index}"] for index, field_id in enumerate(values_by_field)}
 
 
-def root_source(context, entity_binding_ids):
-    """Retain every configured group and explicit selection value in one page."""
-
+def _root_winners(context, entity_binding_ids, profile_slot):
     from process.custom_import.read_core import _winner_identity_statement
 
     winner = context.model(CustomImportWinner)
-    family = context.model(CustomImportFamilyRevision)
-    statement = _winner_identity_statement(context).where(
+    return _winner_identity_statement(context).where(
         winner.generation_id == context.generation_id,
         winner.dataset_id == context.dataset_id,
         winner.definition_revision_id == context.definition_revision_id,
         winner.schema_revision_id == context.schema_revision_id,
-        winner.profile_slot == context.profile_slot,
+        winner.profile_slot == profile_slot,
         winner.entity_binding_id.in_(entity_binding_ids),
         winner.context_collection_slot == 0,
         winner.context_child_revision_id.is_(None),
     )
+
+
+def root_source(context, entity_binding_ids):
+    """Retain every configured group and explicit selection value in one page."""
+
+    winner = context.model(CustomImportWinner)
+    family = context.model(CustomImportFamilyRevision)
+    statement = _root_winners(context, entity_binding_ids, context.profile_slot)
     identities = statement.with_only_columns(
         winner.entity_binding_id,
         family.dataset_id,

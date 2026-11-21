@@ -10,7 +10,7 @@ from db.models.custom_import import CustomImportEntityBinding
 from process.custom_import.query_projection_build import _execute, _source_context
 from process.custom_import.query_projection_evidence import ProjectionDigest, ProjectionDigestState
 from process.custom_import.query_projection_initialize import initialize_projection
-from process.custom_import.query_projection_sources import field_slots
+from process.custom_import.query_projection_sources import field_slots, has_default_roots
 from process.custom_import.query_projection_storage import query_projection_tables
 from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.runner_types import CandidateRunnerError
@@ -83,7 +83,9 @@ def retained_projection_digest(manifest, definition):
             manifest.digest_after_selected_value,
             manifest.digest_after_child_key,
         )
-    return ProjectionDigest(definition, state=state)
+    return ProjectionDigest(
+        definition, state=state, default_roots=has_default_roots(definition, manifest.capability_sha256)
+    )
 
 
 def _retain_digest(manifest, digest):

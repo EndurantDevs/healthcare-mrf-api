@@ -7,7 +7,7 @@ import json
 from dataclasses import replace
 
 import pytest
-from sqlalchemy import BigInteger, Numeric
+from sqlalchemy import BigInteger, Numeric, literal, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import visitors
 from sqlalchemy.sql.compiler import FROM_LINTING
@@ -16,6 +16,7 @@ from sqlalchemy.sql.selectable import CTE
 
 from process.custom_import import grouped_read, read_core
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.query_projection_default_roots import DEFAULT_ROOTS, default_root_table
 from process.custom_import.query_projection_storage import query_projection_tables
 from process.custom_import.storage_layout import snapshot_models
 from tests import custom_import_grouped_child_support as fixture
@@ -55,6 +56,31 @@ def _sql(prepared):
 
 def _ctes(prepared):
     return {node.name: node for node in visitors.iterate(prepared.statement) if isinstance(node, CTE)}
+
+
+@pytest.mark.parametrize("mode", ("default_required", "explicit_period", "optional", "unpaged_scope_absent"))
+def test_default_root_companion_is_limited_to_authorized_default_period_child_queries(mode):
+    context = _context(snapshot=True)
+    context = replace(context, projection_tables={**context.projection_tables, DEFAULT_ROOTS: default_root_table(1)})
+    predicates = (read_core.ReadFilter("service_code", "eq", "chosen"),)
+    if mode == "explicit_period":
+        predicates += (read_core.ReadFilter("period", "eq", 2024),)
+    native = select(literal(1234567893, type_=BigInteger).label("npi")) if mode != "unpaged_scope_absent" else None
+    prepared = grouped_read.prepare_relation(
+        context,
+        fixture.query(
+            context_filters=predicates,
+            require_match=mode != "optional",
+            order_terms=(read_core.ReadOrderTerm("child_quality", "desc", "last"),),
+        ),
+        read_core.ExtensionReadScope("synthetic"),
+        native_entity_scope=native,
+        use_default_roots=True,
+    )
+    sql = _sql(prepared)
+    assert (DEFAULT_ROOTS in sql) is (mode == "default_required")
+    assert "validated_score_children AS MATERIALIZED" in sql
+    assert "custom_import_derived_child.child_key_sha256 = projected_score_child.child_key_sha256" in sql
 
 
 @pytest.mark.parametrize("entity_values", (None, (), ("1234567893",)))

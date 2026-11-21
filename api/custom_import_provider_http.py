@@ -86,6 +86,7 @@ class _ProviderScopePreparer:
     pinned_target: PinnedReadTarget
     query: NpiEntityRelationQuery
     prepared: PreparedNpiEntityRelation
+    use_default_roots: bool = False
 
     async def prepare(self, native_entity_scope):
         """Restrict scores to complete native eligibility in the pinned snapshot."""
@@ -97,6 +98,7 @@ class _ProviderScopePreparer:
             prepared=self.prepared,
             query=self.query,
             native_entity_scope=native_entity_scope,
+            use_default_roots=self.use_default_roots,
         )
         return self.prepared
 
@@ -356,7 +358,12 @@ async def _read_provider_payload(request, session, parsed, verified):
     )
     context = ProviderImportQuery(prepared, compile_npi_entity_relation(prepared.statement), query.require_match)
 
-    scope_preparer = _ProviderScopePreparer(session, service, authorization, pinned_target, query, prepared)
+    statewide = bool(parsed.native_args.get("state")) and not (
+        parsed.native_args.get("city") or parsed.native_args.get("zip_code")
+    )
+    scope_preparer = _ProviderScopePreparer(
+        session, service, authorization, pinned_target, query, prepared, use_default_roots=statewide
+    )
     reply = await _provider_page(
         request,
         native_args=parsed.native_args,
