@@ -148,10 +148,15 @@ async def _read_named_edition(connection, catalog_schema, pointer_record):
 
 
 async def named_editions_for_session(session, catalog_schema, source_ids=None):
-    """Use the existing caller's read transaction for standalone payload loaders."""
+    """Use the caller's transaction and reuse an unfiltered provider snapshot."""
     from process.provider_directory_projection_stage import _copy_driver
 
-    return await named_current_editions(await _copy_driver(session), catalog_schema, source_ids)
+    editions_by_schema = getattr(session, "info", {}).get("provider_profile_named_editions")
+    if source_ids is not None or editions_by_schema is None:
+        return await named_current_editions(await _copy_driver(session), catalog_schema, source_ids)
+    if catalog_schema not in editions_by_schema:
+        editions_by_schema[catalog_schema] = await named_current_editions(await _copy_driver(session), catalog_schema)
+    return editions_by_schema[catalog_schema]
 
 
 def _literal(value):

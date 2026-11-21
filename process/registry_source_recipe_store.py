@@ -494,18 +494,23 @@ def _decode_wire_recipes(documents):
     return tuple(recipes)
 
 
+def _canonicalize_recipe_batch(recipes):
+    """Validate the canonical wire form and return the recipes in that same order."""
+    if type(recipes) not in {tuple, list} or len(recipes) > MAX_SOURCE_RECIPES:
+        raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    documents = _pack_recipe_documents([_recipe_document(recipe) for recipe in recipes])
+    canonical = _canonical_json(documents)
+    decoded_recipes = _decode_wire_recipes(json.loads(canonical))
+    identities = [(type(recipe.source_pin).__name__, recipe.source_pin.generation_id) for recipe in decoded_recipes]
+    if len(set(identities)) != len(identities):
+        raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    return canonical, decoded_recipes
+
+
 def canonical_registry_source_recipes(recipes) -> str:
     """Validate and sort a complete recipe batch into bounded canonical UTF-8 JSON."""
     try:
-        if type(recipes) not in {tuple, list} or len(recipes) > MAX_SOURCE_RECIPES:
-            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        documents = _pack_recipe_documents([_recipe_document(recipe) for recipe in recipes])
-        canonical = _canonical_json(documents)
-        decoded_recipes = _decode_wire_recipes(json.loads(canonical))
-        identities = [(type(recipe.source_pin).__name__, recipe.source_pin.generation_id) for recipe in decoded_recipes]
-        if len(set(identities)) != len(identities):
-            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        return canonical
+        return _canonicalize_recipe_batch(recipes)[0]
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError, ReferenceFamilyArchiveError:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid") from None
 
@@ -518,8 +523,7 @@ def decode_registry_source_recipes(value) -> tuple[RegistrySourceMembershipRecip
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         _canonical_json(documents)
         recipes = _decode_wire_recipes(documents)
-        canonical = canonical_registry_source_recipes(recipes)
-        return _decode_wire_recipes(json.loads(canonical))
+        return _canonicalize_recipe_batch(recipes)[1]
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError, ReferenceFamilyArchiveError:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid") from None
 
@@ -540,7 +544,12 @@ def _project_legacy_typed_recipe(document):
 
 
 def canonical_decoded_registry_source_recipes(document):
-    """Check complete old/new recipe syntax while retaining original canonical transport bytes."""
+    """Return the canonical form of a validated old or new recipe document."""
+    return decode_registry_source_recipe_transport(document)[0]
+
+
+def decode_registry_source_recipe_transport(document):
+    """Validate once and retain both the original transport and normalized recipes."""
     raw = _decode_document(document)
     decoded = decode_registry_source_recipes(raw)
     encoded = _canonical_json(raw)
@@ -563,7 +572,7 @@ def canonical_decoded_registry_source_recipes(document):
             if _canonical_json(projected) != normalized:
                 raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         # Keep the validated transport bytes for the retained inventory digest.
-    return encoded
+    return encoded, decoded
 
 
 def registry_source_recipes_sha256(canonical: str) -> str:
@@ -581,13 +590,11 @@ def verify_registry_source_recipes(candidate: Mapping) -> tuple[RegistrySourceMe
     try:
         if not isinstance(candidate, Mapping):
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        recipes = decode_registry_source_recipes(candidate["source_recipes_json"])
+        canonical, recipes = decode_registry_source_recipe_transport(candidate["source_recipes_json"])
         generations = _decode_document(candidate["source_generations"])
         if type(generations) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        raw = _decode_document(candidate["source_recipes_json"])
         retained_id = generations.get(RECIPE_DIGEST_KEY)
-        canonical = canonical_decoded_registry_source_recipes(raw)
         expected = hashlib.sha256(canonical.encode()).hexdigest() if recipes else None
         if (recipes and retained_id != expected) or (not recipes and RECIPE_DIGEST_KEY in generations):
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")

@@ -438,8 +438,11 @@ async def _read_snapshot_scope(session, schema, *, include_detail, table_names=N
         geo_bindings = await read_active_bindings(session, schema)
     previous_authorities = session.info.get("provider_profile_native_authorities")
     previous_receipt = session.info.get("provider_profile_cms_serving_receipt")
+    previous_editions = session.info.get("provider_profile_named_editions")
     session.info["provider_profile_native_authorities"] = authorities_by_family
     session.info["provider_profile_cms_serving_receipt"] = receipt
+    if previous_editions is None:
+        session.info["provider_profile_named_editions"] = {}
     token = _SNAPSHOT.set(relation_names)
     cms_token = _CMS_SERVING.set((schema, authorities_by_family.get("cms-doctors")))
     geo_token = _GEO_BINDINGS.set((schema, geo_bindings))
@@ -452,6 +455,7 @@ async def _read_snapshot_scope(session, schema, *, include_detail, table_names=N
         for key, previous in (
             ("provider_profile_native_authorities", previous_authorities),
             ("provider_profile_cms_serving_receipt", previous_receipt),
+            ("provider_profile_named_editions", previous_editions),
         ):
             if previous is None:
                 session.info.pop(key, None)
