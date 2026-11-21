@@ -196,9 +196,8 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_m
 
     assert "entity_address_unified" in sql
     assert "npi_address" not in sql
-    assert "join lateral" in sql
-    assert "limit" in sql
-    assert 1 in compiled.params.values()
+    assert "exists" in sql
+    assert "join lateral" not in sql
     assert f"npi_taxonomy.npi = {address_table}.npi" in sql
     assert "npi_taxonomy.healthcare_provider_taxonomy_code like" in sql
     assert "taxonomy_array" not in sql
@@ -228,6 +227,7 @@ def test_site_intelligence_pharmacy_geo_prefilter_keeps_the_exact_coordinate_win
 
     assert sql.count("::numeric") == 4
     assert ("_st_expand" in sql) is use_spatial
+    assert ("join lateral" in sql) is use_spatial
     if use_spatial:
         assert "operator(public.&&)" in sql
         assert sql.index("offset") < sql.index("between")

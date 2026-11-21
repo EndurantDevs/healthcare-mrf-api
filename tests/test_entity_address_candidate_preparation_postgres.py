@@ -170,6 +170,37 @@ async def test_site_score_switches_from_gist_after_covering_address_preparation(
             assert not await site_intelligence._should_use_pharmacy_geo_index(session)
 
 
+async def test_site_score_requires_pharmacy_taxonomy_once_per_address(monkeypatch):
+    async with _temporary_schema() as (database, schema):
+        for model in (site_intelligence.EntityAddressUnified, site_intelligence.NPIDataTaxonomy):
+            monkeypatch.setattr(model.__table__, "schema", schema)
+        await database.status(
+            f"CREATE TABLE {schema}.entity_address_unified "
+            "(npi bigint, lat numeric, long numeric, type varchar, address_precision varchar);"
+        )
+        await database.status(f"""INSERT INTO {schema}.entity_address_unified VALUES
+            (1, 39, -95, 'primary', NULL), (1, 39.01, -95, 'primary', 'point'),
+            (2, 39, -95, 'primary', 'point'), (3, 39, -95, 'primary', 'city_zip'),
+            (3, 39, -95, 'secondary', 'point'), (3, 39.11, -95, 'primary', 'point'),
+            (4, 39, -95, 'primary', 'point');""")
+        await database.status(
+            f"CREATE TABLE {schema}.npi_taxonomy (npi bigint, healthcare_provider_taxonomy_code varchar);"
+        )
+        await database.status(f"""INSERT INTO {schema}.npi_taxonomy VALUES
+            (1, '3336A0001X'), (1, '3336B0002X'), (2, '3337A0001X'),
+            (3, '3336A0001X'), (4, NULL);""")
+
+        statement = site_intelligence._pharmacy_geo_stmt(
+            use_unified_addresses=True, lat=39, lng=-95, lat_delta=0.1, lng_delta=0.1
+        )
+        async with database.session() as session:
+            rows = (await session.execute(statement)).all()
+        assert sorted((row.npi, float(row.lat), float(row.long)) for row in rows) == [
+            (1, 39.0, -95.0),
+            (1, 39.01, -95.0),
+        ]
+
+
 async def _candidate_tables(database, schema):
     statements = [
         "CREATE TABLE {schema}.provider_directory_source (source_id varchar, endpoint_id varchar)",
