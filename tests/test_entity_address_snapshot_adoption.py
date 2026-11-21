@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from process.entity_address_candidate_preparation import analyze_staged_address_table
+from process.entity_address_candidate_preparation import analyze_staged_address_table, vacuum_address_covering_index
 
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
 cutover_contract = importlib.import_module("process.entity_address_cutover_contract")
@@ -52,6 +52,14 @@ async def test_analyze_main_stage_maintains_covering_index_only_when_present(mon
     analyze.assert_awaited_once_with(
         "ANALYZE candidate.entity_address_unified_20260913;", context=timing_by_phase, phase="stage analysis"
     )
+    vacuum.reset_mock()
+    await vacuum_address_covering_index("candidate", "entity_address_unified", context=timing_by_phase, published=True)
+    if covering_index:
+        vacuum.assert_awaited_once_with(
+            "VACUUM (SKIP_LOCKED, TRUNCATE OFF, INDEX_CLEANUP OFF) candidate.entity_address_unified;"
+        )
+    else:
+        vacuum.assert_not_awaited()
 
 
 @pytest.mark.asyncio

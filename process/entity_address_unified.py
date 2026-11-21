@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
@@ -6142,20 +6141,6 @@ async def _is_location_primary_key_validated(db_schema: str, table_name: str) ->
              LIMIT 1;
             """,
         )
-    )
-
-
-@asynccontextmanager
-async def _snapshot_publication_progress(context: dict, run_id: str):
-    phase = "entity-address-unified preparing snapshot publication"
-    await _emit_phase_progress(
-        run_id, phase, unit="operations", done=0, total=1, message="validating finalized snapshot for publication"
-    )
-    started = time.monotonic()
-    yield
-    _record_phase_timing(context, phase, time.monotonic() - started, context.get("staged_rows"))
-    await _emit_phase_progress(
-        run_id, phase, unit="operations", done=1, total=1, message="snapshot publication preparation complete"
     )
 
 
@@ -12921,7 +12906,9 @@ async def startup(ctx):
     )
 
 
-async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool = False, dependency_bindings=None):
+async def publish_entity_address_unified_generation(
+    ctx, *, prepare_only: bool = False, dependency_bindings=None, _defer_serving_refresh: bool = False
+):
     """Finalize, validate, and publish one entity-address-unified import."""
     if prepare_only and candidate_preparation.current() is None:
         raise RuntimeError("entity-address preparation requires internal desired inputs")
@@ -12952,9 +12939,15 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             db, db_schema, **({"control_context": ctx} if protected_publication else {})
         ) as selected:
             if selected is not None:
-                return await publish_entity_address_unified_generation(
-                    ctx, prepare_only=prepare_only, dependency_bindings=selected
+                publication_result = await publish_entity_address_unified_generation(
+                    ctx, prepare_only=prepare_only, dependency_bindings=selected, _defer_serving_refresh=True
                 )
+        if selected is not None:
+            # The dependency transaction's older snapshot prevents visibility during staged vacuum.
+            if not prepare_only and not protected_publication:
+                await candidate_preparation.refresh_published_address_serving(db_schema, context)
+                print_time_info(context.get("start"))
+            return publication_result
     named_prepared_bindings = prepared_doctors._named_prepared_geo_bindings(
         db_schema, geo_dependency_options_dict.get("dependency_bindings")
     )
@@ -13259,7 +13252,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     current_alias_generation = await _address_alias_generation(db_schema)
     if current_alias_generation != int(context.get("address_alias_generation") or 0):
         raise RuntimeError("address alias generation changed during entity-address-unified build")
-    async with _snapshot_publication_progress(context, run_id):
+    async with candidate_preparation.snapshot_publication_progress(context, run_id):
         if prepare_only:
             return await candidate_preparation.prepare_finalized_generation(
                 db_schema, stage_cls, support_stage_class_map, context=context
@@ -13484,8 +13477,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             preserve_finished_at=True,
             committed_context=context if context.get("control_run_terminal_committed") else None,
         )
-    await provider_geo_search.refresh_after_publication("address", test_mode=bool(context.get("test_mode")))
-    print_time_info(context.get("start"))
+    if not _defer_serving_refresh:
+        await provider_geo_search.refresh_after_publication("address", test_mode=bool(context.get("test_mode")))
+        print_time_info(context.get("start"))
 
 
 shutdown = publish_entity_address_unified_generation

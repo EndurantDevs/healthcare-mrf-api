@@ -132,8 +132,12 @@ async def test_site_score_switches_from_gist_after_covering_address_preparation(
         monkeypatch.setattr(native, "db", database)
         monkeypatch.setattr(site_intelligence.EntityAddressUnified.__table__, "schema", schema)
         monkeypatch.setattr(site_intelligence, "_TABLE_EXISTS_CACHE", {})
-        await database.status(f"CREATE TABLE {address_table} (npi bigint, lat numeric, long numeric);")
-        await database.status(f"INSERT INTO {address_table} VALUES (1000000001, 39, -95);")
+        await database.status(
+            f"CREATE TABLE {address_table} (npi bigint, lat numeric, long numeric, padding text STORAGE PLAIN);"
+        )
+        await database.status(
+            f"INSERT INTO {address_table} SELECT npi, 39, -95, repeat('x', 4500) FROM generate_series(1, 128) npi;"
+        )
         await database.status(
             f"CREATE INDEX {table_name}_idx_geo_idx ON {address_table} USING gist "
             "(public.Geography(public.ST_MakePoint(long::double precision, lat::double precision)));"
@@ -151,6 +155,16 @@ async def test_site_score_switches_from_gist_after_covering_address_preparation(
         await preparation.analyze_staged_address_table(
             schema, site_intelligence.EntityAddressUnified, context={}, phase="test staged address analysis"
         )
+        site_intelligence._TABLE_EXISTS_CACHE.clear()
+        async with database.session() as session:
+            assert not await site_intelligence._should_use_pharmacy_geo_index(session)
+
+        await database.status(f"INSERT INTO {address_table} VALUES (129, 39, -95, repeat('x', 4500));")
+        await database.status(f"ANALYZE {address_table};")
+        missing_visibility_pages = await database.scalar(
+            f"SELECT relpages - relallvisible FROM pg_class WHERE oid='{address_table}'::regclass;"
+        )
+        assert missing_visibility_pages == 1
         site_intelligence._TABLE_EXISTS_CACHE.clear()
         async with database.session() as session:
             assert not await site_intelligence._should_use_pharmacy_geo_index(session)
