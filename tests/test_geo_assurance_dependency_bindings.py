@@ -280,9 +280,15 @@ async def test_normal_finalizer_forwards_explicit_held_inputs_through_projection
         assert events[-1] != ("custody", "locked")
         events.append(("custody", "released"))
 
+    async def refresh_zip_projection(source, *, test_mode):
+        assert source == "address" and test_mode
+        assert events[-1] == ("custody", "released")
+        events.append(("serving", "refreshed"))
+
     monkeypatch.setattr(native, "selected_publication_dependencies", held_selection)
+    monkeypatch.setattr(native.provider_geo_search, "refresh_after_publication", refresh_zip_projection)
     await native.shutdown(_shutdown_context(refresh_mode=native.ENTITY_ADDRESS_REFRESH_MODE_FULL))
-    assert events[-1] == ("custody", "released")
+    assert events[-2:] == [("custody", "released"), ("serving", "refreshed")]
     changed = deepcopy(bindings_by_name)
     changed.pop("tiger.zcta5")
     with pytest.raises(ValueError):

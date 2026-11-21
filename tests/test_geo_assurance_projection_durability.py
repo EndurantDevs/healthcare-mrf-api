@@ -514,7 +514,7 @@ async def test_failed_late_publication_work_never_reports_completion(monkeypatch
 async def test_snapshot_publication_progress_tracks_operation_completion(monkeypatch, is_failed):
     from tests.entity_address_progress_support import assert_snapshot_publication_progress
 
-    await assert_snapshot_publication_progress(monkeypatch, entity_address_unified, is_failed=is_failed)
+    await assert_snapshot_publication_progress(monkeypatch, is_failed=is_failed)
 
 
 @pytest.mark.asyncio

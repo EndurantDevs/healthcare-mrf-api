@@ -9,7 +9,7 @@ import importlib
 import os
 import re
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date
@@ -538,27 +538,64 @@ async def _require_stage_indexes(db_schema: str, stage_cls) -> None:
         raise RuntimeError("entity-address preparation requires all serving indexes")
 
 
+async def vacuum_address_covering_index(db_schema: str, table_name: str, *, context: dict, published: bool) -> None:
+    """Set heap visibility for the optional covering index."""
+    native = _native()
+    relation = f"{db_schema}.{table_name}"
+    index_name = native._stage_index_name(table_name, ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX)
+    has_covering_index = await admitted.read_scalar(
+        native.db,
+        "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid=to_regclass(:relation) "
+        "AND indexrelid=to_regclass(:index) AND indisvalid)",
+        relation=relation,
+        index=f"{db_schema}.{index_name}",
+    )
+    if has_covering_index:
+        started = time.monotonic()
+        options = "SKIP_LOCKED, TRUNCATE OFF, INDEX_CLEANUP OFF" if published else "SKIP_LOCKED"
+        await native.db.execute_ddl(f"VACUUM ({options}) {relation};")
+        table_state = "published" if published else "staged"
+        native._record_phase_timing(
+            context, f"entity-address-unified vacuuming {table_state} main table", time.monotonic() - started, None
+        )
+
+
+async def refresh_published_address_serving(db_schema: str, context: dict) -> None:
+    """Refresh lookup visibility and ZIP coverage after the dependency transaction has closed."""
+    native = _native()
+    if not context.get("test_mode"):
+        try:
+            await vacuum_address_covering_index(
+                db_schema, native.EntityAddressUnified.__main_table__, context=context, published=True
+            )
+        except Exception:
+            native.logger.exception("Could not refresh visibility for the published address covering index")
+    await native.provider_geo_search.refresh_after_publication("address", test_mode=bool(context.get("test_mode")))
+
+
+@asynccontextmanager
+async def snapshot_publication_progress(context: dict, run_id: str):
+    """Record progress around the final snapshot publication block."""
+    native = _native()
+    phase = "entity-address-unified preparing snapshot publication"
+    await native._emit_phase_progress(
+        run_id, phase, unit="operations", done=0, total=1, message="validating finalized snapshot for publication"
+    )
+    started = time.monotonic()
+    yield
+    native._record_phase_timing(context, phase, time.monotonic() - started, context.get("staged_rows"))
+    await native._emit_phase_progress(
+        run_id, phase, unit="operations", done=1, total=1, message="snapshot publication preparation complete"
+    )
+
+
 async def analyze_staged_address_table(db_schema: str, stage_cls, *, context: dict, phase: str) -> None:
     """Analyze the stage and prepare visibility for the optional covering index."""
     native = _native()
     table_name = stage_cls.__tablename__
-    relation = f"{db_schema}.{table_name}"
     if getattr(stage_cls, "__main_table__", None) == native.EntityAddressUnified.__main_table__:
-        index_name = native._stage_index_name(table_name, ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX)
-        has_covering_index = await admitted.read_scalar(
-            native.db,
-            "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid=to_regclass(:relation) "
-            "AND indexrelid=to_regclass(:index) AND indisvalid)",
-            relation=relation,
-            index=f"{db_schema}.{index_name}",
-        )
-        if has_covering_index:
-            started = time.monotonic()
-            await native.db.execute_ddl(f"VACUUM (SKIP_LOCKED) {relation};")
-            native._record_phase_timing(
-                context, "entity-address-unified vacuuming staged main table", time.monotonic() - started, None
-            )
-    await native._run_sql_phase(f"ANALYZE {relation};", context=context, phase=phase)
+        await vacuum_address_covering_index(db_schema, table_name, context=context, published=False)
+    await native._run_sql_phase(f"ANALYZE {db_schema}.{table_name};", context=context, phase=phase)
 
 
 def _cutover_plan(db_schema, stage_cls, support_stage_class_map, context):

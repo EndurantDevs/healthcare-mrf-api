@@ -10,6 +10,7 @@ import pytest
 
 from process import control_lifecycle as lifecycle
 from process import live_progress
+from process.entity_address_candidate_preparation import snapshot_publication_progress
 from tests.live_progress_atomic_redis import AtomicLiveProgressRedis
 from tests.test_entity_address_unified_publication_db import _temporary_schema
 
@@ -177,12 +178,12 @@ def assert_phase_ordering():
     assert live_progress.read_live_progress("publication-parent")["done"] == 24
 
 
-async def assert_snapshot_publication_progress(monkeypatch, native, *, is_failed):
+async def assert_snapshot_publication_progress(monkeypatch, *, is_failed):
     token = progress_context(monkeypatch)
     context_by_field = {"staged_rows": 7}
 
     async def publish():
-        async with native._snapshot_publication_progress(context_by_field, "publication-parent"):
+        async with snapshot_publication_progress(context_by_field, "publication-parent"):
             progress = live_progress.read_live_progress("publication-parent")
             assert progress["phase"].endswith("preparing snapshot publication")
             assert (progress["done"], progress["total"], progress["phase_pct"]) == (0, 1, 0)

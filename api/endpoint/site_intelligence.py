@@ -93,7 +93,7 @@ async def _is_table_cached(session, model) -> bool:
 
 
 async def _should_use_pharmacy_geo_index(session) -> bool:
-    """Use GiST when a bounding-box index still needs to read heap pages."""
+    """Use GiST when the bounding-box index may still need substantial heap reads."""
     if not hasattr(session, "get_bind"):
         return False
     table = EntityAddressUnified.__table__
@@ -111,7 +111,8 @@ async def _should_use_pharmacy_geo_index(session) -> bool:
                        JOIN pg_catalog.pg_class AS address ON address.oid = idx.indrelid
                        WHERE idx.indexrelid = to_regclass(:covering_index)
                          AND idx.indisvalid
-                         AND address.relallvisible = address.relpages
+                         -- Keep heap reads bounded when vacuum leaves a few pages without visibility.
+                         AND address.relpages - address.relallvisible <= LEAST(address.relpages / 100, 64)
                          AND address.relpages > 0
                    )
                    AND EXISTS (
