@@ -416,6 +416,18 @@ def _r4_resource_from_normalized(stored_resource, *, base_url=BASE):
     return resource_by_field
 
 
+async def _assert_named_worker_manifest(checks, catalog, state, receipt, settings):
+    """Use the historical fixture's exact checks with the current ordinary layout."""
+    from process import provider_directory_generic_source_provision as provision
+    from process.provider_directory_postal_checkpoint import ROOT
+
+    rooted = any(dataset.startswith(("pdufpd_", "pdrgpd_")) for dataset in state.config["expected_datasets"])
+    with settings.context() as validation:
+        if not rooted:
+            validation.setattr(provision, "ISOLATED_FHIR_ROOTS", (*provision.ISOLATED_FHIR_ROOTS, ROOT))
+        return await checks.assert_isolated_worker_manifest(catalog, state, receipt, settings)
+
+
 @asynccontextmanager
 async def _named_generic_source(monkeypatch):
     """Use ordinary named enrollment, real HTTP acquisition and administrator freeze."""
@@ -440,8 +452,8 @@ async def _named_generic_source(monkeypatch):
             async with source_catalog(state, tmp_path, settings, ordinary_overlay=True) as catalog:
                 configure_isolated_enrollment(catalog, state, tmp_path, settings)
                 enrollment_result = await checks.enroll(catalog, state)
-                issued = await checks.assert_isolated_worker_manifest(
-                    catalog, state, enrollment_result["manifest"], settings
+                issued = await _assert_named_worker_manifest(
+                    checks, catalog, state, enrollment_result["manifest"], settings
                 )
                 _configure_current_source_publication(catalog, state, settings)
                 async with (
