@@ -60,10 +60,41 @@ class ResourceRetryState:
         )
 
 
+def _partition_retryable(directory, fetch_result):
+    """Require a saved, unverified partition with a transient fetch cooldown."""
+    diagnostic = fetch_result.fetch_diagnostic
+    return (
+        isinstance(diagnostic, dict)
+        and diagnostic.get("strategy_version") == directory.LAST_UPDATED_PARTITION_STRATEGY_VERSION
+        and diagnostic.get("verified") is False
+        and diagnostic.get("failure", False) is None
+        and fetch_result.error.startswith(f"{directory.LAST_UPDATED_PARTITION_RETRYABLE_ERROR}:")
+        and parsed_deadline(fetch_result.retry_not_before) is not None
+    )
+
+
 def retryable(directory, runner, source_record_by_field, fetch_result):
     """Only resume an unbounded native REST cursor with transient-fetch evidence."""
     options = runner.options
     checkpoint_context = source_record_by_field.get("_pagination_checkpoint_context")
+    if not (
+        options.checkpointing_enabled
+        and options.deferred_materialization
+        and runner.is_streaming
+        and options.per_resource_limit <= 0
+        and options.page_limit <= 0
+        and options.linked_resource_limit <= 0
+        and not options.stale_cleanup
+        and directory._has_bound_resource_scan_checkpoint(source_record_by_field, checkpoint_context)
+        and checkpoint_context.allow_retained_pagination_reset is False
+        and not fetch_result.complete
+        and fetch_result.error
+        and fetch_result.next_url_remaining
+        and not fetch_result.is_bounded
+    ):
+        return False
+    if fetch_result.fetch_mode == directory.LAST_UPDATED_PARTITION_FETCH_MODE:
+        return _partition_retryable(directory, fetch_result)
     diagnostic = fetch_result.fetch_diagnostic or {}
     is_timestamp_recovery = fetch_result.fetch_mode == timestamp_recovery.FETCH_MODE
     if is_timestamp_recovery:
@@ -88,21 +119,8 @@ def retryable(directory, runner, source_record_by_field, fetch_result):
         or diagnostic.get("response_class") != directory._source_fetch_response_class(status, error)
     ):
         return False
-    return bool(
-        options.checkpointing_enabled
-        and options.deferred_materialization
-        and runner.is_streaming
-        and options.per_resource_limit <= 0
-        and options.page_limit <= 0
-        and options.linked_resource_limit <= 0
-        and not options.stale_cleanup
-        and directory._has_bound_resource_scan_checkpoint(source_record_by_field, checkpoint_context)
-        and checkpoint_context.allow_retained_pagination_reset is False
-        and fetch_result.fetch_mode in {"checkpointed_paged", timestamp_recovery.FETCH_MODE}
-        and not fetch_result.complete
-        and fetch_result.error
-        and fetch_result.next_url_remaining
-        and not fetch_result.is_bounded
+    return (
+        fetch_result.fetch_mode in {"checkpointed_paged", timestamp_recovery.FETCH_MODE}
         and diagnostic.get("response_class")
         in {
             "transient_transport_error",
