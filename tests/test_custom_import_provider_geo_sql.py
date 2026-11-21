@@ -22,6 +22,7 @@ from api import provider_geo_sql as geo_sql
 from api import provider_list_sql as provider_list_sql
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import npi as npi_module
+from api.provider_geo_search import ProviderGeoSearch
 from api.provider_search_sql import plan_scope_query
 from db.connection import ConnectionProxy
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
@@ -808,11 +809,47 @@ async def test_postgres_required_geo_order_keeps_null_score_and_exact_address_pa
     assert len(calls) == 3 and all("AS _geo_total" in sql for sql, _ in calls)
 
 
+async def _seed_geo_projection(session):
+    """Include an office inside the index bound and outside the exact radius."""
+    await session.execute(
+        text(
+            "INSERT INTO mrf.entity_address_unified "
+            "(npi,type,checksum,lat,long,address_key,location_key,address_sources) VALUES "
+            "(1000000002,'primary',42,0.13,0.13,'00000000-0000-0000-0000-000000000006',"
+            "'outside-radius',ARRAY['synthetic'])"
+        )
+    )
+    await session.execute(
+        text(
+            "CREATE TABLE mrf.fixture_geo_projection AS "
+            "SELECT a.*, Geography(ST_MakePoint(a.long,a.lat)) AS geo FROM mrf.entity_address_unified a"
+        )
+    )
+    matches_only_bound = await session.scalar(
+        text(
+            "SELECT geo && _ST_Expand(Geography(ST_MakePoint(0,0)), 16093.4) "
+            "AND NOT ST_DWithin(geo, Geography(ST_MakePoint(0,0)), 16093.4) "
+            "FROM mrf.fixture_geo_projection WHERE location_key='outside-radius'"
+        )
+    )
+    assert matches_only_bound is True
+
+
 @pytest.mark.asyncio
-async def test_postgres_required_geo_order_pages_within_the_linked_plan(monkeypatch):
+@pytest.mark.parametrize("projected", (False, True), ids=("legacy", "projection"))
+async def test_postgres_required_geo_order_pages_within_the_linked_plan(monkeypatch, projected):
+    """Keep linked-plan counts and cursors exact on both address paths."""
+    address_table = "mrf.entity_address_unified" if projected else "mrf.npi_address"
     async with transaction_session() as session:
         await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
-        await _seed_geo_tables(session)
+        await _seed_geo_tables(session, address_table_sql=address_table)
+        if projected:
+            await _seed_geo_projection(session)
+
+            async def projection(*_args, **_kwargs):
+                return ProviderGeoSearch("mrf.fixture_geo_projection")
+
+            monkeypatch.setattr(npi_module, "request_geo_search", projection)
         await session.execute(text("CREATE TABLE mrf.fixture_plan_members (snapshot_key bigint, npi bigint)"))
         await session.execute(
             text(
@@ -826,7 +863,9 @@ async def test_postgres_required_geo_order_pages_within_the_linked_plan(monkeypa
             return plan_scope_query({"mrf.fixture_plan_members": {1, 2}})
 
         monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _PostgresGeoProxy)
-        monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
+        monkeypatch.setattr(
+            npi_module, "_address_serving_table_sql", partial(_legacy_address_table, address_table_sql=address_table)
+        )
         monkeypatch.setattr(npi_module, "_plan_release_npi_scope", plan_scope)
         options_by_name = {"require_match": True, "plan_release_id": "fixture-release"}
         first = await _read_postgres_geo_page(session, "desc", **options_by_name)
@@ -839,7 +878,12 @@ async def test_postgres_required_geo_order_pages_within_the_linked_plan(monkeypa
     assert _provider_identities(second) == [(1000000002, _SECOND_ADDRESS_KEY)]
     assert first["total_count"] == second["total_count"] == 3
     assert first["has_more"] is True and second["has_more"] is False
-    assert len(calls) == 2 and all("(a.npi IN (" in sql and ")) IS TRUE" in sql for sql, _ in calls)
+    assert len(calls) == 2
+    if projected:
+        assert all("a.geo && _ST_Expand(" in sql and "FROM bounding_members AS a" in sql for sql, _ in calls)
+        assert all("a.npi IN (SELECT npi FROM plan_member_npis)" in sql for sql, _ in calls)
+    else:
+        assert all("(a.npi IN (" in sql and ")) IS TRUE" in sql for sql, _ in calls)
 
 
 def _wide_geo_page_statement(context, address_table_sql: str, direction: str):

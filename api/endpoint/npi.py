@@ -10716,12 +10716,10 @@ async def get_near_npi(
             )
             imported_statements = build_imported_geo_statements(
                 import_context,
-                ImportedGeoQuery(
-                    nearby=nearby_query.with_legacy_plan_membership(legacy_page_clauses),
-                    native_parameters=query_parameters_by_name,
-                    limit=limit,
-                    cursor_anchor=cursor_anchor,
-                ),
+                ImportedGeoQuery(nearby_query, query_parameters_by_name, limit, cursor_anchor),
+                plan_member_sql=plan_member_sql,
+                extra_filters=extra_filters,
+                legacy_page_clauses=legacy_page_clauses,
             )
 
         async def fetch_nearby_rows() -> list[Any]:
