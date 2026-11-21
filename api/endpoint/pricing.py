@@ -53,6 +53,7 @@ from api.custom_import_provider_service_sql import (
     build_provider_service_claims_statements,
     provider_service_native_args,
     provider_service_zip_filter,
+    single_procedure_provider_page_query,
 )
 from api.endpoint.pagination import PaginationParams, parse_pagination
 from api.network_address_scope import canonical_network_read
@@ -4611,53 +4612,6 @@ async def _precomputed_procedure_provider_count(
     )
     value = result.scalar()
     return _as_int(value) if value is not None else None
-
-
-def _single_procedure_provider_page_query(
-    *,
-    year: int,
-    procedure_code: int,
-    order: str,
-    limit: int,
-    offset: int,
-):
-    query = (
-        select(
-            provider_procedure_table.c.npi.label("npi"),
-            provider_table.c.provider_name.label("provider_name"),
-            provider_table.c.provider_type.label("provider_type"),
-            provider_table.c.city.label("city"),
-            provider_table.c.state.label("state"),
-            provider_table.c.zip5.label("zip5"),
-            provider_procedure_table.c.total_services.label("total_services"),
-            provider_procedure_table.c.total_submitted_charges.label("total_submitted_charges"),
-            provider_procedure_table.c.total_allowed_amount.label("total_allowed_amount"),
-            provider_procedure_table.c.total_beneficiaries.label("total_beneficiaries"),
-            literal(1).label("matched_service_codes"),
-        )
-        .select_from(
-            provider_procedure_table.join(
-                provider_table,
-                and_(
-                    provider_table.c.npi == provider_procedure_table.c.npi,
-                    provider_table.c.year == provider_procedure_table.c.year,
-                ),
-            )
-        )
-        .where(
-            and_(
-                provider_procedure_table.c.year == year,
-                provider_procedure_table.c.procedure_code == procedure_code,
-            )
-        )
-    )
-    amount = provider_procedure_table.c.total_allowed_amount
-    npi = provider_procedure_table.c.npi
-    query = query.order_by(
-        amount.asc() if order == "asc" else amount.desc(),
-        npi.desc() if order == "asc" else npi.asc(),
-    )
-    return query.limit(limit).offset(offset)
 
 
 async def _query_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[dict[str, Any]]:
@@ -12212,7 +12166,6 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         filters.append(npi_data_table.c.provider_sex_code == provider_sex_code)
     where_clause = and_(*filters)
 
-    total = None
     if (
         import_context is None
         and canonical_network_clause is None
@@ -12235,14 +12188,20 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             year=year,
             procedure_code=internal_codes[0],
         )
-    if total is not None:
-        query = _single_procedure_provider_page_query(
+        query = single_procedure_provider_page_query(
             year=year,
             procedure_code=internal_codes[0],
             order=order,
             limit=pagination.limit,
             offset=pagination.offset,
+            reverse_ascending_ties=total is not None,
         )
+        if total is None:
+            # A single code has at most one claim row and one provider row per NPI and year.
+            count_result = await session.execute(
+                select(func.count()).select_from(provider_procedure_from).where(where_clause)
+            )
+            total = int(count_result.scalar() or 0)
     else:
         grouped = (
             select(

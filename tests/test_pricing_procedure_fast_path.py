@@ -6,6 +6,7 @@ from contextlib import nullcontext
 
 import pytest
 
+from api.custom_import_provider_service_sql import single_procedure_provider_page_query
 from tests.test_pricing_api import (
     FakeResult,
     FakeSession,
@@ -49,7 +50,7 @@ def test_single_code_consecutive_pages_break_amount_ties_by_npi(
     expected_order,
 ):
     queries = (
-        pricing_module._single_procedure_provider_page_query(
+        single_procedure_provider_page_query(
             year=2023,
             procedure_code=1099885900,
             order=order,
@@ -131,8 +132,9 @@ async def test_taxonomy_signal_unavailable_keeps_existing_query(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch):
-    """Use precomputed totals and one ordered provider-page query."""
+@pytest.mark.parametrize(("precomputed_total", "order"), ((3, "desc"), (None, "desc"), (None, "asc")))
+async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch, precomputed_total, order):
+    """Use an ordered provider-page query even when the requested year has no rollup."""
 
     monkeypatch.setattr(pricing_module, "_resolve_internal_codes_for_request", _resolve_single_internal_code)
     monkeypatch.setattr(pricing_module, "_enrich_provider_service_cost_indices", _skip_cost_enrichment)
@@ -149,13 +151,17 @@ async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch):
         "total_beneficiaries": 10.0,
         "matched_service_codes": 1,
     }
+    query_results = [FakeResult(scalar=precomputed_total)]
+    if precomputed_total is None:
+        query_results.append(FakeResult(scalar=3))
     request = make_request(
-        [FakeResult(scalar=3), FakeResult(rows=[provider_by_field])],
+        [*query_results, FakeResult(rows=[provider_by_field])],
         args={
             "code": "99213",
             "code_system": "CPT",
             "year": "2023",
             "limit": "1",
+            "order": order,
         },
     )
 
@@ -171,8 +177,12 @@ async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch):
     ]
     statements = [str(execution_args[0]) for execution_args, _execution_kwargs in request.ctx.sa_session.executions]
     provider_statements = [statement for statement in statements if "pricing_provider_procedure" in statement]
-    assert len(provider_statements) == 1
-    assert "GROUP BY" not in provider_statements[0]
+    assert len(provider_statements) == (2 if precomputed_total is None else 1)
+    assert all("GROUP BY" not in statement for statement in provider_statements)
+    if precomputed_total is None:
+        assert "count(*)" in provider_statements[0].lower()
+        assert "pricing_provider.year" in provider_statements[0]
+    assert f"total_allowed_amount {order.upper()}, mrf.pricing_provider_procedure.npi ASC" in provider_statements[-1]
     assert any("pricing_procedure.provider_count" in statement for statement in statements)
 
 
