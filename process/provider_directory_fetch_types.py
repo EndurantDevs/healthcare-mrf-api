@@ -148,6 +148,9 @@ class PartitionFetchState:
     next_url_remaining: bool = False
     seen_urls: set[str] = field(default_factory=set)
     completed_partition_identities: set[str] = field(default_factory=set)
+    postal_checkpoint_context: PaginationCheckpointContext | None = None
+    resumed_partition_pages: int = 0
+    resumed_partition_rows: int = 0
     retry_leaf_urls: dict[str, str] = field(default_factory=dict)
     active_chain_count: int = 0
     pending_partition_checkpoint_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -174,6 +177,7 @@ class PartitionFetchOptions:
 class PartitionPageFetchResult:
     next_url: str | None
     outcome: str
+    rows_fetched: int = 0
 
 
 @dataclass(frozen=True)
