@@ -75,9 +75,10 @@ async def _sources(connection, namespace, snapshot, *, source_generations=None):
     """Validate the complete source vector before returning selected retained products."""
     vector = snapshot["source_vector_json"]
     vector = json.loads(vector) if type(vector) is str else vector
-    if type(vector) is not list or len(vector) > 1000:
+    try:
+        validate_fhir_catalog_source_vector(vector)
+    except ValueError:
         _fail()
-    validate_fhir_catalog_source_vector(vector)
     vector_by_generation = {entry["source_generation"]: entry for entry in vector}
     selected_generations = _selected_source_generations(source_generations, vector_by_generation)
     sources_by_key, generations, after = {}, set(), ""

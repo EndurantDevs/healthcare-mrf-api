@@ -14,8 +14,10 @@ import pytest
 from process import registry_fhir_catalog_products as products
 from process import registry_fhir_catalog_sync as sync
 from process.registry_fhir_catalog_retained import _descriptor
+from process.registry_native_network_catalog import native_catalog_descriptor
 from tests.test_registry_fhir_catalog_products import ClosedInputs, _binding_document
 from tests.test_registry_fhir_catalog_retained import recipe_fixture
+from tests.test_registry_imported_source_inventory import native_ptg_source
 
 
 class GenerationInputs(ClosedInputs):
@@ -82,6 +84,32 @@ async def test_pinned_generation_selects_same_approval_key_independently_of_fres
     assert {json.loads(row[-1])["evidence_sha256"] for row in bindings} == {"e" * 64}
     assert connection.selectors == approved_before
     assert all("registry_fhir_catalog_binding" not in sql for sql, _ in connection.calls)
+
+
+@pytest.mark.asyncio
+async def test_mixed_source_vector_selects_reviewed_products_above_current_source_limit():
+    connection = GenerationInputs()
+    native_rows = []
+    for ordinal in range(999):
+        source = native_ptg_source()
+        source["source_id"] = source["definitions"][0]["source_key"] = f"source-{ordinal:04d}"
+        native_rows.append(connection._source(native_catalog_descriptor(source)))
+    connection.sources = sorted(connection.sources + native_rows, key=lambda row: row["generation"])
+    candidate = connection.snapshot
+    vector = candidate["source_vector_json"]
+    vector.sort(key=lambda entry: (entry["source_id"], entry["source_generation"]))
+    retained_generations = {connection.original_generation, connection.generation}
+    for entry in vector:
+        if entry["source_generation"] not in retained_generations:
+            entry["status"] = "current"
+    selected_generations = tuple(row["generation"] for row in native_rows) + (connection.generation,)
+    assert len(vector) == 1001 and len(selected_generations) == 1000
+    assert await selected(connection, selected_generations, candidate=candidate) == {
+        connection.generation: connection.active_descriptor,
+    }
+    connection.sources.remove(native_rows[0])
+    with pytest.raises(products.FHIRCatalogProductError):
+        await selected(connection, selected_generations, candidate=candidate)
 
 
 @pytest.mark.asyncio

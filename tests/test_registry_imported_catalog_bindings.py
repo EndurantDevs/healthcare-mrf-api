@@ -71,6 +71,17 @@ async def test_exact_published_source_uses_catalog_without_manual_admission(cata
     assert case.connection.fetchval.await_args_list[-1].args[1:] == (7, *case.coordinates.sql_parameters)
 
 
+@pytest.mark.asyncio
+async def test_published_binding_resolves_from_combined_source_vector(catalog_case):
+    vector = json.loads(catalog_case.snapshot["source_vector"])
+    vector.extend(
+        {"source_generation": f"{index:064x}", "source_id": f"source-{index}", "status": "current"}
+        for index in range(1, 1001)
+    )
+    catalog_case.snapshot["source_vector"] = json.dumps(vector)
+    assert "approved_network_bindings AS MATERIALIZED" in await bindings(catalog_case)
+
+
 def _damage_catalog_scope(case, damage):
     if damage in {"last_good", "missing", "duplicate"}:
         _damage_source_vector(case, damage)
