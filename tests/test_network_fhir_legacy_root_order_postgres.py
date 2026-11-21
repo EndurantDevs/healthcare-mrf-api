@@ -188,6 +188,7 @@ async def test_historical_source_closes_typed_capture_and_replays_without_old_wi
 
     async def observe(scope, origin):
         scope.require_active()
+        assert all(scope is not previous for previous in passes)
         assert dict(
             await scope.connection.fetchrow(
                 "SELECT current_setting('transaction_read_only') AS readonly,"
@@ -205,8 +206,9 @@ async def test_historical_source_closes_typed_capture_and_replays_without_old_wi
         descriptor, _ = await _observed_source_descriptor(
             case.source_runtime, case.source_profile, case.origin, catalog
         )
+        assert not passes
         document, anchor = await _produce_recipe_capture(case, descriptor, (case.fixture.component.reader,))
-        assert len(passes) == 2
+        assert len(passes) == 1
         _assert_closed_root_scopes(passes)
         assert document["graph"]["origin"]["dataset_sha256"] == recorded["root"]
         assert dict(document["graph"]["origin"]["resource_hashes"]) == recorded["hashes"]
@@ -220,13 +222,13 @@ async def test_historical_source_closes_typed_capture_and_replays_without_old_wi
         finally:
             for name in names_by_kind.values():
                 await case.reader.execute('DROP TABLE "' + name + '"')
-        assert len(passes) == 3
+        assert len(passes) == 2
         _assert_closed_root_scopes(passes)
         arguments = capture_arguments(case)
         with pytest.raises(RetainedFHIRCaptureError):
             await _capture(case, witness, arguments)
         await _assert_rolled_back(case, arguments)
-        assert len(passes) == 4 and await _header(case) == before
+        assert len(passes) == 3 and await _header(case) == before
         _assert_closed_root_scopes(passes)
 
 
