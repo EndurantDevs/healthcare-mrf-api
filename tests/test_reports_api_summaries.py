@@ -235,6 +235,7 @@ def test_build_market_sql_uses_unified_address_table_and_index_friendly_filters(
     assert "LEFT(a.postal_code, 5) = :zip_code" not in data_sql
     assert "g.zip_code = a.zip5" in data_sql
     assert "pd.npi9 = (a.npi / 10)" in data_sql
+    assert "SELECT DISTINCT npi / 10 AS npi9 FROM market_addresses" in data_sql
     assert "has_ncpdp_identifier" in data_sql
     assert "has_medicaid_identifier" in data_sql
     assert "has_railroad_medicare_identifier" in data_sql
@@ -272,6 +273,7 @@ def test_market_sql_bounds_known_zip_before_enrichment(market_id, market_zip):
     assert params.get("market_zip") == market_zip
     assert ("a.zip5 = :market_zip" in address_query) == (market_zip is not None)
     assert address_query.startswith("MATERIALIZED" if market_zip is not None else "NOT MATERIALIZED")
+    assert ("SELECT DISTINCT npi / 10 AS npi9 FROM market_addresses" in data_sql) == (market_zip is not None)
     assert ("swm.market_id = :market_id" in data_sql) == (market_id is not None)
 
 
