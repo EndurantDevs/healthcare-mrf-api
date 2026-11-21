@@ -297,5 +297,19 @@
       "provider_directory_acquisition_enabled": true,
       "provider_directory_probe_resource": "Practitioner"
     }
+  },
+  {
+    "id": "optum-flex-provider-directory",
+    "org_tin": "41-1321939",
+    "org_name": "UnitedHealthcare",
+    "plan_name": "UHC Community Plan LA",
+    "api_base": "https://www.uhc.com/legal/interoperability-apis",
+    "portal_url": "https://www.uhc.com/legal/interoperability-apis",
+    "fhir_version": "4.0.1",
+    "source": "defacto_2024",
+    "source_url": "https://defacto.health/2024/06/24/state-of-provider-directory-apis-2024/",
+    "requires_registration": false,
+    "auth_type": "none",
+    "source_detail": "Identity fields adapted from the Provider Directory DB, Mullan Institute for Health Workforce Equity, George Washington University (https://github.com/hltiunn/provider-directory-db/blob/1d55eebea5688258cc2b4a0b0b10855b8d8b9f15/data/provider_directory.db), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). The public directory endpoint is normalized to Optum Flex."
   }
 ]

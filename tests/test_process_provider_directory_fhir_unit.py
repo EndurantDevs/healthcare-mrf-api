@@ -15396,8 +15396,8 @@ def _write_supplemental_catalog_fixtures(tmp_path):
 
 
 def _assert_supplemental_catalog_metrics(metrics) -> None:
-    assert metrics["sources_seeded"] == 33
-    assert metrics["supplemental_catalog_sources_considered"] == 33
+    assert metrics["sources_seeded"] == 34
+    assert metrics["supplemental_catalog_sources_considered"] == 34
     catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
     assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
     assert catalog_metrics["amerihealth_caritas"]["rows"] == 1
@@ -15408,7 +15408,7 @@ def _assert_supplemental_catalog_metrics(metrics) -> None:
     assert catalog_metrics["anthem"]["rows"] == 1
     assert catalog_metrics["aetna_provider_directorydata"]["rows"] == 1
     assert catalog_metrics["mvp_health_care"]["rows"] == 1
-    assert catalog_metrics["configured_sources"]["rows"] == 12
+    assert catalog_metrics["configured_sources"]["rows"] == 13
     assert catalog_metrics["provider_directory_blockers"]["rows"] == 3
 
 
@@ -15436,6 +15436,13 @@ def _assert_supplemental_source_rows(upserted_source_rows) -> None:
     independence = _source_seeded_from(upserted_source_rows, "independence-provider-directory")
     assert independence["source_id"] == "pdfhir_dd4d8d4cf1e5dd3e609ae0b3"
     assert independence["canonical_api_base"] == importer.INDEPENDENCE_PROVIDER_DIRECTORY_BASE
+    optum_sources = [
+        source_row
+        for source_row in upserted_source_rows
+        if source_row["source_id"] == "pdfhir_0b5cfd565c53364a73981dcb"
+    ]
+    assert len(optum_sources) == 1
+    assert optum_sources[0]["canonical_api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
     blockers = [
         source_row
         for source_row in upserted_source_rows

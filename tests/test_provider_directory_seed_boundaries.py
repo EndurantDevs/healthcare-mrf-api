@@ -10,6 +10,8 @@ import ssl
 import urllib.error
 from unittest.mock import Mock
 
+from api.provider_directory_sources import provider_directory_source_catalog
+
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -44,6 +46,20 @@ def test_baked_seed_registry_resolves_generated_and_configured_sources_without_r
     assert len({source_record["source_id"] for source_record in source_records}) == 2
     assert len({source_record["api_base"] for source_record in source_records}) == 2
     unavailable.assert_not_called()
+
+
+def test_optum_catalog_source_resolves_for_named_enrollment():
+    entry = next(item for item in provider_directory_source_catalog()["items"] if item["entry_id"] == "uhc")
+    seeds, _ = importer.source_selection.baked_seed_rows(importer)
+    sources = [importer._source_row_from_seed(seed) for seed in seeds]
+    matching_sources = [source for source in sources if source["source_id"] in entry["source_ids"]]
+    assert len(matching_sources) == 1
+    source = matching_sources[0]
+
+    assert entry["runnable"] is True
+    assert importer._resource_acquisition_blocked_reason(source) is None
+    endpoint = importer._provider_directory_api_endpoint_row(source)
+    assert endpoint["canonical_api_base"] == entry["canonical_base"]
 
 
 def test_supplemental_catalog_preserves_order_and_metrics_through_baked_registry(monkeypatch):
