@@ -2,6 +2,7 @@
 """REST artifact lifecycle boundaries; native authority is tested separately."""
 
 import asyncio
+import importlib
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -472,7 +473,12 @@ async def test_partial_address_pins_source_on_its_own_transaction(case, monkeypa
     selected = replace(case.admission, task=asyncio.current_task()).fence
     selected.datasets[0].dataset_id = "dataset"
     selected.datasets[0].evidence_run_id = "root"
-    case.directory._resolve_provider_directory_artifact_datasets = AsyncMock(return_value=selected)
+    named = importlib.import_module("process.provider_directory_named_edition")
+    resolve = AsyncMock(return_value=selected)
+    held_editions = (SimpleNamespace(endpoint_id="endpoint"),)
+    hold = AsyncMock(return_value=held_editions)
+    monkeypatch.setattr(named, "resolve_artifact_datasets", resolve)
+    monkeypatch.setattr(named, "locked_source_editions", hold)
     lock = AsyncMock()
     verify = AsyncMock()
     monkeypatch.setattr(artifacts, "_lock_ordinary_controls", lock)
@@ -483,6 +489,8 @@ async def test_partial_address_pins_source_on_its_own_transaction(case, monkeypa
         partial_provider_directory_source_ids=["source_a"],
     )
     await artifacts.lock_address_source_fence(case.directory, case.directory.db, "sample", context_by_field)
+    hold.assert_awaited_once_with(case.directory, ["source_a"])
+    resolve.assert_awaited_once_with(case.directory, ["source_a"], named_editions=held_editions)
     lock.assert_awaited_once_with(case.directory, selected, case.directory.db)
     verify.assert_awaited_once_with(case.directory, selected, case.directory.db, for_update=False)
     with pytest.raises(RuntimeError, match="address_source_fence_changed"):
@@ -492,6 +500,36 @@ async def test_partial_address_pins_source_on_its_own_transaction(case, monkeypa
             "sample",
             {**context_by_field, "partial_provider_directory_run_id": "other"},
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_schema", [None, "selected_edition"])
+async def test_resource_input_scope_keeps_the_selected_named_or_catalog_route(monkeypatch, storage_schema):
+    from process import provider_directory_named_edition as named
+    from process import provider_directory_source_storage_binding as storage
+
+    directory = importlib.import_module("process.provider_directory_fhir")
+    dataset = SimpleNamespace(dataset_id="dataset", storage_schema=storage_schema)
+    admission = SimpleNamespace(factory=None, fence=SimpleNamespace(datasets=(dataset,)))
+    root = directory.ProviderDirectoryDatasetResource.__tablename__
+    resolve = AsyncMock(return_value={root: {"schema": "candidate", "name": "selected_resources"}})
+    monkeypatch.setattr(storage, "dataset_source_relations", resolve)
+    monkeypatch.setattr(directory, "_schema", lambda: "catalog")
+    original_by_relation = dict(directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get())
+    async with artifacts._resource_input_scope(directory, admission):
+        resource = named.artifact_resource_input_relation(directory, "catalog", dataset)
+        header = named.artifact_resource_header_relation(directory, "catalog", dataset)
+        if storage_schema is None:
+            assert resource == '"candidate"."selected_resources"'
+            assert header == '"catalog"."provider_directory_endpoint_dataset"'
+        else:
+            assert resource == '"selected_edition"."provider_directory_dataset_resource"'
+            assert header == '"selected_edition"."provider_directory_endpoint_dataset"'
+    assert directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == original_by_relation
+    if storage_schema is None:
+        resolve.assert_awaited_once_with(directory.db, "catalog", "dataset", (root,))
+    else:
+        resolve.assert_not_awaited()
 
 
 @pytest.mark.asyncio

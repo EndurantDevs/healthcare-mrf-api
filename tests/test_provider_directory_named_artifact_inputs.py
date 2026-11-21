@@ -365,3 +365,47 @@ def test_named_payload_relation_has_one_arm_per_logical_dataset():
     assert fhir._artifact_payload_relation("mrf", model, (alias, original)) == once
     mixed = fhir._artifact_payload_relation("mrf", model, (original, alias, successor))
     assert mixed.count('FROM "' + original.storage_schema + '"."provider_directory_dataset_resource"') == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("moved", [False, True])
+async def test_read_committed_pointer_read_waits_for_the_endpoint_publication_lock(monkeypatch, moved):
+    """The fence locks every selected endpoint before it reads pointers, and refuses a moved alias."""
+    from process import provider_directory_named_edition as editions
+
+    events = []
+    endpoint_reads = iter([["endpoint-a"], ["endpoint-b" if moved else "endpoint-a"]])
+
+    async def read_endpoints(_statement, **_parameters):
+        events.append("endpoints")
+        return [{"endpoint_id": endpoint_id} for endpoint_id in next(endpoint_reads)]
+
+    async def lock(endpoints, _database):
+        events.append(("lock", tuple(endpoints.endpoint_ids)))
+
+    async def read_editions(_session, schema, source_ids):
+        events.append(("editions", schema, tuple(source_ids)))
+        return ("edition",)
+
+    session = object()
+    directory = SimpleNamespace(
+        db=SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session), all=read_endpoints),
+        _schema=lambda: "catalog",
+        ProviderDirectorySource=fhir.ProviderDirectorySource,
+        ProviderDirectoryArtifactBuildStale=fhir.ProviderDirectoryArtifactBuildStale,
+        _pagination_checkpoint_row_mapping=dict,
+        _lock_artifact_fence_endpoint_advisories=lock,
+    )
+    monkeypatch.setattr(editions, "named_editions_for_session", read_editions)
+    if moved:
+        with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="source_endpoint_dataset_changed"):
+            await editions.locked_source_editions(directory, ["source-a"])
+        assert events == ["endpoints", ("lock", ("endpoint-a",)), "endpoints"]
+    else:
+        assert await editions.locked_source_editions(directory, ["source-a"]) == ("edition",)
+        assert events == [
+            "endpoints",
+            ("lock", ("endpoint-a",)),
+            "endpoints",
+            ("editions", "catalog", ("source-a",)),
+        ]

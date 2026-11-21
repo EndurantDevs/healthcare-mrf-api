@@ -498,6 +498,7 @@ async def test_selected_address_inputs_are_rechecked_before_use(monkeypatch, fai
 async def test_candidate_preparation_rejects_without_leaking_task_context(monkeypatch, failure):
     native = candidate._native()
     monkeypatch.setattr(native.db, "_transaction_binding", lambda: None)
+    monkeypatch.setattr(candidate, "_pinned_named_editions", AsyncMock(return_value=()))
     build = AsyncMock()
     finalize = AsyncMock(return_value=object())
     dependencies = AsyncMock(return_value=SimpleNamespace())
@@ -1785,6 +1786,7 @@ async def test_native_preparation_reports_original_and_owned_cleanup_errors_with
 
     database.status = AsyncMock(side_effect=status)
     monkeypatch.setattr(native, "db", database)
+    monkeypatch.setattr(candidate, "_pinned_named_editions", AsyncMock(return_value=()))
     monkeypatch.setattr(native, "_acquire_cutover_locks", AsyncMock())
     monkeypatch.setattr(candidate.prepared_doctors, "capture_dependencies", AsyncMock(return_value=SimpleNamespace()))
 

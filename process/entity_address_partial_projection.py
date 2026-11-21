@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from db.plan_release_storage import storage_relation
 from process import entity_address_preparation_admission as admission
 from process import provider_directory_generic_source_policy as source_policy
+from process import provider_directory_named_edition as named_source_editions
 from process.ext.address_batch_stage import lookup_key_sql
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
@@ -55,7 +56,7 @@ def _desired_scope_sql(native, schema, inputs, source_ids, run_id):
     selected = f"WHERE source_id=ANY({native._string_array_literal(list(source_ids))})" if source_ids else ""
     run_filter = f"WHERE dataset.run_id={native._sql_literal(run_id)}" if run_id else ""
     return f"""WITH {preparation._pins_cte(inputs)},desired_datasets AS MATERIALIZED (
-        {preparation._desired_datasets_sql(schema, inputs.ordinary_serving_peer_pins)}
+        {preparation._desired_datasets_sql(schema, inputs.ordinary_serving_peer_pins, preparation._NAMED_EDITIONS.get())}
     ), requested_endpoints AS MATERIALIZED (
         SELECT DISTINCT endpoint_id FROM desired_dataset_pins {selected}
     ), datasets AS MATERIALIZED (
@@ -69,8 +70,7 @@ def _scope_sql(native, schema, source_ids=None, run_id=None):
     inputs = native.candidate_preparation.current()
     if inputs is not None:
         return _desired_scope_sql(native, schema, inputs, source_ids, run_id)
-    source_relation = storage_relation(schema, "provider_directory_source")
-    datasets = storage_relation(schema, "provider_directory_endpoint_dataset")
+    source_relation, datasets, _members = named_source_editions.address_source_relations(schema)
     selected = (
         f"source.source_id=ANY({native._string_array_literal(list(source_ids))})"
         if source_ids
@@ -119,7 +119,9 @@ def _selected_scope(native, relation, source_ids, run_id):
 
 def _raw_sql(native, schema, *, source_ids=None, run_id=None, affected_group_table=None, exclude=None):
     overlay = storage_relation(schema, native.candidate_preparation.table_name("provider_directory_address_overlay"))
-    members = storage_relation(schema, "provider_directory_dataset_resource")
+    preparation = native.candidate_preparation
+    editions = preparation._NAMED_EDITIONS.get() if preparation.current() is not None else None
+    _sources, _datasets, members = named_source_editions.address_source_relations(schema, editions)
     active = _ACTIVE.get()
     selected = (
         _selected_scope(native, active.scope_relation, source_ids, run_id)
@@ -250,7 +252,9 @@ async def prepare_load(native, schema, available, affected_group_table):
 
 
 def _cached_membership_join(native, schema):
-    members = storage_relation(schema, "provider_directory_dataset_resource")
+    preparation = native.candidate_preparation
+    editions = preparation._NAMED_EDITIONS.get() if preparation.current() is not None else None
+    _sources, _datasets, members = named_source_editions.address_source_relations(schema, editions)
     statement = f"JOIN LATERAL (SELECT 1 FROM {members} member WHERE member.dataset_id=overlay.dataset_id AND member.resource_type=overlay.resource_type AND member.resource_id=overlay.resource_id LIMIT 1) cached_membership ON TRUE"
     return native.candidate_preparation.source_sql(schema, statement)
 

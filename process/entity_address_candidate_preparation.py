@@ -19,6 +19,7 @@ from db.models.entity_address_unified import ENTITY_ADDRESS_PRIMARY_GEO_BBOX_IND
 from process import entity_address_preparation_admission as admitted
 from process import entity_address_prepared_doctors as prepared_doctors
 from process import entity_address_source_preparation as source_preparation
+from process import provider_directory_named_edition as named_source_editions
 
 if TYPE_CHECKING:
     from process.provider_directory_cms_overlay_projection import DesiredOverlayProjection
@@ -62,6 +63,7 @@ class PreparedEntityAddressGeneration:
     committed: bool = False
     native_dependencies: prepared_doctors.PreparedAddressDependencies | None = None
     source_preparation: object = field(default=None, repr=False, compare=False)
+    named_editions: tuple = ()
 
     @property
     def native_receipt(self) -> dict | None:
@@ -92,6 +94,7 @@ _PREPARATION: ContextVar[ProviderDirectoryAddressPreparationInput | None] = Cont
 _NATIVE_DEPENDENCIES: ContextVar[prepared_doctors.PreparedAddressDependencies | None] = ContextVar(
     "entity_address_candidate_dependencies", default=None
 )
+_NAMED_EDITIONS: ContextVar[tuple] = ContextVar("entity_address_candidate_named_editions", default=())
 
 
 @dataclass(frozen=True)
@@ -329,15 +332,33 @@ def _ordinary_serving_peers_sql(db_schema, pins):
     )
 
 
-def _desired_datasets_sql(db_schema: str, ordinary_serving_peer_pins=()) -> str:
+async def _pinned_named_editions(inputs) -> tuple:
+    """Locate pinned datasets that are stored only in their own named edition."""
+    directory = importlib.import_module("process.provider_directory_fhir")
+    editions = await named_source_editions.selected_editions(directory, [pin.source_id for pin in inputs.dataset_pins])
+    endpoint_ids = {pin.endpoint_id for pin in inputs.dataset_pins}
+    return tuple(edition for edition in editions if edition.endpoint_id in endpoint_ids)
+
+
+def _desired_datasets_sql(db_schema: str, ordinary_serving_peer_pins=(), editions=()) -> str:
     # The bounded summary of a sealed dataset lists the same sources as its much larger raw document.
     membership = (
         "COALESCE(dataset.publication_metadata_summary_json -> 'source_ids', "
         "(dataset.publication_metadata_json -> 'source_ids')::jsonb) @> jsonb_build_array(pin.source_id)"
     )
     dataset_relation = f"{db_schema}.provider_directory_endpoint_dataset"
+    if editions:
+        columns = (
+            *("dataset_id", "endpoint_id", "dataset_hash", "acquisition_root_run_id", "status", "is_current"),
+            *("published_at", "validated_at", "superseded_at"),
+            *("publication_metadata_summary_json", "publication_metadata_json"),
+        )
+        dataset_relation = named_source_editions.source_relation_sql(
+            db_schema, named_source_editions.HEADER, editions, columns=columns, only=bool(ordinary_serving_peer_pins)
+        )
     if ordinary_serving_peer_pins:
-        dataset_relation = "ONLY " + dataset_relation
+        if not editions:
+            dataset_relation = "ONLY " + dataset_relation
         membership = (
             f"CASE WHEN {_ordinary_serving_peers_sql(db_schema, ordinary_serving_peer_pins)} THEN true "
             f"ELSE {membership} END"
@@ -362,11 +383,12 @@ def _pins_cte(inputs: ProviderDirectoryAddressPreparationInput) -> str:
     )
 
 
-async def assert_dataset_pins(db_schema: str, inputs: ProviderDirectoryAddressPreparationInput) -> None:
+async def assert_dataset_pins(db_schema: str, inputs: ProviderDirectoryAddressPreparationInput, editions=None) -> None:
     """Require every desired dataset to retain its exact admitted content identity."""
+    editions = _NAMED_EDITIONS.get() if editions is None else editions
     matched = await _preparation_scalar(
         f"WITH {_pins_cte(inputs)} SELECT count(*) FROM "
-        f"({_desired_datasets_sql(db_schema, inputs.ordinary_serving_peer_pins)}) AS selected"
+        f"({_desired_datasets_sql(db_schema, inputs.ordinary_serving_peer_pins, editions)}) AS selected"
     )
     if matched != len(inputs.dataset_pins):
         raise RuntimeError("entity-address preparation dataset pins changed")
@@ -383,6 +405,54 @@ async def assert_selected_dataset(db_schema: str, source_id: str, dataset_id: st
     await assert_dataset_pins(db_schema, inputs)
 
 
+def current_overlay_ctes(
+    db_schema: str,
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    run_id: str | None = None,
+    affected_group_table: str | None = None,
+    named_editions=None,
+) -> str:
+    """Return CTEs that retain only current, published dataset overlay rows."""
+    if current() is not None or has_source_query():
+        return desired_overlay_ctes(
+            db_schema, source_ids=source_ids, run_id=run_id, affected_group_table=affected_group_table
+        )
+
+    relations = named_source_editions.address_source_relations(db_schema, named_editions)
+    source_ref, dataset_ref, dataset_resource_ref = relations
+    overlay_ref = f"{db_schema}.provider_directory_address_overlay"
+    requested_source_filter = (
+        f"WHERE source.source_id = ANY({_native()._string_array_literal(list(source_ids))})"
+        if source_ids
+        else "WHERE source.endpoint_id IS NOT NULL"
+    )
+    run_filter = f"\n           AND overlay.last_seen_run_id = {_native()._sql_literal(run_id)}" if run_id else ""
+    affected_overlay_ctes = ""
+    current_overlay_ref = overlay_ref
+    if affected_group_table:
+        affected_overlay_ctes = f"""affected_npis AS MATERIALIZED (
+    SELECT DISTINCT affected.entity_npi AS npi
+      FROM {db_schema}.{affected_group_table} AS affected
+     WHERE affected.entity_npi IS NOT NULL
+), affected_overlay AS MATERIALIZED (
+    SELECT overlay.*
+      FROM {overlay_ref} AS overlay
+      JOIN affected_npis AS affected_npi
+        ON overlay.npi = affected_npi.npi
+), """
+        current_overlay_ref = "affected_overlay"
+    return _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE.format(
+        source_ref=source_ref,
+        requested_source_filter=requested_source_filter,
+        dataset_ref=dataset_ref,
+        affected_overlay_ctes=affected_overlay_ctes,
+        current_overlay_ref=current_overlay_ref,
+        run_filter=run_filter,
+        dataset_resource_ref=dataset_resource_ref,
+    )
+
+
 def desired_overlay_ctes(db_schema: str, *, source_ids=None, run_id=None, affected_group_table=None) -> str:
     """Use exact desired rows without changing the public current-dataset selector."""
     native, inputs = _native(), _SOURCE_QUERY.get() or current()
@@ -394,8 +464,10 @@ def desired_overlay_ctes(db_schema: str, *, source_ids=None, run_id=None, affect
         if affected_group_table
         else ""
     )
+    editions = _NAMED_EDITIONS.get()
+    _source_ref, _dataset_ref, resource_ref = named_source_editions.address_source_relations(db_schema, editions)
     return f"""WITH {_pins_cte(inputs)}, desired_datasets AS MATERIALIZED (
-        {_desired_datasets_sql(db_schema, getattr(inputs, "ordinary_serving_peer_pins", ()))}
+        {_desired_datasets_sql(db_schema, getattr(inputs, "ordinary_serving_peer_pins", ()), editions)}
     ), requested_sources AS MATERIALIZED (
         SELECT source_id, endpoint_id FROM desired_dataset_pins {source_filter}
     ), endpoint_aliases AS MATERIALIZED (
@@ -410,7 +482,7 @@ def desired_overlay_ctes(db_schema: str, *, source_ids=None, run_id=None, affect
           JOIN endpoint_aliases alias ON alias.source_id = overlay.source_id
           JOIN current_datasets dataset ON dataset.endpoint_id = alias.endpoint_id
          WHERE overlay.last_seen_run_id = dataset.run_id {run_filter} {affected_filter}
-           AND EXISTS (SELECT 1 FROM {db_schema}.provider_directory_dataset_resource resource
+           AND EXISTS (SELECT 1 FROM {resource_ref} resource
                 WHERE resource.dataset_id = dataset.dataset_id
                   AND resource.resource_type = overlay.resource_type AND resource.resource_id = overlay.resource_id)
     )"""
@@ -704,6 +776,7 @@ async def prepare_finalized_generation(db_schema, stage_cls, support_stage_class
         inputs,
         context.get("incumbent_provider_directory_overlay_fence"),
         native_dependencies=_NATIVE_DEPENDENCIES.get(),
+        named_editions=_NAMED_EDITIONS.get(),
     )
     await source_preparation.freeze_source_generation(native.db, prepared, scope)
     return prepared
@@ -747,6 +820,7 @@ async def prepare_provider_directory_entity_address(
         admitted.assert_full_recipe(ctx, task_options_by_name)
     _assert_archive_admission(archive, scope)
     dependencies = await _capture_dependencies(preparation_input, scope, doctors, dependency_bindings, archive)
+    editions_token = _NAMED_EDITIONS.set(await _pinned_named_editions(preparation_input))
     token = _PREPARATION.set(preparation_input)
     admission_token = admitted._ADMISSION.set(scope)
     dependency_token = _NATIVE_DEPENDENCIES.set(dependencies)
@@ -769,6 +843,7 @@ async def prepare_provider_directory_entity_address(
         _NATIVE_DEPENDENCIES.reset(dependency_token)
         admitted._ADMISSION.reset(admission_token)
         _PREPARATION.reset(token)
+        _NAMED_EDITIONS.reset(editions_token)
 
 
 async def _capture_dependencies(inputs, scope, doctors, dependency_bindings, archive):
@@ -823,7 +898,7 @@ async def publish_prepared_entity_address_generation(prepared, *, callbacks=None
 
     async def verify_locked_stages():
         """Check prepared identities after native locks and before the first swap."""
-        await assert_dataset_pins(prepared.db_schema, prepared.preparation_input)
+        await assert_dataset_pins(prepared.db_schema, prepared.preparation_input, prepared.named_editions)
         await _assert_prepared_stages(prepared)
         applied_bindings = await prepared_doctors.assert_applied_dependencies(native.db, prepared.native_dependencies)
         if applied_bindings is not None:

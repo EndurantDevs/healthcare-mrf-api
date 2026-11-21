@@ -232,3 +232,50 @@ async def test_control_named_projection_collision_preserves_existing_table(monke
             await create({"context": {"control_run_id": "scope-owner"}})
         assert await database.scalar(f'SELECT sentinel FROM "{schema}"."{existing}"') == 7
         assert projection.group_input_sql(native, schema) is None
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_partial_projection_reads_one_named_edition_selection(prepared):
+    from contextlib import nullcontext
+
+    from process import provider_directory_named_edition as editions
+
+    preparation = native.candidate_preparation
+    selected = SimpleNamespace(
+        catalog_schema="sample",
+        endpoint_id="endpoint",
+        dataset_id="dataset",
+        schema_name="edition",
+        source_ids=("selected",),
+    )
+    inputs = preparation.ProviderDirectoryAddressPreparationInput(
+        dataset_pins=(
+            preparation.ProviderDirectoryAddressDatasetPin("selected", "endpoint", "dataset", "a" * 64, "run"),
+        ),
+        overlay_table="desired_overlay",
+        address_alias_generation=0,
+    )
+    preparation_token = preparation._PREPARATION.set(inputs if prepared else None)
+    edition_token = preparation._NAMED_EDITIONS.set((selected,) if prepared else ())
+    try:
+        with editions.address_editions((selected,)) if not prepared else nullcontext():
+            scope = projection._scope_sql(native, "sample", ["selected"], "run")
+            overlay_sql = projection._raw_sql(native, "sample", source_ids=["selected"], run_id="run")
+            membership = projection._cached_membership_join(native, "sample")
+        assert '"edition"."provider_directory_endpoint_dataset"' in scope
+        assert '"edition"."provider_directory_dataset_resource"' in overlay_sql
+        assert '"edition"."provider_directory_dataset_resource"' in membership
+        assert "member.dataset_id=scope.dataset_id" in overlay_sql
+        assert "member.resource_type=overlay.resource_type" in overlay_sql
+        assert "member.resource_id=overlay.resource_id" in overlay_sql
+        if prepared:
+            assert "dataset.dataset_hash = pin.dataset_hash" in scope
+            assert "dataset.acquisition_root_run_id = pin.run_id" in scope
+            assert '"sample"."desired_overlay"' in overlay_sql
+        else:
+            assert "HAVING count(*)=1" in scope
+            assert "dataset_id NOT IN ('dataset')" in scope
+    finally:
+        preparation._NAMED_EDITIONS.reset(edition_token)
+        preparation._PREPARATION.reset(preparation_token)
+    assert editions._ADDRESS_EDITIONS.get() == ()
