@@ -8,9 +8,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import Float, String, and_, case, cast, exists, func, or_, select
+from sqlalchemy import Float, String, and_, case, cast, exists, func, literal, or_, select
 from sqlalchemy.sql import Select
 
+from db.models import PricingProvider, PricingProviderProcedure
 from process.custom_import.read_contracts import CustomImportReadUnavailableError
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
 
@@ -217,6 +218,57 @@ def _native_claims_statements(
     count_statement = select(func.count()).select_from(native_relation)
     page_statement = _ordered_provider_service_statement(select(native_relation), native_relation, order_by, order)
     return ProviderServiceClaimsStatements(count_statement, page_statement)
+
+
+def single_procedure_provider_page_query(
+    *,
+    year: int,
+    procedure_code: int,
+    order: str,
+    limit: int,
+    offset: int,
+    reverse_ascending_ties: bool = True,
+) -> Select:
+    """Read a single procedure page in index order."""
+    provider_procedure_table = PricingProviderProcedure.__table__
+    provider_table = PricingProvider.__table__
+    query = (
+        select(
+            provider_procedure_table.c.npi.label("npi"),
+            provider_table.c.provider_name.label("provider_name"),
+            provider_table.c.provider_type.label("provider_type"),
+            provider_table.c.city.label("city"),
+            provider_table.c.state.label("state"),
+            provider_table.c.zip5.label("zip5"),
+            provider_procedure_table.c.total_services.label("total_services"),
+            provider_procedure_table.c.total_submitted_charges.label("total_submitted_charges"),
+            provider_procedure_table.c.total_allowed_amount.label("total_allowed_amount"),
+            provider_procedure_table.c.total_beneficiaries.label("total_beneficiaries"),
+            literal(1).label("matched_service_codes"),
+        )
+        .select_from(
+            provider_procedure_table.join(
+                provider_table,
+                and_(
+                    provider_table.c.npi == provider_procedure_table.c.npi,
+                    provider_table.c.year == provider_procedure_table.c.year,
+                ),
+            )
+        )
+        .where(
+            and_(
+                provider_procedure_table.c.year == year,
+                provider_procedure_table.c.procedure_code == procedure_code,
+            )
+        )
+    )
+    amount = provider_procedure_table.c.total_allowed_amount
+    npi = provider_procedure_table.c.npi
+    query = query.order_by(
+        amount.asc() if order == "asc" else amount.desc(),
+        npi.desc() if order == "asc" and reverse_ascending_ties else npi.asc(),
+    )
+    return query.limit(limit).offset(offset)
 
 
 def _imported_claims_statements(
