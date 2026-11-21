@@ -17,12 +17,14 @@ import asyncpg
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from click.testing import CliRunner
 from sqlalchemy import text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from db.migrator import db_group
 from process import npi_result_archive as archive
 from process import npi_result_generation as generation
 from process.npi_canonical_publication import (
@@ -36,6 +38,9 @@ _LOCAL_DATABASE = re.compile(r"hc_npi_archive_[0-9a-f]{32}\Z")
 _CI_DATABASE = "ptg2_v3_lifecycle_test_ci_runner"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _CI_HOSTS = _LOCAL_HOSTS | {"postgres"}
+_LOCAL_BOOTSTRAP_REFUSAL = (
+    "Error: Local NPI generation bootstrap failed. It requires generation zero and all six serving tables.\n"
+)
 _MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260914120000_npi_result_generation.py"
 )
@@ -668,6 +673,145 @@ async def _publication_receipt(connection, schema_name: str):
         publication_generation=1,
         created_at="2026-09-14T12:01:00.000000+00:00",
     )
+
+
+async def _create_family_with_historical_receipt(connection, schema_name: str) -> None:
+    await _create_family(connection, schema_name, populated=True)
+    receipt_fields = ", ".join(f"{name}_table_oid, {name}_row_count" for name in generation.RELATION_NAMES)
+    receipt_by_field = {"reference": "nppub1_" + "a" * 43, "chain": "penpc1_" + "b" * 43}
+    receipt_table_values = ", ".join("1, 1" for _ in generation.RELATION_NAMES)
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}".npi_canonical_publication_receipt '
+            f"(publication_ref, publication_generation, chain_ref, import_date, {receipt_fields}) "
+            f"VALUES (:reference, 1, :chain, DATE '2026-01-01', {receipt_table_values})"
+        ),
+        receipt_by_field,
+    )
+    await connection.execute(
+        text(f'INSERT INTO "{schema_name}".npi_canonical_publication_receipt_seal VALUES (:reference)'),
+        {"reference": receipt_by_field["reference"]},
+    )
+
+
+async def _assert_local_bootstrap_fences_concurrent_callers(sessions, schema_name: str) -> None:
+    async with sessions() as owner:
+        await owner.begin()
+        try:
+            tentative = await generation.bootstrap_npi_result_generation(
+                owner, schema_name=schema_name, local_only=True
+            )
+            assert tentative.local_generation == 1
+            with pytest.raises(DBAPIError, match="lock timeout"):
+                async with sessions() as contender, contender.begin():
+                    await generation.bootstrap_npi_result_generation(
+                        contender, schema_name=schema_name, local_only=True
+                    )
+        finally:
+            await owner.rollback()
+    assert (await _authority(sessions, schema_name)).local_generation == 0
+
+
+async def _invoke_bootstrap_cli(monkeypatch, schema_name: str):
+    url = make_url(_database_url())
+    settings_by_name = {
+        "HLTHPRT_DB_DRIVER": "asyncpg",
+        "HLTHPRT_DB_HOST": url.host,
+        "HLTHPRT_DB_PORT": str(url.port or 5432),
+        "HLTHPRT_DB_USER": url.username,
+        "HLTHPRT_DB_PASSWORD": url.password or "",
+        "HLTHPRT_DB_DATABASE": url.database,
+        "HLTHPRT_DB_SCHEMA": schema_name,
+    }
+    for name, value in settings_by_name.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("HLTHPRT_DB_DATABASE_OVERRIDE", raising=False)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    return await asyncio.to_thread(CliRunner().invoke, db_group, ["bootstrap-local-npi-generation"])
+
+
+@pytest.fixture
+async def local_bootstrap_case():
+    """Provide one isolated schema for native local NPI bootstrap tests."""
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    schema_name = "npi_local_bootstrap_" + uuid4().hex
+    try:
+        yield engine, async_sessionmaker(engine), schema_name
+    finally:
+        try:
+            await _drop_schemas(engine, {schema_name})
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_local_bootstrap_command_publishes_existing_family_without_canonical_provenance(
+    monkeypatch, local_bootstrap_case
+) -> None:
+    """Check transactional local origin, all six unchanged tables, and refusal to repeat."""
+    engine, sessions, schema_name = local_bootstrap_case
+    async with engine.begin() as connection:
+        await _create_family_with_historical_receipt(connection, schema_name)
+    async with sessions() as session:
+        assert await generation._matching_canonical_provenance(session, schema_name=schema_name) is not None
+    await _assert_local_bootstrap_fences_concurrent_callers(sessions, schema_name)
+    first = await _invoke_bootstrap_cli(monkeypatch, schema_name)
+    assert first.exit_code == 0, first.output
+    assert first.output == "Published local NPI generation 1.\n"
+    authority = await _authority(sessions, schema_name)
+    assert authority.local_generation == authority.serving_generation.origin_generation == 1
+    assert authority.serving_generation.origin_lineage_id == authority.local_lineage_id
+    assert authority.relations == tuple((schema_name, name) for name in generation.RELATION_NAMES)
+    assert authority.canonical_provenance is None
+    async with sessions() as session:
+        for name in generation.RELATION_NAMES:
+            serving_rows = await session.execute(text(f'SELECT synthetic_id, marker FROM "{schema_name}"."{name}"'))
+            assert serving_rows.all() == [(1, "before")]
+    repeated = await _invoke_bootstrap_cli(monkeypatch, schema_name)
+    assert repeated.exit_code == 1
+    assert repeated.output == _LOCAL_BOOTSTRAP_REFUSAL
+    assert await _authority(sessions, schema_name) == authority
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("damage", "error_type", "message"),
+    [
+        ("advanced", RuntimeError, "requires an untracked generation zero"),
+        ("missing-authority", RuntimeError, "authority is unavailable"),
+        ("missing-table", DBAPIError, "does not exist"),
+        ("replaced-table", RuntimeError, "serving relations are unavailable"),
+    ],
+)
+async def test_local_bootstrap_refuses_incomplete_or_advanced_family(
+    damage, error_type, message, local_bootstrap_case, monkeypatch
+) -> None:
+    """Refuse partial or already advanced generations without publishing authority."""
+    engine, sessions, schema_name = local_bootstrap_case
+    state = f'"{schema_name}".npi_result_generation'
+    async with engine.begin() as connection:
+        await _create_family(connection, schema_name, populated=True)
+        if damage == "advanced":
+            await connection.execute(text(f"UPDATE {state} SET local_generation=1"))
+        elif damage == "missing-authority":
+            await connection.execute(text(f"DELETE FROM {state}"))
+        elif damage == "missing-table":
+            await connection.execute(text(f'DROP TABLE "{schema_name}".npi_address'))
+        else:
+            await connection.execute(text(f'ALTER TABLE "{schema_name}".npi_address RENAME TO other_address'))
+            await connection.execute(
+                text(f'CREATE VIEW "{schema_name}".npi_address AS SELECT * FROM "{schema_name}".other_address')
+            )
+        before = (await connection.execute(text(f"SELECT * FROM {state}"))).one_or_none()
+    with pytest.raises(error_type, match=message):
+        async with sessions() as session, session.begin():
+            await generation.bootstrap_npi_result_generation(session, schema_name=schema_name, local_only=True)
+    if damage == "missing-table":
+        refused = await _invoke_bootstrap_cli(monkeypatch, schema_name)
+        assert refused.exit_code == 1
+        assert refused.output == _LOCAL_BOOTSTRAP_REFUSAL
+    async with engine.connect() as connection:
+        assert (await connection.execute(text(f"SELECT * FROM {state}"))).one_or_none() == before
 
 
 @pytest.mark.asyncio
