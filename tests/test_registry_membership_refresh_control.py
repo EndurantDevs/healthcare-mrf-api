@@ -164,6 +164,31 @@ async def test_control_target_loads_server_configuration_and_exact_uuid(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_dashboard_failure_logs_redacted_diagnostics(monkeypatch, capsys):
+    from process import control_cancel, registry_network_import
+
+    monkeypatch.setenv(worker.CONFIG_ENV, json.dumps(configuration()))
+    monkeypatch.setattr(control_cancel, "raise_if_cancelled", AsyncMock())
+    message = "synthetic sensitive connection information"
+
+    async def fail(_config, _run_id):
+        try:
+            raise TimeoutError(message)
+        except TimeoutError:
+            raise ValueError("registry_source_connection_unavailable") from None
+
+    monkeypatch.setattr(registry_network_import, "run_latest_network_import", fail)
+    with pytest.raises(RuntimeError, match="^registry_membership_refresh_worker_failed$"):
+        await worker.control_start({}, {"run_id": "run-a"})
+    captured = capsys.readouterr()
+    assert message not in captured.err
+    diagnostic = json.loads(captured.err)
+    assert diagnostic["code"] == "worker_failed"
+    assert [cause.get("code") for cause in diagnostic["causes"]] == ["registry_source_connection_unavailable", None]
+    assert [cause["class"] for cause in diagnostic["causes"]] == ["ValueError", "TimeoutError"]
+
+
+@pytest.mark.asyncio
 async def test_missing_native_runtime_fails_before_pools_or_consumer(monkeypatch):
     module = ModuleType("process.registry_membership_refresh_runtime")
     module.membership_refresh_worker_runtime = AsyncMock(side_effect=RegistryMembershipRefreshUnavailable("disabled"))
