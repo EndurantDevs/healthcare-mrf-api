@@ -125,7 +125,7 @@ async def _prepare_native_recipes(connection, runtime, generation, previous):
 async def prepare_imported_source_recipes(connection, *, request_id, envelope, source_runtime, control_schema):
     """Commit one batch; retain unchanged recipes and distinguish new artifacts from reused inputs."""
     if (
-        type(request_id) is not UUID
+        not isinstance(request_id, UUID)
         or not request_id.int
         or type(source_runtime) is not SourceWitnessRuntime
         or type(source_runtime.catalog_bindings) is not PublishedFHIRCatalogBindingScope

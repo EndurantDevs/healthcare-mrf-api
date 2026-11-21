@@ -103,7 +103,10 @@ def test_normal_core_parameters_are_empty_and_legacy_exact_selector_stays_valid(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("has_replacement", [False, True])
-async def test_imported_refresh_preserves_unavailable_predecessor_recipes(monkeypatch, has_replacement):
+@pytest.mark.parametrize("caller_snapshot", [False, True])
+async def test_imported_refresh_preserves_unavailable_predecessor_recipes(
+    monkeypatch, has_replacement, caller_snapshot
+):
     from process import registry_imported_source_inventory as inventory_module
     from process import registry_membership_refresh_runtime as runtime
     from process import registry_source_recipe_store as recipe_store
@@ -119,10 +122,23 @@ async def test_imported_refresh_preserves_unavailable_predecessor_recipes(monkey
     monkeypatch.setattr(inventory_module, "current_imported_source_inventory", AsyncMock(return_value=inventory))
     require_inputs = AsyncMock()
     monkeypatch.setattr(runtime, "require_imported_catalog_inputs", require_inputs)
-    monkeypatch.setattr(
-        recipe_store, "resolve_retained_registry_source_recipes", AsyncMock(return_value=(native, previous))
-    )
     envelope_by_field = {"command": imported_command()}
+    state = SimpleNamespace(has_snapshot=caller_snapshot)
+
+    @asynccontextmanager
+    async def transaction(*, isolation, readonly):
+        assert not state.has_snapshot and isolation == "repeatable_read" and readonly is True
+        state.has_snapshot = True
+        try:
+            yield
+        finally:
+            state.has_snapshot = False
+
+    async def retained_recipes(connection, manifest, *, control_schema):
+        assert connection.is_in_transaction()
+        return native, previous
+
+    monkeypatch.setattr(recipe_store, "resolve_retained_registry_source_recipes", retained_recipes)
 
     @asynccontextmanager
     async def address():
@@ -137,9 +153,10 @@ async def test_imported_refresh_preserves_unavailable_predecessor_recipes(monkey
     resolver.prepared_command = membership_refresh_command_sha256(envelope_by_field["command"])
     resolver.prepared_recipes = (prepared,)
     monkeypatch.setattr(resolver, "_composition", lambda pin, recipes, manifest, source_runtime: recipes)
-    connection = object()
+    connection = SimpleNamespace(is_in_transaction=lambda: state.has_snapshot, transaction=transaction)
     async with resolver._pin_imported_sources(connection, envelope_by_field, object()) as recipes:
         assert recipes == (native,) + (() if has_replacement else (previous,)) + (prepared,)
+        assert state.has_snapshot == caller_snapshot
     require_inputs.assert_awaited_once_with(connection, envelope_by_field["command"], "registry", inventory=inventory)
 
 
@@ -346,7 +363,7 @@ def capture_preparation(monkeypatch):
     from process import registry_membership_refresh_runtime as runtime
     from process.registry_imported_source_reuse import ImportedSourcePreparation
 
-    stage = SimpleNamespace(active=False, fail_commit=False)
+    stage = SimpleNamespace(active=False, fail_commit=False, repeatable_read=False)
     connection = object()
 
     @asynccontextmanager
@@ -358,13 +375,19 @@ def capture_preparation(monkeypatch):
                 raise RuntimeError("synthetic_capture_commit_failed")
         finally:
             stage.active = False
+            stage.repeatable_read = False
+
+    async def execute(statement):
+        assert stage.active
+        assert str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+        stage.repeatable_read = True
 
     async def prepare(driver, **inputs):
-        assert driver is connection and stage.active
+        assert driver is connection and stage.active and stage.repeatable_read
         assert inputs["source_runtime"] is resolver.source_runtime and inputs["control_schema"] == "registry"
         return prepared_sources
 
-    session = SimpleNamespace(begin=transaction)
+    session = SimpleNamespace(begin=transaction, execute=execute)
     sessions = Mock(side_effect=lambda: nullcontext(session))
     resources = SimpleNamespace(settings=SimpleNamespace(control_schema="registry"))
     resolver = runtime._SourceResolver(resources, source_runtime=object(), capture_sessions=sessions)
