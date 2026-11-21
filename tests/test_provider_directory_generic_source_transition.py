@@ -298,6 +298,48 @@ async def test_completed_empty_collection_retains_isolated_candidate(case):
 
 
 @pytest.mark.asyncio
+async def test_postal_start_failure_retains_the_completed_plan_cursor(case, monkeypatch):
+    from process import provider_directory_postal_checkpoint as postal
+
+    directory = importlib.import_module("process.provider_directory_fhir")
+    resources = sorted(directory.UHC_SUPPORTED_RESOURCES)
+    source_ids = ["synthetic-postal-source"]
+    metadata = case.header["candidate_storage_json"]["identity"]["metadata"]
+    metadata.update(source_ids=source_ids, selected_resources=resources, expected_resources=resources)
+    case.header.update(
+        status="failed",
+        import_run_id=ROOT,
+        resource_count=3,
+        publication_metadata_json={**metadata, "error": storage._POSTAL_START_ERROR},
+    )
+    case.runs[:] = [
+        {
+            **case.runs[-1],
+            "source_ids": source_ids,
+            "postal_error_message": storage._POSTAL_START_ERROR,
+            "postal_endpoint_scope": directory.UHC_PROVIDER_DIRECTORY_BASE,
+        }
+    ]
+    case.checkpoints[0].update(
+        resource_type="InsurancePlan",
+        owner_run_id=ROOT,
+        source_ids=source_ids,
+        source_scope_hash="a" * 64,
+        canonical_api_base=directory.UHC_PROVIDER_DIRECTORY_BASE,
+    )
+    case.input_rows[0]["resource_type"] = "InsurancePlan"
+    provision = AsyncMock()
+    monkeypatch.setattr(postal, "provision", provision)
+    checkpoint_before = deepcopy(case.checkpoints)
+
+    transition = await _transition(case, dict.fromkeys(resources, 0) | {"InsurancePlan": 3}, stopped_run_id=ROOT)
+
+    assert transition["rows"] == 3 and transition["lineage_run_ids"] == [ROOT]
+    assert case.checkpoints == checkpoint_before
+    provision.assert_awaited_once_with(case.connection, case.policy)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("drift", ["missing_positive", "foreign_dataset", "unexpected_type"])
 async def test_empty_collection_still_rejects_foreign_or_missing_input(case, drift):
     _include_completed_empty_collection(case)

@@ -5,6 +5,10 @@ import gzip
 import importlib
 import json
 import urllib.parse
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -20,6 +24,8 @@ from db.models import (
 from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
 from process import provider_directory_uhc_scan as uhc_scan
+from process.provider_directory_generic_source_storage import _require_postal_start_checkpoint
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 importer = importlib.import_module("process.provider_directory_fhir")
 BASE = importer.UHC_PROVIDER_DIRECTORY_BASE
@@ -260,6 +266,125 @@ async def test_uhc_resume_keeps_remaining_partition_queue(monkeypatch):
 
     assert state.completed_partition_identities == {"0", "1"}
     assert queue.qsize() == len(start_urls) - 2
+
+
+def _postal_scan_spies(monkeypatch):
+    """Check each persisted leaf follows its payload write and stays inside its root."""
+    checkpoint = importer.postal_checkpoint
+    active_root = ContextVar("active_postal_root")
+    binding = NamedFHIRSourceStorage("mrf", "candidate_schema")
+    counts_by_leaf = {}
+    requested_postcodes = []
+    saved_payloads = set()
+
+    @asynccontextmanager
+    async def transaction(_database, *, schema, dataset_ids, root_run_ids):
+        assert schema == "mrf" and dataset_ids == ("synthetic-dataset",)
+        token = active_root.set(root_run_ids[0])
+        try:
+            yield
+        finally:
+            active_root.reset(token)
+
+    async def read(statement, *, dataset_id, root, checkpoint_type):
+        assert '"candidate_schema"."provider_directory_postal_partition_checkpoint"' in statement
+        assert dataset_id == "synthetic-dataset" and root == active_root.get()
+        return [
+            (identity, *counts)
+            for (owner, kind, identity), counts in counts_by_leaf.items()
+            if (owner, kind) == (root, checkpoint_type)
+        ]
+
+    async def save(statement, *, dataset_id, root, checkpoints):
+        assert '"candidate_schema"."provider_directory_postal_partition_checkpoint"' in statement
+        assert dataset_id == "synthetic-dataset" and root == active_root.get()
+        for leaf in json.loads(checkpoints):
+            assert leaf["identity"] in saved_payloads
+            counts_by_leaf[root, leaf["kind"], leaf["identity"]] = leaf["page_count"], leaf["row_count"]
+
+    async def fetch(_source, url, *, timeout):
+        postcode = _query(url)[ROLE_PARAM]
+        requested_postcodes.append(postcode)
+        return 200, _bundle(1, resource_id=postcode), None, 1
+
+    async def persist(_model, rows):
+        saved_payloads.update(row["resource_id"] for row in rows)
+        return len(rows)
+
+    monkeypatch.setattr(checkpoint, "source_checkpoint_transaction", transaction)
+    monkeypatch.setattr(checkpoint.source, "bound_publisher", lambda: SimpleNamespace(storage_binding=binding))
+    monkeypatch.setattr(importer, "db", SimpleNamespace(all=read, status=save))
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch)
+    factory = SimpleNamespace(storage_binding=binding, transaction=transaction)
+    return factory, requested_postcodes, persist
+
+
+@pytest.mark.asyncio
+async def test_isolated_postal_scan_resumes_completed_leaves(monkeypatch):
+    """The same root skips stored leaves while a distinct root reads them anew."""
+    factory, requested_postcodes, persist = _postal_scan_spies(monkeypatch)
+    origin = "run_" + "a" * 32
+    successor = "run_" + "b" * 32
+    other = "run_" + "c" * 32
+    context = importer.PaginationCheckpointContext(
+        BASE, "1" * 64, (SOURCE["source_id"],), origin, origin, dataset_id="synthetic-dataset"
+    )
+    complete, remaining = "77030-1234", "77030-1235"
+    options = _options(retain_rows=False, row_batch_handler=persist)
+
+    async def scan(scan_context, *prefixes):
+        source_by_field = {**SOURCE, "_pagination_checkpoint_context": scan_context}
+        return await importer._fetch_partitioned_resource_rows(
+            source_by_field,
+            "PractitionerRole",
+            ProviderDirectoryPractitionerRole,
+            [_role_url(prefix) for prefix in prefixes],
+            replace(options, run_id=scan_context.owner_run_id),
+        )
+
+    async with importer.postal_checkpoint.source.bind_generic_source_transaction_factory(factory):
+        assert (await scan(context, complete)).complete
+        retry = replace(context, owner_run_id=successor, retry_of_run_id=origin, lineage_verified=True)
+        resumed = await scan(retry, complete, remaining)
+        assert resumed.complete and resumed.pages_fetched == resumed.rows_fetched == 2
+        assert resumed.rows_written == 1
+        assert requested_postcodes == [complete, remaining]
+        assert (await scan(replace(context, owner_run_id=other, acquisition_root_run_id=other), complete)).complete
+    assert requested_postcodes == [complete, remaining, complete]
+
+
+def test_postal_handoff_requires_unstarted_resources():
+    identity_by_field = {
+        "failed_run_id": "run_synthetic",
+        "dataset_id": "dataset_synthetic",
+        "acquisition_root_run_id": "run_synthetic",
+    }
+    checkpoint_by_field = {
+        "owner_run_id": identity_by_field["failed_run_id"],
+        "dataset_id": identity_by_field["dataset_id"],
+        "acquisition_root_run_id": identity_by_field["acquisition_root_run_id"],
+        "canonical_api_base": BASE,
+        "source_ids": [SOURCE["source_id"]],
+        "resource_type": "InsurancePlan",
+        "state": "complete",
+        "next_url": None,
+        "source_scope_hash": "1" * 64,
+        "completed_at": "2026-01-01",
+        "rows_processed": 2,
+        "pages_processed": 2,
+    }
+    counts = dict.fromkeys(importer.UHC_SUPPORTED_RESOURCES, 0) | {"InsurancePlan": 2}
+    _require_postal_start_checkpoint(
+        [checkpoint_by_field], identity_by_field, counts, "failed", checkpoint_by_field["source_ids"]
+    )
+    with pytest.raises(ValueError, match="transition_checkpoint_changed"):
+        _require_postal_start_checkpoint(
+            [checkpoint_by_field],
+            identity_by_field,
+            counts | {"Location": 1},
+            "failed",
+            checkpoint_by_field["source_ids"],
+        )
 
 
 def _stored_rows_factory(rows_by_type: dict[str, list[dict[str, Any]]]):

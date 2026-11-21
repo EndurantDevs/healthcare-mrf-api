@@ -309,10 +309,11 @@ async def test_successor_preserves_reset_census(intake_case):
     _before, _observed, checkpoints = await _legacy(case)
     current = await _migrate(case)
     counts_by_resource, identity_by_field = await _transition_census(case, current)
+    stopped_run_by_field = {"status": "failed", "ancestor_run_ids": ["root"]}
     async with source.source_transaction(case.database):
         publisher = source.bound_publisher()
         await storage._verify_transition_inputs(
-            publisher.connection, publisher.policy, current, identity_by_field, counts_by_resource, "failed", ["root"]
+            publisher.connection, publisher.policy, current, identity_by_field, counts_by_resource, stopped_run_by_field
         )
         corrupt_binding_by_field = {**current, "resets": {"PractitionerRole": 0}}
         with pytest.raises(ValueError, match="transition_input_changed"):
@@ -322,8 +323,7 @@ async def test_successor_preserves_reset_census(intake_case):
                 corrupt_binding_by_field,
                 identity_by_field,
                 counts_by_resource,
-                "failed",
-                ["root"],
+                stopped_run_by_field,
             )
         aliases = storage_relation("source_schema", current["tables"]["resource_aliases"]["name"])
         await publisher.connection.execute(
@@ -336,8 +336,7 @@ async def test_successor_preserves_reset_census(intake_case):
                 current,
                 identity_by_field,
                 counts_by_resource,
-                "failed",
-                ["root"],
+                stopped_run_by_field,
             )
     # This data-only successor check does not issue a manifest or authenticate a run.
     assert len(checkpoints) == 7

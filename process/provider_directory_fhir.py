@@ -101,6 +101,7 @@ from process import provider_directory_mvp as mvp
 from process import provider_directory_named_edition as named_source_editions
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_pacificsource as pacificsource
+from process import provider_directory_postal_checkpoint as postal_checkpoint
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_artifact_custody as profile_artifact_custody
 from process import provider_directory_profile_artifact_layout as profile_artifact_layout
@@ -4221,41 +4222,24 @@ async def _record_partition_checkpoint(
     resource_type: str,
     request_url: str,
     run_id: str | None,
+    *,
+    pages_fetched: int = 0,
+    rows_fetched: int = 0,
 ) -> None:
-    partition_identity = _uhc_partition_identity(
+    await postal_checkpoint.record_partition(
+        sys.modules[__name__],
+        state,
         source_record,
         resource_type,
         request_url,
+        run_id,
+        pages_fetched=pages_fetched,
+        rows_fetched=rows_fetched,
     )
-    checkpoint_type = _uhc_partition_checkpoint_type(source_record, resource_type)
-    if not partition_identity or not checkpoint_type or not run_id:
-        return
-    checkpoint_batch_rows: list[dict[str, Any]] = []
-    async with state.checkpoint_lock:
-        if partition_identity in state.completed_partition_identities:
-            return
-        state.completed_partition_identities.add(partition_identity)
-        state.pending_partition_checkpoint_rows.append(
-            _reverse_lookup_checkpoint_row(
-                source_record,
-                checkpoint_type,
-                partition_identity,
-                run_id,
-            )
-        )
-        if len(state.pending_partition_checkpoint_rows) >= _partition_checkpoint_flush_rows():
-            checkpoint_batch_rows = list(state.pending_partition_checkpoint_rows)
-            state.pending_partition_checkpoint_rows.clear()
-    if checkpoint_batch_rows:
-        await _upsert_rows(ProviderDirectoryReverseLookupCheckpoint, checkpoint_batch_rows)
 
 
 async def _flush_partition_checkpoints(state: PartitionFetchState) -> None:
-    async with state.checkpoint_lock:
-        checkpoint_batch_rows = list(state.pending_partition_checkpoint_rows)
-        state.pending_partition_checkpoint_rows.clear()
-    if checkpoint_batch_rows:
-        await _upsert_rows(ProviderDirectoryReverseLookupCheckpoint, checkpoint_batch_rows)
+    await postal_checkpoint.flush_partitions(sys.modules[__name__], state)
 
 
 def _partitioned_resource_start_urls(source: dict[str, Any], resource_type: str, *, page_count: int) -> list[str]:
@@ -47114,7 +47098,8 @@ async def _consume_partition_entries(
     fetch_url: str,
     pending_resource_rows: list[dict[str, Any]],
     fetch_options: PartitionFetchOptions,
-) -> None:
+) -> int:
+    fetched = 0
     for entry_record in bundle_entries:
         parsed_resource = parse_fhir_resource(
             source_record["source_id"],
@@ -47133,6 +47118,7 @@ async def _consume_partition_entries(
         parsed_model, resource_row = parsed_resource
         if parsed_model is not state.result_model:
             continue
+        fetched += 1
         async with state.state_lock:
             state.fetched_count += 1
             if fetch_options.retain_rows:
@@ -47145,6 +47131,7 @@ async def _consume_partition_entries(
                     fetch_options.row_batch_handler,
                     pending_resource_rows,
                 )
+    return fetched
 
 
 async def _partition_page_next_result(
@@ -47326,7 +47313,7 @@ async def _fetch_partition_page(
     if bounded_outcome == "split":
         return await _split_partition_page_result(request, fhir_payload)
     is_partition_failed_on_page = bounded_outcome == "cap_failed"
-    await _consume_partition_entries(
+    rows_fetched = await _consume_partition_entries(
         request.state,
         request.source_record,
         request.resource_type,
@@ -47335,13 +47322,14 @@ async def _fetch_partition_page(
         request.pending_resource_rows,
         request.fetch_options,
     )
-    return await _partition_page_next_result(
+    page_result = await _partition_page_next_result(
         request.source_record,
         request.current_url,
         _next_link(fhir_payload),
         request.state,
         is_partition_failed_on_page,
     )
+    return replace(page_result, rows_fetched=rows_fetched)
 
 
 async def _should_continue_partition_chain(
@@ -47380,6 +47368,7 @@ async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
     is_partition_failed = False
     has_split_children = False
     is_residual_only = False
+    rows_fetched = 0
     current_url: str | None = request.request_url
     while current_url and not request.state.stop_event.is_set():
         if not await _should_continue_partition_chain(request, current_url):
@@ -47399,6 +47388,7 @@ async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
             )
         )
         current_url = page_fetch_result.next_url
+        rows_fetched += page_fetch_result.rows_fetched
         is_partition_failed = is_partition_failed or page_fetch_result.outcome == "failed"
         if page_fetch_result.outcome == "split":
             break
@@ -47419,6 +47409,8 @@ async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
             request.resource_type,
             request.request_url,
             request.fetch_options.run_id,
+            pages_fetched=len(request.page_identities),
+            rows_fetched=rows_fetched,
         )
 
 
@@ -47463,22 +47455,9 @@ async def _prepare_partition_fetch(
     start_urls: list[str],
     run_id: str | None,
 ) -> tuple[asyncio.Queue[str], PartitionFetchState]:
-    start_url_queue: asyncio.Queue[str] = asyncio.Queue()
-    state = PartitionFetchState(result_model=model, retained_resource_rows=[])
-    state.completed_partition_identities = await _load_partition_checkpoints(
-        source_record,
-        resource_type,
-        run_id,
+    return await postal_checkpoint.prepare_fetch(
+        sys.modules[__name__], source_record, resource_type, model, start_urls, run_id
     )
-    for request_url in start_urls:
-        partition_identity = _uhc_partition_identity(
-            source_record,
-            resource_type,
-            request_url,
-        )
-        if partition_identity not in state.completed_partition_identities:
-            start_url_queue.put_nowait(request_url)
-    return start_url_queue, state
 
 
 async def _execute_partition_fetch_workers(
@@ -47545,7 +47524,7 @@ async def _fetch_partitioned_resource_rows(
         and start_url_queue.empty()
     )
     checkpoint_type = _uhc_partition_checkpoint_type(source_record, resource_type)
-    if is_complete and checkpoint_type:
+    if is_complete and checkpoint_type and state.postal_checkpoint_context is None:
         await _clear_reverse_lookup_checkpoints(
             source_record,
             seed_resource_type=checkpoint_type,
@@ -47554,9 +47533,9 @@ async def _fetch_partitioned_resource_rows(
     return ResourceFetchResult(
         model=model,
         rows=state.retained_resource_rows,
-        rows_fetched=state.fetched_count,
+        rows_fetched=state.fetched_count + state.resumed_partition_rows,
         rows_written=state.written_count,
-        pages_fetched=state.page_count,
+        pages_fetched=state.page_count + state.resumed_partition_pages,
         complete=is_complete,
         row_limit_reached=False,
         page_limit_reached=False,

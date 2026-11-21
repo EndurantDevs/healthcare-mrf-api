@@ -22,6 +22,7 @@ from process.provider_directory_generic_source_storage import (
     _json,
     _require,
 )
+from process.provider_directory_postal_checkpoint import provision as provision_postal_checkpoint
 from process.provider_directory_source_checkpoint_catalog import (
     CHECKPOINT_LAYOUTS,
     capture_checkpoint_controls,
@@ -174,6 +175,8 @@ async def provision_isolated_fhir_source_storage(
                     await connection.execute(f"ALTER TABLE {relation} DROP CONSTRAINT {storage_identifier(check)}")
             await connection.execute(f"ALTER TABLE {relation} OWNER TO {storage_identifier(policy.owner_role)}")
             await _close_grants(connection, policy, root)
+        if not rooted:
+            await provision_postal_checkpoint(connection, policy)
     return {"catalog_schema": catalog_schema, "storage_schema": policy.schema}
 
 
