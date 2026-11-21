@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import datetime
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
@@ -441,7 +441,6 @@ async def _write_bootstrap_authority(
     *,
     schema_name: str,
     next_generation: int,
-    relation_oids: tuple[int, ...],
     provenance: NpiCanonicalProvenance | None,
 ) -> NpiResultGenerationAuthority:
     updated_row = (
@@ -479,10 +478,23 @@ async def _write_bootstrap_authority(
     return validate_npi_result_generation_authority(updated_row)
 
 
+async def _require_named_bootstrap_tables(session: Any, schema: str) -> None:
+    table_count = await session.scalar(
+        text(
+            "SELECT count(*) FROM pg_catalog.pg_tables WHERE schemaname=:schema "
+            "AND tablename=ANY(CAST(:names AS name[]))"
+        ),
+        {"schema": schema, "names": list(RELATION_NAMES)},
+    )
+    if table_count != len(RELATION_NAMES):
+        raise RuntimeError("NPI serving relations are unavailable")
+
+
 async def bootstrap_npi_result_generation(
     session: Any,
     *,
     schema_name: str,
+    local_only: bool = False,
 ) -> NpiResultGenerationAuthority:
     """Explicitly establish authority for an existing complete serving family.
 
@@ -490,20 +502,36 @@ async def bootstrap_npi_result_generation(
     a distinct manual bootstrap operation.  The short SHARE lock establishes a
     real revision boundary; later statements advance that revision through the
     migration-installed triggers.
+
+    Local-only bootstrap requires generation zero and leaves canonical provenance empty.
     """
 
     if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
         raise ValueError("NPI result generation bootstrap requires a caller transaction")
     schema = _schema_name(schema_name)
     relations = ", ".join(f"{_quoted(schema)}.{_quoted(table_name)}" for table_name in RELATION_NAMES)
-    async with _bounded_bootstrap(session):
+    # Roll back a failed local lock before restoring the transaction's timeout settings.
+    lock_scope = session.begin_nested() if local_only else nullcontext()
+    async with _bounded_bootstrap(session), lock_scope:
         await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
-        relation_oids = await current_npi_relation_oids(session, schema_name=schema)
+        if local_only:
+            await _require_named_bootstrap_tables(session, schema)
+        else:
+            await current_npi_relation_oids(session, schema_name=schema)
         current = await read_npi_result_generation_authority(
             session,
             schema_name=schema,
             lock=True,
         )
+        if local_only:
+            if current.local_generation != 0 or current.serving_generation is not None:
+                raise RuntimeError("Local NPI bootstrap requires an untracked generation zero")
+            return await _write_bootstrap_authority(
+                session,
+                schema_name=schema,
+                next_generation=1,
+                provenance=None,
+            )
     if current.serving_generation is not None:
         if current.relations != tuple((schema, name) for name in RELATION_NAMES):
             raise RuntimeError("NPI serving generation is unavailable or drifted")
@@ -515,7 +543,6 @@ async def bootstrap_npi_result_generation(
         session,
         schema_name=schema,
         next_generation=current.local_generation + 1,
-        relation_oids=relation_oids,
         provenance=provenance,
     )
 

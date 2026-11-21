@@ -1174,7 +1174,6 @@ async def test_bootstrap_write_rejects_missing_update_returning() -> None:
             session,
             schema_name="mrf",
             next_generation=1,
-            relation_oids=tuple(range(1, 7)),
             provenance=None,
         )
 
