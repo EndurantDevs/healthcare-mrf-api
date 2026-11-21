@@ -131,6 +131,10 @@ async def _fetch_imported_geo_page(database, import_context, request_session, im
 def build_imported_geo_statements(
     import_context: ProviderImportQuery,
     imported_query: ImportedGeoQuery,
+    *,
+    plan_member_sql: str | None = None,
+    extra_filters: Sequence[str] = (),
+    legacy_page_clauses: tuple[str, str] | None = None,
 ) -> ImportedGeoStatements:
     """Build one unbounded eligible relation before imported sorting and paging."""
 
@@ -143,21 +147,13 @@ def build_imported_geo_statements(
     if not import_context.require_match and not import_context.prepared.normalized_order_terms:
         raise ValueError("custom-import geo ordering is required")
 
-    parameters_by_name = dict(imported_query.native_parameters)
-    _add_parameter(parameters_by_name, _PAGE_LIMIT_PARAMETER, imported_query.limit + 1)
-    normalized_anchor = _normalized_cursor_anchor(imported_query.cursor_anchor)
-    if normalized_anchor is not None:
-        _add_parameter(parameters_by_name, _CURSOR_NPI_PARAMETER, normalized_anchor[0])
-        _add_parameter(
-            parameters_by_name,
-            _CURSOR_ADDRESS_KEY_PARAMETER,
-            normalized_anchor[1],
-        )
-    parameters_by_name = _provider_list_parameters(parameters_by_name, import_context)
-
+    parameters_by_name, normalized_anchor = _imported_geo_page_parameters(import_context, imported_query)
     common_ctes = _common_ctes(
         import_context=import_context,
         nearby=imported_query.nearby,
+        plan_member_sql=plan_member_sql,
+        extra_filters=extra_filters,
+        legacy_page_clauses=legacy_page_clauses,
     )
     count = _statement(
         f"WITH {common_ctes}\nSELECT COUNT(*) AS total_count\n  FROM selected_geo",
@@ -168,7 +164,7 @@ def build_imported_geo_statements(
             count=count,
             page=_page_statement(common_ctes, import_context, imported_query.nearby, has_anchor=False),
             anchor=None,
-            parameters=MappingProxyType(parameters_by_name),
+            parameters=parameters_by_name,
         )
 
     anchor_ctes = _anchor_ctes()
@@ -185,16 +181,40 @@ def build_imported_geo_statements(
             has_anchor=True,
         ),
         anchor=anchor,
-        parameters=MappingProxyType(parameters_by_name),
+        parameters=parameters_by_name,
     )
+
+
+def _imported_geo_page_parameters(
+    import_context: ProviderImportQuery,
+    imported_query: ImportedGeoQuery,
+) -> tuple[Mapping[str, object], tuple[str, str] | None]:
+    """Bind the lookahead and any cursor anchor without mutating request parameters."""
+    parameters_by_name = dict(imported_query.native_parameters)
+    _add_parameter(parameters_by_name, _PAGE_LIMIT_PARAMETER, imported_query.limit + 1)
+    normalized_anchor = _normalized_cursor_anchor(imported_query.cursor_anchor)
+    if normalized_anchor is not None:
+        _add_parameter(parameters_by_name, _CURSOR_NPI_PARAMETER, normalized_anchor[0])
+        _add_parameter(parameters_by_name, _CURSOR_ADDRESS_KEY_PARAMETER, normalized_anchor[1])
+    parameters_by_name = _provider_list_parameters(parameters_by_name, import_context)
+    return MappingProxyType(parameters_by_name), normalized_anchor
 
 
 def _common_ctes(
     *,
     import_context: ProviderImportQuery,
     nearby: NearbySqlQuery,
+    plan_member_sql: str | None,
+    extra_filters: Sequence[str],
+    legacy_page_clauses: tuple[str, str] | None,
 ) -> str:
-    native_cte = _native_eligible_geo_cte(nearby)
+    nearby = nearby.with_legacy_plan_membership(legacy_page_clauses)
+    projected_plan_membership = None
+    if nearby.search_provider_facts and plan_member_sql is not None and import_context.require_match:
+        projected_plan_membership = plan_member_sql
+        non_plan_clause, _ = nearby_extra_clauses(extra_filters, None, 0)
+        nearby = replace(nearby, extra_clause=non_plan_clause)
+    native_cte = _native_eligible_geo_cte(nearby, projected_plan_membership=projected_plan_membership)
     materialization = " MATERIALIZED" if import_context.require_match else ""
     relation_cte = f"{_IMPORT_RELATION} AS{materialization} ({import_context.compiled.sql})"
     eligible_cte = (
@@ -212,37 +232,51 @@ def native_geo_entity_scope():
     return select(native_geo.c.npi_code).distinct()
 
 
-def _native_eligible_geo_cte(nearby: NearbySqlQuery) -> str:
+def _native_eligible_geo_cte(nearby: NearbySqlQuery, *, projected_plan_membership: str | None = None) -> str:
     on_search = bool(nearby.search_table_sql)
     taxonomy_where = _taxonomy_filter_where(nearby, on_search=on_search)
     npi_column, npi_join = _search_npi_source(nearby) if on_search else _LIVE_NPI_SOURCE
-    address_key_columns = ",\n           ".join(
-        f"a.{column} AS _geo_address_{column}" for column in _address_row_key_columns(nearby.address_table_sql)
-    )
-    return f"""{_NATIVE_GEO_RELATION} AS MATERIALIZED (
-    SELECT DISTINCT ON ({npi_column}, a.address_key)
-           {npi_column} AS npi_code,
-           a.address_key,
-           {_nearby_geography(nearby)}
-               <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))
-               AS cursor_distance_meters,
-           {address_key_columns}
-      FROM {nearby.search_table_sql or nearby.address_table_sql} AS a{npi_join}
-     WHERE ST_DWithin(
-               {_nearby_geography(nearby)},
-               Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))),
-               :radius * 1609.34
-           )
+    row_keys = _address_row_key_columns(nearby.address_table_sql)
+    address_key_columns = ",\n           ".join(f"a.{column} AS _geo_address_{column}" for column in row_keys)
+    geography = _nearby_geography(nearby)
+    center = "Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))"
+    radius = ":radius * 1609.34"
+    geo_source = f"{nearby.search_table_sql or nearby.address_table_sql} AS a{npi_join}"
+    filters = f"""
        AND a.lat IS NOT NULL
        AND a.long IS NOT NULL
        AND a.address_key IS NOT NULL{taxonomy_where}
        {nearby.geo_precision_clause}
        {nearby.geo_type_clause}
-       {nearby.extra_clause}{nearby.ilike_clause}
+       {nearby.extra_clause}{nearby.ilike_clause}"""
+    preceding_ctes = ""
+    if projected_plan_membership is not None:
+        if not on_search or not nearby.search_provider_facts:
+            raise ValueError("plan membership prefilter requires a provider geo projection")
+        columns = ", ".join(f"a.{column}" for column in dict.fromkeys(("npi", "address_key", "geo", "type", *row_keys)))
+        # Use PostGIS's index bound, then check exact distance only for plan members.
+        preceding_ctes = f"""plan_member_npis AS MATERIALIZED ({projected_plan_membership}),
+bounding_members AS MATERIALIZED (
+    SELECT {columns}
+      FROM {geo_source}
+     WHERE {geography} && _ST_Expand({center}, {radius}){filters}
+       AND a.npi IN (SELECT npi FROM plan_member_npis)
+),
+"""
+        npi_column = "a.npi"
+        geo_source = "bounding_members AS a"
+        filters = ""
+    return f"""{preceding_ctes}{_NATIVE_GEO_RELATION} AS MATERIALIZED (
+    SELECT DISTINCT ON ({npi_column}, a.address_key)
+           {npi_column} AS npi_code,
+           a.address_key,
+           {geography} <-> {center} AS cursor_distance_meters,
+           {address_key_columns}
+      FROM {geo_source}
+     WHERE ST_DWithin({geography}, {center}, {radius}){filters}
      ORDER BY {npi_column} ASC,
               a.address_key ASC,
-              {_nearby_geography(nearby)}
-                  <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))) ASC,
+              {geography} <-> {center} ASC,
               CASE a.type
                   WHEN 'primary' THEN 0
                   WHEN 'practice' THEN 1
