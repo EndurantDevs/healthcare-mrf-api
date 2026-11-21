@@ -1204,6 +1204,18 @@ def _build_market_sql(
 
     partd_table = _qualified_table_name(PartDPharmacyActivity.__table__)
     if has_partd:
+        partd_scope = ""
+        if zip_code or "market_zip" in parameter_map:
+            # Expand the existing NPI key to indexed lookups in the activity table.
+            partd_scope = """
+    JOIN (SELECT DISTINCT npi / 10 AS npi9 FROM market_addresses) market_npis ON (
+        (activity.npi < 1000000000 AND activity.npi = market_npis.npi9)
+        OR (
+            activity.npi >= 1000000000
+            AND activity.npi BETWEEN market_npis.npi9 * 10
+                AND LEAST(market_npis.npi9::numeric * 10 + 9, 9223372036854775807)::bigint
+        )
+    )"""
         partd_cte = f"""
 partd_by_npi AS (
     SELECT
@@ -1220,7 +1232,7 @@ partd_by_npi AS (
             WHERE effective_from <= :as_of
               AND (effective_to IS NULL OR effective_to >= :as_of)
         ) AS pharmacy_type
-    FROM {partd_table}
+    FROM {partd_table} activity{partd_scope}
     GROUP BY 1
 )"""
         partd_join = "LEFT JOIN partd_by_npi pd ON pd.npi9 = (a.npi / 10)"
@@ -1415,8 +1427,6 @@ WITH pharmacy_codes AS (
     FROM mrf.nucc_taxonomy
     WHERE classification = 'Pharmacy'
 ),
-{partd_cte},
-{license_cte},
 market_addresses AS {address_cte} (
     SELECT
         a.npi,
@@ -1431,6 +1441,8 @@ market_addresses AS {address_cte} (
     CROSS JOIN pharmacy_codes pc
     WHERE {" AND ".join(base_filters)}
 ),
+{partd_cte},
+{license_cte},
 base AS (
     SELECT
         a.npi::bigint AS npi,
