@@ -319,6 +319,7 @@ async def register_snowflake_source_binding(
     dataset_key: str,
     definition: CustomImportDefinition,
     binding: SnowflakeSourceBinding,
+    storage_profile_authorized: bool = False,
 ) -> SnowflakeSourceBindingReceipt:
     """Persist one bounded binding revision or return its exact immutable replay.
 
@@ -328,7 +329,9 @@ async def register_snowflake_source_binding(
     """
 
     canonical_definition, canonical_binding = _validated_registration_binding(definition, binding)
-    definition_registration = await register_definition(session, dataset_key, canonical_definition)
+    definition_registration = await register_definition(
+        session, dataset_key, canonical_definition, storage_profile_authorized=storage_profile_authorized
+    )
     binding_revisions = await _locked_source_binding_revisions(session, definition_registration)
     binding_revision = _matching_binding_revision(binding_revisions, canonical_binding)
     is_created = binding_revision is None

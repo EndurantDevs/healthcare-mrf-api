@@ -21,6 +21,7 @@ from db.models.custom_import import (
     CustomImportSourceBindingRevision,
 )
 from process.custom_import.definition import CustomImportDefinition, canonical_json
+from process.custom_import.definition_store import DefinitionRegistrationError, register_definition
 from process.custom_import.registration_authority import (
     RegistrationAuthorityConflict,
     RegistrationAuthorityDenied,
@@ -46,11 +47,19 @@ async def _authority_case():
         yield case
 
 
-def _registration(*, dataset_key: str = "synthetic_authority", unicode_alias: bool = False, refresh_mode="snapshot"):
+def _registration(
+    *,
+    dataset_key: str = "synthetic_authority",
+    unicode_alias: bool = False,
+    refresh_mode="snapshot",
+    storage_profile=False,
+):
     definition_document = json.loads(_definition().canonical)
     definition_document["refresh_mode"] = refresh_mode
     if unicode_alias:
         definition_document["aliases"]["root_source"] = {"RÓOT_NPI": "npi"}
+    if storage_profile:
+        definition_document["storage_profile"] = "rooted_child_text_v1"
     definition = CustomImportDefinition.from_mapping(definition_document)
     binding_document = json.loads(_loaded_binding().binding.canonical)
     binding_document["definition_sha256"] = definition.digest
@@ -181,6 +190,44 @@ async def test_existing_definition_identity_conflict_is_not_a_retryable_failure(
             state = await get_registration_authority(session, authority_id)
             assert state is not None and state.result is None
             assert await session.scalar(select(func.count()).select_from(CustomImportSourceBindingRevision)) == 1
+
+
+@pytest.mark.asyncio
+async def test_storage_profile_registration_requires_the_exact_approved_capability(monkeypatch):
+    registration = _registration(storage_profile=True)
+    approval = "HLTHPRT_CUSTOM_IMPORT_STORAGE_PROFILE_REGISTRATION_SHA256"
+    digest = hashlib.sha256(canonical_json(registration).encode("utf-8")).hexdigest()
+    authority_id, token, token_sha256, expires_at = _intent()
+    async with _authority_case() as case:
+        for configured in ("", "different", "1" * 64):
+            monkeypatch.setenv(approval, configured)
+            with pytest.raises(RegistrationAuthorityDenied, match="storage profile"):
+                await _mint(case, authority_id, registration, expires_at, token_sha256)
+        definition = CustomImportDefinition.from_mapping(registration["definition"])
+        binding = SnowflakeSourceBinding.from_mapping(registration["source_binding"])
+        async with case.sessions() as session, session.begin():
+            with pytest.raises(DefinitionRegistrationError, match="storage profile requires registration authority"):
+                await register_definition(session, registration["dataset_key"], definition)
+            with pytest.raises(DefinitionRegistrationError, match="storage profile requires registration authority"):
+                await register_snowflake_source_binding(
+                    session, dataset_key=registration["dataset_key"], definition=definition, binding=binding
+                )
+        assert await _dataset_count(case) == 0
+
+        monkeypatch.setenv(approval, digest)
+        minted = await _mint(case, authority_id, registration, expires_at, token_sha256)
+        assert minted.input_sha256.hex() == digest
+        monkeypatch.delenv(approval)
+        assert await _mint(case, authority_id, registration, expires_at, token_sha256) == minted
+        with pytest.raises(RegistrationAuthorityConflict):
+            await _register(case, authority_id, registration | {"dataset_key": "synthetic_other"}, token)
+        with pytest.raises(RegistrationAuthorityDenied):
+            await _register(case, authority_id, registration, secrets.token_bytes(32))
+        completed = await _register(case, authority_id, registration, token)
+        assert completed.result["definition_sha256"] == definition.digest
+        assert completed.result["schema_sha256"] == definition.schema_digest
+        assert await _dataset_count(case) == 1
+        assert await _register(case, authority_id, registration, token) == completed
 
 
 @pytest.mark.asyncio

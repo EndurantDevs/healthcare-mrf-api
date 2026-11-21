@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ _DIGEST_FIELDS = ("definition_sha256", "schema_sha256", "source_binding_sha256")
 _RECEIPT_FIELDS = frozenset((*_ID_FIELDS, *_DIGEST_FIELDS, "status"))
 MAX_RESULT_RECEIPT_BYTES = 4096
 MAX_REGISTRATION_INPUT_BYTES = 1024 * 1024
+_STORAGE_PROFILE_REGISTRATION_SHA256 = "HLTHPRT_CUSTOM_IMPORT_STORAGE_PROFILE_REGISTRATION_SHA256"
 
 
 class RegistrationAuthorityError(ValueError):
@@ -231,6 +233,15 @@ async def mint_registration_authority(
     token_digest = _digest(token_sha256)
     _require_transaction(session)
     _require_clean_session(session)
+    if (
+        prepared.definition.storage_profile is not None
+        and await _read_authority(session, identifier, lock=True) is None
+    ):
+        approved = os.getenv(_STORAGE_PROFILE_REGISTRATION_SHA256, "")
+        if _SHA256.fullmatch(approved) is None or not hmac.compare_digest(
+            prepared.input_sha256, bytes.fromhex(approved)
+        ):
+            raise RegistrationAuthorityDenied("registration storage profile is unavailable")
     await session.execute(
         insert(_TABLE)
         .values(
@@ -309,7 +320,11 @@ async def _register_graph(session: AsyncSession, prepared: _Registration) -> Sno
 
     try:
         return await register_snowflake_source_binding(
-            session, dataset_key=prepared.dataset_key, definition=prepared.definition, binding=prepared.binding
+            session,
+            dataset_key=prepared.dataset_key,
+            definition=prepared.definition,
+            binding=prepared.binding,
+            storage_profile_authorized=prepared.definition.storage_profile is not None,
         )
     except DefinitionRegistrationConflict as exc:
         raise RegistrationAuthorityConflict("registration graph identity conflicts") from exc

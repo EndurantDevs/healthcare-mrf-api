@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261119230000_clinical_code_catalog_page_index"
+CURRENT_HEAD = "20261121050000_custom_import_rooted_text"
 _ORIGIN_UPGRADE_REVISIONS = [
     REVISION,
     "20261013010000_registry_custom_history_events",
@@ -85,6 +85,7 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261115120000_named_output_recovery_document",
     "20261116090000_profile_capacity_logical_names",
     "20261119090000_cms_npd_typed_release",
+    "20261119230000_clinical_code_catalog_page_index",
     CURRENT_HEAD,
 ]
 
@@ -209,7 +210,7 @@ def _assert_custom_import_manual_acceptance_lineage(script):
 def _assert_snapshot_migration_head(script):
     """Keep the current head and staged snapshot predecessors explicit."""
     assert script.get_heads() == [CURRENT_HEAD]
-    for parent, child in zip(_ORIGIN_UPGRADE_REVISIONS[-13:-1], _ORIGIN_UPGRADE_REVISIONS[-12:]):
+    for parent, child in zip(_ORIGIN_UPGRADE_REVISIONS[-14:-1], _ORIGIN_UPGRADE_REVISIONS[-13:]):
         assert script.get_revision(child).down_revision == parent
     assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"

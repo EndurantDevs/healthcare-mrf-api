@@ -22,6 +22,7 @@ from process.custom_import.derived_query import DerivedQueryField, parse_derived
 
 CONTRACT_VERSION = "custom-import/v1"
 MAX_DEFINITION_BYTES = 1024 * 1024
+ROOTED_CHILD_TEXT_STORAGE_PROFILE = "rooted_child_text_v1"
 MAX_DEFINITION_DEPTH = 32
 MAX_DEFINITION_NODES = 10_000
 MAX_HOT_FIELDS = 20
@@ -367,6 +368,7 @@ class CustomImportDefinition:
     digest: str
     schema_canonical: str
     schema_digest: str
+    storage_profile: str | None = None
 
     @property
     def fields(self) -> tuple[Field, ...]:
@@ -432,6 +434,7 @@ def _parse_definition_header(definition_value: Mapping[str, Any]) -> Mapping[str
             "aliases",
             "query",
             "selection_profiles",
+            "storage_profile",
         },
     )
     if _required(definition, "contract", "definition") != CONTRACT_VERSION:
@@ -465,6 +468,9 @@ def _parse_definition_contents(definition: Mapping[str, Any]) -> CustomImportDef
     query = _parse_query(definition.get("query", {}), root_fields, child_fields, child_collections)
     selection_profiles = _parse_profiles(definition.get("selection_profiles", []), query, (*root_fields, *child_fields))
     _validate_entity_selection(query, selection_profiles, root_logical_key, entity_field)
+    storage_profile = definition.get("storage_profile")
+    if "storage_profile" in definition and storage_profile != ROOTED_CHILD_TEXT_STORAGE_PROFILE:
+        raise DefinitionError("definition.storage_profile is unsupported")
     schema_by_scope = {"root": root_schema, "children": schema.get("children", [])}
     return CustomImportDefinition(
         definition_revision=definition_revision,
@@ -484,6 +490,7 @@ def _parse_definition_contents(definition: Mapping[str, Any]) -> CustomImportDef
         digest=canonical_sha256(definition),
         schema_canonical=canonical_json(schema_by_scope),
         schema_digest=canonical_sha256(schema_by_scope, domain="schema"),
+        storage_profile=storage_profile,
     )
 
 
