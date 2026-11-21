@@ -110,7 +110,6 @@ CATALOG = (
     """REVOKE ALL ON TABLE hp_snapshot_retention.relation FROM PUBLIC""",
 )
 # Ordinary importers check retained claims before rotation; they read only the claimed names.
-# Applied on every upgrade, so a catalog created before these grants existed also receives them.
 CLAIM_READ_GRANTS = (
     """GRANT USAGE ON SCHEMA hp_snapshot_retention TO PUBLIC""",
     """GRANT SELECT (schema_name,relation_name) ON TABLE hp_snapshot_retention.relation,
@@ -119,25 +118,49 @@ CLAIM_READ_GRANTS = (
 
 
 def upgrade_named_preparation_catalog(bind):
-    """Create one complete fresh catalog or require an already-current shared catalog."""
-    present_names = set(
+    """Create a fresh catalog or validate the shape of a shared catalog.
+
+    Before migrating an externally managed catalog, its owner must provision
+    the ordinary importers' retained-claim reads through an authorized claim
+    view or the named columns. Named publishers need direct access to their
+    preparation inventory under their own role.
+    """
+    relation_kind_by_name = dict(
         bind.execute(
-            text("""SELECT table_name FROM information_schema.tables
-        WHERE table_schema='hp_snapshot_retention' AND table_name::text=ANY(CAST(:names AS text[]))
+            text("""SELECT c.relname, c.relkind::text
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'hp_snapshot_retention' AND c.relname::text = ANY(CAST(:names AS text[]))
         """),
             {"names": list(TABLES)},
-        ).scalars()
+        ).all()
     )
-    if present_names:
-        if present_names != set(TABLES):
+    if relation_kind_by_name:
+        if relation_kind_by_name.keys() != set(TABLES):
             raise RuntimeError("named_preparation_catalog_incomplete")
+        if any(kind != "r" for kind in relation_kind_by_name.values()):
+            raise RuntimeError("named_preparation_catalog_shape_changed")
     else:
         bind.execute(text("CREATE SCHEMA IF NOT EXISTS hp_snapshot_retention"))
         for statement in CATALOG:
             bind.execute(text(statement))
     validate_named_preparation_catalog(bind)
-    for statement in CLAIM_READ_GRANTS:
-        bind.execute(text(statement))
+    # An externally administered catalog already has its own claim access policy.
+    if not relation_kind_by_name or _can_grant_claim_reads(bind):
+        for statement in CLAIM_READ_GRANTS:
+            bind.execute(text(statement))
+
+
+def _can_grant_claim_reads(bind):
+    return bind.execute(
+        text("""SELECT pg_catalog.has_schema_privilege('hp_snapshot_retention', 'USAGE WITH GRANT OPTION')
+          AND bool_and(pg_catalog.has_column_privilege(relation, column_name, 'SELECT WITH GRANT OPTION'))
+        FROM (VALUES
+          ('hp_snapshot_retention.preparation_relation', 'schema_name'),
+          ('hp_snapshot_retention.preparation_relation', 'relation_name'),
+          ('hp_snapshot_retention.relation', 'schema_name'),
+          ('hp_snapshot_retention.relation', 'relation_name')
+        ) AS claims(relation, column_name)""")
+    ).scalar_one()
 
 
 def validate_named_preparation_catalog(bind):
@@ -183,8 +206,11 @@ def validate_named_preparation_catalog(bind):
     }
     columns_by_table = {name: set() for name in TABLES}
     for table, column in bind.execute(
-        text("""SELECT table_name,column_name FROM information_schema.columns
-        WHERE table_schema='hp_snapshot_retention' AND table_name::text=ANY(CAST(:names AS text[]))"""),
+        text("""SELECT c.relname, a.attname
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+        WHERE n.nspname = 'hp_snapshot_retention' AND c.relkind = 'r'
+          AND c.relname::text = ANY(CAST(:names AS text[])) AND a.attnum > 0 AND NOT a.attisdropped"""),
         {"names": list(TABLES)},
     ):
         columns_by_table[table].add(column)
