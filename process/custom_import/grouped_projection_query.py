@@ -6,6 +6,7 @@ from sqlalchemy import and_, case, inspect, select
 
 from db.models.custom_import import CustomImportChildRevision
 from process.custom_import import grouped_query as query
+from process.custom_import.query_projection_default_roots import DEFAULT_ROOTS
 from process.custom_import.query_projection_sources import field_slots
 
 
@@ -59,8 +60,18 @@ def _source_values(context, plan, entity_values, derived_fields):
     fields = [field for field in context.definition.fields if field.field_id in requested_field_ids]
     selectors = [predicate for predicate in plan.context_filters if predicate.field.collection is not None]
     if selectors:
+        roots = (
+            context.projection_tables.get(DEFAULT_ROOTS)
+            if plan.use_default_roots and entity_values is not None
+            else None
+        )
+        scoped = (
+            select(roots).where(roots.c.entity_value.in_(entity_values)).cte("selected_score_families")
+            if roots is not None
+            else None
+        )
         selected, statement, values_by_field, states_by_field, _, child_identity = query._derived_child_values(
-            context, plan, entity_values, fields, selectors, derived_fields, include_binding=True
+            context, plan, entity_values, fields, selectors, derived_fields, include_binding=True, selected=scoped
         )
         return selected, statement, values_by_field, states_by_field, child_identity
     selected = query.selected_identities(context, plan, entity_values, include_binding=True)

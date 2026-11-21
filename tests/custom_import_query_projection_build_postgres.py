@@ -9,11 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, literal, select, text
+from sqlalchemy.exc import IntegrityError
 
 from db.models.custom_import import (
     CustomImportChildRevision,
     CustomImportChildScalar,
+    CustomImportCurrentGeneration,
     CustomImportFamilyChild,
     CustomImportGeneration,
     CustomImportGenerationSeal,
@@ -21,16 +23,19 @@ from db.models.custom_import import (
 )
 from db.models.custom_import_query_projection import CustomImportQueryProjection
 from process.custom_import import build_output as output
+from process.custom_import import publication, read_core
 from process.custom_import import query_projection_build as projection
-from process.custom_import import read_core
 from process.custom_import.build_source import _page_session
-from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.definition import ROOTED_CHILD_TEXT_STORAGE_PROFILE, CustomImportDefinition
+from process.custom_import.definition_store import register_definition
 from process.custom_import.query_projection_build import (
     ProjectionCursorConflict,
     projection_step,
     stage_query_projections,
 )
+from process.custom_import.query_projection_default_roots import DEFAULT_ROOTS, default_root_table
 from process.custom_import.query_projection_evidence import ProjectionDigest
+from process.custom_import.query_projection_sources import capability_sha256
 from process.custom_import.query_projection_storage import query_projection_tables
 from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.runner_codec import child_key_document
@@ -44,8 +49,11 @@ from tests.test_custom_import_query_projection_sources import _context, _owner_r
 from tests.test_custom_import_read_core_postgres import _service
 
 
-def _definition():
+def _definition(*, default_roots=False, revision=1):
     document = derived_document()
+    document["revision"]["definition"] = revision
+    if default_roots:
+        document["storage_profile"] = ROOTED_CHILD_TEXT_STORAGE_PROFILE
     for stream in document["streams"]:
         stream.update(format="parquet", compression="none")
     return CustomImportDefinition.from_mapping(document)
@@ -85,8 +93,19 @@ def _records():
     return {"providers": [roots], "rates": [children[offset : offset + 100] for offset in range(0, len(children), 100)]}
 
 
-async def _winning_build(case):
-    request = await _request_for(case, _records(), page_rows=64, definition=_definition())
+async def _projection_request(case, rows_by_stream, *, default_roots):
+    definition = _definition(default_roots=default_roots)
+    async with case.sessions() as session, session.begin():
+        seed = await register_definition(
+            session, "synthetic_bounded_output", definition, storage_profile_authorized=default_roots
+        )
+    return await _request_for(case, rows_by_stream, seed=seed, page_rows=64, definition=definition)
+
+
+async def _winning_build(case, *, rows_by_stream=None, default_roots=True):
+    request = await _projection_request(
+        case, _records() if rows_by_stream is None else rows_by_stream, default_roots=default_roots
+    )
     request = replace(request, statement_timeout_ms=10_000)
     build_id, generation_id = await _build(case, request)
     async with _page_session(case.sessions, request, build_id) as (session, _build_row):
@@ -98,8 +117,8 @@ async def _winning_build(case):
     return request, build_id
 
 
-def _expected_projection_digest(definition):
-    digest = ProjectionDigest(definition)
+def _expected_projection_digest(definition, *, default_roots=True):
+    digest = ProjectionDigest(definition, default_roots=default_roots)
     digest.add_root("1003000126", 10, {"combined_score": None})
     for period in (10, 20):
         digest.add_root("1234567893", period, {"combined_score": Decimal("0")})
@@ -111,7 +130,7 @@ def _expected_projection_digest(definition):
     return digest.finish()
 
 
-async def _assert_physical_projection_reads(case, request, generation_id):
+async def _assert_physical_projection_reads(case, request, generation_id, *, default_roots):
     await _activate(case, request, generation_id)
     service = _service()
     pinned_target = read_core.PinnedReadTarget(
@@ -155,15 +174,64 @@ async def _assert_physical_projection_reads(case, request, generation_id):
             assert await session.scalar(select(func.count()).select_from(prepared.statement.subquery())) == len(
                 expected
             )
+        await _assert_default_scope_reads(session, service, pinned_target, base_query, default_roots)
+
+
+async def _assert_default_scope_reads(session, service, target, query, default_roots):
+    authorization = read_core.ExtensionReadAuthorization("synthetic-projection")
+    query = replace(query, require_match=True)
+    for npi, expected in ((1234567893, [("1234567893", Decimal("9"))]), (1003000126, [])):
+        scored_pages = []
+        native = select(literal(npi, type_=CustomImportRootScalar.integer_value.type).label("npi"))
+        for use_default_roots in (False, True):
+            baseline = await service.prepare_npi_entity_relation(
+                session, authorization=authorization, target=target, query=query
+            )
+            prepared = await service.scope_npi_entity_relation(
+                session,
+                authorization=authorization,
+                pinned_target=target,
+                prepared=baseline,
+                query=query,
+                native_entity_scope=native,
+                use_default_roots=use_default_roots,
+            )
+            optimized = default_roots and use_default_roots
+            statement_sql = str(prepared.statement)
+            assert (DEFAULT_ROOTS in statement_sql) is optimized
+            assert ("custom_import_generation_family" in statement_sql) is not optimized
+            assert prepared.query_fingerprint == baseline.query_fingerprint
+            assert prepared.authorization_scope_sha256 == baseline.authorization_scope_sha256
+            scored_pages.append((await session.execute(prepared.statement)).all())
+        assert scored_pages == [expected, expected]
+
+
+async def _assert_companion_rows(session, manifest, definition, default_roots):
+    table = default_root_table(manifest.family_id)
+    assert (
+        manifest.projection_sha256
+        == _expected_projection_digest(definition, default_roots=default_roots).projection_sha256
+    )
+    if default_roots:
+        actual = (
+            await session.execute(select(table.c.entity_value, table.c.selected_value, table.c.group_value))
+        ).all()
+        assert sorted(actual) == [
+            ("1003000126", 10, "segment_a"),
+            ("1234567893", 20, "segment_a"),
+            ("1234567893", 20, "segment_b"),
+        ]
+    else:
+        assert await session.scalar(select(func.to_regclass(table.fullname))) is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("physical_pages", (1, 32))
-async def test_projection_resumes_context_pages_and_preserves_all_null_rows(monkeypatch, physical_pages):
+@pytest.mark.parametrize(("physical_pages", "default_roots"), ((1, True), (32, True), (32, False)))
+async def test_projection_resumes_context_pages_and_preserves_all_null_rows(monkeypatch, physical_pages, default_roots):
     monkeypatch.setattr(projection, "_MAX_LOGICAL_PAGES", physical_pages)
     monkeypatch.setattr(projection, "time", SimpleNamespace(monotonic=lambda: 0.0))
     async with _source_case() as case:
-        request, build_id = await _winning_build(case)
+        request, build_id = await _winning_build(case, default_roots=default_roots)
         first = await projection_step(case.sessions, request, build_id)
         with pytest.raises(ProjectionCursorConflict):
             await projection_step(case.sessions, request, build_id, expected=first.before)
@@ -186,7 +254,7 @@ async def test_projection_resumes_context_pages_and_preserves_all_null_rows(monk
         async with case.sessions() as session, session.begin():
             manifest = (await session.scalars(select(CustomImportQueryProjection))).one()
             assert (manifest.root_count, manifest.child_count, manifest.index_count) == (3, 261, 4)
-            assert manifest.projection_sha256 == _expected_projection_digest(request.definition).projection_sha256
+            await _assert_companion_rows(session, manifest, request.definition, default_roots)
             tables = query_projection_tables(manifest.family_id, request.definition)
             roots = (await session.execute(select(tables["custom_import_derived_root"]))).all()
             assert sorted(
@@ -208,7 +276,174 @@ async def test_projection_resumes_context_pages_and_preserves_all_null_rows(monk
         with pytest.raises(CandidateRunnerError):
             await projection_step(case.sessions, request, build_id)
         assert (await output.build_output(case.sessions, request, build_id)).seal.replayed
-        await _assert_physical_projection_reads(case, request, sealed.generation_id)
+        await _assert_physical_projection_reads(case, request, sealed.generation_id, default_roots=default_roots)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ("extra_binding", "missing_root"))
+async def test_default_root_projection_rejects_incomplete_or_extra_coverage(damage):
+    """Refuse changed candidate rows before a generation can be sealed or read."""
+
+    async with _source_case() as case:
+        request, build_id = await _winning_build(case)
+        for _ in range(20):
+            if (await projection_step(case.sessions, request, build_id)).after.phase == "verify_root":
+                break
+        else:
+            pytest.fail("projection did not enter native verification")
+        async with case.sessions() as session, session.begin():
+            manifest = (await session.scalars(select(CustomImportQueryProjection))).one()
+            assert manifest.capability_sha256 == capability_sha256(request.definition, default_roots=True)
+            table = default_root_table(manifest.family_id)
+            if damage == "extra_binding":
+                await _inject_extra_binding(session, table)
+            else:
+                await session.execute(table.delete().where(table.c.entity_value == "1234567893"))
+        with pytest.raises(CandidateRunnerError, match="default root projection verified coverage differs"):
+            await stage_query_projections(case.sessions, request, build_id)
+        async with case.sessions() as session:
+            manifest = (await session.scalars(select(CustomImportQueryProjection))).one()
+            assert manifest.phase == "verify_root" and manifest.complete_at is None
+            assert await session.get(CustomImportGenerationSeal, manifest.generation_id) is None
+
+
+async def _inject_extra_binding(session, table):
+    unowned = table.insert().values(
+        family_revision_id=999,
+        root_record_id=999,
+        root_revision_id=999,
+        entity_value="1000000008",
+        selected_value=20,
+        group_value="segment_a",
+    )
+    with pytest.raises(IntegrityError) as impossible_binding:
+        async with session.begin_nested():
+            await session.execute(unowned.values(entity_binding_id=0))
+    assert impossible_binding.value.orig.sqlstate == "23514"
+    await session.execute(unowned.values(entity_binding_id=999))
+
+
+@pytest.mark.asyncio
+async def test_default_root_projection_resumes_between_periods_of_one_binding(monkeypatch):
+    """Split a binding across root pages without duplicating or losing its companion rows."""
+
+    monkeypatch.setattr(projection, "_MAX_LOGICAL_PAGES", 1)
+    bounded_metadata = projection._bounded_key_metadata
+
+    async def one_accepted_context(session, source, request, manifest):
+        return (await bounded_metadata(session, source, request, manifest))[:1]
+
+    monkeypatch.setattr(projection, "_bounded_key_metadata", one_accepted_context)
+    async with _source_case() as case:
+        rows_by_stream = _records()
+        rows_by_stream["rates"] = [[rows_by_stream["rates"][0][0], rows_by_stream["rates"][-1][-1]]]
+        request, build_id = await _winning_build(case, rows_by_stream=rows_by_stream)
+        retained_pages = []
+        for _ in range(10):
+            page = await projection_step(case.sessions, request, build_id)
+            if page.after.phase != "root":
+                break
+            retained_pages.append(page.after)
+        else:
+            pytest.fail("projection did not finish its root scope")
+        assert any(
+            left.after_entity_binding_id == right.after_entity_binding_id
+            and left.after_selected_value == 10
+            and right.after_selected_value == 20
+            for left, right in zip(retained_pages, retained_pages[1:])
+        )
+        async with case.sessions() as session:
+            manifest = (await session.scalars(select(CustomImportQueryProjection))).one()
+            assert manifest.root_count == 3
+            table = default_root_table(manifest.family_id)
+            roots = (
+                await session.execute(select(table.c.entity_value, table.c.selected_value, table.c.group_value))
+            ).all()
+        assert sorted(roots) == [
+            ("1003000126", 10, "segment_a"),
+            ("1234567893", 20, "segment_a"),
+            ("1234567893", 20, "segment_b"),
+        ]
+
+
+async def _assert_activation_companion(case, request, generation_id, pointer_version, *, default_roots):
+    from process.custom_import.query_projection_evidence import read_projection_tables
+    from tests.test_custom_import_segmented_runner_postgres import _ROOTED_TEXT_INDEX
+
+    async with case.sessions() as session, session.begin():
+        pointer = await session.get(CustomImportCurrentGeneration, request.dataset_id)
+        assert (pointer.generation_id, pointer.pointer_version) == (generation_id, pointer_version)
+        manifest = await session.scalar(
+            select(CustomImportQueryProjection).where(CustomImportQueryProjection.generation_id == generation_id)
+        )
+        tables = await read_projection_tables(
+            session, manifest, request.definition, snapshot_family_id=manifest.family_id
+        )
+        assert (DEFAULT_ROOTS in tables) is default_roots
+        index_name = f"{default_root_table(manifest.family_id).schema}.{_ROOTED_TEXT_INDEX}"
+        assert (await session.scalar(select(func.to_regclass(index_name))) is not None) is default_roots
+
+
+async def _approved_successor(case, monkeypatch, definition):
+    from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
+    from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
+    from tests.custom_import_query_projection_authority_postgres import _binding
+    from tests.test_custom_import_segmented_capture_postgres import _POLICY
+    from tests.test_custom_import_segmented_runner_postgres import _register_profile
+
+    policy = ProcessingPolicy(
+        SegmentedCapturePolicy.from_mapping(_POLICY), 17, BuildPolicy(64, 65_536, 10_000, 120, 300)
+    )
+    with monkeypatch.context() as approved:
+        return await _register_profile(
+            case, approved, "synthetic_bounded_output", definition, _binding(definition, policy)
+        )
+
+
+@pytest.mark.asyncio
+async def test_default_root_projection_can_publish_same_data_then_roll_back(monkeypatch):
+    """Publish the new capability through the normal pointer and retain the original edition."""
+
+    from tests.custom_import_query_projection_authority_postgres import _source_definition
+    from tests.test_custom_import_segmented_runner_postgres import _install_storage_profile_fixture
+
+    rows_by_stream = _records()
+    rows_by_stream["rates"] = [[rows_by_stream["rates"][0][0], rows_by_stream["rates"][-1][-1]]]
+    async with _source_case() as case:
+        await _install_storage_profile_fixture(case)
+        baseline_request = await _request_for(
+            case, rows_by_stream, definition=_source_definition(default_roots=False), page_rows=64
+        )
+        build_id, first_generation = await _build(case, baseline_request)
+        await output.build_output(case.sessions, baseline_request, build_id)
+        await _activate(case, baseline_request, first_generation)
+        definition = _source_definition(default_roots=True, revision=2)
+        activated_profile = await _approved_successor(case, monkeypatch, definition)
+        next_request = await _request_for(
+            case,
+            rows_by_stream,
+            seed=activated_profile,
+            base=first_generation,
+            version=1,
+            definition=definition,
+            page_rows=64,
+        )
+        build_id, second_generation = await _build(case, next_request)
+        sealed = await output.build_output(case.sessions, next_request, build_id)
+        assert sealed.generation_id == second_generation and sealed.no_change is None
+        await _assert_activation_companion(case, baseline_request, first_generation, 1, default_roots=False)
+        await _activate(case, next_request, second_generation, base=first_generation, version=1)
+        await _assert_activation_companion(case, next_request, second_generation, 2, default_roots=True)
+        async with case.sessions() as session, session.begin():
+            rolled_back = await publication.rollback_generation(
+                session,
+                dataset_id=baseline_request.dataset_id,
+                target_generation_id=first_generation,
+                expected_generation_id=second_generation,
+                expected_pointer_version=2,
+            )
+        assert rolled_back.event_kind == "rolled_back"
+        await _assert_activation_companion(case, baseline_request, first_generation, 3, default_roots=False)
 
 
 @pytest.mark.asyncio
@@ -330,6 +565,7 @@ async def _assert_writer_rejects(
         after_child_key_sha256=b"\xff" * 32 if exhausted and phase == "child" else None,
         root_count=0,
         child_count=0,
+        capability_sha256=capability_sha256(context.definition),
     )
     original = vars(manifest).copy()
     with pytest.raises(CandidateRunnerError, match=f"query projection {expected_scope} is ambiguous"):

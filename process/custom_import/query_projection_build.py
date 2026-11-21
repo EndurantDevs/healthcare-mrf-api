@@ -5,7 +5,7 @@
 import time
 from dataclasses import dataclass
 
-from sqlalchemy import func, select, text, tuple_
+from sqlalchemy import func, select, text, tuple_, union
 
 from db.models.custom_import import CustomImportGeneration, CustomImportWinner
 from process.custom_import.admission_sql import _verify_writer_permit
@@ -18,6 +18,7 @@ from process.custom_import.query_projection_authorization import (
     ProjectionPermit,
 )
 from process.custom_import.query_projection_binding import validate_projection_indexes
+from process.custom_import.query_projection_default_roots import default_root_source, default_root_table
 from process.custom_import.query_projection_initialize import initialize_projection
 from process.custom_import.query_projection_pages import cell_insert_statement, context_key_statement
 from process.custom_import.query_projection_sources import (
@@ -25,6 +26,7 @@ from process.custom_import.query_projection_sources import (
     child_hash_collision_statement,
     child_source,
     field_slots,
+    has_default_roots,
     root_source,
 )
 from process.custom_import.query_projection_storage import (
@@ -132,7 +134,7 @@ async def _source_context(session, request, build):
     )
 
 
-async def _entity_window(session, context, manifest, limit):
+async def _entity_window(session, context, manifest, limit, *, companion=None):
     winner = context.model(CustomImportWinner)
     is_entity_exhausted = manifest.after_selected_value == _MAX_INTEGER and (
         manifest.phase in {"root", "verify_root", "verify_child"} or manifest.after_child_key_sha256 == b"\xff" * 32
@@ -142,22 +144,22 @@ async def _entity_window(session, context, manifest, limit):
         if is_entity_exhausted
         else winner.entity_binding_id >= max(1, manifest.after_entity_binding_id)
     )
-    statement = (
-        select(winner.entity_binding_id)
-        .where(
-            winner.generation_id == context.generation_id,
-            winner.dataset_id == context.dataset_id,
-            winner.definition_revision_id == context.definition_revision_id,
-            winner.schema_revision_id == context.schema_revision_id,
-            winner.profile_slot == context.profile_slot,
-            winner.context_collection_slot == 0,
-            winner.context_child_revision_id.is_(None),
-            boundary,
-        )
-        .distinct()
-        .order_by(winner.entity_binding_id)
-        .limit(limit)
+    statement = select(winner.entity_binding_id).where(
+        winner.generation_id == context.generation_id,
+        winner.dataset_id == context.dataset_id,
+        winner.definition_revision_id == context.definition_revision_id,
+        winner.schema_revision_id == context.schema_revision_id,
+        winner.profile_slot == context.profile_slot,
+        winner.context_collection_slot == 0,
+        winner.context_child_revision_id.is_(None),
+        boundary,
     )
+    statement = statement.distinct().order_by(winner.entity_binding_id).limit(limit)
+    if companion is not None:
+        key = companion.c.entity_binding_id
+        projected = select(key).where(key > manifest.after_entity_binding_id).distinct().order_by(key).limit(limit)
+        both = union(statement, projected).subquery()
+        statement = select(both.c.entity_binding_id).order_by(both.c.entity_binding_id).limit(limit)
     return (await _execute(session, statement)).scalars().all()
 
 
@@ -206,19 +208,71 @@ async def _bounded_key_metadata(session, source, request, manifest):
     return accepted
 
 
+def _root_companion(manifest, request, phase):
+    if manifest.phase == phase and has_default_roots(request.definition, manifest.capability_sha256):
+        return default_root_table(manifest.family_id)
+    return None
+
+
+def _root_window_limit(request, companion):
+    if companion is None:
+        return request.page_row_limit
+    groups = request.definition.query.entity_selection.group_values
+    bytes_per_binding = sum(80 + len(group.encode("utf-8")) for group in groups)
+    if request.page_byte_limit < bytes_per_binding:
+        raise CandidateRunnerError("default root projection exceeds the byte page")
+    return min(max(1, request.page_row_limit // len(groups)), request.page_byte_limit // bytes_per_binding)
+
+
+async def _insert_default_roots(session, companion, context, entity_ids, request, manifest):
+    pending_entity_ids = [entity_id for entity_id in entity_ids if entity_id > manifest.after_entity_binding_id]
+    if pending_entity_ids:
+        statement = default_root_source(context, pending_entity_ids)
+        inserted = await _execute(session, companion.insert().from_select(tuple(companion.c.keys()), statement))
+        if not 0 <= inserted.rowcount <= request.page_row_limit:
+            raise CandidateRunnerError("default root projection exceeds the row page")
+
+
+async def _scope_page(session, request, build, manifest, fields, companion):
+    context = await _source_context(session, request, build)
+    entity_ids = await _entity_window(session, context, manifest, _root_window_limit(request, companion))
+    if fields and entity_ids:
+        return context, entity_ids
+    if companion is not None and entity_ids:
+        await _insert_default_roots(session, companion, context, entity_ids, request, manifest)
+        manifest.after_entity_binding_id = entity_ids[-1]
+        manifest.after_selected_value = _MAX_INTEGER
+    else:
+        _advance_phase(manifest)
+    return None
+
+
+async def _complete_child_keys(session, source_relation, keys):
+    identities = [source_relation.c[name] for name in ("entity_binding_id", "selected_value", "child_key_sha256")]
+    statement = (
+        select(*identities, source_relation.c.canonical_child_key)
+        .where(tuple_(*identities).in_(keys))
+        .distinct()
+        .order_by(*identities)
+    )
+    return [tuple(context_row) for context_row in (await _execute(session, statement)).all()]
+
+
 async def _write_contexts(session, request, build, manifest):
+    """Validate a bounded candidate page before atomically writing cells and its cursor."""
+
     is_child = manifest.phase == "child"
+    companion = _root_companion(manifest, request, "root")
     fields = tuple(
         field for field in configured_fields(request.definition) if (field.collection is not None) == is_child
     )
-    if not fields:
+    if not fields and companion is None:
         _advance_phase(manifest)
         return
-    context = await _source_context(session, request, build)
-    entity_ids = await _entity_window(session, context, manifest, request.page_row_limit)
-    if not entity_ids:
-        _advance_phase(manifest)
+    scope = await _scope_page(session, request, build, manifest, fields, companion)
+    if scope is None:
         return
+    context, entity_ids = scope
     collection_slot = await _child_collection_slot(session, context) if is_child else None
     discovery, _ = root_source(context, entity_ids)
     if is_child:
@@ -229,6 +283,8 @@ async def _write_contexts(session, request, build, manifest):
     source_relation, values_by_field = await _validated_source(
         session, context, validation_ids, child=is_child, collection_slot=collection_slot
     )
+    if companion is not None:
+        await _insert_default_roots(session, companion, context, validation_ids, request, manifest)
     if not keys:
         # Empty/unknown groups and exhausted children must not hide later entities.
         manifest.after_entity_binding_id = entity_ids[-1]
@@ -236,14 +292,7 @@ async def _write_contexts(session, request, build, manifest):
         manifest.after_child_key_sha256 = b"\xff" * 32 if is_child else None
         return
     if is_child:
-        identities = [source_relation.c[name] for name in ("entity_binding_id", "selected_value", "child_key_sha256")]
-        statement = (
-            select(*identities, source_relation.c.canonical_child_key)
-            .where(tuple_(*identities).in_(keys))
-            .distinct()
-            .order_by(*identities)
-        )
-        keys = [tuple(context_row) for context_row in (await _execute(session, statement)).all()]
+        keys = await _complete_child_keys(session, source_relation, keys)
     table = query_projection_tables(manifest.family_id, request.definition)[
         "custom_import_derived_child" if is_child else "custom_import_derived_root"
     ]
@@ -362,25 +411,34 @@ async def _advance_projection(session, request, build, manifest):
 
 
 async def _verify_contexts(session, request, build, manifest):
-    from process.custom_import.query_projection_verify import _verify_window
+    from process.custom_import.query_projection_verify import _comparison_statement, _verify_window
 
     is_child = manifest.phase == "verify_child"
+    companion = _root_companion(manifest, request, "verify_root")
     fields = tuple(
         field for field in configured_fields(request.definition) if (field.collection is not None) == is_child
     )
-    if not fields:
+    if not fields and companion is None:
         _advance_phase(manifest)
         return
     context = await _source_context(session, request, build)
-    entity_ids = await _entity_window(session, context, manifest, request.page_row_limit)
+    entity_ids = await _entity_window(
+        session, context, manifest, _root_window_limit(request, companion), companion=companion
+    )
     if not entity_ids:
         _advance_phase(manifest)
         return
-    expected, actual = await _verify_window(session, request, context, manifest, entity_ids, fields, child=is_child)
-    if expected != actual:
-        raise CandidateRunnerError("query projection verified coverage differs")
-    name = "verified_child_count" if is_child else "verified_root_count"
-    setattr(manifest, name, getattr(manifest, name) + expected)
+    if companion is not None:
+        expected_roots = default_root_source(context, entity_ids)
+        comparison = (await _execute(session, _comparison_statement(expected_roots, companion, entity_ids))).one()
+        if comparison.differs or comparison.expected_count != comparison.actual_count:
+            raise CandidateRunnerError("default root projection verified coverage differs")
+    if fields:
+        expected, actual = await _verify_window(session, request, context, manifest, entity_ids, fields, child=is_child)
+        if expected != actual:
+            raise CandidateRunnerError("query projection verified coverage differs")
+        name = "verified_child_count" if is_child else "verified_root_count"
+        setattr(manifest, name, getattr(manifest, name) + expected)
     manifest.after_entity_binding_id = entity_ids[-1]
     manifest.after_selected_value = _MAX_INTEGER
 

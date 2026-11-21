@@ -98,6 +98,15 @@ from tests.custom_import_query_projection_authority_postgres import (
     test_signed_scope_rejections_leave_native_projection_state_untouched as test_signed_scope_rejections_leave_native_projection_state_untouched,
 )
 from tests.custom_import_query_projection_build_postgres import (
+    test_default_root_projection_can_publish_same_data_then_roll_back as test_default_root_projection_can_publish_same_data_then_roll_back,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_default_root_projection_rejects_incomplete_or_extra_coverage as test_default_root_projection_rejects_incomplete_or_extra_coverage,
+)
+from tests.custom_import_query_projection_build_postgres import (
+    test_default_root_projection_resumes_between_periods_of_one_binding as test_default_root_projection_resumes_between_periods_of_one_binding,
+)
+from tests.custom_import_query_projection_build_postgres import (
     test_later_projection_chunk_rolls_back as test_later_projection_chunk_rolls_back,
 )
 from tests.custom_import_query_projection_build_postgres import (
@@ -147,6 +156,9 @@ from tests.custom_import_query_projection_sources_postgres import (
 )
 from tests.custom_import_query_projection_sources_postgres import (
     test_configured_ids_matching_envelope_names_keep_their_own_values as test_configured_ids_matching_envelope_names_keep_their_own_values,
+)
+from tests.custom_import_query_projection_sources_postgres import (
+    test_default_roots_use_one_exact_owned_default_or_fail_closed as test_default_roots_use_one_exact_owned_default_or_fail_closed,
 )
 from tests.custom_import_query_projection_sources_postgres import (
     test_root_source_ignores_colliding_scalar_rows_from_other_owners as test_root_source_ignores_colliding_scalar_rows_from_other_owners,

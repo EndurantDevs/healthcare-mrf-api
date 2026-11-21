@@ -33,6 +33,7 @@ from process.custom_import.capture_pending import (
 from process.custom_import.definition import CustomImportDefinition, canonical_json
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
 from process.custom_import.query_projection_authorization import PROJECTION_PATH, PROJECTION_PERMIT_CONTRACT
+from process.custom_import.query_projection_default_roots import DEFAULT_ROOTS, default_root_table
 from process.custom_import.query_projection_evidence import read_projection_tables
 from process.custom_import.query_projection_storage import QUERY_PROJECTION_TABLE_NAMES, query_projection_tables
 from process.custom_import.runner_registry import load_registry
@@ -54,8 +55,8 @@ _TOKEN = b"synthetic-projection-owner"
 _DOMAIN = b"CUSTOM_IMPORT_QUERY_PROJECTION_PERMIT_V1\x00"
 
 
-def _source_definition():
-    definition = _definition()
+def _source_definition(*, default_roots, revision=1):
+    definition = _definition(default_roots=default_roots, revision=revision)
     document = json.loads(definition.canonical)
     document["aliases"] = {
         stream.stream_id: {
@@ -105,6 +106,7 @@ async def _pending_capture(case, definition, policy):
             dataset_key="synthetic_projection_authority",
             definition=definition,
             binding=_binding(definition, policy),
+            storage_profile_authorized=definition.storage_profile is not None,
         )
     identity = hashlib.sha256(b"synthetic-projection-request").digest()
     idempotency_key = uuid.uuid4().hex
@@ -149,8 +151,8 @@ def _bound_receipt(pending, stream, parts):
     )
 
 
-async def _winning_bound_build(case):
-    definition = _source_definition()
+async def _winning_bound_build(case, *, default_roots=True):
+    definition = _source_definition(default_roots=default_roots)
     policy = ProcessingPolicy(
         SegmentedCapturePolicy.from_mapping(_POLICY), 17, BuildPolicy(64, 65_536, 10_000, 120, 300)
     )
@@ -259,11 +261,14 @@ async def _native_state(state):
                     "SELECT n.nspname,c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
                     "WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])) ORDER BY c.relname"
                 ),
-                {"schema": snapshot_schema(state.family_id), "names": list(QUERY_PROJECTION_TABLE_NAMES)},
+                {"schema": snapshot_schema(state.family_id), "names": [*QUERY_PROJECTION_TABLE_NAMES, DEFAULT_ROOTS]},
             )
         ).all()
         counts = []
-        for table in query_projection_tables(state.family_id, state.request.definition).values():
+        for table in (
+            *query_projection_tables(state.family_id, state.request.definition).values(),
+            default_root_table(state.family_id),
+        ):
             if any(relation.relname == table.name for relation in relations):
                 counts.append(await session.scalar(select(func.count()).select_from(table)))
         lease = await session.get(CustomImportLease, state.request.execution_id)
@@ -271,9 +276,10 @@ async def _native_state(state):
         return manifest_rows, relations, counts, lease.expires_at, build.phase
 
 
-async def test_signed_scope_rejections_leave_native_projection_state_untouched():
+@pytest.mark.parametrize("default_roots", (False, True))
+async def test_signed_scope_rejections_leave_native_projection_state_untouched(default_roots):
     async with isolated_publication_case() as case:
-        state = await _winning_bound_build(case)
+        state = await _winning_bound_build(case, default_roots=default_roots)
         before = await _native_state(state)
         rejected_requests = [
             (_wire(state, domain=b"CUSTOM_IMPORT_ADMISSION_PERMIT_V1\x00"), 403),
@@ -291,6 +297,7 @@ async def test_signed_scope_rejections_leave_native_projection_state_untouched()
         accepted = await _serve(state, _wire(state))
         assert accepted.status == 200
         assert json.loads(accepted.body)["after"]["root_count"] == 3
+        assert (await _native_state(state))[2] == ([3, 0, 3] if default_roots else [3, 0])
 
 
 @asynccontextmanager
@@ -332,7 +339,8 @@ async def _role_session(case, role):
             await connection.commit()
 
 
-async def test_projection_initialization_preserves_select_for_the_inherited_root_owner():
+@pytest.mark.parametrize("default_roots", (False, True))
+async def test_projection_initialization_preserves_select_for_the_inherited_root_owner(default_roots):
     async with isolated_publication_case() as case, _reader_roles(case) as (root_owner, initializer):
         family_id = uuid.uuid4().int % (2**63 - 1) + 1
         namespace = snapshot_schema(family_id)
@@ -353,10 +361,18 @@ async def test_projection_initialization_preserves_select_for_the_inherited_root
             async with _role_session(case, initializer) as session, session.begin():
                 assert await session.scalar(text(f'SELECT count(*) FROM "{namespace}".custom_import_root_record')) == 0
                 await initialize._create_cells(
-                    session, SimpleNamespace(family_id=family_id), None, _definition(), prepare=prepare
+                    session,
+                    SimpleNamespace(family_id=family_id),
+                    None,
+                    _definition(),
+                    prepare=prepare,
+                    default_roots=default_roots,
                 )
             async with _role_session(case, root_owner) as session, session.begin():
-                for name in QUERY_PROJECTION_TABLE_NAMES:
+                names = (
+                    (*QUERY_PROJECTION_TABLE_NAMES, DEFAULT_ROOTS) if default_roots else QUERY_PROJECTION_TABLE_NAMES
+                )
+                for name in names:
                     table = f'"{namespace}"."{name}"'
                     assert await session.scalar(text(f"SELECT count(*) FROM {table}")) == 0
                     await _assert_denied(session, f"UPDATE {table} SET selected_value=selected_value")
@@ -370,16 +386,20 @@ async def test_projection_initialization_preserves_select_for_the_inherited_root
 async def _worker_cannot_mutate(state, worker):
     namespace = snapshot_schema(state.family_id)
     root = f'"{namespace}".custom_import_derived_root'
+    default_root = f'"{namespace}"."{DEFAULT_ROOTS}"'
     manifest = f'"{state.case.schema_name}".custom_import_query_projection'
     registry = f'"{state.case.schema_name}".custom_import_snapshot_relation'
     async with _role_session(state.case, worker) as session, session.begin():
         assert await session.scalar(text("SELECT current_user = session_user"))
         assert await session.scalar(text(f"SELECT count(*) FROM {root}")) == 3
+        assert await session.scalar(text(f"SELECT count(*) FROM {default_root}")) == 3
         for statement in (
             f"INSERT INTO {root} DEFAULT VALUES",
             f"UPDATE {root} SET field_1=0",
             f"DELETE FROM {root}",
             f"TRUNCATE {root}",
+            f"UPDATE {default_root} SET selected_value=selected_value",
+            f"TRUNCATE {default_root}",
             f"ALTER TABLE {root} ADD COLUMN unexpected bigint",
             f'CREATE TABLE "{namespace}".unregistered_projection (entity_binding_id bigint)',
             f"UPDATE {manifest} SET root_count=root_count",
@@ -404,8 +424,12 @@ async def _sealed_reader(state, reader):
         tables = await read_projection_tables(
             session, target, state.request.definition, snapshot_family_id=state.family_id
         )
-        assert tuple(tables) == QUERY_PROJECTION_TABLE_NAMES
-        assert [await session.scalar(select(func.count()).select_from(table)) for table in tables.values()] == [3, 261]
+        assert tuple(tables) == (*QUERY_PROJECTION_TABLE_NAMES, DEFAULT_ROOTS)
+        assert [await session.scalar(select(func.count()).select_from(table)) for table in tables.values()] == [
+            3,
+            261,
+            3,
+        ]
         assert await session.scalar(text("SHOW transaction_read_only")) == "on"
 
 
@@ -475,4 +499,4 @@ async def test_interrupted_native_step_rolls_back_and_a_fresh_permit_retries(mon
         monkeypatch.setattr(projection, "_advance_projection", original)
         accepted = await _serve(state, _wire(state))
         assert accepted.status == 200 and json.loads(accepted.body)["after"]["root_count"] == 3
-        assert (await _native_state(state))[2] == [3, 0]
+        assert (await _native_state(state))[2] == [3, 0, 3]

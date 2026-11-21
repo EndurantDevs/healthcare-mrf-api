@@ -10,6 +10,8 @@ from sqlalchemy import literal, select
 
 from process.custom_import import query_projection_build as build
 from process.custom_import import query_projection_digest as digest
+from process.custom_import.query_projection_default_roots import default_root_table
+from process.custom_import.query_projection_sources import capability_sha256
 from process.custom_import.runner_types import CandidateRunnerError
 from tests.test_custom_import_query_projection_pages import _source
 from tests.test_custom_import_query_projection_storage import _definition
@@ -23,8 +25,9 @@ async def test_empty_projection_scope_advances_without_source_reads(monkeypatch,
     monkeypatch.setattr(build, "configured_fields", lambda _definition: ())
     source = AsyncMock()
     monkeypatch.setattr(build, "_source_context", source)
-    manifest = SimpleNamespace(phase=phase)
-    await getattr(build, operation)(object(), SimpleNamespace(definition=object()), object(), manifest)
+    definition = _definition()
+    manifest = SimpleNamespace(phase=phase, capability_sha256=capability_sha256(definition))
+    await getattr(build, operation)(object(), SimpleNamespace(definition=definition), object(), manifest)
     assert manifest.phase == next_phase
     source.assert_not_awaited()
 
@@ -32,7 +35,13 @@ async def test_empty_projection_scope_advances_without_source_reads(monkeypatch,
 async def test_projection_insert_coverage_failure_preserves_cursor(monkeypatch):
     request = SimpleNamespace(definition=_definition(), page_row_limit=256, page_byte_limit=1024)
     source = _source()
-    manifest = SimpleNamespace(family_id=17, phase="root", after_entity_binding_id=0, root_count=0)
+    manifest = SimpleNamespace(
+        family_id=17,
+        phase="root",
+        after_entity_binding_id=0,
+        root_count=0,
+        capability_sha256=capability_sha256(request.definition),
+    )
     monkeypatch.setattr(build, "_source_context", AsyncMock(return_value=object()))
     monkeypatch.setattr(build, "_entity_window", AsyncMock(return_value=[1]))
     monkeypatch.setattr(build, "root_source", Mock(return_value=(source, {})))
@@ -48,11 +57,33 @@ async def test_projection_insert_coverage_failure_preserves_cursor(monkeypatch):
     assert manifest.after_entity_binding_id == manifest.root_count == 0
 
 
+@pytest.mark.parametrize("stored_count", (0, 1, 2))
+async def test_default_root_insert_checks_real_fanout_before_advancing(monkeypatch, stored_count):
+    table = default_root_table(17)
+    monkeypatch.setattr(build, "default_root_source", Mock(return_value=select(table)))
+    execute = AsyncMock(return_value=SimpleNamespace(rowcount=stored_count))
+    monkeypatch.setattr(build, "_execute", execute)
+    request = SimpleNamespace(page_row_limit=1)
+    manifest = SimpleNamespace(after_entity_binding_id=0)
+    operation = build._insert_default_roots(object(), table, object(), [1], request, manifest)
+    if stored_count > 1:
+        with pytest.raises(CandidateRunnerError, match="exceeds the row page"):
+            await operation
+    else:
+        await operation
+    execute.assert_awaited_once()
+
+
 async def test_projection_verify_coverage_failure_preserves_cursor_and_count(monkeypatch):
     from process.custom_import import query_projection_verify
 
     request = SimpleNamespace(definition=_definition(), page_row_limit=256)
-    manifest = SimpleNamespace(phase="verify_root", after_entity_binding_id=0, verified_root_count=0)
+    manifest = SimpleNamespace(
+        phase="verify_root",
+        after_entity_binding_id=0,
+        verified_root_count=0,
+        capability_sha256=capability_sha256(request.definition),
+    )
     monkeypatch.setattr(build, "_source_context", AsyncMock(return_value=object()))
     monkeypatch.setattr(build, "_entity_window", AsyncMock(return_value=[1]))
     monkeypatch.setattr(query_projection_verify, "_verify_window", AsyncMock(return_value=(2, 1)))
@@ -166,6 +197,7 @@ async def test_write_validates_the_original_entity_prefix_before_payload_or_curs
         after_child_key_sha256=None,
         root_count=0,
         child_count=0,
+        capability_sha256=capability_sha256(definition),
     )
     source_relation = _source(child=child)
     values_by_field = {
@@ -211,7 +243,9 @@ async def test_write_validates_the_original_entity_prefix_before_payload_or_curs
 async def test_invalid_complete_prefix_cannot_fetch_payload_write_or_advance(monkeypatch, child):
     definition = _definition()
     source = _source(child=child)
-    manifest = SimpleNamespace(phase="child" if child else "root", after_entity_binding_id=0)
+    manifest = SimpleNamespace(
+        phase="child" if child else "root", after_entity_binding_id=0, capability_sha256=capability_sha256(definition)
+    )
     identity = (3, 2024, b"a" * 32) if child else (3, 2024)
     monkeypatch.setattr(build, "_source_context", AsyncMock(return_value=SimpleNamespace(definition=definition)))
     monkeypatch.setattr(build, "_entity_window", AsyncMock(return_value=[1, 2, 3, 4]))

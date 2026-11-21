@@ -552,19 +552,24 @@ def _retained_root_columns(roots, root_values, root_states, include_binding):
     return columns
 
 
-def _derived_child_values(context, plan, entity_values, fields, selectors, derived_fields, *, include_binding=False):
+def _derived_child_values(
+    context, plan, entity_values, fields, selectors, derived_fields, *, include_binding=False, selected=None
+):
     """Reduce every configured group from one root-preserving complete-child join."""
 
     owned_members = _child_candidate_members(context, selectors) if entity_values is None else None
-    selected = selected_identities(
-        context,
-        plan,
-        entity_values,
-        include_binding=include_binding,
-        entity_binding_ids=(
-            _child_candidate_ids(context, selectors, owned_members=owned_members) if owned_members is not None else None
-        ),
-    )
+    if selected is None:
+        selected = selected_identities(
+            context,
+            plan,
+            entity_values,
+            include_binding=include_binding,
+            entity_binding_ids=(
+                _child_candidate_ids(context, selectors, owned_members=owned_members)
+                if owned_members is not None
+                else None
+            ),
+        )
     statement, root_values, root_states = _root_values(
         context, selected, [field for field in fields if field.collection is None]
     )

@@ -500,6 +500,7 @@ async def _physical_drop(session, quoted, family):
     names = [*snapshot_tables(family.family_id), *await _optional_relation_names(session, family.family_id)]
     if await session.scalar(select(exists().where(CustomImportQueryProjection.family_id == family.family_id))):
         names.extend(("custom_import_derived_root", "custom_import_derived_child"))
+        await session.execute(text(f'DROP TABLE IF EXISTS "{namespace}"."custom_import_default_score_root" RESTRICT'))
     qualified_tables_sql = ",".join(f'"{namespace}"."{name}"' for name in names)
     # Native RESTRICT protects external dependents, including row-type consumers.
     await session.execute(text(f"DROP TABLE {qualified_tables_sql} RESTRICT"))

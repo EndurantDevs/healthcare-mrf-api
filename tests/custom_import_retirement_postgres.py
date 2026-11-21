@@ -876,7 +876,8 @@ async def _supersede_build(case, request, generation_id, records):
         generation_id = sealed.generation_id
 
 
-async def test_retirement_preserves_completed_projection_history_and_removes_its_storage():
+@pytest.mark.parametrize("default_roots", (False, True))
+async def test_retirement_preserves_completed_projection_history_and_removes_its_storage(default_roots):
     from db.models.custom_import_query_projection import CustomImportQueryProjection
     from tests import custom_import_query_projection_build_postgres as projection
     from tests import test_custom_import_build_output_postgres as output_fixture
@@ -886,12 +887,7 @@ async def test_retirement_preserves_completed_projection_history_and_removes_its
     async with _source_case() as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(install_current_verification, case.schema_name)
-        request = await output_fixture._request_for(
-            case,
-            projection._records(),
-            definition=projection._definition(),
-            page_rows=64,
-        )
+        request = await projection._projection_request(case, projection._records(), default_roots=default_roots)
         _, sealed = await output_fixture._complete(case, request)
         async with case.sessions() as session, session.begin():
             family = await session.scalar(
@@ -903,6 +899,7 @@ async def test_retirement_preserves_completed_projection_history_and_removes_its
             manifest = await session.get(CustomImportQueryProjection, family_id)
             assert manifest.phase == "complete"
             history_values = tuple(getattr(manifest, column.name) for column in manifest.__table__.columns)
+            await _assert_projection_retirement_reader(session, request, manifest, default_roots)
         await _supersede_build(case, request, sealed.generation_id, projection._records())
         async with case.sessions() as session, session.begin():
             await _bounded(session)
@@ -923,6 +920,30 @@ async def test_retirement_preserves_completed_projection_history_and_removes_its
                 )
                 is None
             )
+
+
+async def _assert_projection_retirement_reader(session, request, manifest, default_roots):
+    """Read the older or new physical inventory through the same version-aware reader."""
+
+    from process.custom_import.query_projection_default_roots import DEFAULT_ROOTS, DEFAULT_ROOTS_ENTITY_INDEX
+    from process.custom_import.query_projection_evidence import read_projection_tables
+
+    async def indexes():
+        return (
+            await session.scalars(
+                text("SELECT indexname FROM pg_indexes WHERE schemaname=:schema ORDER BY indexname"),
+                {"schema": retirement.snapshot_schema(manifest.family_id)},
+            )
+        ).all()
+
+    before = await indexes()
+    projection = await read_projection_tables(
+        session, manifest, request.definition, snapshot_family_id=manifest.family_id
+    )
+    assert (DEFAULT_ROOTS in projection) is default_roots
+    assert (DEFAULT_ROOTS_ENTITY_INDEX in before) is default_roots
+    assert manifest.index_count == 4
+    assert await indexes() == before
 
 
 async def _assert_commit_closure_deadline(case, family_id, monkeypatch):

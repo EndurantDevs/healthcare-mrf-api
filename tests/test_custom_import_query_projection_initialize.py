@@ -71,7 +71,7 @@ def prepared(monkeypatch):
     monkeypatch.setattr(initialize, "_flush_page", flush)
     monkeypatch.setattr(initialize, "validate_projection_table", validate)
     monkeypatch.setattr(initialize, "lock_projection_tables", lock)
-    monkeypatch.setattr(initialize, "capability_sha256", lambda definition: b"k" * 32)
+    monkeypatch.setattr(initialize, "capability_sha256", lambda definition, *, default_roots=False: b"k" * 32)
     return SimpleNamespace(prepare=prepare, flush=flush, validate=validate, lock=lock)
 
 

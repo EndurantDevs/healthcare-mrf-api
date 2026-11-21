@@ -532,12 +532,13 @@ async def test_retirement_refuses_origin_registered_during_the_frozen_proof(monk
     await verify(monkeypatch)
 
 
-async def test_retirement_preserves_completed_projection_history_and_removes_its_storage():
+@pytest.mark.parametrize("default_roots", (False, True))
+async def test_retirement_preserves_completed_projection_history_and_removes_its_storage(default_roots):
     from tests.custom_import_retirement_postgres import (
         test_retirement_preserves_completed_projection_history_and_removes_its_storage as verify,
     )
 
-    await verify()
+    await verify(default_roots)
 
 
 async def test_retirement_preserves_closed_continuation_history_but_refuses_active_authority(monkeypatch):
