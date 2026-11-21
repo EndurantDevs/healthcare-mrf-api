@@ -238,23 +238,32 @@ async def _persist_root_page(session, window, page):
         root_write.family.family_revision_id = family_id
 
 
-def _family_child_inputs(definition, selected_family):
+def _new_child_inputs(definition, selected_family, *, preserve_child_order):
+    for collection in definition.child_collections:
+        children = selected_family.children[collection.name]
+        if not preserve_child_order:
+            children = sorted(children, key=lambda child: child_key_hash(definition, collection.name, child))
+        for child in children:
+            yield collection.name, child, None
+
+
+def _family_child_inputs(request, selected_family):
     """Keep retained order or the existing declared-collection/key order."""
+    definition = request.definition
     if isinstance(selected_family, StoredCandidateFamily):
+        retained_children = selected_family.children
+        if request.preserve_child_order:
+            retained_children = sorted(
+                retained_children,
+                key=lambda child: (child.collection, child.child.source_ordinal, child.child.child_revision_id),
+            )
         return (
-            ((child.collection, child.values_by_field, child.child) for child in selected_family.children),
+            ((child.collection, child.values_by_field, child.child) for child in retained_children),
             selected_family.family.family_revision_id,
             selected_family.root_record.canonical_logical_key,
             bytes(selected_family.root_record.logical_key_sha256),
         )
-    child_inputs = (
-        (collection.name, child_values, None)
-        for collection in definition.child_collections
-        for child_values in sorted(
-            selected_family.children[collection.name],
-            key=lambda child_values: child_key_hash(definition, collection.name, child_values),
-        )
-    )
+    child_inputs = _new_child_inputs(definition, selected_family, preserve_child_order=request.preserve_child_order)
     return (
         child_inputs,
         None,
@@ -268,7 +277,7 @@ def _child_rows(request, registry, packs, selected, published):
     ordinals = defaultdict(int)
     fields = fields_by_collection(request.definition)
     for family_index, (selected_family, family) in enumerate(zip(selected, published, strict=True)):
-        child_inputs, base_family, parent_key, parent_hash = _family_child_inputs(request.definition, selected_family)
+        child_inputs, base_family, parent_key, parent_hash = _family_child_inputs(request, selected_family)
         for collection, child_values, stored_child in child_inputs:
             key = (
                 stored_child.canonical_child_key

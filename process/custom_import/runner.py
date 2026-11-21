@@ -514,10 +514,12 @@ def has_matching_live_grant(
 
 
 def can_attempt_no_change(pointer: _Pointer | None, request: CandidateRunRequest) -> bool:
-    """Return whether the captured pointer uses the candidate's immutable schema."""
+    """Require comparable output and the same immutable schema before reuse."""
 
     return (
         pointer is not None
+        # The effective-output digest omits source ordinals.
+        and not request.preserve_child_order
         and pointer.definition_revision_id == request.definition_revision_id
         and pointer.schema_revision_id == request.schema_revision_id
     )

@@ -253,15 +253,17 @@ def _source_request_from_stdin(
     parsed: argparse.Namespace, stream: Any | None
 ) -> HttpsCandidateRequest | ObjectCandidateRequest:
     document = load_json_definition(_read_stdin(stream))
-    if (
-        not isinstance(document, dict)
-        or not _SOURCE_INPUT_KEYS <= set(document) <= _SOURCE_INPUT_KEYS | _SOURCE_OPTIONAL_KEYS
-    ):
+    optional_keys = _SOURCE_OPTIONAL_KEYS
+    if parsed.source == "upload":
+        optional_keys = optional_keys | {"preserve_child_order"}
+    if not isinstance(document, dict) or not _SOURCE_INPUT_KEYS <= set(document) <= _SOURCE_INPUT_KEYS | optional_keys:
         raise _DefinitionInputError("source request is invalid")
     if not isinstance(document["limits"], dict):
         raise _DefinitionInputError("source limits are invalid")
     request_type = HttpsCandidateRequest if parsed.source == "https" else ObjectCandidateRequest
     extra = {} if parsed.source == "https" else {"source_kind": parsed.source}
+    if "preserve_child_order" in document:
+        extra["preserve_child_order"] = document["preserve_child_order"]
     request = request_type(
         dataset_id=parsed.dataset_id,
         definition_revision_id=parsed.definition_revision_id,

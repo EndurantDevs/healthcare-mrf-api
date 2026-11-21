@@ -114,6 +114,7 @@ def _candidate_request(request, execution_id, records_by_stream=None):
             if stream.record_kind == "child"
         },
         complete_scope=request.complete_scope,
+        preserve_child_order=getattr(request, "preserve_child_order", False),
     )
 
 

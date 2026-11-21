@@ -12,6 +12,8 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy import MetaData
+from sqlalchemy.orm import aliased
 
 from db.models import custom_import as custom_import_models
 from db.models.custom_import import CustomImportChildRevision, CustomImportRootRevision
@@ -38,6 +40,33 @@ def test_verification_counts_refuse_boolean_population_before_reading_evidence()
 def test_publication_receipt_refuses_missing_persisted_material():
     with pytest.raises(PublicationConflict, match="receipt is not canonical"):
         publication.verify_publication_event_material(SimpleNamespace())
+
+
+@pytest.mark.parametrize(
+    ("build_statement", "aliases"),
+    [
+        (publication._family_child_material_statement, ("root_pack", "child_pack")),
+        (publication._root_scalar_material_statement, ("root_pack",)),
+        (publication._child_scalar_material_statement, ("root_pack", "child_pack")),
+        (publication._winner_material_statement, ("root_pack", "context_pack")),
+    ],
+)
+def test_finality_verification_joins_pack_aliases_in_the_frozen_snapshot(build_statement, aliases):
+    from tests.test_custom_import_build_graph import _request
+    from tests.test_custom_import_build_output import _generation
+
+    pack = custom_import_models.CustomImportPack
+    snapshot_pack = pack.__table__.to_metadata(MetaData(), schema="frozen_schema")
+    model_by_type = {
+        model: model
+        for model in vars(custom_import_models).values()
+        if isinstance(model, type) and hasattr(model, "__table__")
+    }
+    model_by_type[pack] = aliased(pack, snapshot_pack, adapt_on_names=True)
+    statement = str(build_statement(_generation(_request()), models=model_by_type))
+
+    for alias in aliases:
+        assert f"frozen_schema.custom_import_pack AS {alias}" in statement
 
 
 async def test_finality_binding_refuses_an_unbound_control_schema_before_sql():

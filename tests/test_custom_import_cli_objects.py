@@ -63,6 +63,38 @@ def test_native_stdin_parsing_never_constructs_source_providers(monkeypatch, sou
     assert cli._prepare_stdin(parsed, _document_stream(_document(source_kind))).source_kind == source_kind
 
 
+def test_upload_child_order_is_bound_to_the_execution():
+    parsed = cli._parse_arguments(_arguments("upload"))
+    document = _document("upload")
+    document["definition"]["refresh_mode"] = "snapshot"
+    original = cli._prepare_stdin(parsed, _document_stream(document))
+    ordered = cli._prepare_stdin(parsed, _document_stream(document | {"preserve_child_order": True}))
+
+    assert original.preserve_child_order is False
+    assert ordered.preserve_child_order is True
+    assert object_candidate.object_request_identity_sha256(original) != (
+        object_candidate.object_request_identity_sha256(ordered)
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "mode", "order_value"),
+    [
+        ("s3", "snapshot", True),
+        ("upload", "upsert", True),
+        ("upload", "snapshot", 1),
+    ],
+)
+def test_child_order_requires_a_typed_staged_snapshot(monkeypatch, source_kind, mode, order_value):
+    document = _document(source_kind)
+    document["definition"]["refresh_mode"] = mode
+    document["preserve_child_order"] = order_value
+    database = _CandidateDatabase()
+    monkeypatch.setattr(cli, "db", database)
+    assert cli.run_command(_arguments(source_kind), stream=_document_stream(document)) == 1
+    assert not database.events
+
+
 @pytest.mark.parametrize("source_kind", ("s3", "upload"))
 @pytest.mark.parametrize("invalid", ("missing_cap", "bad_cap", "path", "credential", "missing_pin", "wrong_object"))
 def test_native_invalid_stdin_fails_before_database(monkeypatch, capsys, source_kind, invalid):
