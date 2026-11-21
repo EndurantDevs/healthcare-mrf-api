@@ -783,6 +783,65 @@ def test_transport_retry_excludes_quota_and_mismatched_http_evidence():
         assert not retry.retryable(importer, runner, runner.source_record, refused)
 
 
+def _partition_retry_result():
+    return _result(
+        error=f"{importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR}:http_503",
+        fetch_mode=importer.LAST_UPDATED_PARTITION_FETCH_MODE,
+        fetch_diagnostic={
+            "strategy_version": importer.LAST_UPDATED_PARTITION_STRATEGY_VERSION,
+            "verified": False,
+            "failure": None,
+        },
+        retry_not_before="2024-01-01T00:00:00Z",
+    )
+
+
+@pytest.mark.asyncio
+async def test_partition_transient_resumes_in_the_same_scan(monkeypatch):
+    runner = _scan()
+    stopped = _partition_retry_result()
+    finished = replace(
+        stopped,
+        complete=True,
+        error=None,
+        rows_fetched=3,
+        next_url_remaining=False,
+        fetch_diagnostic=stopped.fetch_diagnostic | {"verified": True},
+    )
+    fetch = AsyncMock(side_effect=[stopped, finished])
+    wait = AsyncMock()
+    monkeypatch.setattr(runner, "_fetch_rows", fetch)
+    monkeypatch.setattr(retry, "wait", wait)
+
+    result = await retry.fetch(importer, runner, "Organization", runner.source_record, report_start=False)
+
+    assert result.complete and result.rows_fetched == 3
+    assert fetch.await_count == 2
+    assert fetch.await_args_list[0].args[1] is fetch.await_args_list[1].args[1]
+    wait.assert_awaited_once_with(importer, runner, 0.0)
+
+
+def test_partition_in_process_retry_requires_saved_transient_boundary():
+    runner = _scan()
+    result = _partition_retry_result()
+    proof = result.fetch_diagnostic
+    refused = (
+        replace(
+            result,
+            error=f"{importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR}:pagination_loop_detected",
+            retry_not_before=None,
+        ),
+        replace(result, retry_not_before="2024-01-01T00:00:00"),
+        replace(result, deadline_reached=True),
+        replace(result, fetch_diagnostic=None),
+        replace(result, fetch_diagnostic=proof | {"strategy_version": "unsupported"}),
+        replace(result, fetch_diagnostic=proof | {"verified": True}),
+        replace(result, fetch_diagnostic=proof | {"failure": "count_mismatch"}),
+        replace(result, error=f"{importer.LAST_UPDATED_PARTITION_BLOCKED_ERROR}:count_mismatch"),
+    )
+    assert all(not retry.retryable(importer, runner, runner.source_record, result) for result in refused)
+
+
 def _recovery_result(*, status=503, error="http_503"):
     proof = recovery_page(recovery_start(), [("b", 7), ("a", 7), ("older", 6)], RECOVERY_NEXT)
     return _result(
