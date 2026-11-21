@@ -330,6 +330,15 @@ from custom_import_preflight.snowflake_preflight_schema import validate_prefligh
 _verify_child_membership()
 _definition = CustomImportDefinition.from_mapping(_definition_document())
 _binding = SnowflakeSourceBinding.from_mapping(_binding_document(_definition))
+_profile_definition = CustomImportDefinition.from_mapping(
+    {**_definition_document(), "storage_profile": "rooted_child_text_v1"}
+)
+_profile_binding = SnowflakeSourceBinding.from_mapping(_binding_document(_profile_definition))
+assert _profile_definition.storage_profile == "rooted_child_text_v1"
+assert _profile_definition.schema_digest == _definition.schema_digest
+assert _profile_definition.digest != _definition.digest
+assert _profile_binding.definition_sha256 == _profile_definition.digest
+assert _profile_binding.bundle_components(_profile_definition) == _binding.bundle_components(_definition)
 _approved_relations, _bundle_bindings = _binding.bundle_components(_definition)
 _builder = SnowflakeBundleStatementBuilder(approved_relations=_approved_relations)
 _request = _builder.prepare_request(_definition, bindings=_bundle_bindings)

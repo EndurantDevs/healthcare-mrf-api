@@ -5,13 +5,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 from dataclasses import asdict, replace
 from decimal import Decimal
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import DBAPIError
 
 from db.models.custom_import import (
     CustomImportBuildAttempt,
@@ -22,27 +24,38 @@ from db.models.custom_import import (
     CustomImportGenerationSeal,
     CustomImportLease,
     CustomImportPublicationEvent,
+    CustomImportRegistrationAuthority,
 )
+from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import snowflake_candidate
 from process.custom_import import snowflake_segmented_runner as runner
-from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.definition import CustomImportDefinition, canonical_json
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
+from process.custom_import.publication import rollback_generation
 from process.custom_import.read_core import (
     CustomImportReadAuthorizationError,
     CustomImportReadService,
     ExtensionReadAuthorization,
     ExtensionReadScope,
     PinnedReadTarget,
+    ReadFilter,
     SearchRequest,
 )
+from process.custom_import.registration_authority import mint_registration_authority, register_with_authority
 from process.custom_import.snowflake_binding import SOURCE_BINDING_V2_CONTRACT, SnowflakeSourceBinding
 from process.custom_import.snowflake_candidate import SnowflakeBundleCandidateRequest
-from process.custom_import.snowflake_source_binding import register_snowflake_source_binding
+from process.custom_import.snowflake_source_binding import (
+    load_snowflake_source_binding,
+    register_snowflake_source_binding,
+)
+from process.custom_import.storage_layout import snapshot_schema
 from tests.test_custom_import_build_source_postgres import _source_case
+from tests.test_custom_import_bulk_snapshot_writers_postgres import _install_snapshot_revision
 from tests.test_custom_import_snowflake_capture import _policy as _capture_policy
 from tests.test_custom_import_snowflake_shared_capture import _runtime, _shared_row
 
 _ROWS = (_shared_row("1003000126", key="a"), _shared_row("1234567893", key="b"))
+_ROOTED_TEXT_INDEX = "custom_import_child_scalar_rooted_text_idx"
 
 
 def _binding(statement, policy):
@@ -85,29 +98,74 @@ def _binding(statement, policy):
     )
 
 
-async def _registered_runtime(case, monkeypatch):
-    policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(8, 65_536, 2000, 120, 300))
+async def _registered_runtime(case, monkeypatch, *, child_text=False, rooted_text=False):
+    policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16 if child_text else 8, 65_536, 2000, 120, 300))
     connector, bundle, adapter, cursor, connection = _runtime(
         monkeypatch, _ROWS, partition_rows=1, processing_policy=policy
     )
     monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
-    binding = _binding(connector.build_statement(bundle), policy)
-    async with case.sessions() as session, session.begin():
-        registered = await register_snowflake_source_binding(
-            session, dataset_key="synthetic_segmented_runner", definition=bundle.definition, binding=binding
+    definition = _read_definition(bundle.definition) if child_text else bundle.definition
+    if rooted_text:
+        document = json.loads(definition.canonical)
+        document["revision"]["definition"] += 1
+        document["storage_profile"] = "rooted_child_text_v1"
+        definition = CustomImportDefinition.from_mapping(document, previous=definition)
+    if child_text or rooted_text:
+        bundle = connector.prepare_request(
+            definition,
+            bindings=bundle.bindings,
+            encoding=bundle.encoding,
+            processing_policy=policy,
         )
+    binding = _binding(connector.build_statement(bundle), policy)
+    dataset_key = "synthetic_segmented_runner"
+    if rooted_text:
+        registered = await _register_profile(case, monkeypatch, dataset_key, bundle.definition, binding)
+    else:
+        async with case.sessions() as session, session.begin():
+            registered = await register_snowflake_source_binding(
+                session, dataset_key=dataset_key, definition=bundle.definition, binding=binding
+            )
     request = SnowflakeBundleCandidateRequest(
         dataset_id=registered.dataset_id,
         definition_revision_id=registered.definition_revision_id,
         schema_revision_id=registered.schema_revision_id,
         definition=bundle.definition,
         bundle_request=bundle,
-        idempotency_key="synthetic-segmented-run",
+        idempotency_key="synthetic-rooted-text-run" if rooted_text else "synthetic-segmented-run",
         lease_token=b"synthetic-segmented-owner",
         source_binding_revision_id=registered.source_binding_revision_id,
         source_binding_sha256=registered.source_binding_sha256,
     )
     return connector, request, policy, cursor, connection
+
+
+async def _register_profile(case, monkeypatch, dataset_key, definition, binding):
+    registration_by_name = {
+        "dataset_key": dataset_key,
+        "definition": json.loads(definition.canonical),
+        "source_binding": json.loads(binding.canonical),
+    }
+    digest = hashlib.sha256(canonical_json(registration_by_name).encode("utf-8")).hexdigest()
+    monkeypatch.setenv("HLTHPRT_CUSTOM_IMPORT_STORAGE_PROFILE_REGISTRATION_SHA256", digest)
+    token = b"a" * 32
+    async with case.sessions() as session, session.begin():
+        await mint_registration_authority(
+            session,
+            authority_id="synthetic-rooted-text",
+            registration=registration_by_name,
+            token_sha256=hashlib.sha256(token).digest(),
+            expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(seconds=120),
+        )
+    async with case.sessions() as session, session.begin():
+        state = await register_with_authority(
+            session, authority_id="synthetic-rooted-text", registration=registration_by_name, token=token
+        )
+        return await load_snowflake_source_binding(
+            session,
+            definition_revision_id=state.result["definition_revision_id"],
+            source_binding_revision_id=state.result["source_binding_revision_id"],
+        )
 
 
 def _assert_seal_counts(seal, outcome):
@@ -199,6 +257,146 @@ async def test_native_cursor_runs_one_claim_through_ordinary_activation(monkeypa
         _assert_source_once(connector, request, cursor, connection)
 
 
+async def _install_storage_profile_fixture(case):
+    async with case.engine.begin() as connection:
+        for revision in (
+            "20261114010000_custom_import_snapshot_names",
+            "20261114020000_custom_import_snapshot_metadata",
+            "20261121050000_custom_import_rooted_text",
+        ):
+            await connection.run_sync(_install_snapshot_revision, case.schema_name, revision)
+        await connection.run_sync(CustomImportRegistrationAuthority.__table__.create)
+
+
+async def _assert_current_child_text_lookups(case, request, generation_id):
+    target = PinnedReadTarget(
+        request.dataset_id, generation_id, request.definition_revision_id, request.schema_revision_id, "default"
+    )
+    reader = CustomImportReadService(authorizer=_ExactReadAuthorizer(target), cursor_secret=b"r" * 32)
+    async with case.sessions() as session:
+        pointer = await session.get(CustomImportCurrentGeneration, request.dataset_id)
+        assert pointer.generation_id == generation_id
+        for key, expected_npis in (("a", ("1003000126",)), ("b", ("1234567893",)), ("absent", ())):
+            page = await reader.search(
+                session,
+                authorization=ExtensionReadAuthorization("synthetic-reader"),
+                request=SearchRequest(target, filters=(ReadFilter("detail_id", "eq", key),)),
+            )
+            assert (page.total, page.next_cursor) == (len(expected_npis), None)
+            assert tuple(item.root_fields[0].value for item in page.items) == expected_npis
+            for item in page.items:
+                detail_id = next(field for field in item.context_fields if field.field_id == "detail_id")
+                assert (detail_id.state, detail_id.value) == ("value", key)
+
+
+async def _assert_candidate_index_and_payload_parity(case, baseline_generation_id, candidate_generation_id):
+    """Check the index on the new family and compare both logical snapshots."""
+
+    async with case.sessions() as session, session.begin():
+        family_id_by_generation = dict(
+            (
+                await session.execute(
+                    select(CustomImportSnapshotFamily.generation_id, CustomImportSnapshotFamily.family_id)
+                )
+            )
+            .tuples()
+            .all()
+        )
+        old = snapshot_schema(family_id_by_generation[baseline_generation_id])
+        candidate_family_id = family_id_by_generation[candidate_generation_id]
+        new = snapshot_schema(candidate_family_id)
+        assert (
+            await session.scalar(text("SELECT to_regclass(:index)"), {"index": f"{old}.{_ROOTED_TEXT_INDEX}"}) is None
+        )
+        shape = (
+            await session.execute(
+                text("""
+                SELECT i.indnkeyatts, i.indnatts,
+                       ARRAY(SELECT pg_get_indexdef(i.indexrelid,n,false) FROM generate_series(1,i.indnatts) n),
+                       regexp_replace(pg_get_expr(i.indpred,i.indrelid),'[()[:space:]]|::text','','g'),
+                       i.indisvalid AND i.indisready AND i.indislive AND am.amname='btree' AND NOT i.indisunique
+                FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam
+                WHERE i.indexrelid=to_regclass(:index) AND i.indrelid=to_regclass(:heap)
+                """),
+                {"index": f"{new}.{_ROOTED_TEXT_INDEX}", "heap": f"{new}.custom_import_child_scalar"},
+            )
+        ).one()
+        assert shape == (
+            5,
+            7,
+            [
+                "schema_revision_id",
+                "collection_slot",
+                "field_slot",
+                "root_record_id",
+                "string_value",
+                "dataset_id",
+                "child_revision_id",
+            ],
+            "value_state='value'ANDstring_valueISNOTNULL",
+            True,
+        )
+        for table in ("custom_import_root_revision", "custom_import_child_revision"):
+            query = 'SELECT array_agg(canonical_payload ORDER BY canonical_payload) FROM "{}".{}'
+            expected = await session.scalar(text(query.format(old, table)))
+            actual = await session.scalar(text(query.format(new, table)))
+            assert expected and actual == expected
+    return old, candidate_family_id
+
+
+async def test_native_storage_profile_builds_on_candidate_and_preserves_rollback(monkeypatch):
+    """Verify the covering index and child text lookups across activation and rollback."""
+
+    async with _source_case() as case:
+        await _install_storage_profile_fixture(case)
+        connector, original, policy, _, _ = await _registered_runtime(case, monkeypatch, child_text=True)
+        baseline = await runner.run_segmented_snowflake_candidate(
+            case.sessions, connector, original, processing_policy=policy
+        )
+        assert baseline.status == "activated"
+        await _assert_current_child_text_lookups(case, original, baseline.generation_id)
+        connector, opted_in, policy, _, _ = await _registered_runtime(
+            case, monkeypatch, child_text=True, rooted_text=True
+        )
+        assert (opted_in.dataset_id, opted_in.schema_revision_id) == (original.dataset_id, original.schema_revision_id)
+        assert opted_in.definition_revision_id != original.definition_revision_id
+        candidate = await runner.run_segmented_snowflake_candidate(
+            case.sessions, connector, opted_in, processing_policy=policy
+        )
+        assert candidate.status == "activated"
+        assert candidate.publication.from_generation_id == baseline.generation_id
+        assert candidate.seal.effective_output_sha256 != baseline.seal.effective_output_sha256
+        assert candidate.seal.child_scalar_count == baseline.seal.child_scalar_count == 6
+        await _assert_current_child_text_lookups(case, opted_in, candidate.generation_id)
+
+        old, candidate_family_id = await _assert_candidate_index_and_payload_parity(
+            case, baseline.generation_id, candidate.generation_id
+        )
+        with pytest.raises(DBAPIError, match="custom_import_snapshot_attempt_lost"):
+            async with case.sessions() as session, session.begin():
+                await session.execute(text("SET LOCAL statement_timeout='2000ms'"))
+                await session.scalar(
+                    text(f"SELECT \"{case.schema_name}\".prepare_custom_import_snapshot_indexes(:family,'serving')"),
+                    {"family": candidate_family_id},
+                )
+
+        async with case.sessions() as session, session.begin():
+            rollback = await rollback_generation(
+                session,
+                dataset_id=original.dataset_id,
+                target_generation_id=baseline.generation_id,
+                expected_generation_id=candidate.generation_id,
+                expected_pointer_version=candidate.publication.committed_pointer_version,
+            )
+            assert rollback.to_generation_id == baseline.generation_id
+            assert rollback.event_kind == "rolled_back"
+            assert (
+                await session.scalar(text("SELECT to_regclass(:index)"), {"index": f"{old}.{_ROOTED_TEXT_INDEX}"})
+                is None
+            )
+        await _assert_current_child_text_lookups(case, original, baseline.generation_id)
+
+
 async def test_sealed_capture_resumes_next_fence_without_source_or_deadline_extension(monkeypatch):
     stage_source = runner.stage_segmented_source
 
@@ -253,9 +451,10 @@ async def test_sealed_capture_resumes_next_fence_without_source_or_deadline_exte
         _assert_source_once(connector, request, cursor, connection)
 
 
-def _read_definition(definition):
+def _read_definition(definition, *, nullable_other=False):
     document = json.loads(definition.canonical)
-    document["schema"]["children"][1]["fields"][2]["nullable"] = True
+    if nullable_other:
+        document["schema"]["children"][1]["fields"][2]["nullable"] = True
     projection_slot = 0
     for scope in (document["schema"]["root"], *document["schema"]["children"]):
         for field in scope["fields"]:
@@ -290,7 +489,7 @@ async def _registered_capture(case, monkeypatch):
         monkeypatch, physical_rows, interleaved=True, partition_rows=1, processing_policy=policy
     )
     bundle = connector.prepare_request(
-        _read_definition(bundle.definition),
+        _read_definition(bundle.definition, nullable_other=True),
         bindings=bundle.bindings,
         encoding=bundle.encoding,
         processing_policy=policy,

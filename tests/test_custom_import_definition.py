@@ -101,6 +101,25 @@ def test_json_and_yaml_have_one_canonical_definition_and_digest():
     ]
 
 
+def test_storage_profile_changes_only_the_definition_identity(definition):
+    raw = _raw_definition()
+    raw["revision"]["definition"] += 1
+    raw["storage_profile"] = "rooted_child_text_v1"
+    next_definition = CustomImportDefinition.from_mapping(raw, previous=definition)
+
+    assert definition.storage_profile is None and "storage_profile" not in json.loads(definition.canonical)
+    assert next_definition.storage_profile == "rooted_child_text_v1"
+    assert next_definition.digest != definition.digest
+    assert next_definition.schema_revision == definition.schema_revision
+    assert next_definition.schema_digest == definition.schema_digest
+    assert next_definition.fields == definition.fields and next_definition.query == definition.query
+
+
+@pytest.mark.parametrize("value", [None, "unknown", True, ["rooted_child_text_v1"]])
+def test_storage_profile_requires_the_closed_value(value):
+    _assert_invalid_definition(lambda raw: raw.update(storage_profile=value), "storage_profile is unsupported")
+
+
 @pytest.mark.parametrize(
     "serialized",
     [

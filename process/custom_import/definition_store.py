@@ -88,7 +88,7 @@ def _normalized_dataset_key(value: object) -> str:
     return value
 
 
-def _canonical_definition(value: object) -> CustomImportDefinition:
+def _canonical_definition(value: object, *, storage_profile_authorized: bool = False) -> CustomImportDefinition:
     if not isinstance(value, CustomImportDefinition):
         raise TypeError("definition must be a CustomImportDefinition")
     try:
@@ -97,6 +97,8 @@ def _canonical_definition(value: object) -> CustomImportDefinition:
         raise DefinitionRegistrationError("definition canonical content is invalid") from exc
     if canonical_definition != value:
         raise DefinitionRegistrationError("definition canonical content does not match its fields")
+    if canonical_definition.storage_profile is not None and storage_profile_authorized is not True:
+        raise DefinitionRegistrationError("definition storage profile requires registration authority")
     return canonical_definition
 
 
@@ -302,7 +304,12 @@ async def _validate_affected_field_slot_history(
         ledger_row = ledger_by_slot.get(field_row.field_slot)
         schema_row = schema_by_id.get(field_row.schema_revision_id)
         definition_row = definition_by_schema.get(field_row.schema_revision_id)
-        if ledger_row is None or ledger_row.field_id != field_row.field_name or schema_row is None or definition_row is None:
+        if (
+            ledger_row is None
+            or ledger_row.field_id != field_row.field_name
+            or schema_row is None
+            or definition_row is None
+        ):
             raise DefinitionRegistrationError("persisted field slot identity is invalid")
         stored_definition = _persisted_definition(definition_row, schema_row)
         stored_field = next(
@@ -663,6 +670,8 @@ async def register_definition(
     session: AsyncSession,
     dataset_key: str,
     definition: CustomImportDefinition,
+    *,
+    storage_profile_authorized: bool = False,
 ) -> RegisteredDefinition:
     """Create one immutable definition revision or return its exact replay.
 
@@ -673,7 +682,7 @@ async def register_definition(
     """
 
     normalized_dataset_key = _normalized_dataset_key(dataset_key)
-    canonical_definition = _canonical_definition(definition)
+    canonical_definition = _canonical_definition(definition, storage_profile_authorized=storage_profile_authorized)
     _require_transaction(session)
     _require_clean_session(session)
 
