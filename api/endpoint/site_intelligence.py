@@ -612,10 +612,11 @@ def _pharmacy_geo_stmt(
     if not use_unified_addresses:
         return addresses.join(NPIDataTaxonomy, is_same_npi).where(pharmacy_code)
 
-    # Check taxonomy only for nearby addresses. Score already deduplicates by NPI.
-    pharmacy = select(NPIDataTaxonomy.npi).where(is_same_npi, pharmacy_code).limit(1).lateral()
-    addresses = addresses.join(pharmacy, true())
-    return addresses if spatial_filter is not None else addresses.where(has_exact_precision)
+    pharmacy = select(NPIDataTaxonomy.npi).where(is_same_npi, pharmacy_code)
+    if spatial_filter is None:
+        # Keep the covering scan eligible for a parallel semi-join.
+        return addresses.where(has_exact_precision, pharmacy.exists())
+    return addresses.join(pharmacy.limit(1).lateral(), true())
 
 
 @blueprint.get("/score")
