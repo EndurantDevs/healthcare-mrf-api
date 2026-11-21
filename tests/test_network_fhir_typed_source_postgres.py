@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import pytest
@@ -30,12 +31,26 @@ async def _stages(connection):
     )
 
 
+@asynccontextmanager
+async def _replayed_graph(case):
+    """Produce the graph and compare it with an independent replay of the same Source edition."""
+    async with typed._workspace(case.writer) as producer, typed._workspace(case.writer) as checker:
+        arguments = _arguments(case)
+        document = await typed.produce_typed_source_graph(case.source_export, case.writer, producer, **arguments)
+        replayed_rows = await typed.verify_typed_source_graph(
+            case.source_export, case.writer, producer, replay_stage=checker, **arguments
+        )
+        assert replayed_rows == document["counts"]["source_rows"]
+        producer.require_ready()
+        yield producer
+
+
 async def test_genuine_typed_source_complete_export_and_independent_replay(monkeypatch):
     async with (
         source_witness_case(monkeypatch, named=True) as case,
         case.writer.transaction(isolation="repeatable_read"),
     ):
-        async with typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage:
+        async with _replayed_graph(case) as stage:
             document = validate_graph_document(json.loads(json.dumps(stage.document)))
             assert document["derivation_version"] == 3
             assert document["origin"]["dataset_id"] == case.origin.dataset_id
@@ -214,7 +229,7 @@ async def test_role_pages_preserve_type_boundaries_and_reference_multiplicity(mo
     async with (
         source_witness_case(monkeypatch, named=True) as case,
         case.writer.transaction(isolation="repeatable_read"),
-        typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage,
+        _replayed_graph(case) as stage,
     ):
         pair_rows = await case.writer.fetch(
             "SELECT resource_type,resource_id,provider_id,reference_rows FROM "
@@ -255,10 +270,10 @@ async def test_raw_checker_refuses_producer_npi_substitution(monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(typed, "_project_page", corrupt)
             with pytest.raises(TypedFHIRGraphError, match="raw_graph_differs"):
-                async with typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)):
+                async with _replayed_graph(case):
                     pytest.fail("producer substitution admitted")
         assert await _stages(case.writer) == 0
-        async with typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage:
+        async with _replayed_graph(case) as stage:
             assert stage.document["counts"]["pair_rows"] == 1
 
 
