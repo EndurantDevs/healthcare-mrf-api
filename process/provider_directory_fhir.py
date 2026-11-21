@@ -125,6 +125,7 @@ from process import provider_directory_serving_recovery as serving_recovery
 from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
 from process import provider_directory_time_partition as time_partition
+from process import provider_directory_timestamp_recovery as timestamp_recovery
 from process import provider_directory_uhc_scan as uhc_scan
 from process import vsp_directory_integration as vsp_directory
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
@@ -604,6 +605,7 @@ LOGGER = logging.getLogger(__name__)
 MAX_FHIR_JSON_BODY_BYTES = 20 * 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
 DEFAULT_MAX_PAGE_COUNT = 1000
+INDEPENDENCE_TIMESTAMP_RECOVERY_RESOURCES = frozenset({"HealthcareService", "Organization", "PractitionerRole"})
 MIN_CREDIBLE_PROVIDER_AGE_YEARS = 18
 MAX_CREDIBLE_PROVIDER_AGE_YEARS = 100
 DEFAULT_RESOURCES = (
@@ -39800,15 +39802,7 @@ def _source_fetch_response_class(
     status_code: int | None,
     fetch_error: str | None,
 ) -> str | None:
-    if fetch_error:
-        return "transient_transport_error"
-    if status_code == 423:
-        return "transient_locked"
-    if status_code == 429:
-        return "transient_rate_limited"
-    if status_code is not None and 500 <= status_code < 600:
-        return "transient_server_error"
-    return None
+    return fhir_response.source_fetch_response_class(status_code, fetch_error)
 
 
 def _cigna_empty_collection_retry_delays(
@@ -39838,23 +39832,7 @@ def _cigna_empty_collection_retry_delays(
 
 
 def _source_fetch_candidate_urls(url: str) -> list[str]:
-    parsed = urllib.parse.urlsplit(url)
-    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    query_by_name = dict(query_items)
-    if christus.is_request_url(url) or _has_fhir_continuation_query(url):
-        return [url]
-    try:
-        requested_count = int(query_by_name.get("_count") or 0)
-    except TypeError, ValueError:
-        return [url]
-    if requested_count <= 1:
-        return [url]
-    candidate_urls = [url]
-    for fallback_count in (100, 25, 10, 1):
-        if fallback_count >= requested_count:
-            continue
-        candidate_urls.append(_url_with_replaced_query_item(url, "_count", str(fallback_count)))
-    return candidate_urls
+    return fhir_response.source_fetch_candidate_urls(sys.modules[__name__], url)
 
 
 def _should_reduce_source_page_size(
@@ -51773,6 +51751,42 @@ async def _fetch_resource_rows(
                 )
     source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     is_anthem_source = source_api_base == anthem.API_BASE
+    is_timestamp_source = (
+        source_api_base == INDEPENDENCE_PROVIDER_DIRECTORY_BASE
+        and resource_type in INDEPENDENCE_TIMESTAMP_RECOVERY_RESOURCES
+    )
+    timestamp_proof = None
+    timestamp_identity = None
+    if is_timestamp_source and checkpoint_context and checkpoint_start_url and resume_state:
+        from process.provider_directory_generic_source_adapters import (
+            prepare_timestamp_recovery,
+            timestamp_recovery_identity,
+        )
+
+        try:
+            resume_state = await prepare_timestamp_recovery(
+                sys.modules[__name__], checkpoint_context, resource_type, checkpoint_start_url, resume_state
+            )
+        except (ValueError, RuntimeError) as exc:
+            return ResourceFetchResult(
+                model=model,
+                rows=[],
+                rows_fetched=resume_state.rows_processed,
+                rows_written=0,
+                pages_fetched=resume_state.pages_processed,
+                complete=False,
+                row_limit_reached=False,
+                page_limit_reached=False,
+                hard_page_limit_reached=False,
+                next_url_remaining=True,
+                error=f"provider_directory_timestamp_recovery_blocked:{exc}",
+                fetch_mode=timestamp_recovery.FETCH_MODE,
+            )
+        if timestamp_recovery.marked(resume_state.completeness):
+            timestamp_proof = resume_state.completeness
+            timestamp_identity = timestamp_recovery_identity(
+                checkpoint_context, resource_type, hashlib.sha256(checkpoint_start_url.encode()).hexdigest()
+            )
     is_highmark_source = source_api_base in highmark.API_BASES
     is_minnesota_cache = source_api_base == bcbs_minnesota.API_BASE and resource_type in bcbs_minnesota.CACHED_RESOURCES
     cached_total = (
@@ -51864,14 +51878,16 @@ async def _fetch_resource_rows(
             hard_page_limit_reached=False,
             next_url_remaining=False,
             fetch_mode=(
-                _current_version_census_fetch_mode(
+                timestamp_recovery.FETCH_MODE
+                if timestamp_proof is not None
+                else _current_version_census_fetch_mode(
                     current_version_proof_by_field,
                     contract=current_version_census_contract(source_record),
                 )
                 if is_current_version_census_enabled
                 else (CARESOURCE_OPAQUE_CURSOR_FETCH_MODE if is_caresource_census_enabled else "checkpoint_complete")
             ),
-            fetch_diagnostic=(current_version_proof_by_field or caresource_proof_by_field),
+            fetch_diagnostic=(timestamp_proof or current_version_proof_by_field or caresource_proof_by_field),
         )
     retained_resource_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
@@ -51968,7 +51984,9 @@ async def _fetch_resource_rows(
         if timing_progress_callback is None:
             return
         fetch_mode = (
-            _current_version_census_fetch_mode(
+            timestamp_recovery.FETCH_MODE
+            if timestamp_proof is not None
+            else _current_version_census_fetch_mode(
                 current_version_proof_by_field,
                 contract=current_version_census_contract(source_record),
             )
@@ -52006,6 +52024,40 @@ async def _fetch_resource_rows(
         )
 
     report_page_timing()
+
+    async def recover_timestamp_page(status_code):
+        """Return a changed resume or a blocked-recovery reason for this response."""
+        if not (
+            is_timestamp_source
+            and checkpoint_context
+            and checkpoint_start_url
+            and resume_state
+            and (status_code == 403 or (status_code or 0) >= 500)
+        ):
+            return None, None
+        observed_resume = replace(
+            resume_state,
+            next_url=url,
+            pages_processed=pages,
+            rows_processed=rows_fetched,
+            recent_url_hashes=tuple(recent_url_hashes),
+            completeness=timestamp_proof if timestamp_proof is not None else resume_state.completeness,
+            resumed=True,
+        )
+        try:
+            recovered_resume = await prepare_timestamp_recovery(
+                sys.modules[__name__],
+                checkpoint_context,
+                resource_type,
+                checkpoint_start_url,
+                observed_resume,
+                is_failed_continuation=True,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return None, str(exc)
+        if not timestamp_recovery.marked(recovered_resume.completeness) or recovered_resume.next_url == url:
+            return None, None
+        return recovered_resume, None
 
     async def fetch_prefetched_page(
         request_url: str,
@@ -52171,6 +52223,17 @@ async def _fetch_resource_rows(
                     cancel_task,
                 )
             source_fetch_elapsed_ms += max(0, int(page_fetch_result[3]))
+            recovered_resume, recovery_error = await recover_timestamp_page(page_fetch_result[0])
+            if recovery_error is not None:
+                error_message = f"provider_directory_timestamp_recovery_blocked:{recovery_error}"
+                has_next_url = True
+                break
+            if recovered_resume is not None:
+                resume_state = recovered_resume
+                timestamp_proof = recovered_resume.completeness
+                timestamp_identity = timestamp_proof[timestamp_recovery.KEY]["identity"]
+                url = recovered_resume.next_url
+                continue
             if (
                 checkpoint_context
                 and not is_current_version_census_enabled
@@ -52204,6 +52267,17 @@ async def _fetch_resource_rows(
                 is_pagination_cooldown_deadline_blocked = (
                     is_pagination_cooldown_deadline_blocked or cooldown_result.deadline_blocked
                 )
+                recovered_resume, recovery_error = await recover_timestamp_page(page_fetch_result[0])
+                if recovery_error is not None:
+                    error_message = f"provider_directory_timestamp_recovery_blocked:{recovery_error}"
+                    has_next_url = True
+                    break
+                if recovered_resume is not None:
+                    resume_state = recovered_resume
+                    timestamp_proof = recovered_resume.completeness
+                    timestamp_identity = timestamp_proof[timestamp_recovery.KEY]["identity"]
+                    url = recovered_resume.next_url
+                    continue
             status_code, response_payload, error, _elapsed = page_fetch_result
             is_checkpoint_continuation = bool(
                 checkpoint_context
@@ -52225,6 +52299,7 @@ async def _fetch_resource_rows(
                     checkpoint_context
                     and checkpoint_start_url
                     and not is_highmark_source
+                    and timestamp_proof is None
                     and _should_restart_expired_pagination_checkpoint(
                         status_code=status_code,
                         fetch_error=error,
@@ -52371,6 +52446,50 @@ async def _fetch_resource_rows(
                 if census_bundle_error is not None:
                     error_message = census_bundle_error
                     break
+            timestamp_page_proof = None
+            parsed_timestamp_entries = None
+            if timestamp_proof is not None:
+                from process.provider_directory_generic_source_adapters import timestamp_recovery_content_hash
+
+                try:
+                    timestamp_entries = _bundle_entries(response_payload)
+                    parsed_timestamp_entries = _parsed_current_version_census_entries(
+                        source_record,
+                        resource_type,
+                        model,
+                        timestamp_entries,
+                        url,
+                        run_id,
+                        normalize_location_contacts=False,
+                    )
+                    trusted_next = _resolved_fhir_next_url(
+                        source_record,
+                        url,
+                        fhir_response.strict_search_next_link(response_payload),
+                        resource_type=resource_type,
+                        page_entry_count=len(timestamp_entries),
+                    )
+                    timestamp_page_proof = timestamp_recovery.advance(
+                        timestamp_proof,
+                        identity=timestamp_identity,
+                        requested_url=url,
+                        payload=response_payload,
+                        trusted_next=trusted_next,
+                        content_hashes={
+                            resource_row["resource_id"]: timestamp_recovery_content_hash(
+                                sys.modules[__name__],
+                                _resource_payload_for_contract(
+                                    model, resource_row, source_record["_resource_hash_contract"]
+                                ),
+                                resource_type,
+                            )
+                            for _, resource_row in parsed_timestamp_entries
+                        },
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    error_message = f"provider_directory_timestamp_recovery_blocked:{exc}"
+                    has_next_url = True
+                    break
             pages += 1
             fetch_counts_by_name["attempt_pages_fetched"] += 1
             child_urls = _uhc_adaptive_partition_child_urls(source_record, resource_type, url, response_payload)
@@ -52438,7 +52557,7 @@ async def _fetch_resource_rows(
                     error_message = str(exc)
                     has_next_url = True
                     break
-            parsed_census_entries = None
+            parsed_census_entries = parsed_timestamp_entries
             if is_current_version_census_enabled:
                 try:
                     parsed_census_entries = _parsed_current_version_census_entries(
@@ -52504,6 +52623,7 @@ async def _fetch_resource_rows(
                     if (
                         not is_current_version_census_enabled
                         and not (is_anthem_source and checkpoint_context)
+                        and timestamp_proof is None
                         and len(pending_rows) >= max(1, row_batch_size)
                     ):
                         await flush_pending_rows()
@@ -52559,6 +52679,8 @@ async def _fetch_resource_rows(
                 break
             if not entries and source_api_base in FHIR_OFFSET_PAGINATION_BASES:
                 resolved_next_url = None
+            if timestamp_page_proof is not None:
+                resolved_next_url = timestamp_page_proof[timestamp_recovery.KEY]["url"]
             if (
                 checkpoint_context
                 and not entries
@@ -52652,7 +52774,9 @@ async def _fetch_resource_rows(
                                 rows_processed=rows_fetched,
                                 recent_url_hashes=recent_url_hashes,
                                 completeness=(
-                                    caresource_proof_by_field
+                                    timestamp_page_proof
+                                    if timestamp_page_proof is not None
+                                    else caresource_proof_by_field
                                     if defer_caresource_terminal_checkpoint
                                     else current_version_proof_by_field
                                     if is_current_version_census_enabled
@@ -52667,6 +52791,8 @@ async def _fetch_resource_rows(
                                     )
                                 ),
                             )
+                        if timestamp_page_proof is not None:
+                            timestamp_proof = timestamp_page_proof
                     finally:
                         checkpoint_persist_elapsed_seconds += max(
                             0.0,
@@ -52829,7 +52955,9 @@ async def _fetch_resource_rows(
         next_url_remaining=has_next_url or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode=(
-            _current_version_census_fetch_mode(
+            timestamp_recovery.FETCH_MODE
+            if timestamp_proof is not None
+            else _current_version_census_fetch_mode(
                 current_version_proof_by_field,
                 contract=current_version_census_contract(source_record),
             )
@@ -52842,7 +52970,11 @@ async def _fetch_resource_rows(
         ),
         deadline_reached=is_deadline_reached,
         retry_not_before=retry_not_before,
-        fetch_diagnostic=(current_version_proof_by_field or caresource_proof_by_field or fetch_diagnostic),
+        fetch_diagnostic=(
+            {**timestamp_proof, "transport": fetch_diagnostic}
+            if timestamp_proof is not None
+            else current_version_proof_by_field or caresource_proof_by_field or fetch_diagnostic
+        ),
         pagination_cooldown_retries=pagination_cooldown_retries,
         pagination_cooldown_wait_seconds=pagination_cooldown_wait_seconds,
         is_pagination_cooldown_recovered=is_pagination_cooldown_recovered,
@@ -54518,6 +54650,7 @@ def _empty_resource_stats() -> dict[str, Any]:
         "last_updated_ranged_root_post": 0,
         "last_updated_unfiltered_post": 0,
         "caresource_opaque_cursor_sources": 0,
+        "timestamp_recovery_traversal_completed_sources": 0,
         "caresource_opaque_cursor_verified_sources": 0,
         "caresource_opaque_cursor_pre_count": 0,
         "caresource_opaque_cursor_processed_rows": 0,
@@ -54728,7 +54861,9 @@ def _record_resource_fetch_stats(
     _record_pagination_cooldown_stats(resource_stats, fetch_result)
     if fetch_result.complete:
         resource_stats["sources_completed"] += 1
-        if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE:
+        if fetch_result.fetch_mode == timestamp_recovery.FETCH_MODE:
+            resource_stats["timestamp_recovery_traversal_completed_sources"] += 1
+        elif fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE:
             resource_stats["server_issued_subset_traversal_completed_sources"] += 1
         else:
             resource_stats["collection_complete_sources"] += 1
@@ -54749,202 +54884,52 @@ def _record_resource_fetch_stats(
 
 
 def _is_resource_fetch_complete_for_publish(result: ResourceFetchResult) -> bool:
-    return result.complete and not result.error and not result.is_bounded and not result.next_url_remaining
+    """Delegate completion accounting to the shared response checks."""
+    return fhir_response.is_resource_fetch_complete_for_publish(sys.modules[__name__], result)
 
 
 def _record_resource_completion(
-    completion: dict[str, set[str]] | None,
-    resource_type: str,
-    source_ids: list[str],
-    result: ResourceFetchResult,
+    completion: dict[str, set[str]] | None, resource_type: str, source_ids: list[str], result: ResourceFetchResult
 ) -> None:
-    if completion is None or not _is_resource_fetch_complete_for_publish(result):
-        return
-    completion.setdefault(resource_type, set()).update(source_ids)
+    """Delegate completion accounting to the shared response checks."""
+    return fhir_response.record_resource_completion(
+        sys.modules[__name__], completion, resource_type, source_ids, result
+    )
 
 
-def _resource_fetch_timing_diagnostic(
-    fetch_result: ResourceFetchResult,
-) -> dict[str, Any]:
+def _resource_fetch_timing_diagnostic(fetch_result: ResourceFetchResult) -> dict[str, Any]:
     """Return transport, persistence, and prefetch timings and counts."""
-    return {
-        "source_fetch_elapsed_ms": fetch_result.source_fetch_elapsed_ms,
-        "stream_write_elapsed_seconds": fetch_result.stream_write_elapsed_seconds,
-        "checkpoint_persist_elapsed_seconds": (fetch_result.checkpoint_persist_elapsed_seconds),
-        "page_prefetch_eligible": fetch_result.page_prefetch_eligible,
-        "page_prefetch_started": fetch_result.page_prefetch_started,
-        "page_prefetch_consumed": fetch_result.page_prefetch_consumed,
-        "page_prefetch_discarded": fetch_result.page_prefetch_discarded,
-        "page_prefetch_wait_seconds": fetch_result.page_prefetch_wait_seconds,
-    }
+    return fhir_response.resource_fetch_timing_diagnostic(sys.modules[__name__], fetch_result)
 
 
-def _resource_fetch_completeness_diagnostics(
-    fetch_result: ResourceFetchResult,
-) -> dict[str, Any]:
+def _resource_fetch_completeness_diagnostics(fetch_result: ResourceFetchResult) -> dict[str, Any]:
     """Return mode-specific completeness proof fields."""
-
-    subset_proof = (
-        _sanitized_server_issued_subset_execution_proof(fetch_result.fetch_diagnostic)
-        if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
-        else None
-    )
-    replay_evidence = (
-        _server_issued_subset_internal_replay_evidence(fetch_result.fetch_diagnostic)
-        if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
-        else None
-    )
-
-    return {
-        "last_updated_completeness": (
-            fetch_result.fetch_diagnostic if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE else None
-        ),
-        "caresource_opaque_cursor_completeness": (
-            fetch_result.fetch_diagnostic if fetch_result.fetch_mode == CARESOURCE_OPAQUE_CURSOR_FETCH_MODE else None
-        ),
-        "current_version_census_completeness": (
-            fetch_result.fetch_diagnostic if fetch_result.fetch_mode == CURRENT_VERSION_CENSUS_FETCH_MODE else None
-        ),
-        "server_issued_subset_completeness": (subset_proof),
-        "server_issued_subset_coverage": (
-            _server_issued_subset_coverage(fetch_result.fetch_diagnostic)
-            if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
-            else None
-        ),
-        **({_SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY: replay_evidence} if replay_evidence is not None else {}),
-    }
+    return fhir_response.resource_fetch_completeness_diagnostics(sys.modules[__name__], fetch_result)
 
 
-def _sanitized_server_issued_subset_execution_proof(
-    proof_by_field: Any,
-) -> dict[str, Any] | None:
+def _sanitized_server_issued_subset_execution_proof(proof_by_field: Any) -> dict[str, Any] | None:
     """Exclude root-specific opaque-hop hashes from status diagnostics."""
-
-    if not isinstance(proof_by_field, Mapping):
-        return None
-    return {
-        field_name: field_value
-        for field_name, field_value in proof_by_field.items()
-        if field_name != "continuation_hop_sha256"
-    }
+    return fhir_response.sanitized_server_issued_subset_execution_proof(sys.modules[__name__], proof_by_field)
 
 
-def _server_issued_subset_internal_replay_evidence(
-    proof_by_field: Any,
-) -> dict[str, Any] | None:
+def _server_issued_subset_internal_replay_evidence(proof_by_field: Any) -> dict[str, Any] | None:
     """Retain token-inclusive replay hashes only for sealed dataset evidence."""
-
-    if not isinstance(proof_by_field, Mapping):
-        return None
-    continuation_hop_sha256 = proof_by_field.get("continuation_hop_sha256")
-    if type(continuation_hop_sha256) is not list:
-        return None
-    return {"continuation_hop_sha256": list(continuation_hop_sha256)}
+    return fhir_response.server_issued_subset_internal_replay_evidence(sys.modules[__name__], proof_by_field)
 
 
-def _server_issued_subset_coverage(
-    proof_by_field: Any,
-) -> dict[str, Any] | None:
+def _server_issued_subset_coverage(proof_by_field: Any) -> dict[str, Any] | None:
     """Return safe resource-level coverage without implying absent targets."""
-
-    if not isinstance(proof_by_field, Mapping):
-        return None
-    geometry = proof_by_field.get("terminal_page_geometry")
-    continuation_shape_sha256 = proof_by_field.get("continuation_shape_sha256")
-    return {
-        "cutoff": proof_by_field.get("cutoff"),
-        "scope": "server_issued_traversal_subset",
-        "advertised_pre": proof_by_field.get("advertised_pre"),
-        "advertised_post": proof_by_field.get("advertised_post"),
-        "returned_unique": proof_by_field.get("returned_unique"),
-        "deficit": proof_by_field.get("deficit"),
-        "geometry": (
-            {
-                "pages": geometry.get("pages_processed"),
-                "logical_terminal_offset": geometry.get("terminal_page_start_offset"),
-                "sparse_pages": geometry.get("sparse_pages"),
-                "empty_pages": geometry.get("empty_pages"),
-                "page_entry_counts_sha256": subset_canonical_sha256(proof_by_field.get("page_entry_counts")),
-                "geometry_sha256": subset_canonical_sha256(
-                    {
-                        **dict(geometry),
-                        "page_entry_counts": proof_by_field.get("page_entry_counts"),
-                    }
-                ),
-            }
-            if isinstance(geometry, Mapping)
-            else None
-        ),
-        "continuation": (
-            {
-                "validated_hops": len(continuation_shape_sha256),
-                "chain_sha256": subset_canonical_sha256(continuation_shape_sha256),
-            }
-            if type(continuation_shape_sha256) is list
-            else None
-        ),
-        "twin_state": "pending_matching_reviewed_root",
-        "proof_state": ("resource_terminal_verified" if proof_by_field.get("verified") is True else "not_verified"),
-        "unresolved_reference_count": None,
-        "absence_semantics": "unknown_under_subset",
-    }
+    return fhir_response.server_issued_subset_coverage(sys.modules[__name__], proof_by_field)
 
 
-def _resource_fetch_diagnostic(
-    fetch_result: ResourceFetchResult,
-    *,
-    rows_written: int,
-) -> dict[str, Any]:
+def _resource_fetch_diagnostic(fetch_result: ResourceFetchResult, *, rows_written: int) -> dict[str, Any]:
     """Return one resource fetch's nonsecret operational diagnostics."""
-    is_server_issued_subset = fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
-    return {
-        "complete": fetch_result.complete,
-        "collection_complete": (False if is_server_issued_subset else fetch_result.complete),
-        **(
-            {
-                "traversal_complete": fetch_result.complete,
-                "source_continuation_exhausted": bool(fetch_result.complete and not fetch_result.next_url_remaining),
-                "absence_semantics": "unknown_under_subset",
-            }
-            if is_server_issued_subset
-            else {}
-        ),
-        "plan_graph_complete": False,
-        "bounded": fetch_result.is_bounded,
-        "error": fetch_result.error,
-        "fetch_mode": fetch_result.fetch_mode,
-        "pages_fetched": fetch_result.pages_fetched,
-        "rows_fetched": fetch_result.rows_fetched,
-        "rows_written": rows_written,
-        **_resource_fetch_timing_diagnostic(fetch_result),
-        "row_limit_reached": fetch_result.row_limit_reached,
-        "page_limit_reached": fetch_result.page_limit_reached,
-        "hard_page_limit_reached": fetch_result.hard_page_limit_reached,
-        "deadline_reached": fetch_result.deadline_reached,
-        "next_url_remaining": fetch_result.next_url_remaining,
-        "retry_not_before": fetch_result.retry_not_before,
-        "source_fetch": _safe_source_fetch_diagnostic(fetch_result),
-        **_resource_fetch_completeness_diagnostics(fetch_result),
-        "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
-        "pagination_cooldown_wait_seconds": (fetch_result.pagination_cooldown_wait_seconds),
-        "pagination_cooldown_recovered": (fetch_result.is_pagination_cooldown_recovered),
-        "pagination_cooldown_exhausted": (fetch_result.is_pagination_cooldown_exhausted),
-        "pagination_cooldown_deadline_blocked": (fetch_result.is_pagination_cooldown_deadline_blocked),
-    }
+    return fhir_response.resource_fetch_diagnostic(sys.modules[__name__], fetch_result, rows_written=rows_written)
 
 
-def _safe_source_fetch_diagnostic(
-    fetch_result: ResourceFetchResult,
-) -> dict[str, Any] | None:
+def _safe_source_fetch_diagnostic(fetch_result: ResourceFetchResult) -> dict[str, Any] | None:
     """Hide source transport detail for reviewed cursor proof modes."""
-
-    hidden_fetch_modes = {
-        LAST_UPDATED_PARTITION_FETCH_MODE,
-        CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
-        CURRENT_VERSION_CENSUS_FETCH_MODE,
-        SERVER_ISSUED_SUBSET_FETCH_MODE,
-    }
-    return None if fetch_result.fetch_mode in hidden_fetch_modes else fetch_result.fetch_diagnostic
+    return fhir_response.safe_source_fetch_diagnostic(sys.modules[__name__], fetch_result)
 
 
 async def _update_source_resource_import_metadata(
@@ -59788,7 +59773,7 @@ async def _fetch_pagination_checkpoint(
             SELECT dataset_id, source_ids, acquisition_root_run_id, owner_run_id,
                    retry_of_run_id, start_url_hash, next_url, state,
                    pages_processed, rows_processed, recent_cursor_hashes,
-                   completeness_json
+                   completeness_json, resource_type
               FROM {_pagination_checkpoint_table_ref()}
              WHERE canonical_api_base = :canonical_api_base
                AND resource_type = :resource_type
@@ -59822,6 +59807,24 @@ def _compatible_pagination_resume_state(
     next_url = _clean_text(checkpoint.get("next_url"))
     if not is_complete and not next_url:
         return None
+    completeness = _json_object(checkpoint.get("completeness_json"))
+    if timestamp_recovery.marked(completeness):
+        from process.provider_directory_generic_source_adapters import timestamp_recovery_identity
+
+        if _clean_text(checkpoint.get("start_url_hash")) != start_url_hash:
+            raise ValueError("timestamp_recovery_start_url_changed")
+        state = timestamp_recovery.validate_checkpoint(
+            completeness,
+            identity=timestamp_recovery_identity(context, checkpoint.get("resource_type"), start_url_hash),
+            next_url=next_url,
+            pages_processed=int(checkpoint.get("pages_processed") or 0),
+            rows_processed=int(checkpoint.get("rows_processed") or 0),
+            complete=is_complete,
+        )
+        if is_complete:
+            hashes = _json_text_list(checkpoint.get("recent_cursor_hashes"))
+            if not hashes or _pagination_url_hash(state["terminal_request_url"]) != hashes[-1]:
+                raise ValueError("timestamp_recovery_terminal_request_changed")
     return PaginationResumeState(
         next_url=next_url,
         pages_processed=int(checkpoint.get("pages_processed") or 0),
@@ -59829,7 +59832,7 @@ def _compatible_pagination_resume_state(
         recent_url_hashes=tuple(_json_text_list(checkpoint.get("recent_cursor_hashes"))),
         complete=is_complete,
         resumed=True,
-        completeness=_json_object(checkpoint.get("completeness_json")),
+        completeness=completeness,
     )
 
 
@@ -60388,24 +60391,12 @@ def _current_version_census_terminal_failure_details(
 
 
 def _pagination_terminal_failure_details(
-    diagnostics_by_resource: dict[str, dict[str, Any]],
-    incomplete_resource_types: list[str],
+    diagnostics_by_resource: dict[str, dict[str, Any]], incomplete_resource_types: list[str]
 ) -> str | None:
     """Return the first terminal completeness failure across census modes."""
-
-    failure_helpers = (
-        _last_updated_partition_terminal_failure_details,
-        _caresource_terminal_failure_details,
-        _current_version_census_terminal_failure_details,
+    return fhir_response.pagination_terminal_failure_details(
+        sys.modules[__name__], diagnostics_by_resource, incomplete_resource_types
     )
-    for failure_helper in failure_helpers:
-        failure_details = failure_helper(
-            diagnostics_by_resource,
-            incomplete_resource_types,
-        )
-        if failure_details:
-            return failure_details
-    return None
 
 
 def _handle_incomplete_source_pagination(
@@ -60488,20 +60479,9 @@ async def _finalize_source_pagination_checkpoints(
     )
 
 
-def _is_resource_diagnostic_acquisition_complete(
-    diagnostic: dict[str, Any],
-) -> bool:
-    if diagnostic.get("complete") is True:
-        return True
-    return bool(
-        diagnostic.get("fetch_mode") == UHC_PLAN_GRAPH_FETCH_MODE
-        and diagnostic.get("plan_graph_complete") is True
-        and diagnostic.get("collection_complete") is False
-        and diagnostic.get("stability_verified") is True
-        and not diagnostic.get("error")
-        and not diagnostic.get("bounded")
-        and not diagnostic.get("next_url_remaining")
-    )
+def _is_resource_diagnostic_acquisition_complete(diagnostic: dict[str, Any]) -> bool:
+    """Apply the shared traversal and recovery completeness rules."""
+    return fhir_response.is_resource_diagnostic_acquisition_complete(sys.modules[__name__], diagnostic)
 
 
 async def _reset_unexpected_empty_pagination_checkpoint(
@@ -62161,6 +62141,16 @@ def _is_endpoint_dataset_publishable(
             or diagnostic.get("error")
             or diagnostic.get("bounded")
             or diagnostic.get("next_url_remaining")
+        ):
+            return False
+        if not timestamp_recovery.diagnostic_is_complete(
+            diagnostic,
+            expected={
+                "dataset_id": candidate.dataset_id,
+                "acquisition_root_run_id": candidate.acquisition_root_run_id,
+                "resource_type": resource_type,
+                **({"source_id": candidate.source_ids[0]} if len(candidate.source_ids) == 1 else {}),
+            },
         ):
             return False
     return True

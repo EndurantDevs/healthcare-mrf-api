@@ -1,8 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Existing FHIR/CMS call adapters for the explicit publisher snapshot contract."""
 
+import hashlib
 import json
 from contextlib import aclosing, asynccontextmanager
+from dataclasses import replace
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_directory_generic_candidate import RESOURCE_COLUMNS, GenericCandidateError
@@ -124,10 +126,9 @@ async def _legacy_candidate_count(directory, context, resource_type):
     return int(count_map.get("unique_candidate_rows") or 0)
 
 
-async def candidate_resource_count(directory, context, resource_type, *, distinct=True):
-    """Count exact active loading identities, or with distinct=False every active staged row, without an input heap."""
-    if not is_source_storage_required():
-        return await _legacy_candidate_count(directory, context, resource_type)
+@asynccontextmanager
+async def _candidate_resource_scope(directory, context, resource_type):
+    """Keep aggregate reads in the existing fenced candidate transaction."""
     from process.provider_directory_generic_source_policy import _publisher_scope, _require_active_source_session
     from process.provider_directory_source_checkpoint_control import require_checkpoint_executor
 
@@ -150,6 +151,19 @@ async def candidate_resource_count(directory, context, resource_type, *, distinc
         await _verify_tables(connection, policy, binding)
         cutoff = max(binding["resets"].get("*", 0), binding["resets"].get(resource_type, 0))
         table = storage_relation(policy.schema, binding["tables"]["resource_input"]["name"])
+        yield connection, table, cutoff, binding["ordinal"]
+        current = await require_checkpoint_executor(directory.db)
+        _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
+        _require_active_source_session(connection)
+        async with source_owner_transaction(directory.db) as current:
+            _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
+
+
+async def candidate_resource_count(directory, context, resource_type, *, distinct=True):
+    """Count exact active loading identities, or with distinct=False every active staged row, without an input heap."""
+    if not is_source_storage_required():
+        return await _legacy_candidate_count(directory, context, resource_type)
+    async with _candidate_resource_scope(directory, context, resource_type) as (connection, table, cutoff, ordinal):
         counted = 'DISTINCT resource_id COLLATE "C"' if distinct else "*"
         count = await connection.fetchval(
             f"SELECT count({counted}) FROM {table} "
@@ -157,15 +171,205 @@ async def candidate_resource_count(directory, context, resource_type, *, distinc
             context.dataset_id,
             resource_type,
             cutoff,
-            binding["ordinal"],
+            ordinal,
         )
         _require(type(count) is int and 0 <= count < 2**63, "resource_count_invalid")
-        current = await require_checkpoint_executor(directory.db)
-        _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
-        _require_active_source_session(connection)
-        async with source_owner_transaction(directory.db) as current:
-            _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
         return count
+
+
+_TIMESTAMP_RECOVERY_STAMP_SQL = """CASE WHEN payload_json #>> '{fhir_meta,lastUpdated}'
+          ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?(Z|[+]00:00)$'
+          AND pg_catalog.pg_input_is_valid(payload_json #>> '{fhir_meta,lastUpdated}', 'timestamp with time zone')
+          THEN (payload_json #>> '{fhir_meta,lastUpdated}')::timestamptz END"""
+
+
+class _TimestampPrefixIneligible(ValueError):
+    """Keep the ordinary cursor when its retained prefix cannot qualify."""
+
+
+async def candidate_timestamp_recovery_summary(directory, context, resource_type):
+    """Qualify retained page ranges and return only the bounded seam_rows payloads."""
+    from process.provider_directory_timestamp_recovery import MAX_TIES
+
+    _require(is_source_storage_required(), "timestamp_recovery_named_storage_required")
+    async with _candidate_resource_scope(directory, context, resource_type) as (connection, table, cutoff, ordinal):
+        if cutoff != 0:
+            raise _TimestampPrefixIneligible("timestamp_recovery_reset_not_supported")
+        summary_by_field = dict(
+            await connection.fetchrow(
+                f"""
+            WITH observations AS MATERIALIZED (
+                SELECT resource_id,batch_ordinal,row_ordinal,
+                  {_TIMESTAMP_RECOVERY_STAMP_SQL} AS stamp
+                FROM {table} WHERE dataset_id=$1 AND resource_type=$2
+                  AND batch_ordinal>$3 AND batch_ordinal<=$4
+            ), batches AS (
+                SELECT batch_ordinal,min(stamp) AS low,max(stamp) AS high,count(*) AS n,
+                  count(stamp)=count(*) AND count(DISTINCT row_ordinal)=count(*)
+                    AND min(row_ordinal)=0 AND max(row_ordinal)=count(*)-1 AND count(*)<=20 AS valid
+                FROM observations GROUP BY batch_ordinal
+            ), ordered AS (
+                SELECT *,lag(low) OVER(ORDER BY batch_ordinal) AS previous_low FROM batches
+            ), boundary AS (SELECT min(stamp) AS lowest FROM observations)
+            SELECT (SELECT count(*) FROM observations) AS observations,
+              (SELECT count(DISTINCT resource_id) FROM observations) AS unique_ids,
+              (SELECT count(*)-count(stamp) FROM observations) AS invalid_timestamps,
+              count(*) AS pages,count(*) FILTER(WHERE NOT valid) AS bad_batches,
+              count(*) FILTER(WHERE high>previous_low) AS inversions,
+              (SELECT lowest FROM boundary) AS lowest,
+              (SELECT min(stamp) FROM observations WHERE stamp>(SELECT lowest FROM boundary)) AS second_lowest,
+              (SELECT count(*) FROM observations WHERE stamp=(SELECT lowest FROM boundary)) AS overlap_count
+            FROM ordered
+            """,
+                context.dataset_id,
+                resource_type,
+                cutoff,
+                ordinal,
+                timeout=120,
+            )
+        )
+        if summary_by_field["invalid_timestamps"] or not 0 < summary_by_field["overlap_count"] <= MAX_TIES:
+            return summary_by_field, []
+        seam_rows = await connection.fetch(
+            f"SELECT resource_id,payload_json FROM {table} "
+            "WHERE dataset_id=$1 AND resource_type=$2 AND batch_ordinal>$3 AND batch_ordinal<=$4 "
+            f"AND ({_TIMESTAMP_RECOVERY_STAMP_SQL})=$5 LIMIT $6",
+            context.dataset_id,
+            resource_type,
+            cutoff,
+            ordinal,
+            summary_by_field["lowest"],
+            MAX_TIES + 1,
+            timeout=120,
+        )
+        _require(len(seam_rows) == summary_by_field["overlap_count"], "timestamp_recovery_seam_changed")
+        return summary_by_field, [dict(resource_row) for resource_row in seam_rows]
+
+
+def timestamp_recovery_identity(context, resource_type, start_url_hash):
+    """Bind recovery to the unchanged ordinary checkpoint's logical scope."""
+    _require(len(context.source_ids) == 1 and context.dataset_id, "timestamp_recovery_scope_invalid")
+    return {
+        "canonical_api_base": context.canonical_api_base,
+        "source_id": context.source_ids[0],
+        "dataset_id": context.dataset_id,
+        "acquisition_root_run_id": context.acquisition_root_run_id,
+        "resource_type": resource_type,
+        "start_url_hash": start_url_hash,
+        "source_scope_hash": context.source_scope_hash,
+    }
+
+
+def timestamp_recovery_content_hash(directory, payload, resource_type):
+    """Compare a replayed boundary's content without its changing transport URLs."""
+    return directory.resource_payload_sha256_for_contract(
+        payload, directory.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT, resource_type=resource_type
+    )
+
+
+async def _begin_timestamp_recovery(directory, context, resource_type, resume, identity):
+    """Qualify every retained page before preparing the first overlapping window."""
+    from process import provider_directory_timestamp_recovery as recovery
+
+    summary_by_field, seam_rows = await candidate_timestamp_recovery_summary(directory, context, resource_type)
+    if not (
+        summary_by_field["observations"] == summary_by_field["unique_ids"] == resume.rows_processed
+        and summary_by_field["pages"] == resume.pages_processed
+        and summary_by_field["invalid_timestamps"]
+        == summary_by_field["bad_batches"]
+        == summary_by_field["inversions"]
+        == 0
+        and summary_by_field["second_lowest"] is not None
+        and seam_rows
+    ):
+        raise _TimestampPrefixIneligible("timestamp_recovery_prefix_invalid")
+    return recovery.begin(
+        resume.completeness,
+        identity=identity,
+        original_url=resume.next_url,
+        original_pages=resume.pages_processed,
+        original_rows=resume.rows_processed,
+        upper=summary_by_field["second_lowest"].isoformat(),
+        overlap_timestamp=summary_by_field["lowest"].isoformat(),
+        overlap_hashes={
+            resource_row["resource_id"]: timestamp_recovery_content_hash(
+                directory, directory._json_object(resource_row["payload_json"]), resource_type
+            )
+            for resource_row in seam_rows
+        },
+    )
+
+
+def _is_timestamp_recovery_candidate(context, resume):
+    """Limit recovery to an unreset, verified retained candidate."""
+    return bool(
+        is_source_storage_required()
+        and context.dataset_id
+        and context.lineage_verified
+        and context.retry_of_run_id
+        and not context.allow_retained_pagination_reset
+        and resume.resumed
+        and resume.rows_processed
+        and not resume.complete
+    )
+
+
+async def prepare_timestamp_recovery(
+    directory, context, resource_type, start_url, resume, *, is_failed_continuation=False
+):
+    """Preserve the original scan and fence a timestamp-only successor inside its existing checkpoint."""
+    from process import provider_directory_timestamp_recovery as recovery
+
+    proof = resume.completeness
+    has_recovery = recovery.marked(proof)
+    can_start = _is_timestamp_recovery_candidate(context, resume)
+    if not has_recovery and not (can_start and is_failed_continuation):
+        return resume
+    identity = timestamp_recovery_identity(context, resource_type, hashlib.sha256(start_url.encode()).hexdigest())
+    if has_recovery:
+        state = recovery.validate_checkpoint(
+            proof,
+            identity=identity,
+            next_url=resume.next_url,
+            pages_processed=resume.pages_processed,
+            rows_processed=resume.rows_processed,
+            complete=resume.complete,
+        )
+        if resume.complete:
+            _require(
+                resume.recent_url_hashes
+                and directory._pagination_url_hash(state["terminal_request_url"]) == resume.recent_url_hashes[-1],
+                "timestamp_recovery_terminal_request_changed",
+            )
+            return resume
+        _require(can_start, "timestamp_recovery_retained_lineage_required")
+        if (
+            not is_failed_continuation
+            or state["action"] == "fresh_lt"
+            or state["remaining_overlap"]
+            or state["closed"] is None
+        ):
+            return resume
+    try:
+        async with source_transaction(directory.db):
+            proof = (
+                recovery.reanchor(proof, identity=identity)
+                if has_recovery
+                else await _begin_timestamp_recovery(directory, context, resource_type, resume, identity)
+            )
+            next_url = proof[recovery.KEY]["url"]
+            await directory._save_pagination_checkpoint(
+                context,
+                resource_type,
+                next_url=next_url,
+                pages_processed=resume.pages_processed,
+                rows_processed=resume.rows_processed,
+                recent_url_hashes=list(resume.recent_url_hashes),
+                completeness=proof,
+            )
+    except _TimestampPrefixIneligible:
+        return resume
+    return replace(resume, next_url=next_url, completeness=proof)
 
 
 async def source_retry_rows(directory, dataset_id, resource_type, *, payload_hash=None, resource_ids=None):

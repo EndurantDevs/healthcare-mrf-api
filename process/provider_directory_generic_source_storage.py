@@ -19,6 +19,7 @@ from uuid import uuid4
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_compact_payload as compact_payload
 from process import provider_directory_compact_source_storage as compact_storage
+from process import provider_directory_timestamp_recovery as timestamp_recovery
 from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.plan_release_storage_provision import _GRANTEES_SQL
 from process.provider_directory_generic_candidate import (
@@ -403,6 +404,7 @@ def validate_handoff_completion(header):
     from process.provider_directory_fhir_subset_canonical import validate_subset_completion_proof_pair
 
     validate_handoff_header({field: header[field] for field in HANDOFF_HEADER_FIELDS})
+    _validate_handoff_recovery_completion(header)
     proof = _json(header["completion_proof_json"])
     if header["completion_proof_required_version"] is None:
         _require(proof is None, "completion_proof_unexpected")
@@ -415,6 +417,45 @@ def validate_handoff_completion(header):
         proof["dataset"]["hash"] == header["dataset_hash"] and proof["dataset"]["count"] == header["resource_count"],
         "completion_dataset_changed",
     )
+
+
+def _validate_handoff_recovery_completion(header):
+    """Recheck compact recovery receipts against the detached header's logical scope."""
+    metadata = _json(header.get("publication_metadata_json"))
+    diagnostics = metadata.get("resource_diagnostics", {}) if isinstance(metadata, dict) else {}
+    if not isinstance(diagnostics, dict):
+        return
+    for resource_type, diagnostic in diagnostics.items():
+        if not isinstance(diagnostic, dict):
+            continue
+        mode = diagnostic.get("fetch_mode")
+        if not (
+            timestamp_recovery.marked(diagnostic)
+            or isinstance(mode, str)
+            and mode.startswith(timestamp_recovery.FETCH_MODE)
+        ):
+            continue
+        source_ids = metadata.get("source_ids")
+        selected_resources = metadata.get("selected_resources")
+        _require(
+            type(source_ids) is list
+            and len(source_ids) == 1
+            and type(selected_resources) is list
+            and resource_type in selected_resources,
+            "completion_recovery_invalid",
+        )
+        _require(
+            timestamp_recovery.diagnostic_is_complete(
+                diagnostic,
+                expected={
+                    "dataset_id": header.get("dataset_id"),
+                    "acquisition_root_run_id": header.get("acquisition_root_run_id"),
+                    "source_id": source_ids[0],
+                    "resource_type": resource_type,
+                },
+            ),
+            "completion_recovery_invalid",
+        )
 
 
 def _require_ordinary_source_metadata(metadata):
@@ -1131,6 +1172,9 @@ def _transition_run_ancestors(run_rows, root_run_id, failed_run_id):
 
 def _is_resumable_transition_checkpoint(checkpoint):
     """Keep completed scans or an unchanged, same-origin retained continuation."""
+    completeness = _json(checkpoint.get("completeness_json"))
+    if timestamp_recovery.marked(completeness) and not _valid_transition_recovery_checkpoint(checkpoint, completeness):
+        return False
     if checkpoint["state"] == "complete":
         return checkpoint["completed_at"] is not None
     cursor = checkpoint["next_url"]
@@ -1148,6 +1192,46 @@ def _is_resumable_transition_checkpoint(checkpoint):
     try:
         return directory._is_trusted_fhir_pagination_url({"canonical_api_base": base}, base, cursor)
     except ValueError:
+        return False
+
+
+def _valid_transition_recovery_checkpoint(checkpoint, completeness):
+    """Bind retained recovery progress and terminal request evidence to its checkpoint."""
+    try:
+        source_ids = _json(checkpoint["source_ids"])
+        if type(source_ids) is not list or len(source_ids) != 1:
+            return False
+        identity_by_field = {
+            key: checkpoint[key]
+            for key in (
+                "canonical_api_base",
+                "dataset_id",
+                "acquisition_root_run_id",
+                "resource_type",
+                "start_url_hash",
+                "source_scope_hash",
+            )
+        }
+        identity_by_field["source_id"] = source_ids[0]
+        is_complete = checkpoint["state"] == "complete"
+        state = timestamp_recovery.validate_checkpoint(
+            completeness,
+            identity=identity_by_field,
+            next_url=checkpoint["next_url"],
+            pages_processed=checkpoint["pages_processed"],
+            rows_processed=checkpoint["rows_processed"],
+            complete=is_complete,
+        )
+        if not is_complete:
+            return True
+        recent = _json(checkpoint["recent_cursor_hashes"])
+        directory = import_module("process.provider_directory_fhir")
+        return bool(
+            type(recent) is list
+            and recent
+            and recent[-1] == directory._pagination_url_hash(state["terminal_request_url"])
+        )
+    except KeyError, TypeError, ValueError:
         return False
 
 
@@ -1350,7 +1434,8 @@ async def _verify_transition_checkpoints(
     dataset_id = identity_by_field["dataset_id"]
     checkpoint_rows = await connection.fetch(
         "SELECT resource_type,state,owner_run_id,dataset_id,rows_processed,pages_processed,completed_at,"
-        "canonical_api_base,start_url_hash,next_url,acquisition_root_run_id,source_ids,source_scope_hash FROM "
+        "canonical_api_base,start_url_hash,next_url,acquisition_root_run_id,source_ids,source_scope_hash,"
+        "completeness_json,recent_cursor_hashes FROM "
         + storage_relation(policy.schema, "provider_directory_pagination_checkpoint")
         + " WHERE acquisition_root_run_id=$1 OR dataset_id=$2 FOR SHARE NOWAIT",
         root_run_id,

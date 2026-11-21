@@ -8,6 +8,8 @@ import re
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 
+from process import provider_directory_timestamp_recovery as timestamp_recovery
+
 DEFAULT_RETRY_WAIT_LIMIT_SECONDS = 600.0
 ATTEMPT_COUNTERS = (
     "rows_written",
@@ -63,11 +65,29 @@ def retryable(directory, runner, source_record_by_field, fetch_result):
     options = runner.options
     checkpoint_context = source_record_by_field.get("_pagination_checkpoint_context")
     diagnostic = fetch_result.fetch_diagnostic or {}
+    is_timestamp_recovery = fetch_result.fetch_mode == timestamp_recovery.FETCH_MODE
+    if is_timestamp_recovery:
+        try:
+            if timestamp_recovery.completion_receipt(diagnostic) != {"version": 1, "complete": False}:
+                return False
+        except KeyError, TypeError, ValueError:
+            return False
+        diagnostic = diagnostic.get("transport")
+    if not isinstance(diagnostic, dict):
+        return False
     status = diagnostic.get("status")
     http_error = re.fullmatch(r"http_([0-9]{3})", fetch_result.error or "")
     if http_error and status != int(http_error[1]):
         return False
     error = None if http_error else fetch_result.error
+    if is_timestamp_recovery and (
+        not {"status", "response_class"} <= diagnostic.keys()
+        or (status is not None and type(status) is not int)
+        or (error and error.startswith(("timestamp_recovery_", "provider_directory_timestamp_recovery_")))
+        or error in {"non_bundle_payload", "pagination_cursor_repeated", "pagination loop detected"}
+        or diagnostic.get("response_class") != directory._source_fetch_response_class(status, error)
+    ):
+        return False
     return bool(
         options.checkpointing_enabled
         and options.deferred_materialization
@@ -78,7 +98,7 @@ def retryable(directory, runner, source_record_by_field, fetch_result):
         and not options.stale_cleanup
         and directory._has_bound_resource_scan_checkpoint(source_record_by_field, checkpoint_context)
         and checkpoint_context.allow_retained_pagination_reset is False
-        and fetch_result.fetch_mode == "checkpointed_paged"
+        and fetch_result.fetch_mode in {"checkpointed_paged", timestamp_recovery.FETCH_MODE}
         and not fetch_result.complete
         and fetch_result.error
         and fetch_result.next_url_remaining
