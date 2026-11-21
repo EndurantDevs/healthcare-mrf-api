@@ -113,6 +113,7 @@ class SourceBuildRequest:
     authorization_expires_at: dt.datetime | None = field(default=None, compare=False)
     continuation: BuildContinuationContext | None = field(default=None, repr=False)
     operation_deadline: float | None = field(default_factory=_OPERATION_DEADLINE.get, compare=False)
+    prefer_fenced_writes: bool = field(default=False, compare=False, kw_only=True)
 
     def __post_init__(self) -> None:
         for name in ("dataset_id", "definition_revision_id", "schema_revision_id", "execution_id", "fence"):
@@ -131,6 +132,8 @@ class SourceBuildRequest:
         _integer(self.lease_seconds, "lease_seconds", 1, MAX_LEASE_SECONDS)
         if type(self.complete_scope) is not bool or type(self.lease_token) not in (str, bytes):
             raise ValueError("build scope and immutable lease token are required")
+        if type(self.prefer_fenced_writes) is not bool:
+            raise ValueError("fenced write preference must be a boolean")
         lease_token_sha256(self.lease_token)
         if self.operation_deadline is not None and (
             type(self.operation_deadline) not in (int, float) or not math.isfinite(self.operation_deadline)
@@ -392,10 +395,10 @@ async def _can_update_build_cursor(session: AsyncSession) -> bool:
     return result.scalar_one() is True
 
 
-async def _try_ordinary_write(session, write, *arguments, **options):
+async def _try_ordinary_write(session, write, *arguments, prefer_fenced_writes=False, **options):
     """Roll back a denied direct write before using the fenced dispatcher."""
 
-    if not await _can_update_build_cursor(session):
+    if prefer_fenced_writes or not await _can_update_build_cursor(session):
         return False, None
     try:
         # Keep authorization, COPY and page locks in the enclosing transaction.
@@ -697,7 +700,13 @@ async def _store_pages(session_factory, context, pages, *, verified_parts=()):
         await _copy_source_landing(session, landing_rows)
         from process.custom_import.source_finalize_sql import finalize_source_batch
 
-        direct, completed = await _try_ordinary_write(session, finalize_source_batch, batch_id, earlier_parts)
+        direct, completed = await _try_ordinary_write(
+            session,
+            finalize_source_batch,
+            batch_id,
+            earlier_parts,
+            prefer_fenced_writes=context.request.prefer_fenced_writes,
+        )
         if not direct:
             completed = (
                 await _call(session, "source_set_finalize", (("uuid", batch_id), ("integer[]", earlier_parts)))
@@ -1301,7 +1310,11 @@ async def _admit_local_pages(session_factory, request, build_id):
                 if build.phase != "admission":
                     raise CandidateRunnerError("source build is not ready for global admission")
                 direct, _ = await _try_ordinary_write(
-                    session, admission._admit_locked, build, build.admission_after_occurrence_id
+                    session,
+                    admission._admit_locked,
+                    build,
+                    build.admission_after_occurrence_id,
+                    prefer_fenced_writes=request.prefer_fenced_writes,
                 )
                 if not direct:
                     # Restricted connections keep the existing fenced dispatcher.

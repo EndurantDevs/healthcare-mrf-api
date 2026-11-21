@@ -80,6 +80,19 @@ def _copy_stubs(monkeypatch, *, part=1, first_row=0, ordinal=0):
     return session, copied, called
 
 
+async def test_source_can_select_fenced_finalization_with_cursor_update_access(monkeypatch):
+    session, _, called = _copy_stubs(monkeypatch)
+    session.execute.return_value.scalar_one = lambda: True
+    ordinary_finalize = AsyncMock()
+    monkeypatch.setattr(finalizer, "finalize_source_batch", ordinary_finalize)
+    context = _bulk_context()
+    context = replace(context, request=replace(context.request, prefer_fenced_writes=True))
+    result = await staging._store_pages(lambda: None, context, (_prepared_page(context),))
+    assert result == 1
+    assert called.await_args.args[1] == "source_set_finalize"
+    ordinary_finalize.assert_not_awaited()
+
+
 @pytest.mark.parametrize("can_update", [True, False, None, 1])
 @pytest.mark.parametrize("schema", ['synthetic " mapped', "synthetic_candidate"])
 async def test_cursor_write_route_uses_native_privilege_and_mapped_relation(monkeypatch, can_update, schema):
