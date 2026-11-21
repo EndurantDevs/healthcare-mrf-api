@@ -10,7 +10,9 @@ import logging
 import urllib.parse
 import zlib
 from contextlib import asynccontextmanager, nullcontext
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
+
+from process.provider_directory_fetch_types import ResourceFetchResult
 
 SOURCE_HTTP_REQUEST_SLOTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "provider_directory_http_request_slots", default=None
@@ -637,3 +639,295 @@ def retained_census_retry_boundary(directory, source_record, retry_at):
         retry_at,
         directory._retry_not_before_timestamp(directory.datetime.datetime.now(directory.datetime.UTC), remaining),
     )
+
+
+def resource_fetch_timing_diagnostic(directory, fetch_result: ResourceFetchResult) -> dict[str, Any]:
+    """Return transport, persistence, and prefetch timings and counts."""
+    return {
+        "source_fetch_elapsed_ms": fetch_result.source_fetch_elapsed_ms,
+        "stream_write_elapsed_seconds": fetch_result.stream_write_elapsed_seconds,
+        "checkpoint_persist_elapsed_seconds": fetch_result.checkpoint_persist_elapsed_seconds,
+        "page_prefetch_eligible": fetch_result.page_prefetch_eligible,
+        "page_prefetch_started": fetch_result.page_prefetch_started,
+        "page_prefetch_consumed": fetch_result.page_prefetch_consumed,
+        "page_prefetch_discarded": fetch_result.page_prefetch_discarded,
+        "page_prefetch_wait_seconds": fetch_result.page_prefetch_wait_seconds,
+    }
+
+
+def resource_fetch_completeness_diagnostics(directory, fetch_result: ResourceFetchResult) -> dict[str, Any]:
+    """Return mode-specific completeness proof fields."""
+    subset_proof = (
+        directory._sanitized_server_issued_subset_execution_proof(fetch_result.fetch_diagnostic)
+        if fetch_result.fetch_mode == directory.SERVER_ISSUED_SUBSET_FETCH_MODE
+        else None
+    )
+    replay_evidence = (
+        directory._server_issued_subset_internal_replay_evidence(fetch_result.fetch_diagnostic)
+        if fetch_result.fetch_mode == directory.SERVER_ISSUED_SUBSET_FETCH_MODE
+        else None
+    )
+    return {
+        **(
+            {
+                directory.timestamp_recovery.KEY: directory.timestamp_recovery.completion_receipt(
+                    fetch_result.fetch_diagnostic
+                )
+            }
+            if directory.timestamp_recovery.marked(fetch_result.fetch_diagnostic)
+            else {}
+        ),
+        "last_updated_completeness": fetch_result.fetch_diagnostic
+        if fetch_result.fetch_mode == directory.LAST_UPDATED_PARTITION_FETCH_MODE
+        else None,
+        "caresource_opaque_cursor_completeness": fetch_result.fetch_diagnostic
+        if fetch_result.fetch_mode == directory.CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+        else None,
+        "current_version_census_completeness": fetch_result.fetch_diagnostic
+        if fetch_result.fetch_mode == directory.CURRENT_VERSION_CENSUS_FETCH_MODE
+        else None,
+        "server_issued_subset_completeness": subset_proof,
+        "server_issued_subset_coverage": directory._server_issued_subset_coverage(fetch_result.fetch_diagnostic)
+        if fetch_result.fetch_mode == directory.SERVER_ISSUED_SUBSET_FETCH_MODE
+        else None,
+        **(
+            {directory._SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY: replay_evidence}
+            if replay_evidence is not None
+            else {}
+        ),
+    }
+
+
+def sanitized_server_issued_subset_execution_proof(directory, proof_by_field: Any) -> dict[str, Any] | None:
+    """Exclude root-specific opaque-hop hashes from status diagnostics."""
+    if not isinstance(proof_by_field, Mapping):
+        return None
+    return {
+        field_name: field_value
+        for field_name, field_value in proof_by_field.items()
+        if field_name != "continuation_hop_sha256"
+    }
+
+
+def server_issued_subset_internal_replay_evidence(directory, proof_by_field: Any) -> dict[str, Any] | None:
+    """Retain token-inclusive replay hashes only for sealed dataset evidence."""
+    if not isinstance(proof_by_field, Mapping):
+        return None
+    continuation_hop_sha256 = proof_by_field.get("continuation_hop_sha256")
+    if type(continuation_hop_sha256) is not list:
+        return None
+    return {"continuation_hop_sha256": list(continuation_hop_sha256)}
+
+
+def server_issued_subset_coverage(directory, proof_by_field: Any) -> dict[str, Any] | None:
+    """Return safe resource-level coverage without implying absent targets."""
+    if not isinstance(proof_by_field, Mapping):
+        return None
+    geometry = proof_by_field.get("terminal_page_geometry")
+    continuation_shape_sha256 = proof_by_field.get("continuation_shape_sha256")
+    return {
+        "cutoff": proof_by_field.get("cutoff"),
+        "scope": "server_issued_traversal_subset",
+        "advertised_pre": proof_by_field.get("advertised_pre"),
+        "advertised_post": proof_by_field.get("advertised_post"),
+        "returned_unique": proof_by_field.get("returned_unique"),
+        "deficit": proof_by_field.get("deficit"),
+        "geometry": {
+            "pages": geometry.get("pages_processed"),
+            "logical_terminal_offset": geometry.get("terminal_page_start_offset"),
+            "sparse_pages": geometry.get("sparse_pages"),
+            "empty_pages": geometry.get("empty_pages"),
+            "page_entry_counts_sha256": directory.subset_canonical_sha256(proof_by_field.get("page_entry_counts")),
+            "geometry_sha256": directory.subset_canonical_sha256(
+                {**dict(geometry), "page_entry_counts": proof_by_field.get("page_entry_counts")}
+            ),
+        }
+        if isinstance(geometry, Mapping)
+        else None,
+        "continuation": {
+            "validated_hops": len(continuation_shape_sha256),
+            "chain_sha256": directory.subset_canonical_sha256(continuation_shape_sha256),
+        }
+        if type(continuation_shape_sha256) is list
+        else None,
+        "twin_state": "pending_matching_reviewed_root",
+        "proof_state": "resource_terminal_verified" if proof_by_field.get("verified") is True else "not_verified",
+        "unresolved_reference_count": None,
+        "absence_semantics": "unknown_under_subset",
+    }
+
+
+def resource_fetch_diagnostic(directory, fetch_result: ResourceFetchResult, *, rows_written: int) -> dict[str, Any]:
+    """Return one resource fetch's nonsecret operational diagnostics."""
+    is_server_issued_subset = fetch_result.fetch_mode == directory.SERVER_ISSUED_SUBSET_FETCH_MODE
+    is_timestamp_traversal = fetch_result.fetch_mode == directory.timestamp_recovery.FETCH_MODE
+    return {
+        "complete": fetch_result.complete,
+        "collection_complete": False if is_server_issued_subset or is_timestamp_traversal else fetch_result.complete,
+        **(
+            {
+                "traversal_complete": fetch_result.complete,
+                "absence_semantics": "unknown_outside_observed_timestamp_traversal",
+            }
+            if is_timestamp_traversal
+            else {}
+        ),
+        **(
+            {
+                "traversal_complete": fetch_result.complete,
+                "source_continuation_exhausted": bool(fetch_result.complete and (not fetch_result.next_url_remaining)),
+                "absence_semantics": "unknown_under_subset",
+            }
+            if is_server_issued_subset
+            else {}
+        ),
+        "plan_graph_complete": False,
+        "bounded": fetch_result.is_bounded,
+        "error": fetch_result.error,
+        "fetch_mode": fetch_result.fetch_mode,
+        "pages_fetched": fetch_result.pages_fetched,
+        "rows_fetched": fetch_result.rows_fetched,
+        "rows_written": rows_written,
+        **directory._resource_fetch_timing_diagnostic(fetch_result),
+        "row_limit_reached": fetch_result.row_limit_reached,
+        "page_limit_reached": fetch_result.page_limit_reached,
+        "hard_page_limit_reached": fetch_result.hard_page_limit_reached,
+        "deadline_reached": fetch_result.deadline_reached,
+        "next_url_remaining": fetch_result.next_url_remaining,
+        "retry_not_before": fetch_result.retry_not_before,
+        "source_fetch": directory._safe_source_fetch_diagnostic(fetch_result),
+        **directory._resource_fetch_completeness_diagnostics(fetch_result),
+        "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
+        "pagination_cooldown_wait_seconds": fetch_result.pagination_cooldown_wait_seconds,
+        "pagination_cooldown_recovered": fetch_result.is_pagination_cooldown_recovered,
+        "pagination_cooldown_exhausted": fetch_result.is_pagination_cooldown_exhausted,
+        "pagination_cooldown_deadline_blocked": fetch_result.is_pagination_cooldown_deadline_blocked,
+    }
+
+
+def safe_source_fetch_diagnostic(directory, fetch_result: ResourceFetchResult) -> dict[str, Any] | None:
+    """Hide source transport detail for reviewed cursor proof modes."""
+    hidden_fetch_modes = {
+        directory.timestamp_recovery.FETCH_MODE,
+        directory.LAST_UPDATED_PARTITION_FETCH_MODE,
+        directory.CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+        directory.CURRENT_VERSION_CENSUS_FETCH_MODE,
+        directory.SERVER_ISSUED_SUBSET_FETCH_MODE,
+    }
+    return None if fetch_result.fetch_mode in hidden_fetch_modes else fetch_result.fetch_diagnostic
+
+
+def pagination_terminal_failure_details(
+    directory, diagnostics_by_resource: dict[str, dict[str, Any]], incomplete_resource_types: list[str]
+) -> str | None:
+    """Return the first terminal completeness failure across census modes."""
+    timestamp_failures = [
+        resource
+        for resource in incomplete_resource_types
+        if str(diagnostics_by_resource[resource].get("error") or "").startswith(
+            "provider_directory_timestamp_recovery_blocked:"
+        )
+    ]
+    if timestamp_failures:
+        return ",".join((f"{resource}={diagnostics_by_resource[resource]['error']}" for resource in timestamp_failures))
+    failure_helpers = (
+        directory._last_updated_partition_terminal_failure_details,
+        directory._caresource_terminal_failure_details,
+        directory._current_version_census_terminal_failure_details,
+    )
+    for failure_helper in failure_helpers:
+        failure_details = failure_helper(diagnostics_by_resource, incomplete_resource_types)
+        if failure_details:
+            return failure_details
+    return None
+
+
+def is_resource_diagnostic_acquisition_complete(directory, diagnostic: dict[str, Any]) -> bool:
+    """Validate recovery evidence before the existing ordinary and graph completion rules."""
+    if not directory.timestamp_recovery.diagnostic_is_complete(diagnostic):
+        return False
+    if diagnostic.get("complete") is True:
+        return True
+    return bool(
+        diagnostic.get("fetch_mode") == directory.UHC_PLAN_GRAPH_FETCH_MODE
+        and diagnostic.get("plan_graph_complete") is True
+        and (diagnostic.get("collection_complete") is False)
+        and (diagnostic.get("stability_verified") is True)
+        and (not diagnostic.get("error"))
+        and (not diagnostic.get("bounded"))
+        and (not diagnostic.get("next_url_remaining"))
+    )
+
+
+def is_resource_fetch_complete_for_publish(directory, result: ResourceFetchResult) -> bool:
+    """Apply the existing completion accounting with recovery receipt validation."""
+    return (
+        result.complete
+        and (not result.error)
+        and (not result.is_bounded)
+        and (not result.next_url_remaining)
+        and directory.timestamp_recovery.diagnostic_is_complete(
+            directory._resource_fetch_diagnostic(result, rows_written=result.rows_written)
+        )
+    )
+
+
+def record_resource_completion(
+    directory,
+    completion: dict[str, set[str]] | None,
+    resource_type: str,
+    source_ids: list[str],
+    result: ResourceFetchResult,
+) -> None:
+    """Apply the existing completion accounting with recovery receipt validation."""
+    if completion is None or not directory._is_resource_fetch_complete_for_publish(result):
+        return
+    completion.setdefault(resource_type, set()).update(source_ids)
+
+
+def source_fetch_candidate_urls(directory, url: str) -> list[str]:
+    """Preserve exact recovery requests and ordinary page-size fallbacks."""
+    parsed = urllib.parse.urlsplit(url)
+    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query_by_name = dict(query_items)
+    is_timestamp_window = (
+        len(query_items) == 2
+        and query_by_name.keys() == {"_count", "_lastUpdated"}
+        and query_by_name["_count"] == str(directory.timestamp_recovery.PAGE_SIZE)
+        and query_by_name["_lastUpdated"].startswith("lt")
+        and url.split("?", 1)[0]
+        in {
+            f"{directory.INDEPENDENCE_PROVIDER_DIRECTORY_BASE}/{resource}"
+            for resource in directory.INDEPENDENCE_TIMESTAMP_RECOVERY_RESOURCES
+        }
+    )
+    if directory.christus.is_request_url(url) or directory._has_fhir_continuation_query(url) or is_timestamp_window:
+        return [url]
+    try:
+        requested_count = int(query_by_name.get("_count") or 0)
+    except TypeError, ValueError:
+        return [url]
+    if requested_count <= 1:
+        return [url]
+    candidate_urls = [url]
+    for fallback_count in (100, 25, 10, 1):
+        if fallback_count >= requested_count:
+            continue
+        candidate_urls.append(directory._url_with_replaced_query_item(url, "_count", str(fallback_count)))
+    return candidate_urls
+
+
+def source_fetch_response_class(
+    status_code: int | None,
+    fetch_error: str | None,
+) -> str | None:
+    """Classify source transport failures for the existing bounded retry policy."""
+    if fetch_error:
+        return "transient_transport_error"
+    if status_code == 423:
+        return "transient_locked"
+    if status_code == 429:
+        return "transient_rate_limited"
+    if status_code is not None and 500 <= status_code < 600:
+        return "transient_server_error"
+    return None

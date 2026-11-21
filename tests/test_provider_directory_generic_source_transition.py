@@ -17,6 +17,7 @@ import pytest
 from process import provider_directory_generic_source_policy as policy_module
 from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_source_storage_binding as binding
+from process import provider_directory_timestamp_recovery as timestamp_recovery
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.vsp_directory_contract import RESOURCE_TYPES, SOURCE_ID
@@ -95,6 +96,73 @@ def _completed_input_evidence():
     ]
     input_rows = [dict(dataset_id=DATASET, resource_type="Organization", total=3, active=3)]
     return run_rows, checkpoint_rows, input_rows
+
+
+def _timestamp_test_page(resource_type, next_url):
+    return {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [
+            {"resource": {"resourceType": resource_type, "id": resource_id, "meta": {"lastUpdated": stamp}}}
+            for resource_id, stamp in (
+                ("retained", "2026-01-01T00:00:07.000000Z"),
+                ("older", "2026-01-01T00:00:06.000000Z"),
+            )
+        ],
+        "link": [] if next_url is None else [{"relation": "next", "url": next_url}],
+    }
+
+
+def _timestamp_recovery_checkpoint(checkpoint, *, complete=True):
+    """Produce retained progress through the real recovery engine, including its overlap seam."""
+    checkpoint = deepcopy(checkpoint)
+    checkpoint.setdefault("source_ids", ["cms-npd"])
+    checkpoint.setdefault("source_scope_hash", hashlib.sha256(b"synthetic-scope").hexdigest())
+    identity_by_field = {
+        key: checkpoint[key]
+        for key in (
+            "canonical_api_base",
+            "dataset_id",
+            "acquisition_root_run_id",
+            "resource_type",
+            "start_url_hash",
+            "source_scope_hash",
+        )
+    }
+    identity_by_field["source_id"] = checkpoint["source_ids"][0]
+    collection = identity_by_field["canonical_api_base"] + "/" + identity_by_field["resource_type"]
+    row_hash = hashlib.sha256(b"retained-row").hexdigest()
+    proof = timestamp_recovery.begin(
+        {"retained": True},
+        identity=identity_by_field,
+        original_url=collection + "?_page_token=original%2B",
+        original_pages=1,
+        original_rows=1,
+        upper="2026-01-01T00:00:09.000000Z",
+        overlap_timestamp="2026-01-01T00:00:07.000000Z",
+        overlap_hashes={"retained": row_hash},
+    )
+    requested_url = proof[timestamp_recovery.KEY]["url"]
+    next_url = None if complete else collection + "?_page_token=next%2B"
+    proof = timestamp_recovery.advance(
+        proof,
+        identity=identity_by_field,
+        requested_url=requested_url,
+        payload=_timestamp_test_page(identity_by_field["resource_type"], next_url),
+        trusted_next=next_url,
+        content_hashes={"retained": row_hash, "older": hashlib.sha256(b"older").hexdigest()},
+    )
+    directory = importlib.import_module("process.provider_directory_fhir")
+    checkpoint.update(
+        state="complete" if complete else "active",
+        completed_at="now" if complete else None,
+        next_url=next_url,
+        pages_processed=2,
+        rows_processed=3,
+        completeness_json=proof,
+        recent_cursor_hashes=[directory._pagination_url_hash(requested_url)],
+    )
+    return checkpoint
 
 
 def _update_test_transition_header(header, args):
@@ -924,6 +992,69 @@ async def test_mixed_checkpoint_transition_and_replay_preserve_all_acquisition_e
     assert (await _transition(case, {"Organization": 3, "Location": 2}))["already_applied"] is True
     assert len(case.writes) == 2
     assert (case.checkpoints, case.input_rows, case.runs) == (checkpoints, inputs, runs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("complete", [False, True])
+async def test_timestamp_recovery_transition_keeps_exact_progress_and_terminal_evidence(case, complete):
+    case.checkpoints[0] = _timestamp_recovery_checkpoint(case.checkpoints[0], complete=complete)
+    saved = deepcopy((case.checkpoints, case.input_rows, case.runs))
+    assert (await _transition(case))["already_applied"] is False
+    assert (await _transition(case))["already_applied"] is True
+    assert (case.checkpoints, case.input_rows, case.runs) == saved
+    query = next(
+        call.args[0]
+        for call in case.connection.fetch.await_args_list
+        if "provider_directory_pagination_checkpoint" in call.args[0]
+    )
+    assert "completeness_json,recent_cursor_hashes" in query
+
+
+def _tamper_recovery_checkpoint(checkpoint, drift):
+    proof = checkpoint["completeness_json"]
+    state = proof[timestamp_recovery.KEY]
+    if drift == "version":
+        proof["descending_timestamp_recovery_v2"] = proof.pop(timestamp_recovery.KEY)
+        return
+    if drift == "incomplete":
+        checkpoint.update(state="complete", completed_at="now", next_url=None)
+        return
+    if drift in state["identity"]:
+        state["identity"][drift] = "f" * 64 if drift.endswith("hash") else "changed"
+        return
+    if drift == "observations":
+        state["observations"] += 1
+        return
+    if drift == "terminal_hash":
+        checkpoint["recent_cursor_hashes"] = ["f" * 64]
+        return
+    checkpoint.pop("recent_cursor_hashes")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "version",
+        "incomplete",
+        "dataset_id",
+        "acquisition_root_run_id",
+        "source_id",
+        "resource_type",
+        "source_scope_hash",
+        "start_url_hash",
+        "observations",
+        "terminal_hash",
+        "missing_recent",
+    ],
+)
+async def test_timestamp_recovery_transition_refuses_changed_proof_before_write(case, drift):
+    checkpoint = _timestamp_recovery_checkpoint(case.checkpoints[0], complete=drift != "incomplete")
+    _tamper_recovery_checkpoint(checkpoint, drift)
+    case.checkpoints[0] = checkpoint
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await _transition(case)
+    assert case.writes == []
 
 
 @pytest.mark.asyncio

@@ -601,7 +601,7 @@ async def _validated_header(publisher, binding_by_field):
     header = await connection.fetchrow(
         f"SELECT status,is_current,dataset_hash,content_proof_admission_version,content_proof_admission_kind,"
         f"content_proof_admission_sha256,candidate_storage_json,resource_count,previous_dataset_id,"
-        f"completion_proof_required_version,completion_proof_sha256,completion_proof_json,endpoint_id,acquisition_root_run_id,"
+        f"completion_proof_required_version,completion_proof_sha256,completion_proof_json,dataset_id,endpoint_id,acquisition_root_run_id,"
         f"publication_metadata_json "
         f"FROM {storage_relation(policy.schema, storage.HEADER)} "
         "WHERE dataset_id=$1 FOR UPDATE",

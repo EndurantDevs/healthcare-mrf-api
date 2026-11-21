@@ -15,6 +15,9 @@ import pytest
 from process import provider_directory_resource_retry as retry
 from tests.test_process_provider_directory_fhir_unit import _stub_resource_import_metadata, importer
 from tests.test_provider_directory_fhir_reviewed_serial_stop import _runner
+from tests.test_provider_directory_timestamp_recovery import NEXT as RECOVERY_NEXT
+from tests.test_provider_directory_timestamp_recovery import start as recovery_start
+from tests.test_provider_directory_timestamp_recovery import step as recovery_page
 
 BASE = "https://directory.example.test/fhir"
 
@@ -778,6 +781,127 @@ def test_transport_retry_excludes_quota_and_mismatched_http_evidence():
     assert retry.retryable(importer, runner, runner.source_record, result)
     for refused in (replace(result, error=importer.SOURCE_QUOTA_EXHAUSTED_ERROR), _result(error="http_400")):
         assert not retry.retryable(importer, runner, runner.source_record, refused)
+
+
+def _recovery_result(*, status=503, error="http_503"):
+    proof = recovery_page(recovery_start(), [("b", 7), ("a", 7), ("older", 6)], RECOVERY_NEXT)
+    return _result(
+        pages=5,
+        rows=83,
+        written=3,
+        error=error,
+        fetch_mode=retry.timestamp_recovery.FETCH_MODE,
+        fetch_diagnostic=proof
+        | {
+            "transport": {
+                "status": status,
+                "response_class": importer._source_fetch_response_class(
+                    status, None if error == f"http_{status}" else error
+                ),
+            }
+        },
+    )
+
+
+@pytest.mark.parametrize("status", [423, 429, 500, 502, 503, 504])
+def test_active_timestamp_recovery_keeps_supported_transient_http_retries(status):
+    runner = _scan()
+    result = _recovery_result(status=status, error=f"http_{status}")
+    before = copy.deepcopy(result.fetch_diagnostic)
+    assert retry.retryable(importer, runner, runner.source_record, result)
+    assert result.fetch_diagnostic == before
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["TimeoutError", "ServerTimeoutError", "ClientPayloadError", "ClientConnectorError", "ConnectionResetError"],
+)
+@pytest.mark.parametrize("status", [None, 200, 503])
+def test_active_timestamp_recovery_keeps_transport_exception_retries(error, status):
+    runner = _scan()
+    assert retry.retryable(importer, runner, runner.source_record, _recovery_result(status=status, error=error))
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        None,
+        [],
+        {},
+        {"status": 503},
+        {"response_class": "transient_server_error"},
+        {"status": "503", "response_class": "transient_server_error"},
+        {"status": 429, "response_class": "transient_rate_limited"},
+        {"status": 503, "response_class": "transient_rate_limited"},
+        {"status": 503, "response_class": "unknown"},
+    ],
+)
+def test_timestamp_recovery_requires_matching_nested_transport_evidence(transport):
+    runner = _scan()
+    result = _recovery_result()
+    result.fetch_diagnostic["transport"] = transport
+    assert not retry.retryable(importer, runner, runner.source_record, result)
+    result.fetch_diagnostic.pop("transport")
+    result.fetch_diagnostic.update(status=503, response_class="transient_server_error")
+    assert not retry.retryable(importer, runner, runner.source_record, result)
+
+
+@pytest.mark.parametrize("proof", [None, {}, {"invalid": True}, "invalid"])
+def test_timestamp_recovery_refuses_malformed_proof_even_with_transient_transport(proof):
+    runner = _scan()
+    result = _recovery_result()
+    result.fetch_diagnostic[retry.timestamp_recovery.KEY] = proof
+    assert not retry.retryable(importer, runner, runner.source_record, result)
+
+
+def test_timestamp_recovery_refuses_terminal_or_unsupported_proof():
+    runner = _scan()
+    result = _recovery_result()
+    terminal = recovery_page(result.fetch_diagnostic, [])
+    assert not retry.retryable(importer, runner, runner.source_record, replace(result, fetch_diagnostic=terminal))
+    result.fetch_diagnostic[retry.timestamp_recovery.KEY + "_unsupported"] = {}
+    assert not retry.retryable(importer, runner, runner.source_record, result)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "provider_directory_timestamp_recovery_blocked:timestamp_recovery_order",
+        "timestamp_recovery_missing_overlap",
+        "non_bundle_payload",
+        "pagination_cursor_repeated",
+        "pagination loop detected",
+        importer.SOURCE_QUOTA_EXHAUSTED_ERROR,
+    ],
+)
+def test_timestamp_recovery_never_retries_rejected_pages_or_proofs(error):
+    runner = _scan()
+    assert not retry.retryable(importer, runner, runner.source_record, _recovery_result(status=None, error=error))
+
+
+@pytest.mark.asyncio
+async def test_active_timestamp_recovery_retries_after_committed_page_without_losing_proof(monkeypatch):
+    runner = _scan()
+    transient = _recovery_result()
+    proof_by_field = {key: value for key, value in transient.fetch_diagnostic.items() if key != "transport"}
+    terminal = recovery_page(proof_by_field, [])
+    finished = _result(
+        complete=True,
+        error=None,
+        pages=6,
+        rows=83,
+        fetch_mode=retry.timestamp_recovery.FETCH_MODE,
+        fetch_diagnostic=terminal,
+    )
+    fetch = AsyncMock(side_effect=[transient, finished])
+    wait = AsyncMock()
+    monkeypatch.setattr(runner, "_fetch_rows", fetch)
+    monkeypatch.setattr(retry, "wait", wait)
+    result = await retry.fetch(importer, runner, "Organization", runner.source_record, report_start=False)
+    assert fetch.await_count == 2
+    wait.assert_awaited_once_with(importer, runner, importer.SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS)
+    assert result.complete and result.error is None and result.rows_written == 3
+    assert result.fetch_diagnostic == terminal
 
 
 def test_progress_errors_are_sanitized_and_invalid_deadlines_refuse_retry():

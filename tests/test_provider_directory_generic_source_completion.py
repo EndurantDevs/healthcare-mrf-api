@@ -4,6 +4,7 @@
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -11,10 +12,12 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from process import provider_directory_generic_source_completion as completion
+from process import provider_directory_timestamp_recovery as timestamp_recovery
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_role_merge import MERGED_ROLE_SOURCES_ENV
 from tests.test_provider_directory_generic_candidate import _merge, _resource
 from tests.test_provider_directory_generic_source_storage import _isolated_harness, harness
+from tests.test_provider_directory_generic_source_transition import _timestamp_recovery_checkpoint
 
 
 @asynccontextmanager
@@ -360,6 +363,126 @@ async def test_detached_completion_checks_reject_tampering_before_mutation(harne
         harness.connection.execute.reset_mock()
         with pytest.raises(GenericCandidateError, match="completion_"):
             await completion.prepare_generic_source_handoff(publisher, binding)
+        harness.connection.execute.assert_not_awaited()
+
+
+def _add_recovery_completion(header, binding):
+    """Store a real compact receipt while canonical rows remain distinct from observations."""
+    identity = binding["identity"]
+    header["dataset_id"] = identity["dataset_id"]
+    checkpoint = _timestamp_recovery_checkpoint(
+        {
+            "canonical_api_base": "https://example.test/fhir",
+            "dataset_id": identity["dataset_id"],
+            "acquisition_root_run_id": identity["acquisition_root_run_id"],
+            "source_ids": identity["metadata"]["source_ids"],
+            "resource_type": "Organization",
+            "start_url_hash": hashlib.sha256(b"https://example.test/fhir/Organization?_count=20").hexdigest(),
+        }
+    )
+    diagnostic_by_field = {
+        timestamp_recovery.KEY: timestamp_recovery.completion_receipt(checkpoint["completeness_json"]),
+        "fetch_mode": timestamp_recovery.FETCH_MODE,
+        "complete": True,
+        "error": None,
+        "bounded": False,
+        "next_url_remaining": False,
+        "pages_fetched": checkpoint["pages_processed"],
+        "rows_fetched": checkpoint["rows_processed"],
+    }
+    header["publication_metadata_json"] = {
+        **deepcopy(header["publication_metadata_json"]),
+        "resource_diagnostics": {"Organization": diagnostic_by_field},
+    }
+    return diagnostic_by_field
+
+
+async def _frozen_recovery_header(harness, monkeypatch, handoff):
+    header = deepcopy(harness.header)
+    read_headers = AsyncMock(return_value=[header])
+    monkeypatch.setattr(completion, "_FrozenSourceRows", lambda _connection: SimpleNamespace(all=read_headers))
+    policy = SimpleNamespace(schema=handoff.document["storage"]["storage_schema"])
+    return await completion._frozen_handoff_header(object(), policy, handoff.document)
+
+
+def _tamper_recovery_completion(diagnostic, drift):
+    receipt = diagnostic[timestamp_recovery.KEY]
+    if drift == "version":
+        diagnostic["descending_timestamp_recovery_v2"] = diagnostic.pop(timestamp_recovery.KEY)
+        return
+    if drift == "incomplete":
+        receipt["complete"] = False
+        return
+    if drift == "missing":
+        diagnostic.pop(timestamp_recovery.KEY)
+        return
+    if drift == "unknown_mode_without_receipt":
+        diagnostic.pop(timestamp_recovery.KEY)
+        diagnostic["fetch_mode"] = "descending_timestamp_recovery_v2"
+        return
+    if drift == "unselected_resource":
+        receipt["identity"]["resource_type"] = "Location"
+        return
+    if drift in receipt["identity"]:
+        receipt["identity"][drift] = "changed"
+        return
+    if drift == "count":
+        diagnostic["rows_fetched"] += 1
+        return
+    receipt["terminal_request_url"] = "https://example.test/fhir/Organization?_page_token=raw"
+
+
+@pytest.mark.asyncio
+async def test_recovery_completion_survives_handoff_replay_and_frozen_publication(harness, monkeypatch):
+    async with _prepared_detached(harness, monkeypatch) as (publisher, binding):
+        diagnostic = _add_recovery_completion(harness.header, binding)
+        assert diagnostic["rows_fetched"] > harness.header["resource_count"]
+        assert "_page_token" not in json.dumps(diagnostic)
+        handoff = await completion.prepare_generic_source_handoff(publisher, binding)
+        header_query = next(
+            call.args[0]
+            for call in harness.connection.fetchrow.await_args_list
+            if "publication_metadata_json " in call.args[0] and "FOR UPDATE" in call.args[0]
+        )
+        assert "dataset_id" in header_query.removeprefix("SELECT ").partition(" FROM ")[0].split(",")
+        replay = await completion.prepare_generic_source_handoff(publisher, handoff.document)
+        assert replay.document_sha256 == handoff.document_sha256
+    assert await _frozen_recovery_header(harness, monkeypatch, handoff) == harness.header
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frozen", [False, True])
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "version",
+        "incomplete",
+        "missing",
+        "unknown_mode_without_receipt",
+        "unselected_resource",
+        "dataset_id",
+        "acquisition_root_run_id",
+        "source_id",
+        "resource_type",
+        "count",
+        "raw_url",
+    ],
+)
+async def test_recovery_completion_refuses_bad_receipts_before_handoff_or_publication(
+    harness, monkeypatch, drift, frozen
+):
+    async with _prepared_detached(harness, monkeypatch) as (publisher, binding):
+        diagnostic = _add_recovery_completion(harness.header, binding)
+        handoff = await completion.prepare_generic_source_handoff(publisher, binding) if frozen else None
+        _tamper_recovery_completion(diagnostic, drift)
+        if drift == "unselected_resource":
+            harness.header["publication_metadata_json"]["resource_diagnostics"] = {"Location": diagnostic}
+        harness.connection.execute.reset_mock()
+        with pytest.raises(GenericCandidateError, match="completion_recovery_invalid"):
+            if frozen:
+                await _frozen_recovery_header(harness, monkeypatch, handoff)
+            else:
+                await completion.prepare_generic_source_handoff(publisher, binding)
         harness.connection.execute.assert_not_awaited()
 
 
