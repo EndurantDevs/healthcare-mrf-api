@@ -100,6 +100,18 @@ async def test_complete_named_family_batches_locks_before_first_snapshot():
     assert not any(sql.startswith("SELECT") for sql in session.statements)
 
 
+async def test_single_missing_relation_in_a_large_family_keeps_other_locks_batched():
+    names = tuple(f"relation_{index:02d}" for index in range(64))
+    missing = names[17]
+    session = _Session(installed=set(names) - {missing})
+    locked = await snapshots.lock_reader_relations(session, (("published", name) for name in reversed(names)))
+
+    assert locked == {f"published.{name}": None if name == missing else f"published.{name}" for name in names}
+    assert list(locked) == [f"published.{name}" for name in names]
+    assert sum(sql.startswith("LOCK TABLE") for sql in session.statements) <= 13
+    assert not any(sql.startswith("SELECT") for sql in session.statements)
+
+
 async def test_unreadable_npi_metadata_disables_only_canonical_projection_cache():
     names = ("npi", "npi_result_generation")
     session = _Session(installed=names, denied=("npi_result_generation",))

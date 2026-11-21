@@ -482,33 +482,27 @@ async def lock_reader_relations(session, relation_names):
             for identifier in (schema, name)
         ):
             raise ValueError("provider_profile_relation_invalid")
-    if relation_names:
-        qualified_names = ", ".join(f'"{schema}"."{name}"' for schema, name in relation_names)
+    pending = [relation_names] if relation_names else []
+    while pending:
+        batch = pending.pop()
+        qualified_names = ", ".join(f'"{schema}"."{name}"' for schema, name in batch)
         try:
             async with session.begin_nested():
                 await session.execute(text(f"LOCK TABLE {qualified_names} IN ACCESS SHARE MODE"))
         except DBAPIError as error:
-            if postgres_sqlstate(error) not in {"42P01", "3F000"} and not (
-                postgres_sqlstate(error) == "42501"
-                and any(name == "npi_result_generation" for _, name in relation_names)
-            ):
+            state = postgres_sqlstate(error)
+            is_missing = state in {"42P01", "3F000"}
+            if not is_missing and not (state == "42501" and any(name == "npi_result_generation" for _, name in batch)):
                 raise
+            if len(batch) == 1:
+                schema, name = batch[0]
+                relations_by_name[f"{schema}.{name}"] = None if is_missing else False
+            else:
+                # Isolate the failed names without a catalog read or changing lock order.
+                middle = len(batch) // 2
+                pending.extend((batch[middle:], batch[:middle]))
         else:
-            return {f"{schema}.{name}": f"{schema}.{name}" for schema, name in relation_names}
-    for schema, name in relation_names:
-        qualified = f"{schema}.{name}"
-        try:
-            async with session.begin_nested():
-                await session.execute(text(f'LOCK TABLE "{schema}"."{name}" IN ACCESS SHARE MODE'))
-        except DBAPIError as error:
-            if postgres_sqlstate(error) == "42501" and name == "npi_result_generation":
-                relations_by_name[qualified] = False
-                continue
-            if postgres_sqlstate(error) not in {"42P01", "3F000"}:
-                raise
-            relations_by_name[qualified] = None
-        else:
-            relations_by_name[qualified] = qualified
+            relations_by_name.update((f"{schema}.{name}", f"{schema}.{name}") for schema, name in batch)
     return relations_by_name
 
 

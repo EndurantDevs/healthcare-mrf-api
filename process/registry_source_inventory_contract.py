@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
+from functools import cached_property
 
 from process.registry_source_contribution_store import (
     MAX_RECEIPT_BYTES,
@@ -113,6 +114,10 @@ class SourceInventoryEntry:
     def __post_init__(self):
         encode_source_inventory_entry(self)
 
+    @cached_property
+    def _validated_identity(self):
+        return _validate_entry_identity(self)
+
 
 def make_source_inventory_entry(ordinal, recipe, *, contribution=None, office_derivation=None):
     """Retain exact existing singleton recipe bytes and independently validated optional metadata."""
@@ -131,8 +136,8 @@ def make_source_inventory_entry(ordinal, recipe, *, contribution=None, office_de
         raise RegistrySourceInventoryError("registry_source_inventory_invalid") from None
 
 
-def _entry_details(entry):
-    if type(entry) is not SourceInventoryEntry or type(entry.ordinal) is not int or entry.ordinal < 1:
+def _validate_entry_identity(entry):
+    if type(entry.ordinal) is not int or entry.ordinal < 1:
         raise ValueError
     if entry.ordinal > MAX_INVENTORY_ENTRIES:
         raise RegistrySourceInventoryError("registry_source_inventory_unsupported_bound")
@@ -148,10 +153,17 @@ def _entry_details(entry):
         or _derivation(entry.office_derivation_json, recipe_sha256, retained=True) != entry.office_derivation_json
     ):
         raise ValueError
+    return type(recipe.source_pin).__name__, recipe.source_pin.generation_id
+
+
+def _entry_details(entry):
+    if type(entry) is not SourceInventoryEntry:
+        raise ValueError
+    identity = entry._validated_identity
     encoded = _canonical(asdict(entry)).encode()
     if len(encoded) + 2 > MAX_INVENTORY_PAGE_BYTES:
         raise RegistrySourceInventoryError("registry_source_inventory_unsupported_bound")
-    return encoded, (type(recipe.source_pin).__name__, recipe.source_pin.generation_id)
+    return encoded, identity
 
 
 def _checked_entry(entry):
