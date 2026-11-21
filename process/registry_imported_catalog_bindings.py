@@ -64,7 +64,7 @@ async def published_fhir_catalog_bindings_sql(connection, scope, approved, coord
     vector = _document(snapshot["source_vector"])
     matches = (
         [entry for entry in vector if type(entry) is dict and entry.get("source_generation") == generation]
-        if type(vector) is list and len(vector) <= 1000
+        if type(vector) is list
         else []
     )
     statuses = {"current", "last_good"} if scope.prepared_inventory_token is not None else {"current"}
