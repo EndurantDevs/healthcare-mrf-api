@@ -42,6 +42,19 @@ def test_catalog_preserves_carrier_identity_and_documented_scope(carrier_source)
     assert set(entry["supported_resources"]) == set(directory.PUBLIC_DIRECTORY_SEVEN_RESOURCES)
 
 
+def test_fresh_minnesota_plan_contains_updates_during_acquisition(carrier_source):
+    config, error = directory._last_updated_partition_config(carrier_source, "Practitioner")
+    assert error is None
+    started = datetime.datetime.now(datetime.UTC)
+    default = directory._last_updated_partition_initialization("Practitioner", config)
+    minnesota = directory._last_updated_partition_initialization("Practitioner", config, BASE)
+    assert minnesota.start_url_hash == default.start_url_hash
+    regular_plan = directory._last_updated_partition_plan_from_checkpoint(default.checkpoint_payload, config)
+    scoped_plan = directory._last_updated_partition_plan_from_checkpoint(minnesota.checkpoint_payload, config)
+    assert regular_plan.windows["root"].end < started + datetime.timedelta(minutes=1)
+    assert scoped_plan.windows["root"].end >= started + datetime.timedelta(days=1)
+
+
 @pytest.mark.parametrize(
     "resources",
     [[resource] for resource in directory.PUBLIC_DIRECTORY_SEVEN_RESOURCES]

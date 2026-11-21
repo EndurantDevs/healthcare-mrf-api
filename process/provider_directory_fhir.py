@@ -47746,25 +47746,18 @@ def _last_updated_partition_start_hash(
 
 def _new_last_updated_partition_plan(
     config: LastUpdatedPartitionConfig,
+    *,
+    canonical_api_base: str | None = None,
 ) -> PartitionPlan:
-    root_end = config.root_end()
-    if config.start >= root_end:
-        raise RuntimeError("provider_directory_last_updated_partition_root_cutoff_invalid")
-    return PartitionPlan.create(
-        config.start,
-        root_end,
-        ceiling=config.ceiling,
-        minimum_width=config.minimum_width,
-        volatile_metadata_paths=config.volatile_metadata_paths,
-        boundary_precision=config.boundary_precision,
-    )
+    return time_partition.new_partition_plan(config, canonical_api_base=canonical_api_base)
 
 
 def _last_updated_partition_initialization(
     resource_type: str,
     config: LastUpdatedPartitionConfig,
+    canonical_api_base: str | None = None,
 ) -> LastUpdatedPartitionInitialization:
-    plan = _new_last_updated_partition_plan(config)
+    plan = _new_last_updated_partition_plan(config, canonical_api_base=canonical_api_base)
     return LastUpdatedPartitionInitialization(
         resource_type=resource_type,
         checkpoint_resource_type=(_last_updated_partition_checkpoint_resource_type(resource_type)),
@@ -47819,7 +47812,7 @@ async def _initialize_partition_plan(
 ) -> LastUpdatedPartitionResume:
     if context.retry_of_run_id and not context.lineage_verified:
         raise RuntimeError("provider_directory_last_updated_partition_checkpoint_retry_unverified")
-    plan = _new_last_updated_partition_plan(config)
+    plan = _new_last_updated_partition_plan(config, canonical_api_base=context.canonical_api_base)
     checkpoint_payload = _last_updated_partition_checkpoint_payload(config, plan)
     await _clear_checkpoint_dataset_resource_type(
         context,
@@ -59402,6 +59395,7 @@ def _candidate_partition_initializations(
     if candidate.reused_from_checkpoint:
         return ()
     partition_source = _compatibility_storage_source(source_records)
+    canonical_api_base = _canonical_base(partition_source.get("canonical_api_base") or partition_source.get("api_base"))
     initializations: list[LastUpdatedPartitionInitialization] = []
     for resource_type in candidate.selected_resources:
         config, config_error = _last_updated_partition_config(
@@ -59412,7 +59406,7 @@ def _candidate_partition_initializations(
             if config_error == "resource_not_opted_in":
                 continue
             raise RuntimeError(f"provider_directory_last_updated_partition_{config_error}")
-        initializations.append(_last_updated_partition_initialization(resource_type, config))
+        initializations.append(_last_updated_partition_initialization(resource_type, config, canonical_api_base))
     if initializations and not isinstance(
         candidate.checkpoint_context,
         PaginationCheckpointContext,

@@ -1453,19 +1453,23 @@ async def _verify_transition_checkpoints(
     _require_registered_transition_scope(checkpoint_rows, bulk_checkpoints, source_ids)
     if is_empty_vsp_failure:
         _require(not (checkpoint_rows or bulk_checkpoints), "transition_checkpoint_changed")
-        return
+        return []
     _require(not (checkpoint_rows and bulk_checkpoints), "transition_checkpoint_changed")
     if bulk_checkpoints:
         _require(not any(name.startswith("LU:") for name in expected_counts), "transition_checkpoint_changed")
         await _verify_bulk_transition_checkpoints(
             connection, policy, bulk_checkpoints, identity_by_field, expected_counts, lineage_run_ids
         )
-        return
-    from process.provider_directory_partition_successor import has_verified_partition_checkpoints
+        return []
+    from process.provider_directory_partition_successor import partition_checkpoint_renewals
 
-    if has_verified_partition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, source_ids, run_status):
-        return
-    _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status)
+    renewals = await partition_checkpoint_renewals(
+        checkpoint_rows, identity_by_field, expected_counts, source_ids, run_status
+    )
+    if renewals is None:
+        _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status)
+        return []
+    return renewals
 
 
 def _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status):
@@ -1503,7 +1507,7 @@ async def _verify_transition_inputs(
         from process.provider_directory_compact_source_completion import validate_storage
 
         await validate_storage(connection, policy, candidate_by_field)
-    await _verify_transition_checkpoints(
+    renewals = await _verify_transition_checkpoints(
         connection,
         policy,
         identity_by_field,
@@ -1530,7 +1534,16 @@ async def _verify_transition_inputs(
         candidate_by_field["ordinal"],
     )
     _require_transition_census(input_rows, dataset_id, expected_counts, has_retired_observations)
+    for resource, _checkpoint, _payload, _observed_count in renewals:
+        _require(
+            not any(
+                input_row["resource_type"] == resource or input_row["resource_type"].startswith(f"LU:{resource}:")
+                for input_row in input_rows
+            ),
+            "transition_partition_input_changed",
+        )
     await _verify_transition_witness(connection, policy, candidate_by_field, dataset_id, is_empty_vsp_failure)
+    return renewals
 
 
 def _require_transition_census(input_rows, dataset_id, expected_counts, has_retired_observations):
@@ -1680,7 +1693,7 @@ async def _verify_stopped_candidate(
         expected_failure_error=failure_error,
     )
     _require(not is_empty_vsp_failure or run_evidence_by_field["status"] == "failed", "transition_checkpoint_changed")
-    await _verify_transition_inputs(
+    renewals = await _verify_transition_inputs(
         connection,
         policy,
         candidate_by_field,
@@ -1692,7 +1705,7 @@ async def _verify_stopped_candidate(
     )
     if any(expected_resource_counts.values()):
         await _validate_transition_payloads(connection, policy, candidate_by_field)
-    return run_evidence_by_field
+    return run_evidence_by_field, renewals
 
 
 async def transition_isolated_loading_candidate_storage(
@@ -1700,6 +1713,7 @@ async def transition_isolated_loading_candidate_storage(
 ):
     """Move one verified stopped private intake to an admin-issued successor producer."""
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
+    from process.provider_directory_partition_successor import renew_verified_partition_checkpoint
 
     _require(type(manifest_replay) is bool, "transition_replay_invalid")
     _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction(), "transition_transaction_required")
@@ -1716,7 +1730,7 @@ async def transition_isolated_loading_candidate_storage(
         manifest_replay=manifest_replay,
     )
     candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate = locked_candidate
-    run_evidence_by_field = await _verify_stopped_candidate(
+    run_evidence_by_field, renewals = await _verify_stopped_candidate(
         connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
     )
     successor_by_field, receipt_by_field = _transition_result(
@@ -1736,6 +1750,10 @@ async def transition_isolated_loading_candidate_storage(
         previous_status,
         is_empty_vsp_failure and failure_error not in _RETAINED_VSP_CAPTURE_ERRORS,
     )
+    for _resource, checkpoint, renewed_payload, observed_count in renewals:
+        await renew_verified_partition_checkpoint(
+            connection, policy.schema, checkpoint, renewed_payload, observed_count
+        )
     return {**receipt_by_field, "already_applied": is_already_applied}
 
 

@@ -1,9 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Time-partition succession retains proof rows and the original bounded planner."""
 
+import datetime
 import importlib
 import json
 from copy import deepcopy
+from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -247,6 +250,154 @@ async def test_partition_successor_keeps_completed_collection_and_pending_census
     assert (case.checkpoints, case.input_rows) == before[1:]
     assert case.checkpoints[0]["state"] == "active"
     assert case.checkpoints[1]["state"] == "complete"
+
+
+def _drifted_partition_case(case):
+    counts = _partition_case(case, 0)
+    _include_completed_empty_collection(case)
+    counts["InsurancePlan"] = 1
+    case.input_rows.append(dict(dataset_id=case.header["dataset_id"], resource_type="InsurancePlan", total=1, active=1))
+    case.checkpoints[1].update(state="complete", completed_at="now", next_url=None, pages_processed=1, rows_processed=1)
+    for checkpoint in case.checkpoints:
+        checkpoint["canonical_api_base"] = directory.bcbs_minnesota.API_BASE
+    config = directory._build_partition_config(
+        dict(start="2024-01-01T00:00:00Z", end="resolved_now", ceiling=2, minimum_width_seconds=1)
+    )
+    end = datetime.datetime(2024, 1, 2, tzinfo=datetime.UTC)
+    plan = directory._new_last_updated_partition_plan(replace(config, end=end))
+    plan.observe_count("root", directory.CountObservation.exact(4))
+    plan.observe_count("root.0", directory.CountObservation.exact(2))
+    plan.observe_count("root.1", directory.CountObservation.exact(1))
+    assert plan.failure.code == "split_count_mismatch"
+    checkpoint = case.checkpoints[0]
+    checkpoint.update(
+        pages_processed=4,
+        completeness_json={},
+        start_url_hash=directory._last_updated_partition_start_hash("Organization", config),
+        next_url=directory._last_updated_partition_checkpoint_payload(
+            config, plan, directory.LastUpdatedCompletenessCensus(unfiltered_pre=4, ranged_root_pre=4)
+        ),
+    )
+    return counts, config
+
+
+@pytest.mark.asyncio
+async def test_partition_successor_renews_only_failed_pre_data_census_once(case):
+    counts, config = _drifted_partition_case(case)
+    original, sibling = deepcopy(case.checkpoints)
+    execute = case.connection.execute.side_effect
+    archived_plans = []
+
+    async def record_update(sql, *args):
+        if "SET next_url=$1" not in sql:
+            return await execute(sql, *args)
+        checkpoint = case.checkpoints[0]
+        assert args[2:] == tuple(
+            original[key]
+            for key in (
+                "canonical_api_base",
+                "resource_type",
+                "source_scope_hash",
+                "acquisition_root_run_id",
+                "dataset_id",
+                "owner_run_id",
+                "next_url",
+                "pages_processed",
+            )
+        )
+        checkpoint.update(next_url=args[0], completeness_json=json.loads(args[1]))
+        archived_plans.append(checkpoint["completeness_json"])
+        return "UPDATE 1"
+
+    case.connection.execute.side_effect = record_update
+    receipt = await _transition(case, counts)
+    assert receipt["rows"] == 1
+    assert case.checkpoints[1] == sibling
+    assert case.checkpoints[0]["pages_processed"] == 4
+    before = directory._last_updated_partition_resume_from_checkpoint(original["next_url"], config)
+    renewed = directory._last_updated_partition_resume_from_checkpoint(case.checkpoints[0]["next_url"], config)
+    assert renewed.plan.status is directory.PlanStatus.COUNTING
+    assert [window.window_id for window in renewed.plan.pending_count_windows()] == ["root"]
+    assert renewed.plan.windows["root"].end > before.plan.windows["root"].end
+    assert renewed.census == directory.LastUpdatedCompletenessCensus()
+    assert archived_plans == [
+        {
+            "pre_data_census_renewal": {
+                "checkpoint": original["next_url"],
+                "owner_run_id": original["owner_run_id"],
+                "pages_processed": original["pages_processed"],
+            }
+        }
+    ]
+    assert (await _transition(case, counts, manifest_replay=True))["already_applied"] is True
+    assert len(archived_plans) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed_count", [None, 3, 4])
+async def test_partition_successor_rechecks_incomplete_count_only_plan(case, monkeypatch, observed_count):
+    """Only an exact changed count renews the unfinished partition."""
+    case.runs[0]["status"] = "canceled"
+    counts, config = _drifted_partition_case(case)
+    checkpoint = case.checkpoints[0]
+    active_plan = json.loads(checkpoint["next_url"])
+    active_plan["control"]["failure"] = None
+    pending_window = next(window for window in active_plan["control"]["windows"] if window["window_id"] == "root.1")
+    pending_window.update(state="needs_count", count=None)
+    checkpoint["next_url"] = json.dumps(active_plan)
+    before = deepcopy(case.checkpoints)
+    fetched = directory.LastUpdatedCountFetch(
+        observation=None if observed_count is None else directory.CountObservation.exact(observed_count)
+    )
+    count_request = AsyncMock(return_value=fetched)
+    monkeypatch.setattr(directory, "_fetch_last_updated_partition_count", count_request)
+    execute = case.connection.execute.side_effect
+    renewed_checkpoints = []
+
+    async def record_update(sql, *args):
+        if "SET next_url=$1" not in sql:
+            return await execute(sql, *args)
+        renewed_checkpoints.append((args[0], json.loads(args[1])))
+        return "UPDATE 1"
+
+    case.connection.execute.side_effect = record_update
+    await _transition(case, counts)
+    count_request.assert_awaited_once()
+    assert count_request.await_args.args[1].startswith(directory.bcbs_minnesota.API_BASE + "/Organization?")
+    if observed_count == 3:
+        ((new_payload, archive),) = renewed_checkpoints
+        assert archive["pre_data_census_renewal"]["observed_ranged_count"] == 3
+        assert archive["pre_data_census_renewal"]["checkpoint"] == before[0]["next_url"]
+        renewed = directory._last_updated_partition_resume_from_checkpoint(new_payload, config)
+        assert directory.PlanStatus.COUNTING is renewed.plan.status
+        assert renewed.census == directory.LastUpdatedCompletenessCensus()
+    else:
+        assert renewed_checkpoints == []
+    assert case.checkpoints == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["foreign_source", "archived", "committed_pass", "retained_rows"])
+async def test_partition_successor_cannot_renew_unsafe_census(case, fault):
+    counts, _ = _drifted_partition_case(case)
+    checkpoint = case.checkpoints[0]
+    if fault == "foreign_source":
+        for record in case.checkpoints:
+            record["canonical_api_base"] = "https://example.test/fhir"
+    elif fault == "archived":
+        checkpoint["completeness_json"] = {"pre_data_census_renewal": {}}
+    elif fault == "committed_pass":
+        payload = json.loads(checkpoint["next_url"])
+        payload["control"]["windows"][-1]["completed_passes"] = [1]
+        checkpoint["next_url"] = json.dumps(payload)
+    else:
+        counts["Organization"] = 1
+        case.input_rows.append(
+            dict(dataset_id=case.header["dataset_id"], resource_type="Organization", total=1, active=1)
+        )
+    with pytest.raises(GenericCandidateError, match="transition_partition_"):
+        await _transition(case, counts)
+    assert case.writes == []
 
 
 @pytest.mark.asyncio

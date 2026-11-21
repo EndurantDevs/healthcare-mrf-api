@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
+from process import provider_directory_bcbs_minnesota as bcbs_minnesota
 from process import provider_directory_time_partition_primitives as _primitives
 from process.provider_directory_fetch_types import PartitionFetchState
 from process.provider_directory_time_partition_primitives import (
@@ -301,6 +302,29 @@ async def fetch_partition_resource_rows(directory, source_record, resource_type,
             break
     return await directory._finish_partition_fetch(
         source_record, resource_type, model, config, prepared_state, fetch_options
+    )
+
+
+def new_partition_plan(config, *, canonical_api_base: str | None = None) -> PartitionPlan:
+    """Create a durable, bounded plan for the ordinary opening and closing censuses."""
+    root_end = config.root_end()
+    if (
+        canonical_api_base == bcbs_minnesota.API_BASE
+        and config.end is None
+        and config.census_mode is None
+        and config.versioned_search_limit is None
+    ):
+        # Keep versions updated during the scan inside the census range.
+        root_end += datetime.timedelta(days=1)
+    if config.start >= root_end:
+        raise RuntimeError("provider_directory_last_updated_partition_root_cutoff_invalid")
+    return PartitionPlan.create(
+        config.start,
+        root_end,
+        ceiling=config.ceiling,
+        minimum_width=config.minimum_width,
+        volatile_metadata_paths=config.volatile_metadata_paths,
+        boundary_precision=config.boundary_precision,
     )
 
 
