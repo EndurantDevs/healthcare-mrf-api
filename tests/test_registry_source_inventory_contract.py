@@ -82,6 +82,30 @@ def test_101_sources_and_mixed_page_cuts_have_identical_complete_roots():
         assert inventory.verify_source_inventory_root(chain.from_iterable(page.entries for page in pages), root) == root
 
 
+def test_entry_validation_is_reused_without_changing_wire_bytes(monkeypatch):
+    validate = inventory._validate_entry_identity
+    checked_ordinals = []
+
+    def record(entry):
+        checked_ordinals.append(entry.ordinal)
+        return validate(entry)
+
+    monkeypatch.setattr(inventory, "_validate_entry_identity", record)
+    (entry,) = _entries((_example(),))
+    encoded = inventory.encode_source_inventory_entry(entry)
+    page = inventory.source_inventory_page(
+        (entry,), after_ordinal=0, row_limit=1, byte_limit=inventory.MAX_INVENTORY_PAGE_BYTES
+    )
+    assert page.payload == b"[" + encoded + b"]"
+    assert inventory.source_inventory_root((entry,)).entry_count == 1
+    assert checked_ordinals == [1]
+
+    with pytest.raises(inventory.RegistrySourceInventoryError):
+        replace(entry, recipe_json="{}")
+    assert checked_ordinals == [1, 1]
+    assert inventory.encode_source_inventory_entry(entry) == encoded
+
+
 @pytest.mark.asyncio
 async def test_async_pages_feed_the_accumulator_without_collecting_the_inventory():
     entries = _entries(_example(index) for index in range(101))
