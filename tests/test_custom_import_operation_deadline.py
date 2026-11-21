@@ -270,7 +270,11 @@ def test_non_http_request_keeps_default_and_immutable_equality():
 
 def test_non_http_positional_continuation_keeps_existing_field_order():
     request = continuation_fixture._build_request()
-    original_fields = (getattr(request, item.name) for item in fields(request) if item.name != "operation_deadline")
+    original_fields = (
+        getattr(request, item.name)
+        for item in fields(request)
+        if not item.kw_only and item.name != "operation_deadline"
+    )
     rebuilt = staging.SourceBuildRequest(*original_fields)
     assert rebuilt.continuation is request.continuation and rebuilt.operation_deadline is None
     assert rebuilt == request
