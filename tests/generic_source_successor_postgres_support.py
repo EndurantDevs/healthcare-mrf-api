@@ -416,7 +416,7 @@ def _r4_resource_from_normalized(stored_resource, *, base_url=BASE):
     return resource_by_field
 
 
-async def _assert_named_worker_manifest(checks, catalog, state, receipt, settings):
+async def _assert_named_worker_manifest(check, catalog, state, receipt, settings):
     """Use the historical fixture's exact checks with the current ordinary layout."""
     from process import provider_directory_generic_source_provision as provision
     from process.provider_directory_postal_checkpoint import ROOT
@@ -425,7 +425,7 @@ async def _assert_named_worker_manifest(checks, catalog, state, receipt, setting
     with settings.context() as validation:
         if not rooted:
             validation.setattr(provision, "ISOLATED_FHIR_ROOTS", (*provision.ISOLATED_FHIR_ROOTS, ROOT))
-        return await checks.assert_isolated_worker_manifest(catalog, state, receipt, settings)
+        return await check(catalog, state, receipt, settings)
 
 
 @asynccontextmanager
@@ -445,6 +445,11 @@ async def _named_generic_source(monkeypatch):
             catalog_enrollment_database,
         )
 
+        settings.setattr(
+            checks,
+            "assert_isolated_worker_manifest",
+            partial(_assert_named_worker_manifest, checks.assert_isolated_worker_manifest),
+        )
         tmp_path = Path(temporary)
         request = SimpleNamespace(param="protected")
         async with aclosing(catalog_enrollment_database.__wrapped__(settings, tmp_path, request)) as databases:
@@ -452,8 +457,8 @@ async def _named_generic_source(monkeypatch):
             async with source_catalog(state, tmp_path, settings, ordinary_overlay=True) as catalog:
                 configure_isolated_enrollment(catalog, state, tmp_path, settings)
                 enrollment_result = await checks.enroll(catalog, state)
-                issued = await _assert_named_worker_manifest(
-                    checks, catalog, state, enrollment_result["manifest"], settings
+                issued = await checks.assert_isolated_worker_manifest(
+                    catalog, state, enrollment_result["manifest"], settings
                 )
                 _configure_current_source_publication(catalog, state, settings)
                 async with (
