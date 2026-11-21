@@ -10,7 +10,10 @@ import pytest
 from sqlalchemy.exc import DBAPIError
 
 from api import provider_profile_snapshot as snapshots
+from api.endpoint import npi
 from process import entity_address_dependency_bindings as bindings
+from process import provider_directory_named_edition as named_editions
+from process import provider_directory_projection_stage as directory_stage
 
 
 class _Session:
@@ -80,6 +83,24 @@ async def test_loader_failure_and_cancellation_cleanup_snapshot_metadata(metadat
     assert caught.value is failure
     assert session.info == {"api_reader_verified": True, "provider_profile_native_authorities": previous_by_family}
     assert snapshots.snapshot_relation_available("published.cms_doctor_education") is None
+
+
+async def test_named_directory_editions_are_reused_only_for_the_same_unfiltered_snapshot(metadata, monkeypatch):
+    session = _Session()
+    read_editions = AsyncMock(side_effect=[(), ("filtered",), ("new-edition",)])
+    monkeypatch.setattr(directory_stage, "_copy_driver", AsyncMock())
+    monkeypatch.setattr(named_editions, "named_current_editions", read_editions)
+
+    async with snapshots._read_snapshot_scope(session, "published", include_detail=True):
+        assert await npi._named_directory_editions(session, "published") == ()
+        assert await npi._named_directory_editions(session, "published", ("source",)) == ("filtered",)
+        assert await npi._named_directory_editions(session, "published") == ()
+        assert read_editions.await_count == 2
+
+    assert session.info == {"api_reader_verified": True}
+    async with snapshots._read_snapshot_scope(session, "published", include_detail=True):
+        assert await npi._named_directory_editions(session, "published") == ("new-edition",)
+    assert read_editions.await_count == 3
 
 
 async def test_names_replaced_after_snapshot_start_fail_before_any_loader(metadata):

@@ -20,9 +20,8 @@ from process.registry_source_office_summary_v3 import (
     validate_derivation,
 )
 from process.registry_source_recipe_store import (
-    canonical_decoded_registry_source_recipes,
     canonical_registry_source_recipes,
-    decode_registry_source_recipes,
+    decode_registry_source_recipe_transport,
 )
 from process.registry_verified_office_derivation import validate_verified_office_derivation_v2
 
@@ -144,8 +143,8 @@ def _validate_entry_identity(entry):
     if type(entry.recipe_json) is not str:
         raise ValueError
     singleton = "[" + entry.recipe_json + "]"
-    (recipe,) = decode_registry_source_recipes(singleton)
-    if canonical_decoded_registry_source_recipes(singleton) != singleton:
+    transport, (recipe,) = decode_registry_source_recipe_transport(singleton)
+    if transport != singleton:
         raise ValueError
     recipe_sha256 = hashlib.sha256(singleton.encode()).hexdigest()
     if (
