@@ -127,7 +127,8 @@ def _configured_routes(*, setting=ROUTES_ENV):
         routes = json.loads(raw)
     except json.JSONDecodeError as error:
         raise ValueError("fhir_source_worker_route_invalid") from error
-    if type(routes) is not list or len(routes) > 32:
+    max_routes = 64 if setting == ROUTES_ENV else 32
+    if type(routes) is not list or len(routes) > max_routes:
         raise ValueError("fhir_source_worker_route_invalid")
     identities = set()
     for route in routes:

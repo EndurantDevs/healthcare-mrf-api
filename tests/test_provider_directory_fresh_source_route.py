@@ -87,6 +87,23 @@ def test_fresh_route_selects_exact_image_and_credentials():
 
 
 @pytest.mark.usefixtures("configured_runtime")
+def test_selects_fresh_route_in_larger_acquisition_inventory(monkeypatch):
+    routes = [dict(_fresh_route(), source_id=f"synthetic-source-{index}") for index in range(63)]
+    routes.append(_fresh_route())
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps(routes))
+
+    launch = _admitted(_fresh_run()).fhir_source_launch
+    assert launch.source_id == "synthetic-source"
+    assert launch.image == ORDINARY_IMAGE
+    assert launch.secret_name == "synthetic-successor"
+
+    routes.append(dict(_fresh_route(), source_id="synthetic-over-limit"))
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps(routes))
+    with pytest.raises(ValueError, match="fhir_source_worker_route_invalid"):
+        _admitted(_fresh_run())
+
+
+@pytest.mark.usefixtures("configured_runtime")
 @pytest.mark.parametrize("mode", [{"seed_only": True}, {"publish_artifacts_only": True}, {"probe": False}])
 def test_fresh_route_non_http_modes_use_default_without_proxy_policy(monkeypatch, mode):
     monkeypatch.delenv(source.PROXY_POLICY_ENV, raising=False)
