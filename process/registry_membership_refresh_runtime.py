@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4, uuid5
@@ -527,6 +527,7 @@ class _SourceResolver:
             raise _unavailable()
         await require_imported_catalog_inputs(connection, command, self.resources.settings.control_schema)
         async with self.capture_sessions() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             prepared = await prepare_imported_source_recipes(
                 await _driver(session),
                 request_id=record["request_id"],
@@ -565,9 +566,16 @@ class _SourceResolver:
         recipes = self.prepared_recipes
         native_current_ids = {native_source["source_id"] for native_source in inventory.native_sources}
         if source_manifest is not None:
-            retained = await resolve_retained_registry_source_recipes(
-                connection, source_manifest, control_schema=self.resources.settings.control_schema
+            # The final recheck can precede the transaction that publishes the new generation.
+            snapshot = (
+                nullcontext()
+                if connection.is_in_transaction()
+                else connection.transaction(isolation="repeatable_read", readonly=True)
             )
+            async with snapshot:
+                retained = await resolve_retained_registry_source_recipes(
+                    connection, source_manifest, control_schema=self.resources.settings.control_schema
+                )
             recipes = (
                 tuple(
                     recipe

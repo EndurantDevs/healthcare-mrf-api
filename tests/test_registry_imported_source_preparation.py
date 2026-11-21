@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
+from asyncpg.pgproto.pgproto import UUID as PostgresUUID
 
 from process import registry_imported_source_preparation as preparation
 from process.network_fhir_source_witness_contract import digest, source_origin
@@ -148,8 +149,10 @@ async def prepare(case):
 
 
 @pytest.mark.asyncio
-async def test_genuine_selected_origin_closes_before_persistent_capture(prepared_case):
+@pytest.mark.parametrize("request_id_type", [UUID, PostgresUUID], ids=["stdlib", "asyncpg"])
+async def test_genuine_selected_origin_closes_before_persistent_capture(prepared_case, request_id_type):
     case = prepared_case
+    case.request_id = request_id_type(str(case.request_id))
     preparation_result = await prepare(case)
     recipes = preparation_result.recipes
     case.inputs.assert_awaited_once_with(case.connection, case.envelope["command"], "registry")
