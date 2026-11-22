@@ -56,7 +56,8 @@ def test_closed_report_kinds_reuse_collection_selector_and_retained_generation(k
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["selected", "default"])
-async def test_managed_reports_pin_relation_and_live_staffing_without_global_fallback(monkeypatch, mode):
+@pytest.mark.parametrize("zip_code", [None, "10001"])
+async def test_managed_reports_pin_relation_and_live_staffing_without_global_fallback(monkeypatch, mode, zip_code):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     availability = AsyncMock(side_effect=AssertionError("managed addresses/staffing cannot probe global fallback"))
     monkeypatch.setattr(reports, "_is_table_available", availability)
@@ -82,7 +83,7 @@ async def test_managed_reports_pin_relation_and_live_staffing_without_global_fal
         assert parameters.get("_canonical_network_ids", parameters.get("_network_excluded_ids")) == (
             [42] if mode == "selected" else [88]
         )
-        count_sql, data_sql, _ = reports._build_market_sql(
+        count_sql, data_sql, market_params = reports._build_market_sql(
             scope="state",
             sort="access_score",
             order="desc",
@@ -91,15 +92,21 @@ async def test_managed_reports_pin_relation_and_live_staffing_without_global_fal
             has_license=False,
             has_other_id=False,
             market_id_filter=None,
-            state=None,
+            state="NY" if zip_code else None,
             city=None,
             county=None,
-            zip_code=None,
+            zip_code=zip_code,
             chain=None,
             address_table_sql=relation,
         )
         assert relation in count_sql and relation in data_sql and "{address_table_sql}" not in data_sql
         assert data_sql.index(relation) < data_sql.index("LIMIT :limit")
+        if zip_code:
+            zip_query = data_sql.split("market_zip_addresses AS MATERIALIZED (", 1)[1].split("\n),", 1)[0]
+            assert relation in zip_query
+            assert "a.zip5 = :zip_code" in zip_query
+            assert "FROM market_zip_addresses a" in data_sql
+            assert market_params["zip_code"] == zip_code
     availability.assert_not_awaited()
 
 

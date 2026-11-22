@@ -1164,13 +1164,15 @@ def _build_market_sql(
 ) -> tuple[str, str, dict[str, Any]]:
     """Build market SQL."""
     address_table_sql = address_table_sql or _pharmacy_address_table_sql()
+    has_unified_addresses = _is_pharmacy_address_unified(address_table_sql)
     address_zip5_expr = _pharmacy_address_zip5_expr("a", address_table_sql)
     address_table_sql = _source_filtered_report_addresses(address_table_sql, min_address_sources)
     parameter_map: dict[str, Any] = {}
     if min_address_sources:
         parameter_map["min_address_sources"] = min_address_sources
+    address_type_filter = _report_address_type_clause("a")
     base_filters: list[str] = [
-        _report_address_type_clause("a"),
+        address_type_filter,
         "a.taxonomy_array && pc.codes",
     ]
     if state:
@@ -1182,17 +1184,30 @@ def _build_market_sql(
     if county:
         base_filters.append("LOWER(COALESCE(g.county_name, '')) = :county")
         parameter_map["county"] = county.lower()
+    zip_parameter = None
     if zip_code:
-        base_filters.append(f"{address_zip5_expr} = :zip_code")
+        zip_parameter = "zip_code"
         parameter_map["zip_code"] = zip_code
     # The unknown ZIP market also includes rows whose ZIP is null.
-    if scope == "zip" and not zip_code and market_id_filter and market_id_filter != "zip:00000":
-        base_filters.append(f"{address_zip5_expr} = :market_zip")
+    elif scope == "zip" and market_id_filter and market_id_filter != "zip:00000":
+        zip_parameter = "market_zip"
         parameter_map["market_zip"] = market_id_filter.removeprefix("zip:")
-    # Bound the address rows before joining report enrichment for local reads.
-    address_cte = (
-        "MATERIALIZED" if any((state, city, county, zip_code, parameter_map.get("market_zip"))) else "NOT MATERIALIZED"
-    )
+    market_address_source = address_table_sql
+    zip_address_cte = ""
+    if zip_parameter:
+        zip_filter = f"{address_zip5_expr} = :{zip_parameter}"
+        base_filters.append(zip_filter)
+        if has_unified_addresses and (state or city or county):
+            # Bound heap reads by ZIP before the planner can select a wider geographic index.
+            market_address_source = "market_zip_addresses"
+            zip_address_cte = f"""
+market_zip_addresses AS MATERIALIZED (
+    SELECT a.npi, a.city_name, a.state_name, a.zip5, a.telephone_number, a.taxonomy_array, a.type
+    FROM {address_table_sql} a
+    WHERE {address_type_filter} AND {zip_filter}
+),"""
+    address_cte = "MATERIALIZED" if any((state, city, county, zip_parameter)) else "NOT MATERIALIZED"
+    pharmacy_code_materialization = "MATERIALIZED " if zip_address_cte else ""
 
     scoped_filters: list[str] = []
     if chain:
@@ -1205,7 +1220,7 @@ def _build_market_sql(
     partd_table = _qualified_table_name(PartDPharmacyActivity.__table__)
     if has_partd:
         partd_scope = ""
-        if zip_code or "market_zip" in parameter_map:
+        if zip_parameter:
             # Expand the existing NPI key to indexed lookups in the activity table.
             partd_scope = """
     JOIN (SELECT DISTINCT npi / 10 AS npi9 FROM market_addresses) market_npis ON (
@@ -1422,11 +1437,11 @@ identifier_by_npi AS (
         staffing_select = "COALESCE(st.estimated_pharmacist_count_proxy, 0)::int AS estimated_pharmacist_count_proxy"
 
     cte = f"""
-WITH pharmacy_codes AS (
+WITH pharmacy_codes AS {pharmacy_code_materialization}(
     SELECT COALESCE(ARRAY_AGG(int_code), ARRAY[]::integer[]) AS codes
     FROM mrf.nucc_taxonomy
     WHERE classification = 'Pharmacy'
-),
+),{zip_address_cte}
 market_addresses AS {address_cte} (
     SELECT
         a.npi,
@@ -1436,7 +1451,7 @@ market_addresses AS {address_cte} (
         a.telephone_number,
         g.county_name,
         COALESCE(g.population, 0)::bigint AS zip_population
-    FROM {address_table_sql} a
+    FROM {market_address_source} a
     LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = {address_zip5_expr}
     CROSS JOIN pharmacy_codes pc
     WHERE {" AND ".join(base_filters)}

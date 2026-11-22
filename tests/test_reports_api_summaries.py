@@ -249,6 +249,11 @@ def test_build_market_sql_uses_unified_address_table_and_index_friendly_filters(
     assert params["state"] == "TX"
     assert params["zip_code"] == "78701"
     assert "market_addresses AS MATERIALIZED" in data_sql
+    zip_query = data_sql.split("market_zip_addresses AS MATERIALIZED (", 1)[1].split("\n),", 1)[0]
+    assert "WHERE a.type = 'primary' AND a.zip5 = :zip_code" in zip_query
+    assert "a.state_name = :state" not in zip_query
+    assert "FROM market_zip_addresses a" in data_sql
+    assert "pharmacy_codes AS MATERIALIZED" in data_sql
 
 
 @pytest.mark.parametrize(("market_id", "market_zip"), [("zip:12345", "12345"), ("zip:00000", None), (None, None)])
@@ -275,6 +280,7 @@ def test_market_sql_bounds_known_zip_before_enrichment(market_id, market_zip):
     assert address_query.startswith("MATERIALIZED" if market_zip is not None else "NOT MATERIALIZED")
     assert ("SELECT DISTINCT npi / 10 AS npi9 FROM market_addresses" in data_sql) == (market_zip is not None)
     assert ("swm.market_id = :market_id" in data_sql) == (market_id is not None)
+    assert "market_zip_addresses" not in data_sql
 
 
 def test_build_market_sql_can_force_legacy_address_table(monkeypatch):
@@ -289,7 +295,7 @@ def test_build_market_sql_can_force_legacy_address_table(monkeypatch):
         has_license=False,
         has_other_id=False,
         market_id_filter=None,
-        state=None,
+        state="TX",
         city=None,
         county=None,
         zip_code="78701",
@@ -300,6 +306,7 @@ def test_build_market_sql_can_force_legacy_address_table(monkeypatch):
     assert "FROM mrf.entity_address_unified a" not in data_sql
     assert "LEFT(COALESCE(a.postal_code, ''), 5) = :zip_code" in data_sql
     assert params["zip_code"] == "78701"
+    assert "market_zip_addresses" not in data_sql
 
 
 @pytest.mark.asyncio
