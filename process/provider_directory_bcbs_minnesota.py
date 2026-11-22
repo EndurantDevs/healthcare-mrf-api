@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Traverse issued search caches without trusting the gateway's page totals."""
 
+import re
+from dataclasses import replace
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 
@@ -10,6 +12,7 @@ STRATEGY_VERSION = "provider-directory-fhir-minnesota-time-cache-v4"
 CACHE_TOTAL_KEY = "minnesota_cache_expected_total"
 INITIAL_PAGE_COUNT = 50
 PAGE_COUNT_CAP = 500
+DIRECT_VERIFICATION_LIMIT = 16
 _QUERY_NAMES = frozenset(
     {"_count", "_getpages", "_getpagesoffset", "_pretty", "_bundletype", "_summary", "_total", "_format"}
 )
@@ -37,6 +40,86 @@ async def split_timed_out_window(directory, source_record, resource_type, config
         rows_processed=state.rows_fetched,
     )
     return window
+
+
+async def verify_timed_out_practitioner_window(
+    directory, source_record, resource_type, config, state, options, window, fetched
+):
+    """Verify a small retained second pass when the range search times out."""
+    if not (
+        resource_type == "Practitioner"
+        and directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+        == API_BASE
+        and fetched.transient
+        and fetched.error == "http_504"
+        and fetched.pages_fetched == 1
+        and not fetched.resources
+        and set(window.passes) == {1}
+        and window.count is not None
+        and 0 < window.count <= DIRECT_VERIFICATION_LIMIT
+    ):
+        return fetched
+    # The first pass binds the identities. An independent count proves that
+    # those identities can still account for the entire window.
+    proof = await directory._load_last_updated_partition_window_fingerprints(
+        state.context, resource_type, window.window_id, 1
+    )
+    if len(proof) != window.count or not all(
+        key not in {".", ".."} and re.fullmatch(r"[A-Za-z0-9.-]{1,64}", key) for key in proof
+    ):
+        return replace(fetched, error="window_direct_proof_invalid", transient=False, retry_not_before=None)
+    count_url = directory._last_updated_partition_url(
+        state.start_url, window, page_count=config.page_count, count_only=True
+    )
+    count = await directory._fetch_last_updated_partition_count(
+        source_record, count_url, timeout=options.timeout, deadline_at=state.deadline_at
+    )
+    pages = fetched.pages_fetched + count.pages_fetched
+    if count.transient:
+        return replace(
+            fetched, pages_fetched=pages, retry_not_before=count.retry_not_before or fetched.retry_not_before
+        )
+    if count.observation != directory.CountObservation.exact(window.count):
+        return directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_count_mismatch")
+    return await _read_practitioner_window(directory, source_record, state, options, window, sorted(proof), pages)
+
+
+async def _read_practitioner_window(directory, source_record, state, options, window, resource_ids, pages):
+    """Read exact IDs through the shared pacing and deadline checks."""
+    resources = []
+    for resource_id in resource_ids:
+        if options.cancel_ctx is not None:
+            await directory._raise_if_resource_import_cancelled(options.cancel_ctx, options.cancel_task)
+        url = f"{API_BASE}/Practitioner/{resource_id}"
+        response, deadline_blocked = await directory._fetch_cooldown_checkpoint_page(
+            source_record,
+            url,
+            (None, None, "TimeoutError", 0),
+            timeout=options.timeout,
+            deadline_at=state.deadline_at,
+        )
+        status, resource_by_field, error, _elapsed = response
+        pages += int(not deadline_blocked)
+        if status != 200 or error:
+            failure = directory._last_updated_window_page_failure(source_record, url, status, resource_by_field, error)
+            return directory.LastUpdatedWindowFetch(
+                (),
+                pages,
+                False,
+                error=failure.error,
+                transient=failure.transient,
+                deadline_reached=deadline_blocked,
+                retry_not_before=failure.retry_not_before,
+            )
+        if (
+            not isinstance(resource_by_field, dict)
+            or resource_by_field.get("resourceType") != "Practitioner"
+            or resource_by_field.get("id") != resource_id
+            or directory._last_updated_partition_resource_window_error(resource_by_field, window)
+        ):
+            return directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_resource_mismatch")
+        resources.append(resource_by_field)
+    return directory.LastUpdatedWindowFetch(tuple(resources), pages, True)
 
 
 def _query(url, resource):

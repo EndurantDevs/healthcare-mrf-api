@@ -50227,23 +50227,9 @@ async def _fetch_partition_window_for_pass(
     fetch_options: LastUpdatedPartitionFetchOptions,
     window: TimeWindow,
 ) -> tuple[str, LastUpdatedWindowFetch]:
-    request_url = _last_updated_partition_url(
-        state.start_url,
-        window,
-        page_count=config.page_count,
-        count_only=False,
+    return await time_partition.fetch_window_for_pass(
+        sys.modules[__name__], source_record, resource_type, config, state, fetch_options, window
     )
-    window_fetch = await _fetch_last_updated_partition_window(
-        source_record,
-        resource_type,
-        request_url,
-        window,
-        timeout=fetch_options.timeout,
-        cancel_ctx=fetch_options.cancel_ctx,
-        cancel_task=fetch_options.cancel_task,
-        deadline_at=state.deadline_at,
-    )
-    return request_url, window_fetch
 
 
 def _is_partition_window_fetch_retryable(
