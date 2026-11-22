@@ -295,6 +295,56 @@ async def test_missing_bundle_type_is_only_allowed_on_issued_cursor(monkeypatch,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", [None, "wrong_tenant_key", "extra_credential", "wrong_header", "missing_key", "wrong_url", "filter"]
+)
+async def test_window_census_sends_only_the_exact_tenant_key(monkeypatch, tenant_sources, fault):
+    tenant_source = tenant_sources["HMDE"]
+    resource = "PractitionerRole"
+    config, _ = directory._last_updated_partition_config(tenant_source, resource)
+    base = tenant_source["api_base"]
+    credential_base = f"{BASE}/HM" if fault == "wrong_tenant_key" else base
+    key_by_field = {"header": "X-Other-Key" if fault == "wrong_header" else "x-hmhs-keyId", "value": "example-key"}
+    credential_map = {} if fault == "missing_key" else {"api_key": key_by_field}
+    if fault == "extra_credential":
+        credential_map["bearer_token"] = "example-token"
+    monkeypatch.setattr(directory, "_load_credentials_config", lambda: {"api_bases": {credential_base: credential_map}})
+    monkeypatch.setattr(directory, "_save_last_updated_partition_plan", AsyncMock())
+    send = AsyncMock(return_value=(200, {"resourceType": "Bundle", "type": "searchset", "total": 31000}, None, 1))
+    monkeypatch.setattr(directory, "_fetch_json_with_source_session", send)
+    start_url = directory._resource_start_url(tenant_source, resource, page_count=500)
+    if fault == "wrong_url":
+        start_url = start_url.replace("/HMDE/", "/HM/")
+    if fault == "filter":
+        start_url += "&_id=example"
+    state = directory.LastUpdatedPartitionState(
+        None,
+        directory._new_last_updated_partition_plan(config),
+        directory.LastUpdatedCompletenessCensus(),
+        start_url,
+        0,
+        0,
+        None,
+    )
+    options = directory.LastUpdatedPartitionFetchOptions(0, 0, 60, None, None, 500, False, None, None, 0, None)
+    census_result = await directory.leaf_census.pre_census(
+        directory, tenant_source, resource, object, config, state, options
+    )
+    if fault is not None:
+        assert census_result is not None and state.census.failure == "leaf_unfiltered_contract_required"
+        send.assert_not_awaited()
+        return
+    assert census_result is None and state.census.unfiltered_pre == 31000
+    assert len(state.plan.pending_count_windows()) == 2
+    send.assert_awaited_once()
+    url = urlsplit(send.await_args.args[1])
+    assert url._replace(query="").geturl() == f"{base}/{resource}"
+    assert parse_qs(url.query) == {"_count": ["0"], "_summary": ["count"], "_total": ["accurate"]}
+    assert send.await_args.kwargs["extra_headers"] == {"x-hmhs-keyId": "example-key"}
+    assert send.await_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.asyncio
 async def test_highmark_key_is_required_and_used_only_in_verified_requests(monkeypatch, tenant_sources):
     selection = directory.source_selection
     source = tenant_sources["HM"]

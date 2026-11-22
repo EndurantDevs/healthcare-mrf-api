@@ -4,6 +4,7 @@
 import asyncio
 import json
 import re
+from dataclasses import replace
 from importlib import import_module
 
 from db.plan_release_storage import storage_relation
@@ -71,6 +72,33 @@ def _renewed_partition_payload(directory, checkpoint, config, plan):
     return directory._last_updated_partition_checkpoint_payload(config, new_plan)
 
 
+def _renew_highmark_pre_request_failure(directory, checkpoint, resource, config, resume):
+    """Recover a pristine Highmark role plan rejected by the old anonymous-only guard."""
+    base = checkpoint["canonical_api_base"]
+    failure = directory.leaf_census.UNFILTERED_CONTRACT_REQUIRED
+    if (
+        resource != "PractitionerRole"
+        or base not in directory.highmark.CHUNKED_API_BASES
+        or config.census_mode != directory.leaf_census.CONTRACT
+        or config.end is not None
+        or resume.census.failure != failure
+        or checkpoint["state"] != "active"
+        or checkpoint["completed_at"] is not None
+        or checkpoint["pages_processed"] != 0
+        or checkpoint["rows_processed"] != 0
+        or _json(checkpoint["completeness_json"]) != {}
+    ):
+        return None
+    original_cutoff = resume.plan.windows["root"].end
+    pristine_plan = directory._new_last_updated_partition_plan(replace(config, end=original_cutoff))
+    rejected_census = directory.LastUpdatedCompletenessCensus(failure=failure)
+    if checkpoint["next_url"] != directory._last_updated_partition_checkpoint_payload(
+        config, pristine_plan, rejected_census
+    ):
+        return None
+    return _renewed_partition_payload(directory, checkpoint, config, resume.plan)
+
+
 def _verify_partition(directory, checkpoint, resource, counts):
     """Compare committed pass markers and candidate rows without declaring completion."""
     try:
@@ -79,7 +107,7 @@ def _verify_partition(directory, checkpoint, resource, counts):
         _require(False, "transition_partition_checkpoint_invalid")
     plan, census = resume.plan, resume.census
     can_renew = _can_renew_census(directory, checkpoint, config, resume)
-    renewed_payload = None
+    renewed_payload = _renew_highmark_pre_request_failure(directory, checkpoint, resource, config, resume)
     if can_renew and plan.failure is not None and plan.failure.code == "split_count_mismatch":
         renewed_payload = _renewed_partition_payload(directory, checkpoint, config, plan)
     expected_count = directory.capped_partition.expected_count(census)
@@ -94,8 +122,7 @@ def _verify_partition(directory, checkpoint, resource, counts):
         plan.status is directory.PlanStatus.SUCCEEDED and directory._is_last_updated_partition_census_complete(census)
     )
     _require(
-        (plan.failure is None or renewed_payload is not None)
-        and census.failure is None
+        ((plan.failure is None and census.failure is None) or renewed_payload is not None)
         and checkpoint["state"] in {"active", "complete"}
         and (checkpoint["state"] == "complete") == is_complete
         and (checkpoint["completed_at"] is not None) == is_complete,
