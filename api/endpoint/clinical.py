@@ -566,7 +566,6 @@ async def list_clinical_areas(request):
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     query_text = str(args.get("q") or "").strip().lower()
     filters = []
-    filters.extend(_restricted_pair_filters(crosswalk_table.c.from_system, crosswalk_table.c.to_system))
     if query_text:
         q_like = f"%{query_text}%"
         filters.append(
@@ -657,7 +656,7 @@ async def list_crosswalk(request):
     code = _normalize_code(args.get("code"))
     from_code = _normalize_code(args.get("from_code"))
     to_code = _normalize_code(args.get("to_code"))
-    filters = []
+    filters = _restricted_pair_filters(crosswalk_table.c.from_system, crosswalk_table.c.to_system)
     if from_system:
         filters.append(func.upper(crosswalk_table.c.from_system) == from_system)
     if from_code:
