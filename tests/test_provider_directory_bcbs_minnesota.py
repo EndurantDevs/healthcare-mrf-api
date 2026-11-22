@@ -5,6 +5,7 @@ import datetime
 import importlib
 import urllib.parse
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -53,6 +54,56 @@ def test_fresh_minnesota_plan_contains_updates_during_acquisition(carrier_source
     scoped_plan = directory._last_updated_partition_plan_from_checkpoint(minnesota.checkpoint_payload, config)
     assert regular_plan.windows["root"].end < started + datetime.timedelta(minutes=1)
     assert scoped_plan.windows["root"].end >= started + datetime.timedelta(days=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "count_changed", "wrong_id", "wrong_stamp", "throttled"])
+async def test_timed_out_practitioner_verifies_small_retained_window(carrier_source, monkeypatch, outcome):
+    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+    window = directory.TimeWindow("root", start, start + datetime.timedelta(days=1), count=2, passes={1: None})
+    start_url = f"{BASE}/Practitioner?_count=500"
+    state = SimpleNamespace(context=object(), start_url=start_url, deadline_at=None)
+    options = SimpleNamespace(timeout=5, cancel_ctx=None, cancel_task=None)
+    range_fetch = directory.LastUpdatedWindowFetch((), 1, False, error="http_504", transient=True)
+    range_query = AsyncMock(return_value=range_fetch)
+    proof = AsyncMock(return_value={"second": "hash-b", "first": "hash-a"})
+    count = AsyncMock(
+        return_value=directory.LastUpdatedCountFetch(
+            directory.CountObservation.exact(3 if outcome == "count_changed" else 2)
+        )
+    )
+
+    async def direct_read(_source, url, _prior, **_options):
+        resource_id = url.rsplit("/", 1)[-1]
+        if outcome == "throttled":
+            return (429, None, None, 20), False
+        resource_by_field = {
+            "id": "unknown" if outcome == "wrong_id" else resource_id,
+            "resourceType": "Practitioner",
+            "meta": {"lastUpdated": ("2030-01-01T00:00:00Z" if outcome == "wrong_stamp" else start.isoformat())},
+        }
+        return (200, resource_by_field, None, 20), False
+
+    fallback_fetch = AsyncMock(side_effect=direct_read)
+    monkeypatch.setattr(directory, "_fetch_last_updated_partition_window", range_query)
+    monkeypatch.setattr(directory, "_load_last_updated_partition_window_fingerprints", proof)
+    monkeypatch.setattr(directory, "_fetch_last_updated_partition_count", count)
+    monkeypatch.setattr(directory, "_fetch_cooldown_checkpoint_page", fallback_fetch)
+    main_url, window_fetch = await directory._fetch_partition_window_for_pass(
+        carrier_source, "Practitioner", SimpleNamespace(page_count=500), state, options, window
+    )
+    assert "_sort=" in main_url
+    proof.assert_awaited_once_with(state.context, "Practitioner", "root", 1)
+    assert "_summary=count" in count.await_args.args[1]
+    assert "_total=accurate" in count.await_args.args[1]
+    assert window.passes == {1: None}
+    if outcome == "success":
+        assert window_fetch.complete and window_fetch.pages_fetched == 4
+        assert [resource["id"] for resource in window_fetch.resources] == ["first", "second"]
+    else:
+        assert not window_fetch.complete and window_fetch.resources == ()
+        assert fallback_fetch.await_count == (0 if outcome == "count_changed" else 1)
+        assert window_fetch.transient is (outcome == "throttled")
 
 
 @pytest.mark.parametrize(

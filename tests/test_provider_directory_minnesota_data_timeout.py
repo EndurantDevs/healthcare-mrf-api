@@ -40,6 +40,7 @@ class GatewayLimitedCollection:
             for hour in (1, 13)
         ]
         self.data_requests = []
+        self.direct_requests = []
 
     def select(self, bounds):
         if not bounds:
@@ -49,7 +50,18 @@ class GatewayLimitedCollection:
         return [row for row in self.rows if start <= importer.parse_utc_instant(row["meta"]["lastUpdated"]) < end]
 
     async def fetch(self, _source, url, *, timeout):
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        request = urllib.parse.urlsplit(url)
+        if "/Practitioner/" in request.path:
+            assert self.mode in {"second_pass", "second_pass_direct", "second_pass_changed"} and not request.query
+            resource_id = request.path.rsplit("/", 1)[-1]
+            self.direct_requests.append(resource_id)
+            if self.mode == "second_pass":
+                return 504, None, None, 1
+            resource_by_field = next(candidate for candidate in self.rows if candidate["id"] == resource_id)
+            if self.mode == "second_pass_changed":
+                resource_by_field = {**resource_by_field, "name": [{"family": "Changed"}]}
+            return 200, resource_by_field, None, 1
+        query = urllib.parse.parse_qs(request.query)
         bounds = tuple(query.get("_lastUpdated", []))
         selected_resources = self.select(bounds)
         if query.get("_summary") == ["count"]:
@@ -62,12 +74,12 @@ class GatewayLimitedCollection:
         assert query["_count"] == ["10"]
         self.data_requests.append(bounds)
         occurrence = self.data_requests.count(bounds)
-        if len(selected_resources) > 2 and (self.mode != "second_pass" or occurrence == 2):
+        if len(selected_resources) > 2 and (not self.mode.startswith("second_pass") or occurrence == 2):
             return (503 if self.mode == "unavailable" else 504), None, None, 1
         if self.mode == "truncated":
             selected_resources = selected_resources[:1]
         if self.mode == "changed" and occurrence == 2:
-            selected_resources = [{**row, "name": [{"family": "Changed"}]} for row in selected_resources]
+            selected_resources = [{**candidate, "name": [{"family": "Changed"}]} for candidate in selected_resources]
         return 200, bundle(selected_resources, total=len(selected_resources)), None, 1
 
 
@@ -128,6 +140,24 @@ async def test_unsuitable_timeout_keeps_existing_retry_and_proof(monkeypatch, un
     assert "acquisition_retryable:http_" in result.error
     assert not written and saved_plans[-1] == (None, "ready", {1} if mode == "second_pass" else set())
     assert len(collection.data_requests) == (2 if mode == "second_pass" else 1)
+    assert len(collection.direct_requests) == (1 if mode == "second_pass" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["second_pass_direct", "second_pass_changed"])
+async def test_small_second_pass_direct_reads_preserve_the_complete_fingerprint(monkeypatch, unit_source_factory, mode):
+    collection = GatewayLimitedCollection(mode)
+    result, staged, written = await run_fetch(monkeypatch, directory_source(), collection.fetch)
+
+    assert sorted(collection.direct_requests) == sorted(row["id"] for row in collection.rows)
+    assert len(collection.data_requests) == 2 and not written
+    if mode == "second_pass_direct":
+        assert result.complete and result.rows_fetched == result.rows_written == 4
+        assert set(staged) == set(collection.direct_requests)
+        assert result.fetch_diagnostic["verified"] is True
+    else:
+        assert not result.complete and "twin_pass_mismatch" in result.error
+        assert not staged
 
 
 @pytest.mark.asyncio

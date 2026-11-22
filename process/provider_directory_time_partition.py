@@ -272,6 +272,30 @@ async def run_partition_passes[FetchResult, FailureResult](
         await _close_partition_downloads(passes_by_task, admission, slots)
 
 
+async def fetch_window_for_pass(directory, source_record, resource_type, config, state, fetch_options, window):
+    """Fetch a partition window with the carrier-specific recovery if applicable."""
+    request_url = last_updated_partition_url(
+        directory,
+        state.start_url,
+        window,
+        page_count=config.page_count,
+        count_only=False,
+    )
+    window_fetch = await directory._fetch_last_updated_partition_window(
+        source_record,
+        resource_type,
+        request_url,
+        window,
+        timeout=fetch_options.timeout,
+        cancel_ctx=fetch_options.cancel_ctx,
+        cancel_task=fetch_options.cancel_task,
+        deadline_at=state.deadline_at,
+    )
+    return request_url, await bcbs_minnesota.verify_timed_out_practitioner_window(
+        directory, source_record, resource_type, config, state, fetch_options, window, window_fetch
+    )
+
+
 async def fetch_partition_resource_rows(directory, source_record, resource_type, model, config, fetch_options):
     """Retain preflight and census checks while recounting subdivided data windows."""
     preflight_failure = directory._partition_preflight_failure(model, fetch_options)
