@@ -263,6 +263,18 @@ def test_mode_is_explicit_and_cannot_mix_capped_contract(settings):
     assert config is None and "census_mode_invalid" in error
 
 
+def test_uncounted_leaf_census_restores_its_original_root():
+    config, error = importer._last_updated_partition_config(leaf_source(), "Practitioner")
+    assert config is not None and error is None
+    plan = importer._new_last_updated_partition_plan(config)
+    payload = importer._last_updated_partition_checkpoint_payload(config, plan)
+
+    restored = importer._last_updated_partition_resume_from_checkpoint(payload, config)
+
+    assert restored.census == importer.LastUpdatedCompletenessCensus()
+    assert restored.plan.pending_count_windows() == (plan.windows["root"],)
+
+
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.asyncio
 async def test_reporting_requires_truthful_provenance_even_at_zero(monkeypatch, unit_source_factory, empty):

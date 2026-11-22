@@ -334,9 +334,12 @@ async def test_partition_successor_renews_only_failed_pre_data_census_once(case)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("observed_count", [None, 3, 4])
-async def test_partition_successor_rechecks_incomplete_count_only_plan(case, monkeypatch, observed_count):
-    """Only an exact changed count renews the unfinished partition."""
+@pytest.mark.parametrize(
+    ("observed_count", "can_advance"),
+    [(None, True), (3, True), (4, True), ("timeout", True), (3, False)],
+)
+async def test_partition_successor_rechecks_incomplete_count_only_plan(case, monkeypatch, observed_count, can_advance):
+    """Renew only a changed count with a later boundary."""
     case.runs[0]["status"] = "canceled"
     counts, config = _drifted_partition_case(case)
     checkpoint = case.checkpoints[0]
@@ -347,10 +350,13 @@ async def test_partition_successor_rechecks_incomplete_count_only_plan(case, mon
     checkpoint["next_url"] = json.dumps(active_plan)
     before = deepcopy(case.checkpoints)
     fetched = directory.LastUpdatedCountFetch(
-        observation=None if observed_count is None else directory.CountObservation.exact(observed_count)
+        observation=directory.CountObservation.exact(observed_count) if isinstance(observed_count, int) else None
     )
-    count_request = AsyncMock(return_value=fetched)
+    count_request = AsyncMock(return_value=fetched, side_effect=TimeoutError if observed_count == "timeout" else None)
     monkeypatch.setattr(directory, "_fetch_last_updated_partition_count", count_request)
+    if not can_advance:
+        previous = directory._last_updated_partition_resume_from_checkpoint(checkpoint["next_url"], config)
+        monkeypatch.setattr(directory, "_new_last_updated_partition_plan", lambda *_args, **_kwargs: previous.plan)
     execute = case.connection.execute.side_effect
     renewed_checkpoints = []
 
@@ -364,7 +370,7 @@ async def test_partition_successor_rechecks_incomplete_count_only_plan(case, mon
     await _transition(case, counts)
     count_request.assert_awaited_once()
     assert count_request.await_args.args[1].startswith(directory.bcbs_minnesota.API_BASE + "/Organization?")
-    if observed_count == 3:
+    if observed_count == 3 and can_advance:
         ((new_payload, archive),) = renewed_checkpoints
         assert archive["pre_data_census_renewal"]["observed_ranged_count"] == 3
         assert archive["pre_data_census_renewal"]["checkpoint"] == before[0]["next_url"]
