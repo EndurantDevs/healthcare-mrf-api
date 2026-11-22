@@ -248,8 +248,53 @@ def test_catalog_requires_scoped_route(monkeypatch):
         ),
     )
     assert launcher.is_delta_route_available() is True
+    _assert_observation_job_readback(monkeypatch)
     monkeypatch.setenv(launcher.ROUTES_ENV, "[]")
     assert launcher.is_delta_route_available() is False
+
+
+def _assert_observation_job_readback(monkeypatch):
+    """Exercise the persisted Kubernetes callback shape through the full matcher."""
+    from api import control_workers
+
+    worker_spec = control_workers._BY_WORKER_CLASS["process.ProviderDirectoryFHIR"]
+    run_id = "run_" + "1" * 32
+    run_by_field = {
+        "run_id": run_id,
+        "retry_of_run_id": None,
+        "importer": "provider-directory-fhir",
+        "status": "queued",
+        "params": _task(),
+        "metrics": {
+            "queue": worker_spec.queue,
+            "function": "control_single_job_start",
+            "job_id": "provider_directory_start_" + run_id,
+        },
+    }
+    launch = launcher.admit_fhir_source_worker_launch(run_by_field)
+    proxy_selector_by_field = {
+        **_delta_secret_scope(),
+        "name": launcher.PROXY_POOL_ENV,
+        "key": launcher.PROXY_POOL_ENV,
+        "secretName": launch.pool_secret_name,
+        "sourceProxyPool": True,
+    }
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", json.dumps([proxy_selector_by_field]))
+    request = control_workers._AdmittedWorkerRequest(run_id=run_id, importer="provider-directory-fhir")
+    control_workers._bind_admitted_job(request, run_by_field)
+    request.fhir_source_launch = launch
+    job = control_workers._worker_job_manifest(worker_spec, request, launch.image)
+    environment = job["spec"]["template"]["spec"]["containers"][0]["env"]
+    callback_by_field = next(entry for entry in environment if entry["name"] == "HLTHPRT_IMPORT_STATUS_EVENT_URL")
+    assert callback_by_field["value"] == ""
+    assert launcher.is_fhir_source_job_matching(job, launch, request)
+    del callback_by_field["value"]
+    assert launcher.is_fhir_source_job_matching(job, launch, request)
+    callback_by_field["value"] = "https://example.test"
+    assert not launcher.is_fhir_source_job_matching(job, launch, request)
+    del callback_by_field["value"]
+    callback_by_field["valueFrom"] = {"configMapKeyRef": {"name": "example-callback", "key": "url"}}
+    assert not launcher.is_fhir_source_job_matching(job, launch, request)
 
 
 def test_lost_edition_blocks_redownload(tmp_path):
