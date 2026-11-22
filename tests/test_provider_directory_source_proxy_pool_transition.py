@@ -215,6 +215,78 @@ async def test_transition_refuses_ungranted_or_regressing_ancestry(expanded_prox
         )
 
 
+@pytest.fixture
+def direct_activation(monkeypatch, expanded_proxy):
+    request, lineage_rows = expanded_proxy
+    root = lineage_rows[1]
+    root["source_http_proxy_binding"] = None
+    root["source_http_proxy_cooldowns"] = None
+    routes = json.loads(workers.os.environ[source.ROUTES_ENV])
+    del routes[1]["proxy_pool_transition"]
+    routes[1]["retained_proxy"] = {
+        "last_direct_run_id": root["run_id"],
+        "policy_revision": "policy-one",
+        "pool_revision": "pool-two",
+        "secret_name": POOL_TWO,
+        "partition_concurrency": 32,
+    }
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps(routes))
+    monkeypatch.delenv(source.PROXY_POLICY_ENV)
+    request.fhir_source_launch = source.admit_fhir_source_worker_launch(
+        {**_source_route_run(), "params": lineage_rows[0]["params"]}
+    )
+    assert not source._proxy_fields([routes[0]["source_id"]], routes[0]["endpoint_scope"], routes[0])
+    return request, lineage_rows
+
+
+@pytest.mark.asyncio
+async def test_retained_proxy_first_launch_and_retry_preserve_lineage(direct_activation):
+    request, lineage_rows = direct_activation
+    connection = SimpleNamespace(all=AsyncMock(return_value=lineage_rows))
+    request.fhir_source_launch = await source.require_fhir_source_route_ancestry(connection, request.fhir_source_launch)
+    job = workers._worker_job_manifest(SPEC, request, IMAGE)
+    environment = _environment(job)
+    assert environment[source.PARTITION_CONCURRENCY_ENV]["value"] == "32"
+    assert environment[source.PROXY_POOL_ENV]["valueFrom"]["secretKeyRef"]["name"] == POOL_TWO
+    assert json.loads(environment[source.PROXY_COOLDOWNS_ENV]["value"]) == _snapshot("pool-two", [])
+    assert source.is_fhir_job_set_matching(SPEC, request, [job])
+    _parent(request, lineage_rows, "run_" + "d" * 32, "pool-two", [(IDS[3], None)])
+    updated = await source.require_fhir_source_route_ancestry(connection, request.fhir_source_launch)
+    assert json.loads(updated.proxy_cooldowns_json) == _snapshot("pool-two", [(IDS[3], None)])
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("partition_concurrency", 33), ("last_direct_run_id", ""), ("secret_name", _source_route_config()["secret_name"])],
+)
+def test_retained_proxy_rejects_invalid_route_config(monkeypatch, direct_activation, key, value):
+    routes = json.loads(workers.os.environ[source.ROUTES_ENV])
+    routes[1]["retained_proxy"][key] = value
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps(routes))
+    with pytest.raises(ValueError, match="fhir_source_worker_route_invalid"):
+        source._configured_routes()
+
+
+@pytest.mark.parametrize("invalid", ["missing-boundary", "already-proxied", "missing-proxy-audit"])
+@pytest.mark.asyncio
+async def test_retained_proxy_rejects_invalid_transport_history(direct_activation, invalid):
+    request, lineage_rows = direct_activation
+    launch = request.fhir_source_launch
+    if invalid == "missing-boundary":
+        launch = replace(launch, retained_proxy=replace(launch.retained_proxy, last_direct_run_id="run_" + "e" * 32))
+    elif invalid == "already-proxied":
+        lineage_rows[1]["source_http_proxy_binding"] = {**_BINDING, "pool_revision": "pool-two"}
+    else:
+        _parent(request, lineage_rows, "run_" + "d" * 32, "pool-two", [])
+        launch = request.fhir_source_launch
+        lineage_rows[-1]["source_http_proxy_binding"] = None
+        lineage_rows[-1]["source_http_proxy_cooldowns"] = None
+    with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+        await source.require_fhir_source_route_ancestry(
+            SimpleNamespace(all=AsyncMock(return_value=lineage_rows)), launch
+        )
+
+
 @pytest.mark.parametrize(
     "damage",
     [

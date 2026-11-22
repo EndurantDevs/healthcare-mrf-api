@@ -18,7 +18,13 @@ COMMAND = ["/usr/local/bin/fhir-source-worker"]
 IMAGE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_IMAGE"
 ROUTES_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_ROUTES_JSON"
 _ACQUISITION_ROUTE_FIELDS = frozenset(
-    {"allow_retained_retries", "proxy_pool_transition", "proxy_pool", "delta_dental_observed_review_id"}
+    {
+        "allow_retained_retries",
+        "proxy_pool_transition",
+        "proxy_pool",
+        "retained_proxy",
+        "delta_dental_observed_review_id",
+    }
 )
 PROXY_POOL_SECRET_ENV = "HLTHPRT_HTTP_PROXY_POOL_SECRET_NAME"
 PROXY_POOL_REVISION_ENV = "HLTHPRT_HTTP_PROXY_POOL_REVISION"
@@ -26,6 +32,7 @@ PROXY_POLICY_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_POLICY_JSON"
 PROXY_POOL_ENV = "HLTHPRT_HTTP_PROXY_POOL_JSON"
 PROXY_BINDING_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_BINDING_JSON"
 PROXY_COOLDOWNS_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_COOLDOWNS_JSON"
+PARTITION_CONCURRENCY_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY"
 PROFILE_IMAGE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_WORKER_IMAGE"
 _WORKER_CLASS = "process.ProviderDirectoryFHIR"
 _IMPORTER = "provider-directory-fhir"
@@ -46,6 +53,17 @@ class ProxyPoolTransition:
 
 
 @dataclass(frozen=True)
+class RetainedProxyActivation:
+    """Activate one pool after the last direct run in an exact retained lineage."""
+
+    last_direct_run_id: str
+    policy_revision: str
+    pool_revision: str
+    secret_name: str
+    partition_concurrency: int
+
+
+@dataclass(frozen=True)
 class FHIRSourceWorkerLaunch:
     """Keep the owner image and observed native job outside serialized input."""
 
@@ -62,6 +80,7 @@ class FHIRSourceWorkerLaunch:
     pool_secret_name: str = ""
     proxy_cooldowns_json: str = ""
     proxy_pool_transition: ProxyPoolTransition | None = None
+    retained_proxy: RetainedProxyActivation | None = None
     delta_observed_review_id: str = ""
 
 
@@ -85,6 +104,34 @@ def _route_proxy_pool(route):
     ):
         raise ValueError("fhir_source_worker_route_invalid")
     return pool["revision"], pool["secret_name"]
+
+
+def _retained_proxy_activation(route):
+    """Read an explicit proxy activation on a retained HTTP route."""
+    if route is None or "retained_proxy" not in route:
+        return None
+    activation = route["retained_proxy"]
+    if (
+        route["root_run_id"] is None
+        or {"proxy_pool", "proxy_pool_transition", "delta_dental_observed_review_id"}.intersection(route)
+        or type(activation) is not dict
+        or activation.keys() != RetainedProxyActivation.__annotations__.keys()
+        or any(
+            type(activation[name]) is not str
+            for name in ("last_direct_run_id", "policy_revision", "pool_revision", "secret_name")
+        )
+        or not re.fullmatch(r"run_[0-9a-f]{32}", activation["last_direct_run_id"])
+        or any(
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", activation[name])
+            for name in ("policy_revision", "pool_revision")
+        )
+        or len(activation["secret_name"]) > 253
+        or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", activation["secret_name"])
+        or type(activation["partition_concurrency"]) is not int
+        or not 1 <= activation["partition_concurrency"] <= 32
+    ):
+        raise ValueError("fhir_source_worker_route_invalid")
+    return RetainedProxyActivation(**activation)
 
 
 def _pool_transition(route):
@@ -212,28 +259,32 @@ def _configured_routes(*, setting=ROUTES_ENV):
         if route_identity_fields in identities:
             raise ValueError("fhir_source_worker_route_invalid")
         identities.add(route_identity_fields)
-        _pool_transition(route)
     runtime_secrets = {route["secret_name"] for route in routes}
-    for route in routes:
-        grant = _pool_transition(route)
-        if grant is not None and {grant.from_secret_name, grant.to_secret_name}.intersection(runtime_secrets):
-            raise ValueError("fhir_source_worker_route_invalid")
-        pool = _route_proxy_pool(route)
-        if pool is not None and pool[1] in runtime_secrets:
-            raise ValueError("fhir_source_worker_route_invalid")
+    if any(_route_proxy_secrets(route) & runtime_secrets for route in routes):
+        raise ValueError("fhir_source_worker_route_invalid")
     return routes
+
+
+def _route_proxy_secrets(route):
+    """Collect the pool references that must never be used as source credentials."""
+    names = set()
+    grant = _pool_transition(route)
+    if grant is not None:
+        names.update((grant.from_secret_name, grant.to_secret_name))
+    pool = _route_proxy_pool(route)
+    if pool is not None:
+        names.add(pool[1])
+    activation = _retained_proxy_activation(route)
+    if activation is not None:
+        names.add(activation.secret_name)
+    return names
 
 
 def configured_source_proxy_pool_secrets():
     """Reserve global and retained-route pools from all broad credential paths."""
     names = {os.getenv(PROXY_POOL_SECRET_ENV, "").strip()} - {""}
     for route in _configured_routes():
-        grant = _pool_transition(route)
-        if grant is not None:
-            names.update((grant.from_secret_name, grant.to_secret_name))
-        pool = _route_proxy_pool(route)
-        if pool is not None:
-            names.add(pool[1])
+        names.update(_route_proxy_secrets(route))
     return frozenset(names)
 
 
@@ -280,7 +331,7 @@ def _source_route(admitted_run, *, routes=None):
     if len(matches) != 1:
         raise ValueError("fhir_source_worker_route_changed")
     if (
-        _pool_transition(matches[0]) is not None
+        {"proxy_pool_transition", "retained_proxy"}.intersection(matches[0])
         and _uses_source_http(params)
         and params.get("allow_retained_pagination_reset") is not False
     ):
@@ -421,6 +472,16 @@ def _proxy_fields(source_ids, endpoint_scope, route, *, policy=None):
 
     policy = SourceProxyConfig.from_environment() if policy is None else policy
     source_ids = source_ids if type(source_ids) is list else []
+    activation = _retained_proxy_activation(route)
+    if activation is not None:
+        if source_ids != [route["source_id"]] or endpoint_scope != route["endpoint_scope"]:
+            raise ValueError("fhir_source_worker_proxy_route_required")
+        return {
+            "policy_revision": activation.policy_revision,
+            "pool_revision": activation.pool_revision,
+            "pool_secret_name": activation.secret_name,
+            "retained_proxy": activation,
+        }
     enabled_source_ids = [source_id for source_id in source_ids if policy.use_proxy(source_id, endpoint_scope)]
     if not enabled_source_ids:
         return {}
@@ -719,7 +780,7 @@ def admit_fhir_source_worker_launch(admitted_run):
                 route,
                 policy=policy,
             )
-            if policy.has_enabled_sources and _uses_source_http(params_by_name)
+            if _uses_source_http(params_by_name) and (policy.has_enabled_sources or "retained_proxy" in (route or {}))
             else {}
         ),
     )
@@ -840,7 +901,10 @@ async def require_fhir_source_route_ancestry(connection, launch):
             and has_same_rooted_operation(params, current_params)
             and params.get("source_ids") == [launch.source_id]
             and params.get("provider_directory_endpoint_scope") == launch.endpoint_scope
-            and (launch.proxy_pool_transition is None or params.get("allow_retained_pagination_reset") is False)
+            and (
+                (launch.proxy_pool_transition is None and launch.retained_proxy is None)
+                or params.get("allow_retained_pagination_reset") is False
+            )
             and (
                 current_id == launch.root_run_id
                 or params.get("provider_directory_pagination_root_run_id") == launch.root_run_id
@@ -910,7 +974,7 @@ def _require_proxy_launch(launch):
     """A changed capability or server policy cannot silently replace its binding."""
     fields = (launch.policy_revision, launch.pool_revision, launch.pool_secret_name)
     if not launch.source_id and not any(fields):
-        if launch.proxy_cooldowns_json or launch.proxy_pool_transition is not None:
+        if launch.proxy_cooldowns_json or launch.proxy_pool_transition is not None or launch.retained_proxy is not None:
             raise ValueError("fhir_source_worker_admission_unavailable")
         return
     route = _configured_launch_route(launch)
@@ -919,7 +983,9 @@ def _require_proxy_launch(launch):
     )
     if fields != tuple(expected.get(name, "") for name in ("policy_revision", "pool_revision", "pool_secret_name")):
         raise ValueError("fhir_source_worker_admission_unavailable")
-    if launch.proxy_pool_transition != expected.get("proxy_pool_transition"):
+    if launch.proxy_pool_transition != expected.get("proxy_pool_transition") or launch.retained_proxy != expected.get(
+        "retained_proxy"
+    ):
         raise ValueError("fhir_source_worker_admission_unavailable")
     if launch.pool_secret_name:
         _require_proxy_cooldowns(launch)
@@ -1049,7 +1115,17 @@ def _proxy_lineage_launch(launch, ancestors):
         raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
     boundaries_by_id = {}
     has_target_revision = False
+    last_direct_run_id = launch.retained_proxy.last_direct_run_id if launch.retained_proxy is not None else None
     for position, ancestor in enumerate(reversed(ancestors)):
+        if last_direct_run_id is not None:
+            if (
+                ancestor.get("source_http_proxy_binding") is not None
+                or ancestor.get("source_http_proxy_cooldowns") is not None
+            ):
+                raise ValueError("fhir_source_worker_route_changed")
+            if ancestor["run_id"] == last_direct_run_id:
+                last_direct_run_id = None
+            continue
         snapshot_launch, allowed_ids, has_target_revision = _proxy_ancestor_scope(
             launch,
             ancestor.get("source_http_proxy_binding"),
@@ -1070,6 +1146,8 @@ def _proxy_lineage_launch(launch, ancestors):
                 )
             if len(boundaries_by_id) > 64:
                 raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
+    if last_direct_run_id is not None:
+        raise ValueError("fhir_source_worker_route_changed")
     cooldowns = [
         {"proxy_id": proxy_id, "retry_not_before": boundary} for proxy_id, boundary in sorted(boundaries_by_id.items())
     ]
@@ -1088,10 +1166,13 @@ def _proxy_literal_environment(launch):
         "revision": launch.policy_revision,
         "sources": [{"source_id": launch.source_id, "endpoint_scope": launch.endpoint_scope, "use_proxy": True}],
     }
-    return [
+    entries = [
         {"name": name, "value": json.dumps(value, sort_keys=True, separators=(",", ":"))}
         for name, value in ((PROXY_POLICY_ENV, policy_by_field), (PROXY_BINDING_ENV, _proxy_binding(launch)))
     ] + [{"name": PROXY_COOLDOWNS_ENV, "value": launch.proxy_cooldowns_json}]
+    if launch.retained_proxy is not None:
+        entries.append({"name": PARTITION_CONCURRENCY_ENV, "value": str(launch.retained_proxy.partition_concurrency)})
+    return entries
 
 
 def source_proxy_environment(spec, launch_request, environment):
@@ -1151,7 +1232,8 @@ def _is_proxy_job_matching(job, launch):
     observed_entries = [
         entry
         for entry in job["spec"]["template"]["spec"]["containers"][0]["env"]
-        if entry["name"] in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV}
+        if entry["name"]
+        in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV, PARTITION_CONCURRENCY_ENV}
     ]
     return sorted(observed_entries, key=lambda entry: entry["name"]) == sorted(
         expected_entries, key=lambda entry: entry["name"]
