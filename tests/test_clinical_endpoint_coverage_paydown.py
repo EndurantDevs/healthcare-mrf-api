@@ -36,10 +36,12 @@ class _Result:
 class _Session:
     def __init__(self, *results):
         self.results = list(results)
+        self.statements = []
 
-    async def execute(self, _statement):
+    async def execute(self, statement):
         if not self.results:
             raise AssertionError("unexpected clinical query")
+        self.statements.append(statement)
         return self.results.pop(0)
 
 
@@ -348,7 +350,21 @@ async def test_relationship_and_crosswalk_filtered_and_unfiltered(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_crosswalk_applies_terminology_filter_to_count_and_page(monkeypatch):
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: False)
+    session = _Session(_Result(scalar=0), _Result())
+
+    await clinical.list_crosswalk(_request(session))
+
+    for statement in session.statements:
+        query = str(statement.compile(dialect=asyncpg.dialect(), compile_kwargs={"render_postcompile": True}))
+        assert "upper(mrf.code_crosswalk.from_system) NOT IN ('SNOMEDCT_US')" in query
+        assert "upper(mrf.code_crosswalk.to_system) NOT IN ('SNOMEDCT_US')" in query
+
+
+@pytest.mark.asyncio
 async def test_clinical_area_routes_and_code_route_wrappers(monkeypatch):
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: False)
     list_session = _Session(
         _Result(scalar=1),
         _Result([{"clinical_area_id": "mesh:C14", "display_name": "Heart"}]),
@@ -356,6 +372,7 @@ async def test_clinical_area_routes_and_code_route_wrappers(monkeypatch):
         _Result(scalar=3),
     )
     areas = _payload(await clinical.list_clinical_areas(_request(list_session, q="heart")))
+    assert all(statement.get_final_froms() == [clinical.area_table] for statement in list_session.statements[:2])
     assert areas["items"][0]["condition_count"] == 2
     assert areas["items"][0]["treatment_count"] == 3
 
