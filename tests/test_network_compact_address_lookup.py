@@ -67,8 +67,8 @@ def test_lookup_preserves_ordinary_query():
     for index, artifact in enumerate(layout.artifacts):
         arm = selected.split(" UNION ALL ")[index]
         assert f'FROM ONLY "{layout.ref_map.schema_name}"."network_slice_ref" ref' in arm
-        assert f'JOIN ONLY "{artifact.schema_name}".network_office_edge edge' in arm
-        assert "edge.slice_id=ref.slice_id" in arm
+        assert f'FROM ONLY "{artifact.schema_name}".network_office_edge edge' in arm
+        assert "edge.slice_id=ANY(ARRAY(" in arm and "SELECT ref.slice_id" in arm
         assert f"ref.artifact_candidate_id=CAST(:_compact_artifact_{index} AS uuid)" in arm
         assert "ref.network_id=ANY(CAST(:_canonical_network_ids AS integer[]))" in arm
         assert "edge.location_key=office.location_key" in arm
