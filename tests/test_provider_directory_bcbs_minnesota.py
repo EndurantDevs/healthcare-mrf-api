@@ -1,16 +1,25 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Counted time chunks and issued caches share the existing import pipeline."""
 
+import asyncio
 import datetime
 import importlib
 import urllib.parse
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from api.provider_directory_sources import provider_directory_source_catalog
+from db.models import ProviderDirectoryPractitioner
+from tests.provider_directory_fhir_coverage_high_support import (
+    last_updated_partition_config,
+    last_updated_partition_fetch_options,
+    last_updated_partition_state,
+    resource_fetch_result,
+)
 from tests.test_process_provider_directory_fhir_unit import (
     _CensusSequenceResponder,
     _last_updated_partition_test_source,
@@ -54,6 +63,76 @@ def test_fresh_minnesota_plan_contains_updates_during_acquisition(carrier_source
     scoped_plan = directory._last_updated_partition_plan_from_checkpoint(minnesota.checkpoint_payload, config)
     assert regular_plan.windows["root"].end < started + datetime.timedelta(minutes=1)
     assert scoped_plan.windows["root"].end >= started + datetime.timedelta(days=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("left_response", "right_response", "expected_counts", "retry_at"),
+    [
+        (9, 10, (9, 10), None),
+        ("2026-01-01T00:01:00+00:00", 10, (None, 10), "2026-01-01T00:01:00+00:00"),
+        ("2026-01-01T00:01:00+00:00", "2026-01-01T00:05:00+00:00", (None, None), "2026-01-01T00:05:00+00:00"),
+        (9, 8, (9, 8), None),
+    ],
+)
+async def test_minnesota_count_lookahead_preserves_census_and_retry_fences(
+    carrier_source, monkeypatch, left_response, right_response, expected_counts, retry_at
+):
+    config = last_updated_partition_config()
+    state = last_updated_partition_state(census=directory.LastUpdatedCompletenessCensus(ranged_root_pre=19))
+    state.plan.observe_count("root", directory.CountObservation.exact(19))
+    state.context = replace(state.context, canonical_api_base=directory.bcbs_minnesota.API_BASE)
+    state.start_url = state.context.canonical_api_base + "/Practitioner"
+    pending_windows = state.plan.pending_count_windows()
+    responses_by_url = dict(
+        zip(
+            (directory._last_updated_partition_count_url(state, config, window) for window in pending_windows),
+            (left_response, right_response),
+            strict=True,
+        )
+    )
+    started_urls = set()
+    both_started = asyncio.Event()
+
+    async def fetch(_source, url, **_kwargs):
+        response = responses_by_url[url]
+        started_urls.add(url)
+        if len(started_urls) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        if isinstance(response, int):
+            return directory.LastUpdatedCountFetch(directory.CountObservation.exact(response))
+        return directory.LastUpdatedCountFetch(None, transient=True, error="http_504", retry_not_before=response)
+
+    save = AsyncMock()
+    retry_result = resource_fetch_result(error="retry-fenced")
+    retry = AsyncMock(return_value=retry_result)
+    slots = asyncio.BoundedSemaphore(2)
+    monkeypatch.setattr(directory.time_partition, "partition_window_slots", lambda *_args: slots)
+    monkeypatch.setattr(directory, "_fetch_last_updated_partition_count", fetch)
+    monkeypatch.setattr(directory, "_save_last_updated_partition_plan", save)
+    monkeypatch.setattr(directory, "_saved_partition_retry_result", retry)
+    count_outcome = await directory._observe_partition_counts(
+        carrier_source,
+        "Practitioner",
+        ProviderDirectoryPractitioner,
+        config,
+        state,
+        last_updated_partition_fetch_options(window_concurrency=2),
+    )
+
+    assert tuple(window.count for window in pending_windows) == expected_counts
+    assert save.await_count == sum(count is not None for count in expected_counts)
+    if retry_at is not None:
+        assert count_outcome is retry_result
+        assert retry.await_args.kwargs["retry_not_before"] == retry_at
+        assert retry.await_count == 1
+    elif expected_counts == (9, 8):
+        assert state.plan.failure.code == "split_count_mismatch"
+        assert count_outcome is not None
+    else:
+        assert count_outcome is None
+        assert state.plan.status is directory.PlanStatus.ACQUIRING
 
 
 @pytest.mark.asyncio

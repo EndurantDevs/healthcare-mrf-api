@@ -49985,14 +49985,19 @@ async def _observe_next_partition_count(
     config: LastUpdatedPartitionConfig,
     state: LastUpdatedPartitionState,
     fetch_options: LastUpdatedPartitionFetchOptions,
+    *,
+    fetched: tuple[TimeWindow, LastUpdatedCountFetch] | None = None,
 ) -> ResourceFetchResult | None:
-    window = state.plan.pending_count_windows()[0]
-    count_fetch = await _fetch_last_updated_partition_count(
-        source_record,
-        _last_updated_partition_count_url(state, config, window),
-        timeout=fetch_options.timeout,
-        deadline_at=state.deadline_at,
-    )
+    if fetched is None:
+        window = state.plan.pending_count_windows()[0]
+        count_fetch = await _fetch_last_updated_partition_count(
+            source_record,
+            _last_updated_partition_count_url(state, config, window),
+            timeout=fetch_options.timeout,
+            deadline_at=state.deadline_at,
+        )
+    else:
+        window, count_fetch = fetched
     if count_fetch.transient:
         leaf_census.record_deferred_count(sys.modules[__name__], config, state, window, count_fetch)
         return await _saved_partition_retry_result(
@@ -50029,32 +50034,8 @@ async def _observe_partition_counts(
     state: LastUpdatedPartitionState,
     fetch_options: LastUpdatedPartitionFetchOptions,
 ) -> ResourceFetchResult | None:
-    """Resolve exact leaf counts, durably retaining retryable progress."""
-    while state.plan.pending_count_windows():
-        if state.deadline_at is not None and _last_updated_partition_monotonic() >= state.deadline_at:
-            return await _saved_partition_retry_result(
-                model,
-                resource_type,
-                config,
-                state,
-                "deadline_reached",
-                deadline_reached=True,
-            )
-        count_failure = await _observe_next_partition_count(
-            source_record,
-            resource_type,
-            model,
-            config,
-            state,
-            fetch_options,
-        )
-        if count_failure is not None:
-            return count_failure
-    return await _reconcile_partition_leaf_counts(
-        resource_type,
-        model,
-        config,
-        state,
+    return await time_partition.observe_partition_counts(
+        sys.modules[__name__], source_record, resource_type, model, config, state, fetch_options
     )
 
 
