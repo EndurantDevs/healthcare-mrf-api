@@ -1461,7 +1461,7 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
             and len(containers) == 1
             and containers[0]["securityContext"] == _worker_job_container_security_context()
             and containers[0]["image"] == launch.image
-            and (expected_env is None or containers[0]["env"] == expected_env)
+            and (expected_env is None or _is_source_job_env_matching(containers[0]["env"], expected_env, launch))
             and (
                 not uses_isolated_delta_environment(launch)
                 or not any("secretRef" in source_ref for source_ref in containers[0].get("envFrom", []))
@@ -1474,6 +1474,14 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
         )
     except KeyError, TypeError, IndexError, ValueError:
         return False
+
+
+def _is_source_job_env_matching(observed, expected, launch):
+    """Normalize the API's omitted empty callback value only on Delta observations."""
+    if not is_delta_observation_launch(launch) or type(observed) is not list:
+        return observed == expected
+    callback_by_field = {"name": "HLTHPRT_IMPORT_STATUS_EVENT_URL"}
+    return [{**entry, "value": ""} if entry == callback_by_field else entry for entry in observed] == expected
 
 
 def _fhir_source_identity_matches(job, launch):
