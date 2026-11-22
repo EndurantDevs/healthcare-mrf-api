@@ -484,6 +484,7 @@ from process.provider_directory_source_summary_sql import (
 from process.provider_directory_time_partition import (
     CountKind,
     CountObservation,
+    LastUpdatedWindowPage,
     PartitionPlan,
     PartitionPlanError,
     PlanStatus,
@@ -1445,6 +1446,7 @@ UHC_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
 SOURCE_RESOURCE_TIMEOUT_MIN_SECONDS = {
     **{(pacificsource.API_BASE, resource_type): 90 for resource_type in pacificsource.RESOURCES},
     **{(UHC_PROVIDER_DIRECTORY_BASE, resource_type): 60 for resource_type in DEFAULT_RESOURCES},
+    **{(base, "PractitionerRole"): highmark.ROLE_REQUEST_TIMEOUT_SECONDS for base in highmark.CHUNKED_API_BASES},
     (
         REVIEWED_PRACTITIONER_ROLE_TIMEOUT_BASE,
         "PractitionerRole",
@@ -1867,15 +1869,6 @@ class LastUpdatedCompletenessCensus:
     failure: str | None = None
     capped: dict[str, Any] | None = None
     leaf_sum: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class LastUpdatedWindowPage:
-    resources: tuple[dict[str, Any], ...]
-    next_url: str | None
-    error: str | None = None
-    transient: bool = False
-    retry_not_before: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48121,28 +48114,9 @@ async def _fetch_last_updated_window_page(
             response_payload,
             fetch_error,
         )
-    if not _is_fhir_searchset_bundle(response_payload):
-        return LastUpdatedWindowPage((), None, "non_searchset_bundle")
-    page_resources, validation_error = _validated_last_updated_page_resources(
-        response_payload,
-        resource_type,
-        window,
+    return time_partition.validate_window_page(
+        sys.modules[__name__], source_record, resource_type, request_url, window, response_payload
     )
-    if validation_error:
-        return LastUpdatedWindowPage(page_resources, None, validation_error)
-    try:
-        next_url = _resolved_fhir_next_url(
-            source_record,
-            request_url,
-            _next_link(response_payload),
-        )
-    except ValueError as exc:
-        return LastUpdatedWindowPage(
-            resources=page_resources,
-            next_url=None,
-            error=str(exc),
-        )
-    return LastUpdatedWindowPage(page_resources, next_url)
 
 
 def _incomplete_last_updated_window_fetch(

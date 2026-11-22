@@ -4,6 +4,9 @@
 API_ROOT = "https://apicms.hmhs.com/fhir/v4/providers"
 KEY_HEADER = "x-hmhs-keyId"
 PAGE_SIZE = 500
+CHUNKED_PARTITIONS = frozenset({"HM", "HMDE", "HMNY", "HMWV"})
+CHUNKED_API_BASES = frozenset(f"{API_ROOT}/{partition}" for partition in CHUNKED_PARTITIONS)
+ROLE_REQUEST_TIMEOUT_SECONDS = 60
 SOURCE_URL = (
     "https://cmsapiportal.hmhs.com/api-details?Itemid=171"
     "&apiId=696bf543-f205-428f-8065-b3ca967935c7&catalogModuleId=119"
@@ -20,6 +23,28 @@ PARTITIONS = {
     "BCBSWY": "Blue Cross Blue Shield of Wyoming",
 }
 API_BASES = frozenset(f"{API_ROOT}/{partition}" for partition in PARTITIONS)
+
+
+def _role_partition_acquisition(partition):
+    if partition not in CHUNKED_PARTITIONS:
+        return {}
+    return {
+        "provider_directory_last_updated_partition_acquisition": {
+            "enabled": True,
+            "resources": {
+                "PractitionerRole": {
+                    "start": "1900-01-01T00:00:00Z",
+                    "end": "resolved_now",
+                    "ceiling": 25000,
+                    "minimum_width_seconds": 0.001,
+                    "boundary_precision_seconds": 0.001,
+                    "page_count": PAGE_SIZE,
+                    "maximum_pages_per_window": 64,
+                    "census_mode": "unfiltered-leaf-sum-v1",
+                },
+            },
+        },
+    }
 
 
 def search_next_link(directory, source_record, payload, resource_type, request_url):
@@ -57,6 +82,7 @@ def seed_rows(resources):
             "source_url": SOURCE_URL,
             "is_medicaid_mco": partition in {"HMPAMS", "HMWVMS"},
             "metadata_json": {
+                **_role_partition_acquisition(partition),
                 "provider_directory_supported_resources": list(resources),
                 "provider_directory_fully_enumerable_resources": list(resources),
                 "provider_directory_expected_nonempty_resources": [

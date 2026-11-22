@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from process import provider_directory_bcbs_minnesota as bcbs_minnesota
+from process import provider_directory_highmark as highmark
 from process import provider_directory_time_partition_primitives as _primitives
 from process.provider_directory_fetch_types import PartitionFetchState
 from process.provider_directory_time_partition_primitives import (
@@ -876,6 +877,44 @@ async def mark_partition_page_fetched(state: PartitionFetchState) -> None:
         state.page_count += 1
 
 
+@dataclass(frozen=True)
+class LastUpdatedWindowPage:
+    resources: tuple[dict[str, Any], ...]
+    next_url: str | None
+    error: str | None = None
+    transient: bool = False
+    retry_not_before: str | None = None
+
+
+def validate_window_page(directory, source_record, resource_type, request_url, window, response_payload):
+    """Check the window contents and resolve a source-bound continuation."""
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    is_highmark = api_base in highmark.API_BASES
+    if not isinstance(response_payload, dict) or (
+        not is_highmark and not directory._is_fhir_searchset_bundle(response_payload)
+    ):
+        return LastUpdatedWindowPage((), None, "non_searchset_bundle")
+    page_resources, validation_error = directory._validated_last_updated_page_resources(
+        response_payload, resource_type, window
+    )
+    if validation_error:
+        return LastUpdatedWindowPage(page_resources, None, validation_error)
+    try:
+        next_url = (
+            highmark.search_next_link(directory, source_record, response_payload, resource_type, request_url)
+            if is_highmark
+            else directory._resolved_fhir_next_url(source_record, request_url, directory._next_link(response_payload))
+        )
+    except ValueError as exc:
+        return LastUpdatedWindowPage(page_resources, None, str(exc))
+    return LastUpdatedWindowPage(page_resources, next_url)
+
+
+def _needs_zero_count(directory, start_url: str) -> bool:
+    base = directory._resource_or_metadata_parent_base(start_url)
+    return base == bcbs_minnesota.API_BASE or base in highmark.CHUNKED_API_BASES
+
+
 def last_updated_partition_url(
     directory,
     start_url: str,
@@ -920,15 +959,12 @@ def last_updated_partition_url(
                 ("_total", "accurate"),
             )
         )
-        if directory._resource_or_metadata_parent_base(start_url) == directory.bcbs_minnesota.API_BASE:
+        if _needs_zero_count(directory, start_url):
             query_items.append(("_count", "0"))
     else:
-        query_items.extend(
-            (
-                ("_sort", "_lastUpdated,_id"),
-                ("_count", str(page_count)),
-            )
-        )
+        if directory._resource_or_metadata_parent_base(start_url) not in highmark.CHUNKED_API_BASES:
+            query_items.append(("_sort", "_lastUpdated,_id"))
+        query_items.append(("_count", str(page_count)))
     return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query_items, doseq=True)))
 
 
@@ -956,6 +992,6 @@ def last_updated_partition_unfiltered_count_url(directory, start_url: str) -> st
             ("_total", "accurate"),
         )
     )
-    if directory._resource_or_metadata_parent_base(start_url) == directory.bcbs_minnesota.API_BASE:
+    if _needs_zero_count(directory, start_url):
         query_items.append(("_count", "0"))
     return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query_items, doseq=True)))

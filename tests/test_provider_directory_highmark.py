@@ -2,7 +2,9 @@
 """Highmark reuses the shared importer with independent tenant scopes."""
 
 import importlib
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -61,6 +63,94 @@ def test_endpoint_identity_survives_key_rotation(monkeypatch, tenant_sources):
             lambda _, value=key_value: {"api_key": {"header": "x-hmhs-keyId", "value": value}} if value else {},
         )
         assert directory._provider_directory_api_endpoint_row(source)["endpoint_id"] == endpoint_id
+
+
+def test_highmark_role_chunks_use_count_only_requests_and_bounded_windows(tenant_sources):
+    chunk_config_by_tenant = {}
+    for tenant, tenant_source in tenant_sources.items():
+        config, _ = directory._last_updated_partition_config(tenant_source, "PractitionerRole")
+        assert directory._last_updated_partition_config(tenant_source, "Organization")[0] is None
+        if config is not None:
+            chunk_config_by_tenant[tenant] = config
+    assert set(chunk_config_by_tenant) == {"HM", "HMDE", "HMNY", "HMWV"}
+
+    tenant_source = tenant_sources["HM"]
+    config = chunk_config_by_tenant["HM"]
+    assert config.census_mode == "unfiltered-leaf-sum-v1"
+    assert config.page_count == 500 and 0 < config.ceiling <= 25000
+    assert 0 < config.maximum_pages_per_window <= 64
+    assert directory._source_resource_timeout(tenant_source, "PractitionerRole", 15) >= 60
+    resource_url = directory._resource_start_url(tenant_source, "PractitionerRole", page_count=500)
+    begin = datetime(2024, 1, 1, tzinfo=UTC)
+    window = directory.TimeWindow("root", begin, begin + timedelta(days=1))
+
+    def query(url):
+        return parse_qs(urlsplit(url).query)
+
+    census_query_map = {"_count": ["0"], "_summary": ["count"], "_total": ["accurate"]}
+    window_query_map = {"_lastUpdated": ["ge2024-01-01T00:00:00.000000Z", "lt2024-01-02T00:00:00.000000Z"]}
+    assert query(directory._last_updated_partition_unfiltered_count_url(resource_url)) == census_query_map
+    assert query(directory._last_updated_partition_url(resource_url, window, page_count=500, count_only=True)) == {
+        **census_query_map,
+        **window_query_map,
+    }
+    assert query(directory._last_updated_partition_url(resource_url, window, page_count=500, count_only=False)) == {
+        **window_query_map,
+        "_count": ["500"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_highmark_role_chunks_follow_issued_cursor_and_reject_next_window_rows(monkeypatch, tenant_sources):
+    tenant_source = tenant_sources["HM"]
+    begin = datetime(2024, 1, 1, tzinfo=UTC)
+    window = directory.TimeWindow("root", begin, begin + timedelta(days=1))
+    first_url = directory._last_updated_partition_url(
+        f"{BASE}/HM/PractitionerRole", window, page_count=500, count_only=False
+    )
+    next_url = f"{BASE}/HM?_getpages=opaque%2btoken%3d&_getpagesoffset=500&_count=500"
+    entry_map = {
+        "resource": {
+            "resourceType": "PractitionerRole",
+            "id": "synthetic-role",
+            "meta": {"lastUpdated": "2024-01-01T01:00:00+01:00"},
+        },
+    }
+    continuation_bundle_map = {"resourceType": "Bundle", "entry": [entry_map]}
+    first_bundle_map = {**continuation_bundle_map, "type": "searchset", "link": [{"relation": "next", "url": next_url}]}
+    cross_tenant_bundle_map = {
+        **first_bundle_map,
+        "link": [{"relation": "next", "url": next_url.replace("/HM?", "/HMNY?")}],
+    }
+    outside_resource_map = {**entry_map["resource"], "meta": {"lastUpdated": "2024-01-02T00:00:00Z"}}
+    outside_bundle_map = {**continuation_bundle_map, "entry": [{"resource": outside_resource_map}]}
+    monkeypatch.setattr(
+        directory,
+        "_fetch_source_json",
+        AsyncMock(
+            side_effect=[
+                (200, bundle_value, None, 1)
+                for bundle_value in (
+                    first_bundle_map,
+                    continuation_bundle_map,
+                    cross_tenant_bundle_map,
+                    outside_bundle_map,
+                )
+            ]
+        ),
+    )
+
+    async def fetch(url):
+        return await directory._fetch_last_updated_window_page(
+            tenant_source, "PractitionerRole", url, window, timeout=3
+        )
+
+    first_page = await fetch(first_url)
+    assert first_page.error is None and first_page.next_url == next_url
+    final_page = await fetch(first_page.next_url)
+    assert final_page.error is None and final_page.next_url is None and final_page.resources == (entry_map["resource"],)
+    assert (await fetch(first_url)).error == "untrusted_pagination_link"
+    assert (await fetch(next_url)).error == "resource_last_updated_outside_window"
 
 
 def test_issued_cursor_retains_bytes_and_partition(tenant_sources):
