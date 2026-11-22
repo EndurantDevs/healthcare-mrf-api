@@ -40,6 +40,23 @@ def test_scoped_snapshot_preserves_unknowns_and_other_sources():
         scope.publication_scope_metadata(diagnostics_by_resource)
 
 
+def test_extended_name_queries_preserve_legacy_scope_and_disclose_unverified_searches():
+    legacy = example()
+    assert scope.validate_scope(legacy) == legacy
+    selection = scope.make_scope(
+        root_name="Example",
+        additional_names=["A", "B"],
+        owner_reference=legacy["owner_reference"],
+        discovery_counts=legacy["discovery_counts"],
+    )
+    assert scope.validate_scope(selection) == selection
+    assert selection["root_selection"]["additional_name_queries"] == ["A", "B"]
+    assert set(selection["root_selection"]["unverified_name_queries"]) == set("CDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+    selection["root_selection"]["unverified_name_queries"] = []
+    with pytest.raises(RuntimeError, match="scope_invalid"):
+        scope.validate_scope(selection)
+
+
 @pytest.mark.parametrize(
     "counts",
     [

@@ -227,7 +227,12 @@ def _group_summary(directory, source_record, proof, counts_by_type, concurrency)
     from process.provider_directory_network_snapshot_scope import make_scope
 
     config = directory._source_metadata(source_record)["provider_directory_network_snapshot"]
-    scope = make_scope(root_name=config["name"], owner_reference=config["owner_reference"], discovery_counts=proof)
+    scope = make_scope(
+        root_name=config["name"],
+        additional_names=list(config.get("name_search_characters", "")),
+        owner_reference=config["owner_reference"],
+        discovery_counts=proof,
+    )
     diagnostics_by_type = {
         kind: {
             **concurrency,

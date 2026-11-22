@@ -82,6 +82,41 @@ async def test_network_snapshot_followup_keeps_durable_coverage(monkeypatch):
     assert followup_descriptor["dataset_hash"] == "a" * 64
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["legacy", "current", "other_owner", "other_name", "partial", "reordered", "source", "resources", "false_type"],
+)
+def test_published_network_header_binds_reviewed_source_and_search(case):
+    from process import provider_directory_network_snapshot_scope as scope
+    from process.provider_directory_network_traversal import CONFIG, SOURCE_ID
+    from tests.test_provider_directory_network_snapshot_scope import example
+
+    characters = list(CONFIG["name_search_characters"])
+    scope_value = scope.make_scope(
+        root_name="Unrelated" if case == "other_name" else CONFIG["name"],
+        owner_reference="Organization/other" if case == "other_owner" else CONFIG["owner_reference"],
+        additional_names={"legacy": [], "partial": characters[:-1], "reordered": characters[::-1]}.get(
+            case, characters
+        ),
+        discovery_counts=example()["discovery_counts"],
+    )
+    diagnostics_by_type = {kind: {scope.SCOPE_KEY: scope_value} for kind in scope.RESOURCE_TYPES}
+    header_by_field = {
+        **scope.publication_scope_metadata(diagnostics_by_type),
+        "resource_diagnostics": diagnostics_by_type,
+        "source_ids": ["other"] if case == "source" else [SOURCE_ID],
+        "selected_resources": ["Practitioner"] if case == "resources" else list(scope.RESOURCE_TYPES),
+    }
+    if case == "false_type":
+        header_by_field[scope.SCOPE_KEY]["endpoint_complete"] = 0
+    if case in {"current", "legacy"}:
+        assert scope.published_header_scope(header_by_field, source_id=SOURCE_ID)[scope.SCOPE_KEY] == scope_value
+    else:
+        with pytest.raises(RuntimeError, match="scope_invalid"):
+            scope.published_header_scope(header_by_field, source_id=SOURCE_ID)
+        assert scope.validate_scope(scope_value) == scope_value
+
+
 def test_dataset_fence_requires_exact_source_run_scope():
     entity_address_unified._validate_provider_directory_dataset_fence_scope(
         dataset_id="dataset-current",

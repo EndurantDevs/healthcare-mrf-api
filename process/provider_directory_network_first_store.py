@@ -133,9 +133,12 @@ class GraphStore:
         await self.connection.execute(f"DROP TABLE {stage}")
 
     async def pending(self, *, organizations=False, limit=8):
-        """Select an initial page round, then the largest known chains."""
+        """Serialize overlapping name searches while scheduling independent network chains."""
+        work = self.table("work")
         rows = await self.connection.fetch(
-            f"SELECT kind,key,url,payload,pages,total FROM {self.table('work')} WHERE NOT done AND (kind='organization')=$1 ORDER BY total IS NOT NULL,total DESC NULLS FIRST,kind,key LIMIT $2",
+            f"SELECT kind,key,url,payload,pages,total FROM {work} WHERE NOT done AND (kind='organization')=$1 "
+            f"AND (kind<>'roots' OR key=(SELECT min(key) FROM {work} WHERE kind='roots' AND NOT done)) "
+            "ORDER BY total IS NOT NULL,total DESC NULLS FIRST,kind,key LIMIT $2",
             organizations,
             limit,
         )
@@ -250,15 +253,17 @@ class GraphStore:
         await self._persist_entries(entries_by_key, inserted_keys, persist)
         await self._retain_network_references(entries_by_key)
 
-    async def _lock_cursors(self, work_items, page_result):
-        for work in work_items:
-            observed = await self.connection.fetchrow(
-                f"SELECT url,pages FROM {self.table('work')} WHERE kind=$1 AND key=$2 AND NOT done FOR UPDATE",
-                work["kind"],
-                work["key"],
+    async def _lock_cursors(self, work_items, work_keys, page_result):
+        if work_items:
+            observed = await self.connection.fetch(
+                f"SELECT w.kind,w.key,w.url,w.pages FROM {self.table('work')} w "
+                "JOIN unnest($1::text[], $2::text[]) AS batch(kind,key) USING(kind,key) "
+                "WHERE NOT w.done ORDER BY w.kind,w.key FOR UPDATE OF w",
+                *work_keys,
             )
+            expected_cursors = {(item["kind"], item["key"], item["url"], item["pages"]) for item in work_items}
             require(
-                observed is not None and observed["url"] == work["url"] and observed["pages"] == work["pages"],
+                len(expected_cursors) == len(work_items) and {tuple(row) for row in observed} == expected_cursors,
                 "cursor_changed",
             )
         for work in work_items:
@@ -362,12 +367,12 @@ class GraphStore:
         )
         await self.connection.execute(f"DROP TABLE {stage}")
 
-    async def _advance_work(self, work_items, page_result):
-        for work in work_items:
+    async def _advance_work(self, work_keys, page_result):
+        if work_keys[0]:
             await self.connection.execute(
-                f"UPDATE {self.table('work')} SET url=$3,pages=pages+1,total=COALESCE(total,$4),done=$5 WHERE kind=$1 AND key=$2",
-                work["kind"],
-                work["key"],
+                f"UPDATE {self.table('work')} w SET url=$3,pages=w.pages+1,total=COALESCE(w.total,$4),done=$5 "
+                "FROM unnest($1::text[], $2::text[]) AS batch(kind,key) WHERE (w.kind,w.key)=(batch.kind,batch.key)",
+                *work_keys,
                 page_result["next_url"],
                 page_result["total"],
                 page_result["next_url"] is None,
@@ -381,7 +386,8 @@ class GraphStore:
         )
         require(writable is True, "candidate_closed")
         require(len(page_result["ids"]) <= 4096 and len(page_result["memberships"]) <= 4096, "response_batch_too_large")
-        await self._lock_cursors(work_items, page_result)
+        work_keys = ([work["kind"] for work in work_items], [work["key"] for work in work_items])
+        await self._lock_cursors(work_items, work_keys, page_result)
         if len(work_items) == 1 and work_items[0]["kind"] == "roots":
             await self._retain_owned_roots(page_result)
         if len(work_items) == 1 and work_items[0]["kind"] in {"roots", "network"}:
@@ -390,7 +396,7 @@ class GraphStore:
             await self._retain_missing(page_result)
         await self.retain_entries(page_result["entries"], persist)
         await self.add_frontier(page_result["frontier"])
-        await self._advance_work(work_items, page_result)
+        await self._advance_work(work_keys, page_result)
 
     async def counts(self):
         """Count the unique canonical resources already persisted."""
@@ -466,25 +472,81 @@ async def cleanup_published(directory, candidate):
     """Remove only this published dataset's retained graph work, after cutover."""
     from process.provider_directory_generic_source_storage import HEADER
 
-    prefix = "nf_" + hashlib.sha256(candidate.dataset_id.encode()).hexdigest()[:28]
     async with source_transaction(directory.db):
         publisher = bound_publisher()
         connection, schema = publisher.connection, publisher.policy.schema
-        state = storage_relation(schema, prefix + "_state")
-        if await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", state) is not True:
+        work = await _cleanup_work(connection, schema, candidate.dataset_id, candidate.source_ids)
+        if work is None:
             return
-        identity_by_field = decoded(
-            await connection.fetchval(f"SELECT identity FROM {state} WHERE singleton FOR UPDATE")
-        )
-        require(
-            identity_by_field["dataset_id"] == candidate.dataset_id
-            and identity_by_field["source_id"] in candidate.source_ids,
-            "cleanup_candidate_changed",
-        )
         published = await connection.fetchval(
             f"SELECT status='published' FROM {storage_relation(schema, HEADER)} WHERE dataset_id=$1",
             candidate.dataset_id,
         )
         require(published is True, "cleanup_publication_required")
-        for suffix in ("cursors", "networkrefs", "roots", "missing", "resources", "members", "ids", "work", "state"):
-            await connection.execute(f"DROP TABLE {storage_relation(schema, prefix + '_' + suffix)}")
+        await connection.execute(f"DROP TABLE {work}")
+
+
+async def _cleanup_work(connection, schema, dataset_id, source_ids, *, complete_required=False):
+    prefix = "nf_" + hashlib.sha256(dataset_id.encode()).hexdigest()[:28]
+    state = storage_relation(schema, prefix + "_state")
+    if not await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", state):
+        return None
+    row = await connection.fetchrow(f"SELECT identity,complete FROM {state} WHERE singleton FOR UPDATE")
+    require(row is not None, "cleanup_candidate_changed")
+    identity = decoded(row["identity"])
+    require(
+        identity["dataset_id"] == dataset_id
+        and identity["source_id"] in source_ids
+        and (not complete_required or row["complete"] is True),
+        "cleanup_candidate_changed",
+    )
+    return ", ".join(
+        storage_relation(schema, prefix + "_" + suffix)
+        for suffix in ("cursors", "networkrefs", "roots", "missing", "resources", "members", "ids", "work", "state")
+    )
+
+
+async def cleanup_named_published_graph(
+    connection,
+    *,
+    catalog_schema,
+    candidate_schema,
+    source_id,
+    endpoint_id,
+    dataset_id,
+    acquisition_root_run_id,
+    dataset_hash,
+):
+    """Retire a closed candidate's graph in a new transaction after its named edition committed."""
+    from process import provider_directory_named_edition as named
+    from process.provider_directory_network_snapshot_scope import published_header_scope
+    from process.provider_directory_network_traversal import SOURCE_ID
+
+    require(source_id == SOURCE_ID and not connection.is_in_transaction(), "cleanup_publication_required")
+    pointer = storage_relation(named.POINTER_SCHEMA, named.POINTER_TABLE)
+    async with connection.transaction():
+        # Serialize concurrent cleanup retries and pointer changes for this endpoint.
+        edition_schema = await connection.fetchval(
+            f"SELECT schema_name FROM {pointer} WHERE catalog_schema=$1 AND endpoint_id=$2 AND dataset_id=$3 FOR UPDATE",
+            catalog_schema,
+            endpoint_id,
+            dataset_id,
+        )
+        require(
+            edition_schema and candidate_schema not in (edition_schema, catalog_schema), "cleanup_publication_required"
+        )
+        header = await named.read_edition_header(connection, edition_schema, dataset_id)
+        require(
+            header is not None
+            and header["endpoint_id"] == endpoint_id
+            and header["is_current"] is True
+            and header["superseded_at"] is None
+            and header["acquisition_root_run_id"] == acquisition_root_run_id
+            and header["dataset_hash"] == dataset_hash,
+            "cleanup_publication_required",
+        )
+        metadata = decoded(header["publication_metadata_json"])
+        published_header_scope(metadata, source_id=source_id)
+        work = await _cleanup_work(connection, candidate_schema, dataset_id, [source_id], complete_required=True)
+        if work is not None:
+            await connection.execute(f"DROP TABLE {work}")
