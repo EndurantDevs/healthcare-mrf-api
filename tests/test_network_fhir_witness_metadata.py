@@ -159,6 +159,27 @@ async def test_admitted_witness_keeps_original_seal_and_complete_raw_authenticat
     assert list(tmp_path.iterdir()) == [path]
 
 
+@pytest.mark.asyncio
+async def test_admitted_legacy_witness_preserves_original_source_after_registration_change(tmp_path):
+    encoded, original, header = _admitted_inputs(tmp_path)
+    registered = replace(original, source_id="resumed-registration", source_aliases=("resumed-registration",))
+    reader, _ = _reader(encoded)
+
+    await publication.verify_publication(reader, registered, header)
+
+    changed = json.dumps(json.loads(encoded) | {"source_ids": [registered.source_id]}).encode()
+    changed_origin = replace(
+        registered, metadata_bytes=len(changed), metadata_text_sha256=hashlib.sha256(changed).hexdigest()
+    )
+    reader, _ = _reader(changed)
+    with pytest.raises(ValueError, match="source_fhir_witness_contract_invalid"):
+        await publication.verify_publication(
+            reader,
+            changed_origin,
+            header | {"metadata_sha256": changed_origin.metadata_text_sha256, "metadata_bytes": len(changed)},
+        )
+
+
 @pytest.mark.parametrize("profile", [None, OBSERVED_LEGACY_PROFILE, ADMITTED_UHC_PROFILE])
 def test_other_profiles_and_admission_writer_keep_aggregate_capture_bound(tmp_path, profile):
     encoded, origin, _header = _admitted_inputs(tmp_path, oversized=True)
