@@ -1148,6 +1148,10 @@ async def fhir_preservation_obligation(
 ):
     """Derive the publication obligation from the real predecessor, never output metadata."""
     receipt = verify_fhir_serving_preservation(candidate)
+    generations = candidate["source_generations"]
+    generations = json.loads(generations) if type(generations) is str else generations
+    if receipt is None and reviewed_source_manifest is None and "imported_source_inventory" in generations:
+        return None
     expected = candidate["expected_head"]
     if not expected:
         if receipt is not None:
@@ -1189,8 +1193,6 @@ async def fhir_preservation_obligation(
         and predecessor.generation_id != expected
     ):
         _fail("predecessor_changed")
-    generations = candidate["source_generations"]
-    generations = json.loads(generations) if type(generations) is str else generations
     if generations.get("retained_network_source") != predecessor.manifest_sha256:
         _fail("predecessor_changed")
     return predecessor

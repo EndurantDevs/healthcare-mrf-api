@@ -9,7 +9,12 @@ from types import SimpleNamespace
 from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
 from process.network_fhir_source_witness_contract import digest
-from process.registry_imported_source_inventory import ImportedSourceInventory
+from process.registry_fhir_catalog_sources import (
+    fhir_catalog_source_generation,
+    validate_fhir_catalog_source_descriptor,
+)
+from process.registry_imported_source_inventory import ImportedSourceInventory, fhir_feed, select_fhir_editions
+from process.registry_imported_source_reuse import source_edition
 from process.registry_native_network_catalog import native_catalog_descriptor, native_catalog_rows, native_network_ids
 
 _INVENTORY = ContextVar("registry_imported_catalog_preparation", default=None)
@@ -53,12 +58,55 @@ async def replaced_native_generations(connection, previous, accepted):
     return tuple(row["source_generation"] for row in rows)
 
 
-async def retire_native_catalog_rows(connection, relations, generations, *, control_schema, approved_revision):
-    """Remove superseded native metadata from this candidate while preserving shared/manual networks."""
+async def replaced_fhir_generations(connection, previous, accepted):
+    """Omit older copies of current feeds from a new ordinary catalog."""
+    inventory = current_catalog_inventory()
+    if previous is None or inventory is None:
+        return ()
+    carried_by_feed = {
+        fhir_feed(descriptor): source_edition(descriptor) for descriptor in inventory.carried_fhir_descriptors
+    }
+    descriptors = inventory.fhir_descriptors
+    if not descriptors and not carried_by_feed:
+        return ()
+    feeds = {fhir_feed(descriptor) for descriptor in descriptors}
+    endpoints = {descriptor["endpoint_id"] for descriptor in descriptors} | set(inventory.superseded_fhir_endpoints)
+    selected_generations = [fhir_catalog_source_generation(disposition.descriptor) for disposition in accepted]
+    prior_sources = await connection.fetch(
+        f"SELECT source_generation,descriptor_json::text AS descriptor "
+        f"FROM {storage_identifier(previous['schema_name'])}.registry_fhir_catalog_source "
+        "WHERE profile='published_normalized' AND descriptor_json->'coordinates'->>'source_system'='fhir' "
+        "AND NOT(source_generation=ANY($1::text[])) ORDER BY source_generation",
+        selected_generations,
+    )
+    current_generations = {
+        entry["source_generation"] for entry in previous["source_vector_json"] if entry["status"] == "current"
+    }
+    retained_feeds = set()
+    generations = []
+    for prior_source in sorted(prior_sources, key=lambda prior: prior["source_generation"] not in current_generations):
+        descriptor = json.loads(prior_source["descriptor"])
+        feed = fhir_feed(descriptor)
+        if (
+            feed in carried_by_feed
+            and feed not in retained_feeds
+            and source_edition(validate_fhir_catalog_source_descriptor(descriptor)) == carried_by_feed[feed]
+        ):
+            retained_feeds.add(feed)
+            continue
+        if feed in feeds or feed in carried_by_feed or descriptor["endpoint_id"] in endpoints:
+            generations.append(prior_source["source_generation"])
+    return tuple(generations)
+
+
+async def retire_catalog_source_rows(connection, relations, generations, *, control_schema, approved_revision):
+    """Remove superseded metadata from this candidate while preserving shared/manual networks."""
     if not generations:
         return
     removed = await connection.fetch(
-        f"DELETE FROM {relations['binding']} WHERE document_json->'source_scope'->>'source_generation'=ANY($1::text[]) RETURNING network_id",
+        f"DELETE FROM {relations['binding']} "
+        "WHERE document_json->'source_scope'->>'source_generation'=ANY($1::text[]) "
+        "OR split_part(document_json->>'evidence_id',':',1)=ANY($1::text[]) RETURNING network_id",
         list(generations),
     )
     await connection.execute(
@@ -75,33 +123,41 @@ async def retire_native_catalog_rows(connection, relations, generations, *, cont
     )
 
 
-async def retire_candidate_native_sources(
-    connection, target, snapshot, previous, current_by_generation, control_schema
-):
-    """Apply native replacement retirement to the isolated copied candidate before new projection."""
-    generations = await replaced_native_generations(connection, previous, tuple(current_by_generation.values()))
-    namespace = storage_identifier(target.schema_name)
+async def retire_replaced_catalog_sources(connection, copy_target, snapshot, previous, control_schema):
+    """Remove replaced source data from the isolated candidate before projecting new rows."""
+    if previous is None:
+        return
+    surviving_generations = {entry["source_generation"] for entry in snapshot["source_vector_json"]}
+    generations = [
+        entry["source_generation"]
+        for entry in previous["source_vector_json"]
+        if entry["source_generation"] not in surviving_generations
+    ]
+    if not generations:
+        return
+    namespace = storage_identifier(copy_target.schema_name)
     relations_by_kind = {
         kind: namespace + ".registry_fhir_catalog_" + kind for kind in ("network", "binding", "relationship")
     }
-    await retire_native_catalog_rows(
+    await retire_catalog_source_rows(
         connection,
         relations_by_kind,
         generations,
         control_schema=control_schema,
         approved_revision=snapshot["metadata_approved_revision"],
     )
-    if generations:
-        await connection.execute(
-            f"DELETE FROM {namespace}.registry_fhir_catalog_source WHERE source_generation=ANY($1::text[])",
-            list(generations),
-        )
+    await connection.execute(
+        f"DELETE FROM {namespace}.registry_fhir_catalog_observation WHERE source_generation=ANY($1::text[])",
+        generations,
+    )
+    await connection.execute(
+        f"DELETE FROM {namespace}.registry_fhir_catalog_source WHERE source_generation=ANY($1::text[])",
+        generations,
+    )
 
 
 def require_preparation_fhir_inventory(inventory, accepted):
     """Refuse discovery drift before creating a coupled catalogue candidate."""
-    from process.registry_imported_source_reuse import source_edition
-
     expected_generations = {digest(source_edition(source)) for source in inventory.fhir_descriptors}
     actual_generations = {
         digest(source_edition(source.descriptor))
@@ -110,6 +166,20 @@ def require_preparation_fhir_inventory(inventory, accepted):
     }
     if actual_generations != expected_generations:
         raise ValueError("registry_imported_catalog_sources_changed")
+
+
+def select_preparation_fhir_sources(inventory, accepted):
+    """Project only the recognized current edition of each directory feed."""
+    published_sources = [source for source in accepted if source.descriptor["profile"] == "published_normalized"]
+    preferred, _ = select_fhir_editions(
+        [source.descriptor for source in published_sources], inventory.carried_fhir_descriptors
+    )
+    winners = {fhir_catalog_source_generation(descriptor) for descriptor in preferred}
+    selected_sources = [
+        source for source in published_sources if fhir_catalog_source_generation(source.descriptor) in winners
+    ]
+    require_preparation_fhir_inventory(inventory, selected_sources)
+    return selected_sources + [source for source in accepted if source.descriptor["profile"] != "published_normalized"]
 
 
 def native_catalog_sources(inventory, accepted_at):

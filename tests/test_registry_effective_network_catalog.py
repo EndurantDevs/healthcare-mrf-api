@@ -11,6 +11,7 @@ from process import registry_fhir_catalog_read as metadata
 from process import registry_fhir_catalog_validation as validation
 from process.network_provider_only_projection import _provider_only_binding_scope
 from process.registry_effective_network_catalog import apply_effective_catalog_sql
+from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
 from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
 
 
@@ -22,22 +23,14 @@ def test_candidate_identity_binds_prepared_catalogue_generation():
         SimpleNamespace(generation_sha256="c" * 64),
         None,
         None,
-        catalog_generation="a" * 64,
+        catalog_bindings=PublishedFHIRCatalogBindingScope("a" * 64, "d" * 64),
     )
     assert generations_by_source == {
         "fhir_catalog": "a" * 64,
+        "imported_source_inventory": "d" * 64,
         "custom_membership": "b" * 64,
         "unified_address": "c" * 64,
     }
-    with pytest.raises(ValueError):
-        composition._bind_prepared_generations(
-            {},
-            SimpleNamespace(generation_id="b" * 64),
-            SimpleNamespace(generation_sha256="c" * 64),
-            None,
-            None,
-            catalog_generation="invalid",
-        )
 
 
 def test_effective_relation_substitution_never_rewrites_its_own_native_sql():

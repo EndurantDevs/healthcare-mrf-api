@@ -146,7 +146,7 @@ async def _stage_native_descriptor(fixture, candidate, selected, descriptor):
 @pytest.mark.asyncio
 async def test_native_replacement_retires_obsolete_rows_and_keeps_other_sources(storage_database):
     """Retire one accepted native replacement while keeping other Sources and the published predecessor."""
-    from process.registry_imported_catalog_preparation import retire_candidate_native_sources
+    from process.registry_imported_catalog_preparation import retire_replaced_catalog_sources
 
     fixture = storage_database
     await native_control(fixture)
@@ -169,13 +169,11 @@ async def test_native_replacement_retires_obsolete_rows_and_keeps_other_sources(
         old_id = await fixture.connection.fetchval(
             f"SELECT network_id FROM \"{old_candidate.schema_name}\".registry_fhir_catalog_network WHERE display_name LIKE '%Preferred'"
         )
-        await retire_candidate_native_sources(
-            fixture.connection,
-            new_candidate,
-            selected,
-            {"schema_name": old_candidate.schema_name},
-            {digest(new_descriptor): SimpleNamespace(descriptor=new_descriptor)},
-            fixture.control,
+        retained_by_field = dict(source_generation=digest(retained_descriptor))
+        previous_by_field = dict(source_vector_json=[{"source_generation": digest(old_descriptor)}, retained_by_field])
+        selected["source_vector_json"] = [{"source_generation": digest(new_descriptor)}, retained_by_field]
+        await retire_replaced_catalog_sources(
+            fixture.connection, new_candidate, selected, previous_by_field, fixture.control
         )
         await _stage_native_descriptor(fixture, new_candidate, selected, new_descriptor)
         catalog_rows = await fixture.connection.fetch(

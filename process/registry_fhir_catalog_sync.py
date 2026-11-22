@@ -338,19 +338,20 @@ async def _preparation_catalog_sources(config, loader, manifest, previous, accep
         return accepted
     retained_sources = await _collect_retained_catalog_inputs(loader, config.grant, manifest)
     accepted.extend(retained_sources)
-    return accepted
+    from process.registry_imported_catalog_preparation import current_catalog_inventory, select_preparation_fhir_sources
+
+    inventory = current_catalog_inventory()
+    return accepted if inventory is None else select_preparation_fhir_sources(inventory, accepted)
 
 
 async def _admit_native_catalog_sources(loader, accepted):
     from process.registry_imported_catalog_preparation import (
         current_catalog_inventory,
         native_catalog_sources,
-        require_preparation_fhir_inventory,
     )
 
     imported_inventory = current_catalog_inventory()
     if imported_inventory is not None:
-        require_preparation_fhir_inventory(imported_inventory, accepted)
         accepted.extend(
             native_catalog_sources(imported_inventory, await loader.fetchval("SELECT transaction_timestamp()"))
         )
@@ -747,9 +748,11 @@ async def _catalog_source_vector(loader, previous, accepted, source_companies, s
             ),
         )
     }
-    from process.registry_imported_catalog_preparation import replaced_native_generations
+    from process.registry_imported_catalog_preparation import replaced_fhir_generations, replaced_native_generations
 
-    for generation in await replaced_native_generations(loader, previous, accepted):
+    generations = await replaced_native_generations(loader, previous, accepted)
+    generations += await replaced_fhir_generations(loader, previous, accepted)
+    for generation in generations:
         vector_by_generation.pop(generation, None)
     for generation, disposition in current_by_generation.items():
         prior = vector_by_generation.get(generation, {})
@@ -842,11 +845,9 @@ async def _build_source_catalog_candidate(
         accounting_by_phase["retained"] = await copy_fhir_catalog_snapshot(
             loader, previous, copy_target, snapshot["metadata_generation"], **options_by_name
         )
-    from process.registry_imported_catalog_preparation import retire_candidate_native_sources
+    from process.registry_imported_catalog_preparation import retire_replaced_catalog_sources
 
-    await retire_candidate_native_sources(
-        loader, copy_target, snapshot, previous, current_by_generation, config.grant.control_schema
-    )
+    await retire_replaced_catalog_sources(loader, copy_target, snapshot, previous, config.grant.control_schema)
     accounting_by_phase["manual"] = await project_manual_fhir_catalog(loader, copy_target, snapshot, **options_by_name)
     with extraction_transform(snapshot["projector_version"]):
         accounting_by_phase["sources"] = await _project_catalog_sources(

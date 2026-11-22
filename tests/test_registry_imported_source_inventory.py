@@ -14,8 +14,10 @@ from process import registry_imported_catalog_preparation as catalog_preparation
 from process import registry_imported_membership_refresh as refresh
 from process import registry_imported_source_inventory as inventory
 from process import registry_native_network_catalog as native
+from process.registry_fhir_catalog_observation import catalog_observation_descriptor_digest
 from process.registry_fhir_catalog_validation import metadata_generation, snapshot_inputs
 from tests.test_registry_fhir_catalog_grant import standing_grant
+from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor
 from tests.test_registry_fhir_catalog_validation import snapshot
 from tests.test_registry_typed_source_recipe import _recipe
 
@@ -147,6 +149,87 @@ async def observe(case):
     )
 
 
+def edition(dataset, endpoint, uri, day, resource_count):
+    descriptor = observed_descriptor(dataset=dataset)
+    descriptor.update(endpoint_id=endpoint, source_uri=uri)
+    descriptor["admission"]["publication"].update(
+        published_at=f"2026-10-{day:02}T12:00:00+00:00", claimed_resource_count=resource_count
+    )
+    digest = catalog_observation_descriptor_digest(descriptor)
+    descriptor.update(
+        accepted_receipt_id=f"registry-fhir-catalog-observation-v1:{digest}", accepted_receipt_sha256=digest
+    )
+    return descriptor
+
+
+def test_latest_complete_edition_wins_across_registrations_without_merging_distinct_paths():
+    old = edition("old", "endpoint-old", "https://Directory.example.test/tenant", 1, 10)
+    new = edition("new", "endpoint-new", "https://directory.example.test/tenant/", 2, 20)
+    same_date_smaller = edition("smaller", "endpoint-z", "https://directory.example.test/tenant", 2, 15)
+    other = edition("other", "endpoint-other", "https://directory.example.test/other", 1, 10)
+    without_url = edition("no-url", "endpoint-missing-url", None, 1, 10)
+    unfinished_edition = edition("incomplete", "endpoint-incomplete", new["source_uri"], 3, 25)
+    unfinished_edition["complete"] = False
+    current, carried = inventory.select_fhir_editions(
+        [old, new, same_date_smaller, other, without_url, unfinished_edition], [old]
+    )
+    assert {source["endpoint_id"] for source in current} == {"endpoint-new", "endpoint-other", "endpoint-missing-url"}
+    assert not carried
+    current, carried = inventory.select_fhir_editions([old, other], [old, new])
+    assert current == [other]
+    assert carried == [new]
+
+    observed = SimpleNamespace(fhir_descriptors=(new, other, without_url), carried_fhir_descriptors=())
+    dispositions = [
+        SimpleNamespace(descriptor=descriptor) for descriptor in (old, new, same_date_smaller, other, without_url)
+    ]
+    selected = catalog_preparation.select_preparation_fhir_sources(observed, dispositions)
+    assert {source.descriptor["endpoint_id"] for source in selected} == {
+        "endpoint-new",
+        "endpoint-other",
+        "endpoint-missing-url",
+    }
+
+
+def test_current_feed_retires_typed_predecessor_from_a_different_registration():
+    previous = _recipe()
+    descriptor = previous.source_pin.catalog_descriptor
+    winner = edition("winner", "another-registration", descriptor["source_uri"], 2, 20)
+    observed = SimpleNamespace(fhir_descriptors=(winner,), carried_fhir_descriptors=(), superseded_fhir_endpoints=())
+    assert inventory.retained_unavailable_fhir_recipes([previous], observed) == ()
+
+
+@pytest.mark.asyncio
+async def test_catalog_retains_one_copy_of_the_latest_complete_edition_if_unavailable():
+    uri = "https://directory.example.test/tenant"
+    old = edition("old", "endpoint-old", uri, 1, 10)
+    latest = edition("latest", "endpoint-new", uri, 2, 20)
+    observed = SimpleNamespace(
+        fhir_descriptors=(), carried_fhir_descriptors=(latest,), superseded_fhir_endpoints=("endpoint-old",)
+    )
+    descriptor_by_generation = {"old": old, "duplicate": latest, "current": latest}
+    connection = SimpleNamespace(
+        fetch=AsyncMock(
+            return_value=[
+                {"source_generation": generation, "descriptor": json.dumps(descriptor)}
+                for generation, descriptor in descriptor_by_generation.items()
+            ]
+        )
+    )
+    previous_by_field = dict(
+        schema_name="published_catalog",
+        source_vector_json=[{"source_generation": "current", "status": "current"}],
+    )
+    token = catalog_preparation._INVENTORY.set(observed)
+    try:
+        assert set(await catalog_preparation.replaced_fhir_generations(connection, previous_by_field, ())) == {
+            "old",
+            "duplicate",
+        }
+    finally:
+        catalog_preparation._INVENTORY.reset(token)
+
+
 @pytest.mark.asyncio
 async def test_inventory_reads_native_heads_and_excludes_allowed_amounts(inventory_case):
     case = inventory_case
@@ -205,12 +288,12 @@ async def test_native_catalog_preparation_returns_the_exact_input_cohort(invento
 async def test_native_catalog_preparation_refuses_reuse_after_source_discovery_changes(inventory_case, monkeypatch):
     case = inventory_case
     before = await observe(case)
-    previous_snapshot_by_field = {"accounting_json": catalog_preparation.imported_catalog_accounting(before)}
+    previous_by_field_by_field = {"accounting_json": catalog_preparation.imported_catalog_accounting(before)}
     case.ptg["edition_id"] = "successor-snapshot"
     current = await observe(case)
     assert current.token != before.token
     monkeypatch.setattr(
-        catalog_sync, "prepare_fhir_catalog_snapshot", AsyncMock(return_value=(None, previous_snapshot_by_field, {}))
+        catalog_sync, "prepare_fhir_catalog_snapshot", AsyncMock(return_value=(None, previous_by_field_by_field, {}))
     )
 
     with pytest.raises(ValueError, match="registry_imported_catalog_preparation_changed"):
@@ -350,8 +433,6 @@ async def test_catalogue_policy_change_invalidates_inventory_token(inventory_cas
 
 @pytest.mark.asyncio
 async def test_published_catalog_families_key_complete_observations_by_dataset_and_digest():
-    from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor
-
     admitted = observed_descriptor()
     incomplete_by_field = {**observed_descriptor(dataset="other-dataset"), "complete": False}
     connection = SimpleNamespace(
@@ -360,11 +441,12 @@ async def test_published_catalog_families_key_complete_observations_by_dataset_a
             return_value=[{"descriptor": json.dumps(admitted)}, {"descriptor": json.dumps(incomplete_by_field)}]
         ),
     )
-    families_by_dataset = await inventory.published_catalog_families(connection, "registry")
+    descriptors = await inventory._serving_catalog_observations(connection, "registry")
     key = (admitted["coordinates"]["dataset_id"], admitted["dataset_sha256"])
-    assert families_by_dataset == {key: admitted["admission"]["families"]}
+    assert inventory._catalog_families(descriptors) == {key: admitted["admission"]["families"]}
+    assert "network_serving_control" in connection.fetchval.call_args.args[0]
     connection.fetchval.return_value = None
-    assert await inventory.published_catalog_families(connection, "registry") == {}
+    assert await inventory._serving_catalog_observations(connection, "registry") == ()
 
 
 @pytest.mark.asyncio
