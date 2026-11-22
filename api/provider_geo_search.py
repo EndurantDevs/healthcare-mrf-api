@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_geo_search import (
+    ENTITY_TYPE_COLUMN,
     LAYOUT,
     LEGACY_LAYOUT,
     LEGACY_SEARCH_COLUMNS,
@@ -19,6 +20,7 @@ from process.provider_geo_search import (
     SEARCH_COLUMNS,
     STATE_TABLE,
     TABLE_NAME_PATTERN,
+    geo_entity_type_column_available,
     input_keys_sql,
 )
 
@@ -33,6 +35,7 @@ class ProviderGeoSearch:
 
     table_sql: str
     layout: int = LAYOUT
+    has_entity_type_code: bool = False
 
 
 async def current_provider_geo_search(connection, schema: str, *, include_service_locations: bool):
@@ -55,15 +58,16 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
     if not readable_rows or readable_rows[0][0] is not True:
         return None
     address_sql, npi_sql = input_keys_sql(schema)
+    relation = "to_regclass(format('%I.%I', CAST(:schema AS text), s.table_name))"
     current_rows = await connection.all(
         text(
             f"""SELECT s.table_name, s.layout,
                        s.layout IN (:layout, :legacy_layout)
                        AND s.include_service_locations = :include_service_locations
                        AND s.address_input = ({address_sql}) AND s.npi_input = ({npi_sql})
-                       AND COALESCE(has_table_privilege(
-                           to_regclass(format('%I.%I', CAST(:schema AS text), s.table_name)), 'SELECT'), false)
-                       AS is_fresh
+                       AND COALESCE(has_table_privilege({relation}, 'SELECT'), false)
+                       AS is_fresh,
+                       {geo_entity_type_column_available(relation)} AS has_entity_type_code
                   FROM {state} AS s
                  WHERE s.is_current"""
         ),
@@ -74,7 +78,7 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
     )
     if not current_rows:
         return None
-    table_name, layout, is_fresh = current_rows[0]
+    table_name, layout, is_fresh, has_entity_type_code = current_rows[0]
     if not is_fresh:
         if table_name not in _stale_tables_logged:
             _stale_tables_logged.add(table_name)
@@ -84,7 +88,9 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
         return None
     if not isinstance(table_name, str) or not TABLE_NAME_PATTERN.fullmatch(table_name):
         raise ValueError("provider_geo_search_table_invalid")
-    return ProviderGeoSearch(f"{storage_identifier(schema)}.{table_name}", layout)
+    return ProviderGeoSearch(
+        f"{storage_identifier(schema)}.{table_name}", layout, layout == LAYOUT and has_entity_type_code
+    )
 
 
 def provider_geo_search_sql(search: ProviderGeoSearch | None, *clauses: str) -> str | None:
@@ -93,6 +99,8 @@ def provider_geo_search_sql(search: ProviderGeoSearch | None, *clauses: str) -> 
         return None
     used_columns = {quoted or unquoted.lower() for quoted, unquoted in _COLUMN_REFERENCE.findall(" ".join(clauses))}
     available_columns = SEARCH_COLUMNS if search.layout == LAYOUT else LEGACY_SEARCH_COLUMNS
+    if search.has_entity_type_code:
+        available_columns |= {ENTITY_TYPE_COLUMN}
     return search.table_sql if used_columns <= available_columns else None
 
 
@@ -110,9 +118,13 @@ async def request_geo_search(connection_scope, address_table_sql: str, **lookup)
 def nearby_search_fields(network_search_sql, search: ProviderGeoSearch | None, *clauses: str) -> dict[str, object]:
     """Prefer the selected-network projection, then the all-address projection, else the address table."""
     search_table_sql = None if network_search_sql else provider_geo_search_sql(search, *clauses)
-    if search_table_sql is None:
+    if search is None or search_table_sql is None:
         return {"search_table_sql": network_search_sql}
-    return {"search_table_sql": search_table_sql, "search_provider_facts": True}
+    return {
+        "search_table_sql": search_table_sql,
+        "search_provider_facts": True,
+        "search_has_entity_type_code": search.has_entity_type_code,
+    }
 
 
 @asynccontextmanager

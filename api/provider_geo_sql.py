@@ -96,6 +96,14 @@ class NearbySqlQuery:
     search_table_sql: str | None = None
     # The all-address projection bakes NPI existence, primary taxonomy and shared identities into each row.
     search_provider_facts: bool = False
+    search_has_entity_type_code: bool = False
+
+    @property
+    def search_extra_clause(self) -> str:
+        """Use the NPI fact on a projection that carries it without changing the cursor filter."""
+        if self.search_has_entity_type_code:
+            return self.extra_clause.replace(GEO_ENTITY_TYPE_PREDICATE, "a.entity_type_code = :entity_type_code")
+        return self.extra_clause
 
     def with_legacy_plan_membership(self, page_clauses: tuple[str, str] | None) -> NearbySqlQuery:
         """Keep plan membership as a boolean filter during native address deduplication."""
@@ -242,13 +250,14 @@ def _native_eligible_geo_cte(nearby: NearbySqlQuery, *, projected_plan_membershi
     center = "Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))"
     radius = ":radius * 1609.34"
     geo_source = f"{nearby.search_table_sql or nearby.address_table_sql} AS a{npi_join}"
+    extra_clause = nearby.search_extra_clause if on_search else nearby.extra_clause
     filters = f"""
        AND a.lat IS NOT NULL
        AND a.long IS NOT NULL
        AND a.address_key IS NOT NULL{taxonomy_where}
        {nearby.geo_precision_clause}
        {nearby.geo_type_clause}
-       {nearby.extra_clause}{nearby.ilike_clause}"""
+       {extra_clause}{nearby.ilike_clause}"""
     preceding_ctes = ""
     if projected_plan_membership is not None:
         if not on_search or not nearby.search_provider_facts:
@@ -630,13 +639,14 @@ SELECT COUNT(DISTINCT (npi, address_key)) AS total_count
  WHERE npi IN ({plan_member_sql});"""
 
 
+GEO_ENTITY_TYPE_PREDICATE = "d.entity_type_code = :entity_type_code"
 _LIVE_NPI_SOURCE = ("d.npi", "\n      JOIN mrf.npi AS d ON d.npi = a.npi")
 _PROVIDER_COLUMN = re.compile(r"(?<![\w.])d\s*\.")
 
 
 def _search_npi_source(nearby: NearbySqlQuery) -> tuple[str, str]:
     """Skip the provider join when the search rows already prove NPI existence and no provider column is used."""
-    if nearby.search_provider_facts and not _PROVIDER_COLUMN.search(nearby.extra_clause + nearby.ilike_clause):
+    if nearby.search_provider_facts and not _PROVIDER_COLUMN.search(nearby.search_extra_clause + nearby.ilike_clause):
         return "a.npi", ""
     return _LIVE_NPI_SOURCE
 
@@ -651,7 +661,7 @@ def _search_geo_predicates(nearby: NearbySqlQuery, taxonomy_where: str) -> str:
    AND a.address_key IS NOT NULL{taxonomy_where}
    {nearby.geo_precision_clause}
    {nearby.geo_type_clause}
-   {nearby.extra_clause}{nearby.ilike_clause}"""
+   {nearby.search_extra_clause}{nearby.ilike_clause}"""
 
 
 def _native_search_page(nearby: NearbySqlQuery) -> str:

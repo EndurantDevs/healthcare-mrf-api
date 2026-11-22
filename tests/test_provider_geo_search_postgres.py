@@ -136,6 +136,7 @@ def _query(search: ProviderGeoSearch | None, **options) -> NearbySqlQuery:
         geo_type_clause=_TYPE_CLAUSE,
         search_table_sql=search.table_sql if search else None,
         search_provider_facts=search is not None,
+        search_has_entity_type_code=bool(search and search.has_entity_type_code),
     )
 
 
@@ -158,6 +159,7 @@ async def _answers(read, search, parameters, **options):
 
 @pytest.mark.asyncio
 async def test_projection_answers_exactly_like_the_address_table(geo_db):
+    """Compare exact totals and ordered office identities across both storage paths."""
     first_build = await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True)
     assert first_build["status"] == "published" and first_build["generation"] == 1
     assert await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True) == {
@@ -171,7 +173,7 @@ async def test_projection_answers_exactly_like_the_address_table(geo_db):
     async with geo_db.engine.connect() as connection:
         read = _ReadConnection(connection)
         search = await _lookup(read)
-        assert search == ProviderGeoSearch('"mrf".provider_geo_search_g1')
+        assert search == ProviderGeoSearch('"mrf".provider_geo_search_g1', has_entity_type_code=True)
         shared_rows = await geo_db.connection.fetch(
             "SELECT npi, state_name FROM mrf.provider_geo_search_g1 WHERE shares_identity ORDER BY state_name"
         )
@@ -205,6 +207,44 @@ async def test_projection_answers_exactly_like_the_address_table(geo_db):
             projected_answers = await _answers(read, search, parameters_by_name, **options)
             assert projected_answers == live_answers, (parameters_by_name, options)
             assert live_answers[0] > 0 or "General Practice" in str(parameters_by_name)
+
+
+@pytest.mark.asyncio
+async def test_prior_layout_four_remains_readable_until_same_input_rebuild(geo_db):
+    """Preserve entity-filtered results while refreshing an earlier layout from the same inputs."""
+    await geo_db.connection.execute(
+        "UPDATE mrf.npi SET entity_type_code = CASE WHEN npi IN (2, 3, 8, 9, 12) THEN 2 "
+        "WHEN npi = 4 THEN NULL ELSE 1 END"
+    )
+    await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True)
+    await geo_db.connection.execute("ALTER TABLE mrf.provider_geo_search_g1 DROP COLUMN entity_type_code")
+    parameters_by_name = {
+        **_CHICAGO,
+        "radius": 10.0,
+        "entity_type_code": 2,
+        "codes": ["207Q00000X", "208D00000X", "363L00000X"],
+    }
+    options_by_name = {
+        "taxonomy_conditions": "code = ANY(:codes)",
+        "primary_only": True,
+        "extra_clause": "\n AND d.entity_type_code = :entity_type_code",
+    }
+    async with geo_db.engine.connect() as connection:
+        read = _ReadConnection(connection)
+        prior = await _lookup(read)
+        assert prior == ProviderGeoSearch('"mrf".provider_geo_search_g1')
+        expected = await _answers(read, None, parameters_by_name, **options_by_name)
+        assert 0 < expected[0] == len(expected[1])
+        assert await _answers(read, prior, parameters_by_name, **options_by_name) == expected
+
+    build = await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True)
+    assert build["status"] == "published" and build["generation"] == 2
+    assert await geo_db.connection.fetchval("SELECT to_regclass('mrf.provider_geo_search_g1') IS NOT NULL")
+    async with geo_db.engine.connect() as connection:
+        read = _ReadConnection(connection)
+        successor = await _lookup(read)
+        assert successor == ProviderGeoSearch('"mrf".provider_geo_search_g2', has_entity_type_code=True)
+        assert await _answers(read, successor, parameters_by_name, **options_by_name) == expected
 
 
 @pytest.mark.asyncio

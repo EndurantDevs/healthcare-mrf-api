@@ -117,7 +117,12 @@ async def test_current_generation_is_left_alone():
     assert not connection.executed('CREATE TABLE "mrf"."provider_geo_search_g')
     assert connection.statements[0][0] == "SELECT pg_advisory_lock($1)"
     assert connection.statements[-2][0] == "SELECT pg_advisory_unlock($1)"
-    assert connection.statements[-1][0].startswith("SELECT EXISTS")
+    current_sql, current_args = connection.statements[-1]
+    assert current_sql.startswith("SELECT EXISTS")
+    assert "s.layout = $2" in current_sql and current_args == (True, 4, "mrf")
+    assert "attrelid = pg_catalog.to_regclass(pg_catalog.format('%I.%I', $3::text, s.table_name))" in current_sql
+    assert "attname = 'entity_type_code'" in current_sql
+    assert "attnum > 0 AND NOT attisdropped AND atttypid = 'pg_catalog.int4'::pg_catalog.regtype" in current_sql
 
 
 @pytest.mark.asyncio
@@ -151,7 +156,13 @@ async def test_build_indexes_and_analyzes_before_switching_the_pointer():
     assert load < build < geo_index < analyze < switch
     assert "a.type IN ('primary', 'secondary')" in executed_statements[load]
     assert "a.ctid >= '(0,0)'::tid AND a.ctid < '(1,0)'::tid" in executed_statements[load]
-    assert "provider_geo_search_g3_load_npis" in executed_statements[build]
+    assert connection.executed(
+        'CREATE UNLOGGED TABLE "mrf"."provider_geo_search_g3_load_npis" (npi bigint NOT NULL, entity_type_code integer)'
+    )
+    npi_copy = connection.executed('INSERT INTO "mrf"."provider_geo_search_g3_load_npis"')
+    assert len(npi_copy) == 1 and 'SELECT d.npi, d.entity_type_code FROM "mrf"."npi" AS d' in npi_copy[0]
+    assert 'JOIN "mrf"."provider_geo_search_g3_load_npis" AS d ON d.npi = a.npi' in executed_statements[build]
+    assert "e.entity_type_code" in executed_statements[build]
     assert "entity_address_unified" not in executed_statements[build]
     assert executed_statements[load - 3 : load] == [
         "SET LOCAL lock_timeout = '1s'",
@@ -160,6 +171,7 @@ async def test_build_indexes_and_analyzes_before_switching_the_pointer():
     ]
     assert connection.executed('GRANT SELECT ON "mrf"."provider_geo_search_g3" TO "reader"')
     assert connection.executed('DROP TABLE IF EXISTS "mrf"."provider_geo_search_g1"')
+    assert not connection.executed('DROP TABLE IF EXISTS "mrf"."provider_geo_search_g2"')
     assert connection.executed("SELECT pg_advisory_xact_lock($1)")
     insert = next(
         args

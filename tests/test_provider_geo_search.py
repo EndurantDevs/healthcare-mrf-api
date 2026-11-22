@@ -69,6 +69,27 @@ def test_provider_predicates_keep_the_join():
     assert "FILTER (WHERE a.shares_identity)" in sql
 
 
+def test_projected_entity_type_filters_count_and_both_page_paths():
+    filter_clause = "\n AND d.entity_type_code = :entity_type_code"
+    nearby = replace(
+        _nearby(extra_clause=filter_clause, taxonomy=True, primary_only=True), search_has_entity_type_code=True
+    )
+    statements = (
+        build_native_nearby_count_sql(nearby),
+        build_native_nearby_sql(nearby, use_search_page=True).split("hydrated_geo AS")[0],
+        build_native_nearby_sql(nearby, cursor_clause="\n AND a.cursor_distance_meters > :cursor").split("page_geo AS")[
+            0
+        ],
+    )
+    for sql in statements:
+        assert "a.entity_type_code = :entity_type_code" in sql
+        assert "d.entity_type_code" not in sql and "JOIN mrf.npi AS d" not in sql
+        assert "a.taxonomy_array &&" in sql and "a.primary_taxonomy_codes &&" in sql
+    assert nearby.extra_clause == filter_clause
+    named = replace(nearby, ilike_clause="\n AND d.provider_last_name ILIKE :q")
+    assert "JOIN mrf.npi AS d" in build_native_nearby_count_sql(named)
+
+
 def test_primary_taxonomy_reads_the_projection_column_not_npi_taxonomy():
     nearby = _nearby(taxonomy=True, primary_only=True)
     count_sql = build_native_nearby_count_sql(nearby)
@@ -117,15 +138,24 @@ def test_native_zip_page_keeps_exact_postal_fallback_with_zip_prefilter():
 
 
 def test_nearby_query_prefers_the_network_projection(monkeypatch):
-    assert nearby_search_fields("(network projection)", _PROJECTION) == {"search_table_sql": "(network projection)"}
+    typed = replace(_PROJECTION, has_entity_type_code=True)
+    assert nearby_search_fields("(network projection)", typed) == {"search_table_sql": "(network projection)"}
     assert nearby_search_fields(None, _PROJECTION, "AND a.zip5 = :z") == {
         "search_table_sql": _PROJECTION.table_sql,
         "search_provider_facts": True,
+        "search_has_entity_type_code": False,
     }
     assert nearby_search_fields(None, _PROJECTION) == {
         "search_table_sql": _PROJECTION.table_sql,
         "search_provider_facts": True,
+        "search_has_entity_type_code": False,
     }
+    assert nearby_search_fields(None, typed, "AND a.entity_type_code = :type") == {
+        "search_table_sql": typed.table_sql,
+        "search_provider_facts": True,
+        "search_has_entity_type_code": True,
+    }
+    assert nearby_search_fields(None, typed, "AND a.procedures_array && :codes") == {"search_table_sql": None}
     monkeypatch.setattr(npi, "scoped_geo_search_relation_sql", lambda *_args: None)
     nearby = npi._nearby_sql_query(
         "1=1",
@@ -154,9 +184,9 @@ async def test_lookup_serves_only_a_fresh_current_generation(caplog):
     missing = _Rows([(False,)])
     assert await current_provider_geo_search(missing, "mrf", include_service_locations=True) is None
 
-    fresh = _Rows([(True,)], [("provider_geo_search_g3", provider_geo_search.LAYOUT, True)])
+    fresh = _Rows([(True,)], [("provider_geo_search_g3", provider_geo_search.LAYOUT, True, True)])
     assert await current_provider_geo_search(fresh, "mrf", include_service_locations=True) == ProviderGeoSearch(
-        '"mrf".provider_geo_search_g3'
+        '"mrf".provider_geo_search_g3', has_entity_type_code=True
     )
     guard_sql, guard_parameters = fresh.statements[1]
     assert "entity_address_result_generation" in guard_sql and "npi_result_generation" in guard_sql
@@ -172,12 +202,16 @@ async def test_lookup_serves_only_a_fresh_current_generation(caplog):
     assert "s.layout IN (:layout, :legacy_layout)" in guard_sql
     assert "has_table_privilege(" in guard_sql
 
-    legacy = _Rows([(True,)], [("provider_geo_search_g2", provider_geo_search.LEGACY_LAYOUT, True)])
+    prior = _Rows([(True,)], [("provider_geo_search_g5", provider_geo_search.LAYOUT, True, False)])
+    assert await current_provider_geo_search(prior, "mrf", include_service_locations=True) == ProviderGeoSearch(
+        '"mrf".provider_geo_search_g5'
+    )
+    legacy = _Rows([(True,)], [("provider_geo_search_g2", provider_geo_search.LEGACY_LAYOUT, True, False)])
     assert await current_provider_geo_search(legacy, "mrf", include_service_locations=True) == ProviderGeoSearch(
         '"mrf".provider_geo_search_g2', provider_geo_search.LEGACY_LAYOUT
     )
 
-    stale = _Rows([(True,)], [("provider_geo_search_g4", provider_geo_search.LAYOUT, False)])
+    stale = _Rows([(True,)], [("provider_geo_search_g4", provider_geo_search.LAYOUT, False, True)])
     assert await current_provider_geo_search(stale, "mrf", include_service_locations=True) is None
     assert "provider_geo_search_g4 is not readable for the published inputs" in caplog.text
 
@@ -189,7 +223,7 @@ async def test_lookup_serves_only_a_fresh_current_generation(caplog):
 
     with pytest.raises(ValueError, match="provider_geo_search_table_invalid"):
         await current_provider_geo_search(
-            _Rows([(True,)], [("other_table", provider_geo_search.LAYOUT, True)]),
+            _Rows([(True,)], [("other_table", provider_geo_search.LAYOUT, True, False)]),
             "mrf",
             include_service_locations=True,
         )
@@ -253,7 +287,7 @@ async def test_projection_is_looked_up_only_for_unscoped_unified_reads(monkeypat
     @asynccontextmanager
     async def connection_scope():
         opened_scopes.append(True)
-        yield _Rows([(True,)], [("provider_geo_search_g2", provider_geo_search.LAYOUT, True)])
+        yield _Rows([(True,)], [("provider_geo_search_g2", provider_geo_search.LAYOUT, True, False)])
 
     lookup_by_name = {"schema": "mrf", "include_service_locations": True}
     assert await request_geo_search(connection_scope(), "mrf.npi_address", **lookup_by_name) is None

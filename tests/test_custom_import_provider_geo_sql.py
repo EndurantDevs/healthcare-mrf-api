@@ -123,6 +123,31 @@ def test_imported_geo_builder_dedupes_before_ordering_and_uses_typed_binds(direc
     assert set(context.compiled.values) <= set(statements.page._bindparams)
 
 
+def test_required_linked_geo_preserves_projected_entity_filter_when_composing_membership():
+    predicate = geo_sql.GEO_ENTITY_TYPE_PREDICATE
+    query = _imported_geo_query(
+        native_parameters={"in_long": 0.0, "in_lat": 0.0, "radius": 10.0, "entity_type_code": 2}
+    )
+    nearby = replace(
+        query.nearby,
+        extra_clause=f"\n AND {predicate}",
+        search_table_sql="mrf.fixture_geo_projection",
+        search_provider_facts=True,
+        search_has_entity_type_code=True,
+    )
+    statements = geo_sql.build_imported_geo_statements(
+        _context(require_match=True),
+        replace(query, nearby=nearby),
+        plan_member_sql="SELECT npi FROM mrf.fixture_plan_members",
+        extra_filters=(predicate,),
+    )
+    for statement in (statements.count, statements.page):
+        bounding = str(statement).split("native_eligible_geo AS")[0]
+        assert "a.entity_type_code = :entity_type_code" in bounding
+        assert predicate not in bounding and "JOIN mrf.npi AS d" not in bounding
+        assert "a.npi IN (SELECT npi FROM plan_member_npis)" in bounding
+
+
 @pytest.mark.parametrize("direction", (None, "asc", "desc"))
 def test_imported_geo_filter_uses_one_correlated_membership_predicate(direction):
     statements = _statements(direction=direction, require_match=True)
