@@ -2,6 +2,7 @@
 """Highmark reuses the shared importer with independent tenant scopes."""
 
 import importlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
@@ -342,6 +343,88 @@ async def test_window_census_sends_only_the_exact_tenant_key(monkeypatch, tenant
     assert parse_qs(url.query) == {"_count": ["0"], "_summary": ["count"], "_total": ["accurate"]}
     assert send.await_args.kwargs["extra_headers"] == {"x-hmhs-keyId": "example-key"}
     assert send.await_args.kwargs["allow_redirects"] is False
+
+
+def _companion_checkpoints(context, resource, fault):
+    """Represent the same-root predecessor and its independently bound plan."""
+    identity_by_field = {
+        "dataset_id": context.dataset_id,
+        "source_ids": list(context.source_ids),
+        "acquisition_root_run_id": context.acquisition_root_run_id,
+        "owner_run_id": "original",
+    }
+    cursor_base = f"{BASE}/HMDE" if fault == "foreign_cursor" else context.canonical_api_base
+    predecessor_by_field = {
+        **identity_by_field,
+        "state": "superseded",
+        "resource_type": resource,
+        "next_url": None,
+        "completed_at": None,
+        "pages_processed": 4,
+        "rows_processed": 2000,
+        "start_url_hash": "d" * 64,
+        "completeness_json": {directory.highmark.RETIRED_CURSOR_KEY: f"{cursor_base}?_getpages=synthetic"},
+    }
+    if fault == "foreign_predecessor":
+        predecessor_by_field["dataset_id"] = "different-dataset"
+    return predecessor_by_field, {} if fault == "missing_successor" else identity_by_field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "missing_successor", "foreign_predecessor", "foreign_cursor"])
+async def test_retained_companion_uses_admitted_plan_and_preserves_progress(monkeypatch, tenant_sources, fault):
+    """Only the verified successor may fetch, with both kinds of progress accounted for."""
+    tenant = tenant_sources["HM"]
+    base, resource = tenant["api_base"], "InsurancePlan"
+    context = directory._pagination_checkpoint_context(
+        tenant, [tenant["source_id"]], run_id="current", retry_of_run_id="original", pagination_root_run_id="original"
+    )
+    context = replace(context, dataset_id="example-dataset", lineage_verified=True)
+    assert directory._last_updated_partition_config(tenant, resource) == (None, "resource_not_opted_in")
+    predecessor_by_field, successor_by_field = _companion_checkpoints(context, resource, fault)
+    checkpoint_fetch = AsyncMock(side_effect=[predecessor_by_field, successor_by_field])
+    fetch = AsyncMock(
+        return_value=directory._last_updated_partition_failure_result(
+            object, None, "example", pages_fetched=5, rows_fetched=500, fetch_diagnostic={"example": True}
+        )
+    )
+    monkeypatch.setattr(directory, "_fetch_pagination_checkpoint", checkpoint_fetch)
+    monkeypatch.setattr(directory, "_fetch_last_updated_partition_resource_rows", fetch)
+
+    async def scan():
+        return await directory._fetch_resource_rows(
+            tenant,
+            resource,
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=500,
+            timeout=3,
+            run_id="current",
+            pagination_checkpoint=context,
+            deferred_materialization=True,
+        )
+
+    if fault:
+        with pytest.raises(RuntimeError, match="provider_directory_highmark_companion_"):
+            await scan()
+        fetch.assert_not_awaited()
+        return
+
+    partition_result = await scan()
+    fetch.assert_awaited_once()
+    config = fetch.await_args.args[3]
+    assert config.ceiling == 4000 and config.maximum_pages_per_window == 12
+    assert directory._last_updated_window_hard_page_limit(tenant, resource, 4000) == 12
+    assert (partition_result.pages_fetched, partition_result.rows_fetched) == (9, 2500)
+    assert partition_result.fetch_diagnostic == {"example": True, "retained_ordinary_rows": 2000}
+    completed = replace(fetch.return_value, complete=True, rows_fetched=300, error=None)
+    assert directory.highmark.with_retained_companion_progress(completed, (4, 2000)).rows_fetched == 2600
+    assert directory._compatible_pagination_resume_state(predecessor_by_field, context, "d" * 64) is None
+    assert not directory._can_reset_empty_pagination_checkpoint(predecessor_by_field, context)
+    assert directory._pagination_checkpoint_scope_identity(tenant, list(context.source_ids)) == (
+        base,
+        context.source_scope_hash,
+    )
 
 
 @pytest.mark.asyncio

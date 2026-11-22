@@ -137,6 +137,27 @@ def partition_window_concurrency(directory, source_record, request_url):
     return max(1, min(8, session.connector.limit_per_host, directory._source_resource_scan_concurrency(source_record)))
 
 
+def window_hard_page_limit(directory, source_record, resource_type, expected_count):
+    """Apply the declared bound to each counted window."""
+    default_limit = min(directory._max_page_count(), max(1, expected_count))
+    config, _ = directory._last_updated_partition_config(dict(source_record), resource_type)
+    if config is not None:
+        return min(default_limit, config.maximum_pages_per_window or default_limit)
+    base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if settings := directory.highmark.companion_partition_settings(base, resource_type):
+        return min(default_limit, settings["maximum_pages_per_window"])
+    return default_limit
+
+
+async def resource_partition_config(directory, source_record, resource_type, context):
+    """Consult a retained companion only when no ordinary seed declares a partition plan."""
+    config, error = directory._last_updated_partition_config(source_record, resource_type)
+    if error == "resource_not_opted_in":
+        config, progress = await directory.highmark.admitted_companion_partition(directory, context, resource_type)
+        return config, error, progress
+    return config, error, (0, 0)
+
+
 def partition_window_slots(directory, source_record, request_url):
     """Bound fetched and uncommitted windows across one source's resource scans."""
     concurrency = partition_window_concurrency(directory, source_record, request_url)

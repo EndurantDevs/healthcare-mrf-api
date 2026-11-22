@@ -373,6 +373,108 @@ async def test_partition_successor_rejects_highmark_renewal_after_progress(case,
         await _transition(case, counts)
 
 
+def _stalled_highmark_companion_case(case, is_matching_failure):
+    """Set up a retained ordinary cursor alongside an existing role plan."""
+    counts, role_config = _rejected_highmark_case(case)
+    base = f"{directory.highmark.API_ROOT}/HM"
+    source_ids = [directory.highmark.companion_source_id(directory, base)]
+    role, ordinary = case.checkpoints
+    for checkpoint_by_field in case.checkpoints:
+        checkpoint_by_field.update(canonical_api_base=base, source_ids=source_ids)
+    for metadata in (
+        case.header["candidate_storage_json"]["identity"]["metadata"],
+        case.header["publication_metadata_json"],
+    ):
+        metadata["source_ids"] = source_ids
+    for run_record in case.runs:
+        run_record["source_ids"] = source_ids
+    pending_resources = [f"{source_ids[0]}:InsurancePlan"]
+    case.runs[0].update(
+        source_ids=source_ids,
+        pending_resources=pending_resources,
+        error_message=f"provider_directory_pagination_resume_required:{pending_resources[0]}"
+        if is_matching_failure
+        else "example",
+    )
+    role.update(
+        next_url=directory._last_updated_partition_checkpoint_payload(
+            role_config, directory._new_last_updated_partition_plan(role_config)
+        )
+    )
+    original_cursor = f"{base}?_getpages=synthetic&_getpagesoffset=500"
+    ordinary.update(state="active", completed_at=None, next_url=original_cursor)
+    return counts
+
+
+def _simulate_companion_checkpoint_write(case, ordinary):
+    """Model the single transactional write against the checkpoint fixture."""
+    execute = case.connection.execute.side_effect
+
+    async def record_atomic_write(sql, *args):
+        if "WITH retired AS" not in sql:
+            return await execute(sql, *args)
+        marker, request_base, resource, scope, root, dataset, owner, cursor, prior_rows, pages, typed, start, plan = (
+            args
+        )
+        assert (request_base, resource, scope, root, dataset, owner, cursor, prior_rows, pages) == tuple(
+            ordinary[field]
+            for field in (
+                "canonical_api_base",
+                "resource_type",
+                "source_scope_hash",
+                "acquisition_root_run_id",
+                "dataset_id",
+                "owner_run_id",
+                "next_url",
+                "rows_processed",
+                "pages_processed",
+            )
+        )
+        assert marker == directory.highmark.RETIRED_CURSOR_KEY
+        assert typed == "InsurancePlan:LastUpdatedPartition"
+        case.checkpoints.append(
+            {
+                **ordinary,
+                "resource_type": typed,
+                "start_url_hash": start,
+                "next_url": plan,
+                "completeness_json": {},
+                "pages_processed": 0,
+                "rows_processed": 0,
+            }
+        )
+        ordinary.update(state="superseded", next_url=None, completeness_json={marker: cursor})
+        return "INSERT 0 1"
+
+    case.connection.execute.side_effect = record_atomic_write
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_matching_failure", [False, True])
+async def test_highmark_companion_transition_keeps_original_checkpoint_and_rows(case, is_matching_failure):
+    """Change just the exact stalled resource and make the transition replayable."""
+    counts = _stalled_highmark_companion_case(case, is_matching_failure)
+    role, ordinary = case.checkpoints
+    original_cursor = ordinary["next_url"]
+    original_role, original_inputs = deepcopy((role, case.input_rows))
+    _simulate_companion_checkpoint_write(case, ordinary)
+    receipt = await _transition(case, counts)
+    assert receipt["rows"] == 1 and (role, case.input_rows) == (original_role, original_inputs)
+    if not is_matching_failure:
+        assert len(case.checkpoints) == 2 and ordinary["next_url"] == original_cursor
+        return
+    successor = case.checkpoints[2]
+    configuration = directory._build_partition_config(
+        directory.highmark.companion_partition_settings(ordinary["canonical_api_base"], "InsurancePlan")
+    )
+    resume = directory._last_updated_partition_resume_from_checkpoint(successor["next_url"], configuration)
+    assert configuration.ceiling == 4000 and directory.PlanStatus.COUNTING is resume.plan.status
+    assert ordinary["state"] == "superseded" and ordinary["rows_processed"] == 1
+    before_replay = deepcopy(case.checkpoints)
+    assert (await _transition(case, counts, manifest_replay=True))["already_applied"]
+    assert case.checkpoints == before_replay and case.input_rows == original_inputs
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("observed_count", "can_advance"),

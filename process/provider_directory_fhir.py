@@ -48177,17 +48177,7 @@ def _last_updated_window_hard_page_limit(
     resource_type: str,
     expected_count: int,
 ) -> int:
-    default_limit = min(_max_page_count(), max(1, expected_count))
-    partition_config, _partition_error = _last_updated_partition_config(
-        dict(source_record),
-        resource_type,
-    )
-    if partition_config is not None and partition_config.maximum_pages_per_window is not None:
-        return min(
-            default_limit,
-            partition_config.maximum_pages_per_window,
-        )
-    return default_limit
+    return time_partition.window_hard_page_limit(sys.modules[__name__], source_record, resource_type, expected_count)
 
 
 async def _fetch_last_updated_partition_window(
@@ -51391,10 +51381,12 @@ async def _fetch_resource_rows(
         isinstance(raw_partition_config, dict) and raw_partition_config.get("enabled") is True
     )
     if partition_acquisition_declared:
-        partition_config, partition_config_error = _last_updated_partition_config(source_record, resource_type)
+        partition_config, partition_config_error, retained_progress = await time_partition.resource_partition_config(
+            sys.modules[__name__], source_record, resource_type, pagination_checkpoint
+        )
         if partition_config is not None:
             _report_resource_fetch_timing(timing_progress_callback, LAST_UPDATED_PARTITION_FETCH_MODE)
-            return await _fetch_last_updated_partition_resource_rows(
+            partition_result = await _fetch_last_updated_partition_resource_rows(
                 source_record,
                 resource_type,
                 model,
@@ -51417,6 +51409,7 @@ async def _fetch_resource_rows(
                     ),
                 ),
             )
+            return highmark.with_retained_companion_progress(partition_result, retained_progress)
         if partition_config_error != "resource_not_opted_in":
             return _last_updated_partition_failure_result(
                 model,
@@ -59641,7 +59634,7 @@ async def _fetch_pagination_checkpoint(
             SELECT dataset_id, source_ids, acquisition_root_run_id, owner_run_id,
                    retry_of_run_id, start_url_hash, next_url, state,
                    pages_processed, rows_processed, recent_cursor_hashes,
-                   completeness_json, resource_type
+                   completeness_json, resource_type, completed_at
               FROM {_pagination_checkpoint_table_ref()}
              WHERE canonical_api_base = :canonical_api_base
                AND resource_type = :resource_type

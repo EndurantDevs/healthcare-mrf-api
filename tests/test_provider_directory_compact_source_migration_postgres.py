@@ -18,6 +18,7 @@ from process import provider_directory_generic_candidate as candidate_rows
 from process import provider_directory_generic_source_completion as completion
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_generic_source_storage as storage
+from process import provider_directory_partition_successor as partition_successor
 from tests.test_provider_directory_compact_intake_postgres import (
     _append_checkpoint,
     _binding,
@@ -64,6 +65,56 @@ async def _checkpoints(case):
     return await case.connection.fetch(
         "SELECT to_jsonb(c) AS checkpoint FROM source_schema.provider_directory_pagination_checkpoint c ORDER BY resource_type"
     )
+
+
+async def test_companion_successor_atomically_preserves_ordinary_inputs_and_fences_rollback(intake_case):
+    """Exercise the checkpoint conversion and conflict rollback with PostgreSQL."""
+    case = intake_case
+    await _prepare(case)
+    family = "InsurancePlan"
+    await _append_checkpoint(case, family, _rows(case, family))
+    binding = await _binding(case)
+    input_rows = await _observations(case, binding)
+    connection = case.connection
+    table = storage_relation("source_schema", "provider_directory_pagination_checkpoint")
+    base = directory.highmark.API_ROOT + "/HM"
+    cursor = base + "?_getpages=example&_getpagesoffset=500"
+    predecessor = await connection.fetchrow(
+        f"UPDATE {table} SET canonical_api_base=$1,next_url=$2,pages_processed=1,rows_processed=1 "
+        "WHERE resource_type=$3 RETURNING *",
+        base,
+        cursor,
+        family,
+    )
+    settings = directory.highmark.companion_partition_settings(base, family)
+    config = directory._build_partition_config(settings)
+    initialization = directory._last_updated_partition_initialization(family, config, base)
+    siblings = await connection.fetch(
+        f"SELECT * FROM {table} WHERE canonical_api_base<>$1 ORDER BY resource_type", base
+    )
+
+    async with connection.transaction(isolation="serializable"):
+        await partition_successor.start_verified_companion_partition(
+            connection, "source_schema", predecessor, initialization
+        )
+    original, successor = await connection.fetch(
+        f"SELECT * FROM {table} WHERE canonical_api_base=$1 ORDER BY resource_type", base
+    )
+    assert original["state"] == "superseded" and original["next_url"] is None and original["rows_processed"] == 1
+    assert json.loads(original["completeness_json"])[directory.highmark.RETIRED_CURSOR_KEY] == cursor
+    assert successor["resource_type"] == initialization.checkpoint_resource_type and successor["rows_processed"] == 0
+    assert successor["next_url"] == initialization.checkpoint_payload
+    assert dict(original)["source_scope_hash"] == dict(successor)["source_scope_hash"]
+    with pytest.raises(candidate_rows.GenericCandidateError, match="transition_companion_checkpoint_changed"):
+        async with connection.transaction(isolation="serializable"):
+            await partition_successor.start_verified_companion_partition(
+                connection, "source_schema", predecessor, initialization
+            )
+    assert (
+        await connection.fetch(f"SELECT * FROM {table} WHERE canonical_api_base<>$1 ORDER BY resource_type", base)
+        == siblings
+    )
+    assert await _observations(case, binding) == input_rows
 
 
 async def _migrate(case, **kwargs):

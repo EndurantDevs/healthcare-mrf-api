@@ -921,6 +921,12 @@ counts remain unobserved in this mode. Retry boundaries, changed checkpoint
 contracts and unsplittable windows still fail closed. These observations do not
 establish an atomic snapshot of a changing upstream directory.
 
+The named-producer successor can move a stalled Highmark companion collection
+to verified date windows of at most 4,000 resources. It keeps the original
+cursor and staged observations bound to the same candidate. Completion
+requires the existing census and both window passes to account for the
+retained observations as well as the newly fetched content.
+
 REST pagination checkpoints are keyed by canonical API base, resource type,
 source scope, and acquisition root. A direct retry may adopt only its immediate
 predecessor's row within the same root and candidate; a guarded fresh root gets
