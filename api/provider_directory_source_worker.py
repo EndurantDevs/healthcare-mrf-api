@@ -280,6 +280,18 @@ def _route_proxy_secrets(route):
     return names
 
 
+def has_fresh_source_route(source_id, endpoint_scope):
+    """Require a validated fresh route before advertising a scoped acquisition."""
+    try:
+        routes = _configured_routes()
+    except ValueError:
+        return False
+    return any(
+        route["root_run_id"] is None and route["source_id"] == source_id and route["endpoint_scope"] == endpoint_scope
+        for route in routes
+    )
+
+
 def configured_source_proxy_pool_secrets():
     """Reserve global and retained-route pools from all broad credential paths."""
     names = {os.getenv(PROXY_POOL_SECRET_ENV, "").strip()} - {""}
