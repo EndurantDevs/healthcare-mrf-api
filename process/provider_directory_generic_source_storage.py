@@ -1107,11 +1107,18 @@ async def _verify_transition_run(
     failed_run_id = identity_by_field["failed_run_id"]
     is_vsp_artifact_failure = is_empty_vsp_failure and not has_changed_header_owner and failed_run_id != root_run_id
     is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error in _RETAINED_VSP_CAPTURE_ERRORS
+    directory = import_module("process.provider_directory_fhir")
+    is_highmark_companion_source = directory.highmark.is_companion_source(directory, source_ids)
     failure_field = (
         ",error::jsonb->>'message' AS error_message"
-        if has_changed_header_owner or is_vsp_artifact_failure or is_retained_vsp_failure
+        if has_changed_header_owner
+        or is_vsp_artifact_failure
+        or is_retained_vsp_failure
+        or is_highmark_companion_source
         else ""
     )
+    if is_highmark_companion_source:
+        failure_field += ",metrics::jsonb#>'{audit,pagination_resume_required}' AS pending_resources"
     if expected_failure_error == _POSTAL_START_ERROR:
         failure_field += (
             ",error::jsonb->>'message' AS postal_error_message,"
@@ -1141,7 +1148,23 @@ async def _verify_transition_run(
         "status": run_rows[0]["status"],
         "is_empty_vsp_failure": is_empty_vsp_failure,
         "is_postal_start_failure": is_postal_start_failure,
+        "pending_highmark_resources": _transition_highmark_pending_resources(run_rows[0])
+        if is_highmark_companion_source
+        else (),
     }
+
+
+def _transition_highmark_pending_resources(run):
+    """Require the stopped result and the same durable audit to name the families."""
+    pending = _json(run["pending_resources"])
+    if (
+        run["status"] == "failed"
+        and type(pending) is list
+        and all(isinstance(entry, str) for entry in pending)
+        and run["error_message"] == "provider_directory_pagination_resume_required:" + ",".join(pending)
+    ):
+        return pending
+    return ()
 
 
 async def _read_transition_runs(connection, catalog_schema, root_run_id, failure_field):
@@ -1533,26 +1556,26 @@ async def _verify_transition_checkpoints(
     if run_evidence.get("is_postal_start_failure"):
         _require(not bulk_checkpoints, "transition_checkpoint_changed")
         _require_postal_start_checkpoint(checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids)
-        return []
+        return [], []
     if run_evidence.get("is_empty_vsp_failure"):
         _require(not (checkpoint_rows or bulk_checkpoints), "transition_checkpoint_changed")
-        return []
+        return [], []
     _require(not (checkpoint_rows and bulk_checkpoints), "transition_checkpoint_changed")
     if bulk_checkpoints:
         _require(not any(name.startswith("LU:") for name in expected_counts), "transition_checkpoint_changed")
         await _verify_bulk_transition_checkpoints(
             connection, policy, bulk_checkpoints, identity_by_field, expected_counts, run_evidence["ancestor_run_ids"]
         )
-        return []
+        return [], []
     from process.provider_directory_partition_successor import partition_checkpoint_renewals
 
-    renewals = await partition_checkpoint_renewals(
-        checkpoint_rows, identity_by_field, expected_counts, source_ids, run_status
+    transitions = await partition_checkpoint_renewals(
+        checkpoint_rows, identity_by_field, expected_counts, source_ids, run_evidence
     )
-    if renewals is None:
+    if transitions is None:
         _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status)
-        return []
-    return renewals
+        return [], []
+    return transitions
 
 
 def _require_postal_start_checkpoint(checkpoints, identity_by_field, expected_counts, run_status, source_ids):
@@ -1607,7 +1630,7 @@ async def _verify_transition_inputs(
         from process.provider_directory_compact_source_completion import validate_storage
 
         await validate_storage(connection, policy, candidate_by_field)
-    renewals = await _verify_transition_checkpoints(
+    renewals, companion_starts = await _verify_transition_checkpoints(
         connection,
         policy,
         identity_by_field,
@@ -1643,7 +1666,7 @@ async def _verify_transition_inputs(
     await _verify_transition_witness(
         connection, policy, candidate_by_field, dataset_id, run_evidence.get("is_empty_vsp_failure", False)
     )
-    return renewals
+    return renewals, companion_starts
 
 
 def _require_transition_census(input_rows, dataset_id, expected_counts, has_retired_observations):
@@ -1791,7 +1814,7 @@ async def _verify_stopped_candidate(
         expected_failure_error=failure_error,
     )
     _require(not is_empty_vsp_failure or run_evidence_by_field["status"] == "failed", "transition_checkpoint_changed")
-    renewals = await _verify_transition_inputs(
+    transitions = await _verify_transition_inputs(
         connection,
         policy,
         candidate_by_field,
@@ -1801,7 +1824,7 @@ async def _verify_stopped_candidate(
     )
     if any(expected_resource_counts.values()):
         await _validate_transition_payloads(connection, policy, candidate_by_field)
-    return run_evidence_by_field, renewals
+    return run_evidence_by_field, transitions
 
 
 async def transition_isolated_loading_candidate_storage(
@@ -1809,7 +1832,7 @@ async def transition_isolated_loading_candidate_storage(
 ):
     """Move one verified stopped private intake to an admin-issued successor producer."""
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
-    from process.provider_directory_partition_successor import renew_verified_partition_checkpoint
+    from process.provider_directory_partition_successor import apply_partition_transitions
 
     _require(type(manifest_replay) is bool, "transition_replay_invalid")
     _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction(), "transition_transaction_required")
@@ -1826,7 +1849,7 @@ async def transition_isolated_loading_candidate_storage(
         manifest_replay=manifest_replay,
     )
     candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate = locked_candidate
-    run_evidence_by_field, renewals = await _verify_stopped_candidate(
+    run_evidence_by_field, transitions = await _verify_stopped_candidate(
         connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
     )
     if run_evidence_by_field["is_postal_start_failure"]:
@@ -1850,10 +1873,7 @@ async def transition_isolated_loading_candidate_storage(
         previous_status,
         is_empty_vsp_failure and failure_error not in _RETAINED_VSP_CAPTURE_ERRORS,
     )
-    for _resource, checkpoint, renewed_payload, observed_count in renewals:
-        await renew_verified_partition_checkpoint(
-            connection, policy.schema, checkpoint, renewed_payload, observed_count
-        )
+    await apply_partition_transitions(connection, policy.schema, transitions)
     return {**receipt_by_field, "already_applied": is_already_applied}
 
 

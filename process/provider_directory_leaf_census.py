@@ -157,7 +157,7 @@ async def _resume_refinements(directory, resource, model, config, state):
 async def pre_census(directory, source_record, resource, model, config, state, options):
     """Count the whole endpoint, then plan disjoint leaves without a root count."""
     base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    has_reviewed_key = highmark.has_exact_role_census_key(directory, source_record, resource, base)
+    has_reviewed_key = highmark.has_exact_census_key(directory, source_record, resource, base)
     if not shared._is_unfiltered_start(
         directory, source_record, resource, state.start_url, base, has_reviewed_key=has_reviewed_key
     ):
