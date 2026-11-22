@@ -195,6 +195,7 @@ async def _retained_source(connection, source_manifest, control_schema):
             RETENTION_KEY,
             "registry_source_contributions",
             INVENTORY_DIGEST_KEY,
+            "imported_source_inventory",
         }
         and not key.startswith("initial_source_recipe_")
     }
@@ -747,15 +748,15 @@ def _bind_prepared_generations(
     inventory=None,
     *,
     retention=None,
-    catalog_generation=None,
+    catalog_bindings=None,
 ):
     """Bind current custom and prepared dependency proofs before deriving candidate identity."""
     if source_stage is None and inventory is not None:
         raise RegistryCompositionError("registry_composition_source_stage_required")
-    if catalog_generation is not None:
-        from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
-
-        generations_by_source["fhir_catalog"] = PublishedFHIRCatalogBindingScope(catalog_generation).metadata_generation
+    if catalog_bindings is not None:
+        generations_by_source["fhir_catalog"] = catalog_bindings.metadata_generation
+        if catalog_bindings.prepared_inventory_token is not None:
+            generations_by_source["imported_source_inventory"] = catalog_bindings.prepared_inventory_token
     if retention is not None:
         generations_by_source[RETENTION_KEY] = registry_source_retention_sha256(retention)
     generations_by_source.update(
@@ -1614,9 +1615,9 @@ async def _register_prepared_candidate(
         inputs.provider_receipt,
         source_stage,
         inventory,
-        catalog_generation=None
-        if inputs.source_witness_runtime is None or inputs.source_witness_runtime.catalog_bindings is None
-        else inputs.source_witness_runtime.catalog_bindings.metadata_generation,
+        catalog_bindings=None
+        if inputs.source_witness_runtime is None
+        else inputs.source_witness_runtime.catalog_bindings,
     )
     _bind_source_operation(generations_by_source, inputs.source_operation)
     copy_target = _target(

@@ -655,6 +655,10 @@ async def _prepare_preservation(
     """Keep both independent preparation paths on the same public native derivation."""
     if source_manifest is None:
         return None
+    # A full catalog rebuild composes from complete selected editions.
+    catalog = None if source_witness_runtime is None else source_witness_runtime.catalog_bindings
+    if catalog is not None and catalog.prepared_inventory_token is not None:
+        return None
     from process.registry_fhir_serving_preservation import prepare_fhir_serving_preservation
 
     request_id, expected_head, control_schema = scope

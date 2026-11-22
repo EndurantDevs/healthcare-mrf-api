@@ -6,13 +6,18 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from urllib.parse import urlsplit
 
 from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import PROJECTOR_VERSION
 from process.network_cms_registry_address_capture import native_driver
 from process.network_fhir_source_witness_contract import digest
+from process.registry_fhir_catalog_extraction import fhir_source_uri
 from process.registry_fhir_catalog_source_producer import open_source_owned_catalog_export
-from process.registry_fhir_catalog_sources import parse_fhir_catalog_source_profile
+from process.registry_fhir_catalog_sources import (
+    parse_fhir_catalog_source_profile,
+    validate_fhir_catalog_source_descriptor,
+)
 from process.registry_imported_source_reuse import graph_policy, source_edition
 
 INVENTORY_CONTRACT = "registry-imported-source-inventory-v1"
@@ -21,6 +26,46 @@ NATIVE_POLICY = "native-provider-only-networks-v1"
 MAX_SOURCES = 1000
 MAX_DEFINITIONS = 1000000
 _RUNTIME = ContextVar("registry_imported_source_inventory_runtime", default=None)
+
+
+def fhir_feed(descriptor):
+    """Identify editions of one directory feed by its registered full endpoint URL."""
+    uri = fhir_source_uri(descriptor.get("source_uri"))
+    if uri is None:
+        return descriptor["endpoint_id"]
+    parsed = urlsplit(uri)
+    return parsed._replace(netloc=parsed.netloc.lower()).geturl()
+
+
+def _edition_rank(descriptor):
+    publication = (descriptor.get("admission") or {}).get("publication", {})
+    stamp = publication.get("published_at")
+    return (
+        datetime.fromisoformat(stamp) if stamp else datetime.min.replace(tzinfo=timezone.utc),
+        publication.get("claimed_resource_count", 0),
+        descriptor["endpoint_id"],
+        descriptor["coordinates"]["dataset_id"],
+    )
+
+
+def preferred_fhir_editions(accepted):
+    """Select the latest complete publication per feed, preferring more rows on a date tie."""
+    by_feed = {}
+    for descriptor in sorted((source for source in accepted if source["complete"]), key=_edition_rank):
+        by_feed[fhir_feed(descriptor)] = descriptor
+    return list(by_feed.values())
+
+
+def select_fhir_editions(observed, previous):
+    """Prefer current input unless the feed already has a newer approved edition."""
+    retained_by_feed = {fhir_feed(descriptor): descriptor for descriptor in preferred_fhir_editions(previous)}
+    selected_editions = []
+    for descriptor in preferred_fhir_editions(observed):
+        key = fhir_feed(descriptor)
+        if key not in retained_by_feed or _edition_rank(descriptor) >= _edition_rank(retained_by_feed[key]):
+            selected_editions.append(descriptor)
+            retained_by_feed.pop(key, None)
+    return selected_editions, list(retained_by_feed.values())
 
 
 @dataclass(frozen=True)
@@ -71,18 +116,24 @@ class ImportedSourceInventory:
     def token(self):
         """Bind logical source heads, effective date and transformation policies."""
         document = self.document
+        inputs_by_field = {
+            name: document[name]
+            for name in (
+                "contract",
+                "fhir_semantics",
+                "native_sources",
+                "unavailable",
+                "effective_date",
+                "search_policy",
+                "catalog_projector_version",
+            )
+        }
         return digest(
             {
-                name: document[name]
-                for name in (
-                    "contract",
-                    "fhir_semantics",
-                    "native_sources",
-                    "unavailable",
-                    "effective_date",
-                    "search_policy",
-                    "catalog_projector_version",
-                )
+                **inputs_by_field,
+                "fhir_edition_policy": 1,
+                "carried_fhir_semantics": document.get("carried_fhir_semantics", []),
+                "superseded_fhir_endpoints": document.get("superseded_fhir_endpoints", []),
             }
         )
 
@@ -95,6 +146,16 @@ class ImportedSourceInventory:
     def native_sources(self):
         """Return current native ACA and PTG input documents."""
         return tuple(self.document["native_sources"])
+
+    @property
+    def superseded_fhir_endpoints(self):
+        """Identify duplicate registrations whose prior recipes must also leave the new generation."""
+        return tuple(self.document.get("superseded_fhir_endpoints", ()))
+
+    @property
+    def carried_fhir_descriptors(self):
+        """Keep the last approved edition of a feed if its latest input is unavailable."""
+        return tuple(self.document.get("carried_fhir_descriptors", ()))
 
 
 @dataclass(frozen=True)
@@ -162,17 +223,18 @@ async def _observe_current_inventory(runtime):
         await lock_aca_source_tables(
             connection, runtime.config.aca_source_schema, ("plan_npi_raw", "plan", "plan_networktier", "issuer")
         )
-        known = (
-            {}
+        prior = (
+            ()
             if runtime.control_schema is None
-            else await published_catalog_families(connection, runtime.control_schema)
+            else await _serving_catalog_observations(connection, runtime.control_schema)
         )
-        with known_fhir_catalog_families(known):
+        with known_fhir_catalog_families(_catalog_families(prior)):
             observed = await observe_imported_source_inventory(
                 connection,
                 config=runtime.config,
                 catalog_export=runtime.catalog_export,
                 effective_date=runtime.effective_date,
+                previous_fhir=prior,
             )
         if runtime.control_schema is None:
             return observed
@@ -185,19 +247,21 @@ async def _observe_current_inventory(runtime):
         return ImportedSourceInventory(json.dumps(document, sort_keys=True, separators=(",", ":")))
 
 
-async def published_catalog_families(connection, control_schema):
-    """Content families admitted by the latest published catalog, keyed by (dataset id, dataset sha256)."""
+async def _serving_catalog_observations(connection, control_schema):
+    """Read editions and cached families from the catalog that preparation will copy."""
+    control = storage_identifier(control_schema)
     schema = await connection.fetchval(
-        f"SELECT schema_name FROM {storage_identifier(control_schema)}.registry_fhir_catalog_snapshot "
-        "WHERE published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1"
+        f"SELECT c.schema_name FROM {control}.network_serving_control s "
+        f"JOIN {control}.registry_fhir_catalog_snapshot c USING (metadata_generation) "
+        "WHERE s.id=1 AND c.published_at IS NOT NULL"
     )
     if schema is None:
-        return {}
+        return ()
     rows = await connection.fetch(
         f"SELECT descriptor_json::text AS descriptor FROM {storage_identifier(schema)}.registry_fhir_catalog_source "
         f"WHERE profile='published_normalized' LIMIT {MAX_SOURCES + 1}"
     )
-    families_by_dataset = {}
+    descriptors = []
     for row in rows:
         descriptor = json.loads(row["descriptor"])
         admission = descriptor.get("admission")
@@ -206,10 +270,15 @@ async def published_catalog_families(connection, control_schema):
             and type(admission) is dict
             and admission.get("kind") == "catalog_observation"
         ):
-            families_by_dataset[(descriptor["coordinates"]["dataset_id"], descriptor["dataset_sha256"])] = admission[
-                "families"
-            ]
-    return families_by_dataset
+            descriptors.append(validate_fhir_catalog_source_descriptor(descriptor))
+    return tuple(descriptors)
+
+
+def _catalog_families(descriptors):
+    return {
+        (descriptor["coordinates"]["dataset_id"], descriptor["dataset_sha256"]): descriptor["admission"]["families"]
+        for descriptor in descriptors
+    }
 
 
 @asynccontextmanager
@@ -369,7 +438,9 @@ def _ptg_source_document(source_row, schema, plans_by_source):
     }
 
 
-async def observe_imported_source_inventory(connection, *, config, catalog_export, effective_date=None):
+async def observe_imported_source_inventory(
+    connection, *, config, catalog_export, effective_date=None, previous_fhir=()
+):
     """Observe complete native heads in one caller-owned repeatable read snapshot; never acquire inputs."""
     if (
         type(config) is not ImportedSourceInventoryConfig
@@ -382,7 +453,11 @@ async def observe_imported_source_inventory(connection, *, config, catalog_expor
     )
     if await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}:
         raise ValueError("registry_imported_inventory_scope_invalid")
-    descriptors, unavailable = await _fhir_inventory(connection, config, catalog_export)
+    observed, unavailable = await _fhir_inventory(connection, config, catalog_export)
+    descriptors, carried = select_fhir_editions(observed, previous_fhir)
+    superseded = {descriptor["endpoint_id"] for descriptor in (*observed, *previous_fhir)} - {
+        descriptor["endpoint_id"] for descriptor in (*descriptors, *carried)
+    }
     native = await _aca_inputs(connection, config.aca_source_schema)
     native.extend(await _ptg_inputs(connection, config.ptg_source_schema))
     keys = [source_disposition["source_id"] for source_disposition in native] + [
@@ -391,6 +466,7 @@ async def observe_imported_source_inventory(connection, *, config, catalog_expor
     if not keys or len(keys) > MAX_SOURCES or len(set(keys)) != len(keys):
         raise ValueError("registry_imported_inventory_source_bounds")
     descriptors.sort(key=lambda source_disposition: source_disposition["coordinates"]["source_id"])
+    carried.sort(key=fhir_feed)
     inventory_by_field = {
         "contract": INVENTORY_CONTRACT,
         "effective_date": effective_date
@@ -399,6 +475,9 @@ async def observe_imported_source_inventory(connection, *, config, catalog_expor
         "search_policy": "native-network-search-v1",
         "catalog_projector_version": PROJECTOR_VERSION,
         "fhir_descriptors": descriptors,
+        "carried_fhir_descriptors": carried,
+        "carried_fhir_semantics": [source_edition(descriptor) for descriptor in carried],
+        "superseded_fhir_endpoints": sorted(superseded),
         "fhir_semantics": [
             (source_edition(source_disposition), graph_policy(source_disposition["coordinates"]["source_id"]))
             for source_disposition in descriptors
@@ -416,19 +495,35 @@ async def observe_imported_source_inventory(connection, *, config, catalog_expor
 
 def retained_unavailable_fhir_recipes(previous, inventory):
     """Retain unavailable or unknown predecessors; only an accepted replacement retires their input."""
-    from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+    from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_physical_source
     from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 
-    current_endpoints = {source["endpoint_id"] for source in inventory.fhir_descriptors}
-    current_source_ids = {source["coordinates"]["source_id"] for source in inventory.fhir_descriptors}
+    current_endpoints = {descriptor["endpoint_id"] for descriptor in inventory.fhir_descriptors}
+    current_endpoints.update(inventory.superseded_fhir_endpoints)
+    current_source_ids = {descriptor["coordinates"]["source_id"] for descriptor in inventory.fhir_descriptors}
+    current_feeds = {fhir_feed(descriptor) for descriptor in inventory.fhir_descriptors}
+    carried_by_feed = {fhir_feed(descriptor): descriptor for descriptor in inventory.carried_fhir_descriptors}
+    carried_by_endpoint = {descriptor["endpoint_id"]: descriptor for descriptor in carried_by_feed.values()}
     retained_recipes = []
     for recipe in previous:
         pin = recipe.source_pin
         if type(pin) is PinnedTypedFHIRMembershipSource:
-            endpoint_id = pin.catalog_descriptor["endpoint_id"]
-            source_id = pin.catalog_descriptor["coordinates"]["source_id"]
+            descriptor = pin.catalog_descriptor
+            feed = fhir_feed(descriptor)
+            if feed in current_feeds:
+                continue
+            endpoint_id = descriptor["endpoint_id"]
+            source_id = descriptor["coordinates"]["source_id"]
+            if feed in carried_by_feed and source_edition(descriptor) != source_edition(carried_by_feed[feed]):
+                continue
         elif type(pin) is PinnedFHIRMembershipSource:
             endpoint_id, source_id = pin.endpoint_id, pin.source_id
+            if (
+                endpoint_id in carried_by_endpoint
+                and fhir_physical_source(pin).dataset_id
+                != carried_by_endpoint[endpoint_id]["coordinates"]["dataset_id"]
+            ):
+                continue
         else:
             continue
         if source_id not in current_source_ids and endpoint_id not in current_endpoints:

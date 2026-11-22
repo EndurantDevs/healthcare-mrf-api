@@ -113,6 +113,34 @@ def test_preservation_receipt_requires_both_report_and_scope():
             verify_fhir_serving_preservation(candidate_by_field | {field: {}})
 
 
+@pytest.mark.asyncio
+async def test_full_import_uses_selected_editions_without_predecessor_carry(monkeypatch):
+    from process import registry_fhir_serving_preservation as preservation
+    from process.registry_composition_addresses import _prepare_preservation
+    from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
+
+    catalog = PublishedFHIRCatalogBindingScope("a" * 64, "b" * 64)
+    runtime = SimpleNamespace(catalog_bindings=catalog)
+    candidate_by_field = {
+        "source_generations": {
+            "fhir_catalog": catalog.metadata_generation,
+            "imported_source_inventory": catalog.prepared_inventory_token,
+        },
+        "expected_head": 4,
+        "validation_json": {},
+    }
+    assert (
+        await _prepare_preservation(object(), object(), (), 0, (uuid4(), 4, "registry"), source_witness_runtime=runtime)
+        is None
+    )
+    assert await fhir_preservation_obligation(object(), candidate_by_field, control_schema="registry") is None
+    prepare = AsyncMock()
+    monkeypatch.setattr(preservation, "prepare_fhir_serving_preservation", prepare)
+    runtime.catalog_bindings = PublishedFHIRCatalogBindingScope(catalog.metadata_generation)
+    await _prepare_preservation(object(), object(), (), 0, (uuid4(), 4, "registry"), source_witness_runtime=runtime)
+    prepare.assert_awaited_once()
+
+
 def test_vector_preserves_exact_endpoint_slots_and_all_untouched_recipes():
     first, second = recipe(), recipe("one", "endpoint-two")
     successor = recipe("two")
@@ -218,7 +246,10 @@ async def test_reviewed_pre_fhir_target_sets_historical_obligation_baseline(monk
     candidate_by_field = {
         "expected_head": 2,
         "approved_custom_revision": 3,
-        "source_generations": {"retained_network_source": historical.manifest_sha256},
+        "source_generations": {
+            "retained_network_source": historical.manifest_sha256,
+            "fhir_catalog": "d" * 64,
+        },
         "validation_json": {},
         "source_recipes_json": [],
     }

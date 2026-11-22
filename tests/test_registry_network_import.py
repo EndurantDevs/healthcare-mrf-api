@@ -117,6 +117,8 @@ async def test_imported_refresh_preserves_unavailable_predecessor_recipes(
     prepared = object()
     inventory = SimpleNamespace(
         fhir_descriptors=(previous.source_pin.catalog_descriptor,) if has_replacement else (),
+        carried_fhir_descriptors=(),
+        superseded_fhir_endpoints=(),
         native_sources=(),
     )
     monkeypatch.setattr(inventory_module, "current_imported_source_inventory", AsyncMock(return_value=inventory))
