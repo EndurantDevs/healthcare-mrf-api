@@ -10,7 +10,7 @@ import json
 import urllib.parse
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
@@ -153,6 +153,58 @@ def partition_window_slots(directory, source_record, request_url):
     if key not in slots:
         slots[key] = asyncio.BoundedSemaphore(concurrency)
     return slots[key]
+
+
+async def _fetch_partition_count_pair(directory, source_record, config, state, options, windows, slots):
+    """Read two disjoint windows with the normal HTTP pacing and bounded window permits."""
+
+    async def fetch(window):
+        """Hold one shared permit through the normal count transport."""
+        async with slots:
+            return await directory._fetch_last_updated_partition_count(
+                source_record,
+                directory._last_updated_partition_count_url(state, config, window),
+                timeout=options.timeout,
+                deadline_at=state.deadline_at,
+            )
+
+    observations = await asyncio.gather(*(fetch(window) for window in windows), return_exceptions=True)
+    for observation in observations:
+        if isinstance(observation, BaseException):
+            raise observation
+    retry_not_before = max((item.retry_not_before for item in observations if item.retry_not_before), default=None)
+    # Commit successful siblings before yielding a retry. Keep the later source retry fence if both failed.
+    return sorted(
+        (
+            (window, replace(item, retry_not_before=retry_not_before) if item.transient else item)
+            for window, item in zip(windows, observations, strict=True)
+        ),
+        key=lambda pair: pair[1].transient,
+    )
+
+
+async def observe_partition_counts(directory, source_record, resource_type, model, config, state, options):
+    """Resolve exact leaf counts while committing all plan changes through one checkpoint owner."""
+    slots = None
+    if state.context.canonical_api_base == bcbs_minnesota.API_BASE and options.window_concurrency > 1:
+        slots = partition_window_slots(directory, source_record, state.start_url)
+    while pending := state.plan.pending_count_windows():
+        if state.deadline_at is not None and directory._last_updated_partition_monotonic() >= state.deadline_at:
+            return await directory._saved_partition_retry_result(
+                model, resource_type, config, state, "deadline_reached", deadline_reached=True
+            )
+        counts = (
+            await _fetch_partition_count_pair(directory, source_record, config, state, options, pending[:2], slots)
+            if slots is not None and len(pending) >= 2
+            else (None,)
+        )
+        for fetched in counts:
+            failure = await directory._observe_next_partition_count(
+                source_record, resource_type, model, config, state, options, fetched=fetched
+            )
+            if failure is not None:
+                return failure
+    return await directory._reconcile_partition_leaf_counts(resource_type, model, config, state)
 
 
 def _pending_partition_windows(plan):
