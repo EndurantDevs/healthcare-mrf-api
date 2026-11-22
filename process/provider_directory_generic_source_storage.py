@@ -367,9 +367,38 @@ def _validate_binding_tables(binding_by_field, identity):
     _require(len(set(names)) == len(names), "table_binding_changed")
 
 
+HANDOFF_METADATA_PROJECTION = (
+    "CASE WHEN (d.publication_metadata_json->'import_completion') IS NOT NULL "
+    "THEN jsonb_build_object('import_completion',d.publication_metadata_json->'import_completion') "
+    "END AS publication_metadata_json"
+)
+
+
+def handoff_header(header):
+    """Bind optional partial acceptance into the same logical handoff as its data."""
+    admission_by_field = {field: header[field] for field in HANDOFF_HEADER_FIELDS}
+    metadata = _json(header.get("publication_metadata_json"))
+    if isinstance(metadata, dict) and "import_completion" in metadata:
+        admission_by_field["import_completion"] = metadata["import_completion"]
+    return admission_by_field
+
+
 def validate_handoff_header(seal):
     """Keep complete content/completion evidence for revalidation after writer closure."""
-    _require(type(seal) is dict and set(seal) == set(HANDOFF_HEADER_FIELDS), "admission_changed")
+    _require(
+        type(seal) is dict and set(seal) in (set(HANDOFF_HEADER_FIELDS), {*HANDOFF_HEADER_FIELDS, "import_completion"}),
+        "admission_changed",
+    )
+    if "import_completion" in seal:
+        from process.import_completion_policy import validate_completion_receipt
+
+        receipt = seal["import_completion"]
+        _require(type(receipt) is dict and isinstance(receipt.get("request"), dict), "admission_changed")
+        validate_completion_receipt(
+            receipt,
+            retained_counts=receipt["request"].get("retained_counts"),
+            content_hash=seal["dataset_hash"],
+        )
     from process.provider_directory_fhir_subset_canonical import SERVER_ISSUED_SUBSET_REQUIRED_VERSION
 
     completion_version, completion_hash = seal["completion_proof_required_version"], seal["completion_proof_sha256"]
@@ -404,7 +433,10 @@ def validate_handoff_completion(header):
     """Apply the two legacy callable CHECKs without installing them on private heaps."""
     from process.provider_directory_fhir_subset_canonical import validate_subset_completion_proof_pair
 
-    validate_handoff_header({field: header[field] for field in HANDOFF_HEADER_FIELDS})
+    validate_handoff_header(handoff_header(header))
+    from process.provider_directory_import_completion import validate_metadata
+
+    validate_metadata(header)
     _validate_handoff_recovery_completion(header)
     proof = _json(header["completion_proof_json"])
     if header["completion_proof_required_version"] is None:
@@ -423,11 +455,17 @@ def validate_handoff_completion(header):
 def _validate_handoff_recovery_completion(header):
     """Recheck compact recovery receipts against the detached header's logical scope."""
     metadata = _json(header.get("publication_metadata_json"))
+    from process.provider_directory_import_completion import validate_metadata
+
+    accepted_resources = validate_metadata(header)
     diagnostics = metadata.get("resource_diagnostics", {}) if isinstance(metadata, dict) else {}
     if not isinstance(diagnostics, dict):
         return
     for resource_type, diagnostic in diagnostics.items():
         if not isinstance(diagnostic, dict):
+            continue
+        if resource_type in accepted_resources:
+            _require(diagnostic.get("complete") is False, "completion_partial_changed")
             continue
         mode = diagnostic.get("fetch_mode")
         if not (

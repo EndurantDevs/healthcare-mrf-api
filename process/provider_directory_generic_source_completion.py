@@ -616,6 +616,22 @@ async def _validated_header(publisher, binding_by_field):
         and storage._binding_json(header["candidate_storage_json"], policy.schema) == binding_by_field,
         "validated_admission_required",
     )
+    publication_metadata = storage._json(header.get("publication_metadata_json"))
+    if isinstance(publication_metadata, dict) and "import_completion" in publication_metadata:
+        from process.provider_directory_import_completion import validate_metadata
+
+        resource = binding_by_field["tables"][storage.RESOURCE]
+        resource_count_rows = await connection.fetch(
+            f"SELECT resource_type, count(*) AS retained_count FROM {storage_relation(resource['schema'], resource['name'])} "
+            "WHERE dataset_id=$1 GROUP BY resource_type",
+            header["dataset_id"],
+        )
+        validate_metadata(
+            header,
+            retained_counts={
+                count_row["resource_type"]: count_row["retained_count"] for count_row in resource_count_rows
+            },
+        )
     return header
 
 
@@ -648,7 +664,7 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
     storage.validate_handoff_completion(header)
     identity = binding_by_field["identity"]
     _validate_handoff_acquisition(header, identity)
-    admission_by_field = {field: header[field] for field in storage.HANDOFF_HEADER_FIELDS}
+    admission_by_field = storage.handoff_header(header)
     storage.validate_handoff_header(admission_by_field)
     connection, policy = publisher.connection, publisher.policy
     await storage._verify_tables(connection, policy, binding_by_field)
@@ -815,7 +831,7 @@ async def _frozen_handoff_header(connection, policy, document):
         and header["status"] == "validated"
         and header["is_current"] is False
         and named_source_document(storage._json(header["candidate_storage_json"])) == document
-        and {key: header[key] for key in storage.HANDOFF_HEADER_FIELDS} == document["admission"]
+        and storage.handoff_header(header) == document["admission"]
         and type(metadata) is dict
         and all(metadata.get(key) == expected_fact for key, expected_fact in identity["metadata"].items()),
         "header_snapshot_changed",
@@ -872,6 +888,9 @@ async def _frozen_content_proof(connection, directory, policy, document, header)
     )
     for field in ("dataset_hash", "resource_count", "resource_hashes", "resource_counts"):
         storage._require(getattr(direct, field) == getattr(stored, field), "content_proof_changed")
+    from process.provider_directory_import_completion import validate_metadata
+
+    validate_metadata(header, retained_counts=direct.resource_counts)
     storage._require(
         (direct.dataset_hash, direct.resource_count) == (header["dataset_hash"], header["resource_count"]),
         "content_proof_changed",
