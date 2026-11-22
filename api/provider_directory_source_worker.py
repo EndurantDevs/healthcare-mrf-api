@@ -390,11 +390,11 @@ def _proxy_fields(source_ids, endpoint_scope, route, *, policy=None):
 
 def is_delta_observation_launch(launch):
     """Recognize the exact nonpublication Delta source launch."""
-    from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
 
     return type(launch) is FHIRSourceWorkerLaunch and (launch.source_id, launch.endpoint_scope) == (
         SOURCE_ID,
-        SOURCE_ORIGIN,
+        SOURCE_ENDPOINT,
     )
 
 
@@ -417,7 +417,7 @@ def _is_delta_plan_mounted(spec, launch, launch_request=None):
 
 def is_delta_route_available():
     """Advertise a selected run only with a configured image and nonsecret proxy policy."""
-    from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
     from process.ext.source_http_proxy import SourceProxyError
 
     try:
@@ -426,9 +426,9 @@ def is_delta_route_available():
             for route in _configured_routes()
             if route["root_run_id"] is None
             and route["source_id"] == SOURCE_ID
-            and route["endpoint_scope"] == SOURCE_ORIGIN
+            and route["endpoint_scope"] == SOURCE_ENDPOINT
         ]
-        if len(routes) != 1 or not _proxy_fields([SOURCE_ID], SOURCE_ORIGIN, routes[0]):
+        if len(routes) != 1 or not _proxy_fields([SOURCE_ID], SOURCE_ENDPOINT, routes[0]):
             return False
         from api.control_workers import _BY_WORKER_CLASS
 
@@ -439,7 +439,7 @@ def is_delta_route_available():
             route["image"],
             secret_name=route["secret_name"],
             source_id=SOURCE_ID,
-            endpoint_scope=SOURCE_ORIGIN,
+            endpoint_scope=SOURCE_ENDPOINT,
         )
         return _is_delta_plan_mounted(_BY_WORKER_CLASS[_WORKER_CLASS], launch)
     except ValueError, SourceProxyError:
@@ -564,12 +564,12 @@ def require_fresh_ordinary_profile_launch(spec, launch_request):
 
 def _require_delta_observation_route(params, route, policy):
     """Require exact dedicated admission before accepting any Delta worker task."""
-    from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
     from process.delta_dental_directory_worker import is_delta_observation, require_observation_task
 
     if is_delta_observation(params):
         require_observation_task(params)
-        if route is None or not policy.use_proxy(SOURCE_ID, SOURCE_ORIGIN):
+        if route is None or not policy.use_proxy(SOURCE_ID, SOURCE_ENDPOINT):
             raise ValueError("delta_dental_finder_source_proxy_required")
 
 
@@ -1163,7 +1163,7 @@ def _is_fhir_secret_scope(selection, worker_class):
 def is_observation_secret_allowed(selection, launch):
     """Allow only trusted, purpose-scoped connection selectors for observation jobs."""
     if not is_delta_observation_launch(launch):
-        return True
+        return "observationConnection" not in selection
     if selection.get("purposes") != [PURPOSE] or selection.get("optional", False) is not False:
         return False
     if selection.get("sourceProxyPool") is True:
@@ -1200,6 +1200,18 @@ def is_fhir_source_volume_selected(selection, worker_class, launch):
         and type(launch) in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch)
         and _is_launch_secret_selected(selection, launch)
     )
+
+
+def is_worker_secret_volume_allowed(selection, worker_class, launch):
+    """Keep Delta mounts on the selected plan and preserve ordinary mount selection."""
+    if is_delta_observation_launch(launch):
+        from process.delta_dental_directory_worker import MANIFEST_PATH
+
+        name = str(selection.get("secretName") or selection.get("secret_name") or "").strip()
+        path = str(selection.get("mountPath") or selection.get("mount_path") or "").strip()
+        if name != launch.secret_name or path != MANIFEST_PATH or "purposes" not in selection:
+            return False
+    return "purposes" not in selection or is_fhir_source_volume_selected(selection, worker_class, launch)
 
 
 def is_fhir_source_job_matching(job, launch, launch_request=None):

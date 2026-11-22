@@ -15,8 +15,8 @@ from api.provider_directory_rooted_fhir_publication import (
 )
 from api.provider_directory_source_worker import is_delta_route_available
 from process import provider_directory_profile as profile_artifact
-from process.delta_dental_directory_browser import SOURCE_ID as DELTA_DENTAL_SOURCE_ID
-from process.delta_dental_directory_browser import SOURCE_ORIGIN as DELTA_DENTAL_ORIGIN
+from process.delta_dental_directory_json import SOURCE_ENDPOINT as DELTA_DENTAL_ENDPOINT
+from process.delta_dental_directory_json import SOURCE_ID as DELTA_DENTAL_SOURCE_ID
 from process.provider_directory_publication_catalog_authority import (
     canonical_manifest_digest,
 )
@@ -136,7 +136,7 @@ def _append_observation_entries(items, observations):
         or entry["entry_id"] != "delta-dental-provider-directory"
         or entry["owner_id"] != "delta-dental"
         or entry["source_ids"] != [DELTA_DENTAL_SOURCE_ID]
-        or entry["canonical_base"] != DELTA_DENTAL_ORIGIN
+        or entry["canonical_base"] != DELTA_DENTAL_ENDPOINT
         or entry["classification"] != "observation"
         or entry["resources"] != []
         or entry["resource_profile"] is not None

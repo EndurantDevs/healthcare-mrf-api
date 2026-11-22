@@ -11,7 +11,7 @@
       "display_name": "Delta Dental National Dentist Finder",
       "owner_id": "delta-dental",
       "source_ids": ["delta-dental-national-finder"],
-      "canonical_base": "https://www.deltadental.com",
+      "canonical_base": "https://portal.deltadental.com/portal/api/v1/providers/dentistSearch",
       "classification": "observation",
       "resource_profile": null,
       "resources": [],

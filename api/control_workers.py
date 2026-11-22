@@ -1454,6 +1454,8 @@ def _worker_source_policy_container(container_dict, volumes, fhir_source_launch)
             or "value" not in entry
             or _is_worker_policy_path_mounted(entry["value"], volumes)
         ]
+    if provider_directory_source_worker.is_delta_observation_launch(fhir_source_launch):
+        container_dict["env"].append({"name": "HLTHPRT_IMPORT_STATUS_EVENT_URL", "value": ""})
     return container_dict
 
 
@@ -1947,11 +1949,11 @@ def _worker_job_secret_volumes(
             and not _is_admitted_importer_selected(mount_spec, spec.worker_class, launch_request)
         ):
             continue
-        secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
-        if "purposes" in mount_spec and not provider_directory_source_worker.is_fhir_source_volume_selected(
+        if not provider_directory_source_worker.is_worker_secret_volume_allowed(
             mount_spec, spec.worker_class, fhir_source_launch
         ):
             continue
+        secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
         mount_path = str(mount_spec.get("mountPath") or mount_spec.get("mount_path") or "").strip()
         if not secret_name or not mount_path:
             continue
