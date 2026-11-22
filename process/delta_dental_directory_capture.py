@@ -1,11 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Retain raw Delta Dental finder pages and assess the observed search window."""
 
+import asyncio
 import json
 import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from contextlib import closing
+from contextlib import aclosing, closing
 from dataclasses import dataclass
 from os import O_CREAT, O_EXCL, O_WRONLY, close
 from os import open as open_file
@@ -30,6 +31,7 @@ FINDER_RADII = frozenset({0.5, 1, 5, 10, 15, 20, 30, 50, 100})
 PAGE_SIZE = 50
 RESULT_CAP = 100
 MAX_PAGE_BYTES = 8 * 1024 * 1024
+DEFAULT_REQUEST_BUDGET = 100_000
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,9 @@ class FinderCapturePlan:
     plan_id: str | None = None
     resume: bool = False
     allow_unstarted_resume: bool = False
+    concurrency: int = 1
+    requests_per_second: float | None = None
+    max_origin_requests: int = DEFAULT_REQUEST_BUDGET
 
 
 class FinderPaginationUnresolved(ValueError):
@@ -152,18 +157,44 @@ def validate_finder_page(page, search, number, total=None):
         raise ValueError("delta_dental_finder_page_count_mismatch")
 
 
-async def _acquire_page(connection, search, number, previous_page, fetch_page, parse_page):
+async def _acquire_page(connection, search, number, previous_page, fetch_page, parse_page, journal):
     """Reuse exact bytes or persist a newly obtained page before parsing it."""
     key = (search.selector, search.zip_code, search.radius_miles, number)
     stored = connection.execute(
         "SELECT body FROM finder_page WHERE selector=? AND zip_code=? AND radius=? AND page=?", key
     ).fetchone()
-    raw = stored[0] if stored else await fetch_page(search, number, previous_page)
+    if stored:
+        raw = stored[0]
+    elif journal:
+        if connection.execute(
+            "SELECT 1 FROM finder_attempt WHERE selector=? AND zip_code=? AND radius=? AND page=?", key
+        ).fetchone():
+            raise FinderPaginationUnresolved("finder_request_outcome_uncertain")
+
+        def start_attempt():
+            """Journal a request before the transport starts it."""
+            with connection:
+                connection.execute("INSERT INTO finder_attempt VALUES (?, ?, ?, ?)", key)
+
+        def allow_retry():
+            """Clear a rejected attempt after its publisher hold is durable."""
+            with connection:
+                connection.execute(
+                    "DELETE FROM finder_attempt WHERE selector=? AND zip_code=? AND radius=? AND page=?", key
+                )
+
+        raw = await fetch_page(search, number, previous_page, start_attempt=start_attempt, allow_retry=allow_retry)
+    else:
+        raw = await fetch_page(search, number, previous_page)
     if type(raw) is not bytes or not 0 < len(raw) <= MAX_PAGE_BYTES:
         raise ValueError("delta_dental_finder_page_size_invalid")
     if stored is None:
         with connection:
             connection.execute("INSERT INTO finder_page VALUES (?, ?, ?, ?, ?)", (*key, raw))
+            if journal:
+                connection.execute(
+                    "DELETE FROM finder_attempt WHERE selector=? AND zip_code=? AND radius=? AND page=?", key
+                )
     page = parse_page(raw, search, number)
     validate_finder_page(page, search, number, previous_page.displayed_total if previous_page else None)
     return page, int(stored is not None)
@@ -224,13 +255,18 @@ def _bind_search_plan(connection, plan_id, plan, *, resume, allow_unstarted_resu
         connection.execute("INSERT INTO finder_plan VALUES (?, ?)", (plan_id, plan))
 
 
-def _record_window_gap(connection, key, gap):
+def _record_window_gap(connection, key, gap, *, page, journal):
     """Preserve a terminal gap so future runs do not repeat the same request."""
     with connection:
         connection.execute("INSERT INTO finder_gap VALUES (?, ?, ?, ?)", (*key, gap))
+        if journal and gap == "finder_search_rejected":
+            connection.execute(
+                "DELETE FROM finder_attempt WHERE selector=? AND zip_code=? AND radius=? AND page=?",
+                (*key, page),
+            )
 
 
-async def _window_pages(connection, search, fetch_page, parse_page):
+async def _window_pages(connection, search, fetch_page, parse_page, *, journal):
     """Advance only within the activated scoped search window."""
     key = (search.selector, search.zip_code, search.radius_miles)
     blocked = connection.execute(
@@ -245,18 +281,18 @@ async def _window_pages(connection, search, fetch_page, parse_page):
     ):
         return FinderWindow(search, (), frozenset({blocked[0]}), 0)
     try:
-        first, cached = await _acquire_page(connection, search, 1, None, fetch_page, parse_page)
+        first, cached = await _acquire_page(connection, search, 1, None, fetch_page, parse_page, journal)
     except FinderPaginationUnresolved as error:
-        _record_window_gap(connection, key, str(error))
+        _record_window_gap(connection, key, str(error), page=1, journal=journal)
         return FinderWindow(search, (), frozenset({str(error)}), 0)
     if first.single_response or first.displayed_total <= PAGE_SIZE:
         return _window(search, [first], cached, None)
     if blocked is not None:
         return _window(search, [first], cached, blocked[0])
     try:
-        second, second_cached = await _acquire_page(connection, search, 2, first, fetch_page, parse_page)
+        second, second_cached = await _acquire_page(connection, search, 2, first, fetch_page, parse_page, journal)
     except FinderPaginationUnresolved as error:
-        _record_window_gap(connection, key, str(error))
+        _record_window_gap(connection, key, str(error), page=2, journal=journal)
         return _window(search, [first], cached, str(error))
     return _window(search, [first, second], cached + second_cached, None)
 
@@ -269,22 +305,19 @@ def _create_capture_tables(connection):
         "PRIMARY KEY (selector, zip_code, radius, page)) WITHOUT ROWID"
     )
     connection.execute(
+        "CREATE TABLE IF NOT EXISTS finder_attempt (selector TEXT, zip_code TEXT, radius REAL, page INTEGER, "
+        "PRIMARY KEY (selector, zip_code, radius, page)) WITHOUT ROWID"
+    )
+    connection.execute(
         "CREATE TABLE IF NOT EXISTS finder_gap ("
         "selector TEXT, zip_code TEXT, radius REAL, reason TEXT NOT NULL, "
         "PRIMARY KEY (selector, zip_code, radius)) WITHOUT ROWID"
     )
 
 
-async def iter_finder_windows(
-    capture: FinderCapturePlan,
-    *,
-    fetch_page: Callable[[FinderSearch, int, FinderPage | None], Awaitable[bytes]],
-    parse_page: Callable[[bytes, FinderSearch, int], FinderPage],
-    cancel_check: Callable[[], Awaitable[None]],
-) -> AsyncIterator[FinderWindow]:
-    """Resume exact completed pages within the same edition and serialize origin access."""
+def _capture_definition(capture):
+    """Freeze the ordered unique search subset authorized by this run."""
     edition_id = capture.edition_id
-    capture_root = capture.root
     if not isinstance(edition_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", edition_id) is None:
         raise ValueError("delta_dental_finder_capture_invalid")
     plan_id = edition_id if capture.plan_id is None else capture.plan_id
@@ -299,6 +332,66 @@ async def iter_finder_windows(
             [(search.selector, search.zip_code, float(search.radius_miles)) for search in unique_searches],
         ]
     )
+    return unique_searches, plan_id, definition
+
+
+async def _capture_parallel(unique_searches, concurrency, capture_window):
+    """Bound pending work and drain started requests before propagating a failure."""
+    searches = iter(unique_searches)
+    workers_by_task = {}
+    failure = None
+
+    def _enqueue(worker_id):
+        if (search := next(searches, None)) is not None:
+            workers_by_task[asyncio.create_task(capture_window(search, worker_id))] = worker_id
+
+    for worker_id in range(concurrency):
+        _enqueue(worker_id)
+    try:
+        while workers_by_task:
+            done, _ = await asyncio.wait(workers_by_task, return_when=asyncio.FIRST_COMPLETED)
+            finished_windows = []
+            for task in done:
+                worker_id = workers_by_task.pop(task)
+                try:
+                    finished_windows.append((worker_id, task.result()))
+                except Exception as error:
+                    failure = failure or error
+            for worker_id, window in finished_windows:
+                if failure is None:
+                    _enqueue(worker_id)
+                yield window
+        if failure is not None:
+            raise failure
+    finally:
+        for task in workers_by_task:
+            task.cancel()
+        await asyncio.gather(*workers_by_task, return_exceptions=True)
+
+
+async def _capture_windows(unique_searches, concurrency, capture_window):
+    """Keep the legacy serial order unless parallel capture is explicitly selected."""
+    if concurrency == 1:
+        for search in unique_searches:
+            yield await capture_window(search)
+        return
+    async with aclosing(_capture_parallel(unique_searches, concurrency, capture_window)) as windows:
+        async for window in windows:
+            yield window
+
+
+async def iter_finder_windows(
+    capture: FinderCapturePlan,
+    *,
+    fetch_page: Callable[[FinderSearch, int, FinderPage | None], Awaitable[bytes]],
+    parse_page: Callable[[bytes, FinderSearch, int], FinderPage],
+    cancel_check: Callable[[], Awaitable[None]],
+    journal: bool = False,
+) -> AsyncIterator[FinderWindow]:
+    """Resume exact completed pages within the same edition and serialize origin access."""
+    unique_searches, plan_id, definition = _capture_definition(capture)
+    edition_id = capture.edition_id
+    capture_root = capture.root
     capture_root.mkdir(mode=0o750, parents=True, exist_ok=True)
     lock = PTG2ArtifactStore(capture_root).named_lock("delta-dental-directory", "source-acquisition")
     if lock.try_acquire(blocking=False) is None:
@@ -317,13 +410,21 @@ async def iter_finder_windows(
                 allow_unstarted_resume=capture.allow_unstarted_resume,
             )
 
-            async def fetch_checked(search, number, previous_page):
-                """Check cancellation before using the provider-facing transport."""
-                await cancel_check()
-                return await fetch_page(search, number, previous_page)
+            async def capture_window(search, worker_id=None):
+                """Read one cached or fresh window on its assigned worker."""
 
-            for search in unique_searches:
+                async def fetch_checked(search, number, previous_page, **attempt):
+                    """Check cancellation before invoking the transport."""
+                    await cancel_check()
+                    if worker_id is not None:
+                        attempt["worker_id"] = worker_id
+                    return await fetch_page(search, number, previous_page, **attempt)
+
                 await cancel_check()
-                yield await _window_pages(connection, search, fetch_checked, parse_page)
+                return await _window_pages(connection, search, fetch_checked, parse_page, journal=journal)
+
+            async with aclosing(_capture_windows(unique_searches, capture.concurrency, capture_window)) as windows:
+                async for window in windows:
+                    yield window
     finally:
         lock.release()

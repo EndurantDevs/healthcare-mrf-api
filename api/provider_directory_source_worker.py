@@ -61,6 +61,28 @@ class FHIRSourceWorkerLaunch:
     proxy_pool_transition: ProxyPoolTransition | None = None
 
 
+def _route_proxy_pool(route):
+    """Read a dedicated proxy Secret reference for the exact Delta observation route."""
+    if "proxy_pool" not in route:
+        return None
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
+
+    pool = route["proxy_pool"]
+    if (
+        (route["source_id"], route["endpoint_scope"]) != (SOURCE_ID, SOURCE_ENDPOINT)
+        or "proxy_pool_transition" in route
+        or type(pool) is not dict
+        or set(pool) != {"revision", "secret_name"}
+        or type(pool["revision"]) is not str
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", pool["revision"])
+        or type(pool["secret_name"]) is not str
+        or len(pool["secret_name"]) > 253
+        or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", pool["secret_name"])
+    ):
+        raise ValueError("fhir_source_worker_route_invalid")
+    return pool["revision"], pool["secret_name"]
+
+
 def _pool_transition(route):
     """Validate a closed retained-only expansion without reading pool credentials."""
     if "proxy_pool_transition" not in route:
@@ -131,11 +153,11 @@ def _configured_routes(*, setting=ROUTES_ENV):
     if type(routes) is not list or len(routes) > max_routes:
         raise ValueError("fhir_source_worker_route_invalid")
     identities = set()
+    extra_fields = {"allow_retained_retries", "proxy_pool_transition", "proxy_pool"} if setting == ROUTES_ENV else set()
     for route in routes:
         if (
             type(route) is not dict
-            or set(route) - ({"allow_retained_retries", "proxy_pool_transition"} if setting == ROUTES_ENV else set())
-            != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
+            or set(route) - extra_fields != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
             or "allow_retained_retries" in route
             and (
                 setting != ROUTES_ENV
@@ -170,6 +192,9 @@ def _configured_routes(*, setting=ROUTES_ENV):
         grant = _pool_transition(route)
         if grant is not None and {grant.from_secret_name, grant.to_secret_name}.intersection(runtime_secrets):
             raise ValueError("fhir_source_worker_route_invalid")
+        pool = _route_proxy_pool(route)
+        if pool is not None and pool[1] in runtime_secrets:
+            raise ValueError("fhir_source_worker_route_invalid")
     return routes
 
 
@@ -180,6 +205,9 @@ def configured_source_proxy_pool_secrets():
         grant = _pool_transition(route)
         if grant is not None:
             names.update((grant.from_secret_name, grant.to_secret_name))
+        pool = _route_proxy_pool(route)
+        if pool is not None:
+            names.add(pool[1])
     return frozenset(names)
 
 
@@ -362,8 +390,10 @@ def _proxy_fields(source_ids, endpoint_scope, route, *, policy=None):
         return {}
     if route is None or source_ids != [route["source_id"]] or endpoint_scope != route["endpoint_scope"]:
         raise ValueError("fhir_source_worker_proxy_route_required")
-    secret = os.getenv(PROXY_POOL_SECRET_ENV, "")
-    revision = os.getenv(PROXY_POOL_REVISION_ENV, "")
+    revision, secret = _route_proxy_pool(route) or (
+        os.getenv(PROXY_POOL_REVISION_ENV, ""),
+        os.getenv(PROXY_POOL_SECRET_ENV, ""),
+    )
     if (
         not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", secret)
         or len(secret) > 253

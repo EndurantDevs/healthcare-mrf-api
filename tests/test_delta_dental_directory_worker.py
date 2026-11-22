@@ -122,7 +122,8 @@ def test_protected_manifest_scope(tmp_path, monkeypatch):
         "searches": [{"selector": "Delta Dental Patient Direct", "zip_code": "00000", "radius_miles": 30}],
     }
     path.write_text(json.dumps(manifest_by_field))
-    capture_id, searches = worker._authorized_plan()
+    capture_id, searches, concurrency, rate, budget = worker._authorized_plan()
+    assert (concurrency, rate, budget) == (1, None, 100_000)
     assert len(capture_id) == 64
     assert len(searches) == 1
     assert searches[0].selector == "Delta Dental Patient Direct"
@@ -160,7 +161,7 @@ async def test_hold_blocks_new_editions(tmp_path, monkeypatch):
     monkeypatch.setattr(transport, "open_finder_http", unexpected_egress)
     monkeypatch.setattr(worker, "_artifact_root", lambda: tmp_path)
     search = worker.FinderSearch("Delta Dental Premier", "01234", 30)
-    monkeypatch.setattr(worker, "_authorized_plan", lambda: ("new-edition", (search,)))
+    monkeypatch.setattr(worker, "_authorized_plan", lambda: ("new-edition", (search,), 1, None, 100_000))
 
     async def prepare(*_args, **_options):
         return None
@@ -360,3 +361,72 @@ def test_observation_disables_the_inherited_status_event_route(delta_launch):
     expected_by_field = {"name": "HLTHPRT_IMPORT_STATUS_EVENT_URL", "value": ""}
     assert control_workers._worker_source_policy_container({"env": []}, [], delta_launch)["env"] == [expected_by_field]
     assert control_workers._worker_source_policy_container({"env": []}, [], None)["env"] == []
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"concurrency": True},
+        {"concurrency": 0},
+        {"concurrency": 9, "requests_per_second": 1},
+        {"concurrency": 8},
+        {"concurrency": 8, "requests_per_second": 0},
+        {"concurrency": 8, "requests_per_second": float("inf")},
+        {"concurrency": 8, "requests_per_second": float("nan")},
+        {"requests_per_second": True},
+        {"requests_per_second": "2"},
+        {"requests_per_second": None},
+    ],
+)
+def test_protected_manifest_validates_acquisition_settings(tmp_path, monkeypatch, settings):
+    path = tmp_path / "manifest.json"
+    monkeypatch.setenv(worker.MANIFEST_ENV, str(path))
+    manifest_by_field = {
+        "authorization_scope": "example-authority",
+        "data_edition": "example-edition",
+        "zip_inventory": ["01234"],
+        "radius_miles": 30,
+    }
+    path.write_text(json.dumps({**manifest_by_field, "concurrency": 8, "requests_per_second": 2}))
+    assert worker._authorized_plan()[2:] == (8, 2, 100_000)
+    path.write_text(json.dumps({**manifest_by_field, **settings}))
+    with pytest.raises(ValueError, match="authorized_manifest_invalid"):
+        worker._authorized_plan()
+
+
+@pytest.mark.parametrize(
+    ("configured", "rate", "count", "expected"),
+    [
+        ({}, None, 100_000, 100_000),
+        ({}, 2, 188_625, None),
+        ({"max_origin_requests": 200_000}, 2, 188_625, 200_000),
+        ({"max_origin_requests": 200_000}, None, 188_625, None),
+        ({"max_origin_requests": 200_001}, 2, 188_625, None),
+        ({"max_origin_requests": True}, 2, 1, None),
+    ],
+)
+def test_origin_budget_is_explicit_and_bounds_the_plan(configured, rate, count, expected):
+    if expected is None:
+        with pytest.raises(ValueError, match="origin_request_budget_invalid"):
+            worker._origin_request_budget(configured, rate, count)
+    else:
+        assert worker._origin_request_budget(configured, rate, count) == expected
+
+
+@pytest.mark.parametrize("changed", ["concurrency", "rate", "budget"])
+def test_retry_refuses_acquisition_settings_drift(tmp_path, changed):
+    retry_by_field = {"retry_of_run_id": "first", "provider_directory_pagination_root_run_id": "first"}
+    original_by_field = {"concurrency": 8, "rate": 2.0, "budget": 200_000}
+    worker._bind_observation_edition(tmp_path, "first", "example-edition", {}, **original_by_field)
+    worker._bind_observation_edition(tmp_path, "retry", "example-edition", retry_by_field, **original_by_field)
+    changed_by_field = {**original_by_field, changed: original_by_field[changed] - 1}
+    with pytest.raises(ValueError, match="run_edition_changed"):
+        worker._bind_observation_edition(tmp_path, "retry", "example-edition", retry_by_field, **changed_by_field)
+
+
+def test_destination_hold_keeps_the_latest_finite_boundary(tmp_path):
+    shorter = "2099-01-01T00:00:01+00:00"
+    longer = "2099-01-01T00:00:03+00:00"
+    assert worker._persist_destination_hold(tmp_path, shorter) == shorter
+    assert worker._persist_destination_hold(tmp_path, longer) == longer
+    assert worker._persist_destination_hold(tmp_path, shorter) == longer

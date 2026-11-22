@@ -316,7 +316,7 @@ async def test_preflight_refuses_exhausted_budget_route_drift_and_cancellation(s
 
     dispatch = scoped_transport
     cancel_check = AsyncMock()
-    counts_by_action = {"origin_requests": transport._MAX_REQUESTS}
+    counts_by_action = {"origin_requests": transport.DEFAULT_REQUEST_BUDGET}
     async with transport.open_finder_http(
         dispatch.binding, cancel_check=cancel_check, pause=dispatch.pause, stats=counts_by_action
     ) as fetch_page:
@@ -345,3 +345,246 @@ def test_retry_after_accepts_a_full_date_and_invalid_values_remain_held():
     assert transport._retry_boundary("Wed, 06 Jan 2099 01:02:03") is None
     with pytest.raises(SourceProxyError, match="proxy_required"):
         transport._selection(None, SOURCE_ENDPOINT)
+
+
+def _install_parallel_transport(monkeypatch, dispatch, response):
+    import asyncio
+
+    def select(_binding, _url, cursor="finder-http", exclude_ids=frozenset()):
+        assert cursor not in exclude_ids
+        return SimpleNamespace(proxy_id=cursor, request_options={"proxy": f"https://{cursor}.example.test"})
+
+    @asynccontextmanager
+    async def post(_url, **options):
+        request = (asyncio.get_running_loop().time(), options["json"]["address"], options["proxy"])
+        dispatch.requests.append(request)
+        yield await response(request[1])
+
+    @asynccontextmanager
+    async def client(**_options):
+        yield SimpleNamespace(post=post)
+
+    monkeypatch.setattr(transport, "_selection", select)
+    monkeypatch.setattr(transport.aiohttp, "ClientSession", client)
+
+
+def _synthetic_searches(count):
+    return tuple(FinderSearch(PPO.selector, f"{index:05}", 30) for index in range(count))
+
+
+@pytest.mark.asyncio
+async def test_eight_sticky_workers_share_one_pacer_and_exact_cache(tmp_path, scoped_transport, monkeypatch):
+    import asyncio
+
+    dispatch = scoped_transport
+    all_active = asyncio.Event()
+    counts = SimpleNamespace(active=0, peak=0)
+
+    async def response(address):
+        counts.active += 1
+        counts.peak = max(counts.peak, counts.active)
+        if counts.peak == 8:
+            all_active.set()
+        try:
+            await asyncio.wait_for(all_active.wait(), timeout=3)
+            return _Response(200, _response(100 if address == "00000" else 1, PPO.selector))
+        finally:
+            counts.active -= 1
+
+    _install_parallel_transport(monkeypatch, dispatch, response)
+    searches = _synthetic_searches(9)
+    plan = FinderCapturePlan(tmp_path, "test", "test", (*searches, searches[0]), concurrency=8, requests_per_second=50)
+    summary = await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+    assert counts.peak == 8
+    assert len(dispatch.requests) == summary["search_windows"] == 9
+    assert len({proxy for _, _, proxy in dispatch.requests}) == 8
+    starts = [started for started, _, _ in dispatch.requests]
+    assert all(second - first >= 0.02 for first, second in zip(starts, starts[1:]))
+    assert summary["gaps"] == {"result_cap_reached": 1}
+    assert summary["directory_complete"] is False
+
+    warm = FinderCapturePlan(tmp_path, "test", "test", searches, plan_id="warm", concurrency=8, requests_per_second=50)
+    replay = await _run_http_capture(dispatch.binding, warm, AsyncMock(), dispatch.pause)
+    assert len(dispatch.requests) == replay["pages_reused"] == 9
+    assert replay["transport"]["origin_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_racing_holds_stop_admission_and_drain_successes(tmp_path, scoped_transport, monkeypatch):
+    import asyncio
+    import sqlite3
+
+    from process import delta_dental_directory_worker as worker
+
+    dispatch = scoped_transport
+    all_active = asyncio.Event()
+    finite_retained = asyncio.Event()
+    indefinite_retained = asyncio.Event()
+    real_persist = worker._persist_destination_hold
+
+    def observe_hold(root, until):
+        merged = real_persist(root, until)
+        (finite_retained if until is not None else indefinite_retained).set()
+        return merged
+
+    async def response(address):
+        if len(dispatch.requests) == 8:
+            all_active.set()
+        await asyncio.wait_for(all_active.wait(), timeout=3)
+        if address == "00000":
+            return _Response(429, b"", {"Retry-After": "120"})
+        if address == "00001":
+            await finite_retained.wait()
+            return _Response(403, b"")
+        await indefinite_retained.wait()
+        if address == "00002":
+            return _Response(503, b"", {"Retry-After": "240"})
+        return _Response(200, _response(1, PPO.selector))
+
+    monkeypatch.setattr(worker, "_persist_destination_hold", observe_hold)
+    _install_parallel_transport(monkeypatch, dispatch, response)
+    searches = _synthetic_searches(12)
+    plan = FinderCapturePlan(tmp_path, "held", "held", searches, concurrency=8, requests_per_second=100)
+    with pytest.raises(SourceProxyError, match="access_denied"):
+        await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+    assert len(dispatch.requests) == 8
+    assert dispatch.pause.await_args.args[0] is None
+    assert json.loads((tmp_path / "destination-hold.json").read_text()) == {"retry_not_before": None}
+    with sqlite3.connect(tmp_path / "finder-held.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM finder_page").fetchone() == (5,)
+        assert database.execute("SELECT zip_code FROM finder_attempt ORDER BY zip_code").fetchall() == [
+            ("00001",),
+            ("00002",),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_resume_retries_only_definite_rate_rejection(tmp_path, scoped_transport, monkeypatch):
+    from dataclasses import replace
+
+    dispatch = scoped_transport
+    plan = FinderCapturePlan(tmp_path, "resume", "resume", (PPO, PATIENT_DIRECT))
+
+    monkeypatch.setattr(transport, "_retry_boundary", lambda _: "2000-01-01T00:00:00+00:00")
+    dispatch.response = lambda _: _Response(429, b"")
+    with pytest.raises(SourceProxyUnavailable):
+        await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+
+    dispatch.response = Mock(side_effect=[TimeoutError, _Response(200, _response(1, PATIENT_DIRECT.selector))])
+    with pytest.raises(SourceProxyError, match="request_failed"):
+        await _run_http_capture(dispatch.binding, replace(plan, resume=True), AsyncMock(), dispatch.pause)
+    summary = await _run_http_capture(dispatch.binding, replace(plan, resume=True), AsyncMock(), dispatch.pause)
+    assert [options["json"]["productType"] for _, options in dispatch.requests] == ["PPO", "PPO", "PatientDirect"]
+    assert summary["gaps"] == {"finder_request_outcome_uncertain": 1}
+    assert summary["pages_retained"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rate_budget_spans_editions(tmp_path, scoped_transport, monkeypatch):
+    dispatch = scoped_transport
+
+    async def response(_address):
+        return _Response(200, _response(1, PPO.selector))
+
+    _install_parallel_transport(monkeypatch, dispatch, response)
+    for edition in ("first", "second"):
+        plan = FinderCapturePlan(tmp_path, edition, edition, (PPO,), requests_per_second=10)
+        await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+    assert dispatch.requests[1][0] - dispatch.requests[0][0] >= 0.09
+
+
+@pytest.mark.asyncio
+async def test_parallel_egress_refuses_duplicate_configured_routes(tmp_path, scoped_transport):
+    dispatch = scoped_transport
+    plan = FinderCapturePlan(tmp_path, "test", "test", (PPO,), concurrency=8, requests_per_second=1)
+    with pytest.raises(SourceProxyError, match="distinct_proxy_routes_required"):
+        await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+    assert not dispatch.requests
+
+
+@pytest.mark.asyncio
+async def test_parallel_budget_drains_already_admitted_successes(tmp_path, scoped_transport, monkeypatch):
+    import asyncio
+    import sqlite3
+
+    dispatch = scoped_transport
+    both_admitted = asyncio.Event()
+
+    async def response(_address):
+        if len(dispatch.requests) == 2:
+            both_admitted.set()
+        await asyncio.wait_for(both_admitted.wait(), timeout=3)
+        return _Response(200, _response(1, PPO.selector))
+
+    _install_parallel_transport(monkeypatch, dispatch, response)
+    plan = FinderCapturePlan(
+        tmp_path,
+        "bounded",
+        "bounded",
+        _synthetic_searches(8),
+        concurrency=8,
+        requests_per_second=100,
+        max_origin_requests=2,
+    )
+    with pytest.raises(SourceProxyError, match="request_budget_exhausted"):
+        await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+    assert len(dispatch.requests) == 2
+    with sqlite3.connect(tmp_path / "finder-bounded.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM finder_page").fetchone() == (2,)
+        assert database.execute("SELECT COUNT(*) FROM finder_attempt").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_progress_reports_only_aggregate_counts_at_intervals(tmp_path, scoped_transport, monkeypatch):
+    from unittest.mock import call
+
+    from process import delta_dental_directory_worker as worker
+
+    dispatch = scoped_transport
+    ticks = iter((0, 300, 300, 301, 600, 600))
+    monkeypatch.setattr(worker, "monotonic", lambda: next(ticks))
+    plan = FinderCapturePlan(tmp_path, "test", "test", _synthetic_searches(3), requests_per_second=100)
+    directory = SimpleNamespace(_mark_provider_directory_progress=AsyncMock())
+    pause, report = worker._observation_reporters(directory, "synthetic", None, 3)
+    await _run_http_capture(dispatch.binding, plan, AsyncMock(), pause, report=report)
+
+    def aggregate_call(done):
+        return call(
+            "synthetic",
+            phase="delta dental finder capture",
+            done=done,
+            total=3,
+            message="capturing finder observations",
+            metrics={
+                "delta_dental_directory_observation": {
+                    "search_windows": done,
+                    "pages_retained": done,
+                    "pages_reused": 0,
+                }
+            },
+        )
+
+    assert directory._mark_provider_directory_progress.await_args_list == [aggregate_call(1), aggregate_call(3)]
+
+
+def test_pins_eight_distinct_credential_routes_in_a_real_binding(monkeypatch):
+    from process.ext.source_http_proxy import POLICY_ENV, POOL_ENV, SourceProxyConfig
+
+    rule_by_field = {"source_id": "finder", "use_proxy": True, "endpoint_scope": SOURCE_ENDPOINT}
+    monkeypatch.setenv(POLICY_ENV, json.dumps({"version": 1, "revision": "policy", "sources": [rule_by_field]}))
+    routes = [
+        {"id": f"example-{index}", "url": f"https://sticky-{index}:example@proxy.example.test"} for index in range(8)
+    ]
+    pool_by_field = {"version": 1, "revision": "pool", "proxies": routes}
+    monkeypatch.setenv(POOL_ENV, json.dumps(pool_by_field))
+    binding = SourceProxyConfig.from_environment().bind("finder", SOURCE_ENDPOINT)
+    pinned = transport._pin_worker_routes(binding, 8)
+    assert {route.proxy_id for route in pinned} == {route["id"] for route in routes}
+    for index, route in enumerate(pinned):
+        assert transport._validate_worker_route(binding, pinned, index) is route
+
+    routes[1]["url"] = routes[0]["url"]
+    monkeypatch.setenv(POOL_ENV, json.dumps(pool_by_field))
+    aliased = SourceProxyConfig.from_environment().bind("finder", SOURCE_ENDPOINT)
+    with pytest.raises(SourceProxyError, match="distinct_proxy_routes_required"):
+        transport._pin_worker_routes(aliased, 8)
