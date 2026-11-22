@@ -1,8 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Traverse issued search caches without trusting the gateway's page totals."""
 
+import asyncio
 import re
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 
@@ -13,19 +14,49 @@ CACHE_TOTAL_KEY = "minnesota_cache_expected_total"
 INITIAL_PAGE_COUNT = 50
 PAGE_COUNT_CAP = 500
 DIRECT_VERIFICATION_LIMIT = 16
+ORGANIZATION_REFERENCE_LIMIT = 256
+ORGANIZATION_RECOVERY_LIMIT = 128
 _QUERY_NAMES = frozenset(
     {"_count", "_getpages", "_getpagesoffset", "_pretty", "_bundletype", "_summary", "_total", "_format"}
 )
+
+
+def _organization_proof_ids(directory, window_id, references, fingerprints):
+    """Resolve distinct source IDs whose retained observation and raw hash both match."""
+    fingerprint_by_id = {}
+    for occurrence, fingerprint in fingerprints.items():
+        matches = [
+            reference
+            for reference in references
+            if directory._partition_occurrence_id(window_id, reference, fingerprint, 0) == occurrence
+        ]
+        if len(matches) != 1 or matches[0] in fingerprint_by_id:
+            return {}
+        fingerprint_by_id[matches[0]] = fingerprint
+    return fingerprint_by_id
+
+
+@dataclass
+class OrganizationReferenceRecovery:
+    references: tuple[str, ...] | None = None
+    new_window_ids: dict[str, tuple[str, ...]] | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _empty_gateway_timeout(fetched):
+    return (
+        fetched.transient
+        and fetched.error == "http_504"
+        and (fetched.pages_fetched == 1 or fetched.first_page_gateway_timeout)
+        and not fetched.resources
+    )
 
 
 async def split_timed_out_window(directory, source_record, resource_type, config, state, window, fetched):
     """Keep exact counts while reducing a gateway-limited data request."""
     if not (
         directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")) == API_BASE
-        and fetched.transient
-        and fetched.error == "http_504"
-        and fetched.pages_fetched == 1
-        and not fetched.resources
+        and _empty_gateway_timeout(fetched)
         and state.plan.split_acquisition_window(window.window_id)
     ):
         return None
@@ -50,10 +81,7 @@ async def verify_timed_out_practitioner_window(
         resource_type == "Practitioner"
         and directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
         == API_BASE
-        and fetched.transient
-        and fetched.error == "http_504"
-        and fetched.pages_fetched == 1
-        and not fetched.resources
+        and _empty_gateway_timeout(fetched)
         and set(window.passes) == {1}
         and window.count is not None
         and 0 < window.count <= DIRECT_VERIFICATION_LIMIT
@@ -68,6 +96,13 @@ async def verify_timed_out_practitioner_window(
         key not in {".", ".."} and re.fullmatch(r"[A-Za-z0-9.-]{1,64}", key) for key in proof
     ):
         return replace(fetched, error="window_direct_proof_invalid", transient=False, retry_not_before=None)
+    pages, failure = await _recount_direct_window(directory, source_record, config, state, options, window, fetched)
+    if failure is not None:
+        return failure
+    return await _read_practitioner_window(directory, source_record, state, options, window, sorted(proof), pages)
+
+
+async def _recount_direct_window(directory, source_record, config, state, options, window, fetched):
     count_url = directory._last_updated_partition_url(
         state.start_url, window, page_count=config.page_count, count_only=True
     )
@@ -76,33 +111,33 @@ async def verify_timed_out_practitioner_window(
     )
     pages = fetched.pages_fetched + count.pages_fetched
     if count.transient:
-        return replace(
-            fetched, pages_fetched=pages, retry_not_before=count.retry_not_before or fetched.retry_not_before
+        return pages, replace(
+            fetched,
+            pages_fetched=pages,
+            first_page_gateway_timeout=True,
+            retry_not_before=count.retry_not_before or fetched.retry_not_before,
         )
     if count.observation != directory.CountObservation.exact(window.count):
-        return directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_count_mismatch")
-    return await _read_practitioner_window(directory, source_record, state, options, window, sorted(proof), pages)
+        return pages, directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_count_mismatch")
+    return pages, None
 
 
-async def _read_practitioner_window(directory, source_record, state, options, window, resource_ids, pages):
-    """Read exact IDs through the shared pacing and deadline checks."""
-    resources = []
-    for resource_id in resource_ids:
-        if options.cancel_ctx is not None:
-            await directory._raise_if_resource_import_cancelled(options.cancel_ctx, options.cancel_task)
-        url = f"{API_BASE}/Practitioner/{resource_id}"
-        response, deadline_blocked = await directory._fetch_cooldown_checkpoint_page(
-            source_record,
-            url,
-            (None, None, "TimeoutError", 0),
-            timeout=options.timeout,
-            deadline_at=state.deadline_at,
-        )
-        status, resource_by_field, error, _elapsed = response
-        pages += int(not deadline_blocked)
-        if status != 200 or error:
-            failure = directory._last_updated_window_page_failure(source_record, url, status, resource_by_field, error)
-            return directory.LastUpdatedWindowFetch(
+async def _direct_request(directory, source_record, state, options, url, pages, *, optional=False):
+    if options.cancel_ctx is not None:
+        await directory._raise_if_resource_import_cancelled(options.cancel_ctx, options.cancel_task)
+    response, deadline_blocked = await directory._fetch_cooldown_checkpoint_page(
+        source_record, url, (None, None, "TimeoutError", 0), timeout=options.timeout, deadline_at=state.deadline_at
+    )
+    status, payload, error, _elapsed = response
+    pages += int(not deadline_blocked)
+    if status == 404 and error is None and optional:
+        return None, pages, None
+    if status != 200 or error:
+        failure = directory._last_updated_window_page_failure(source_record, url, status, payload, error)
+        return (
+            None,
+            pages,
+            directory.LastUpdatedWindowFetch(
                 (),
                 pages,
                 False,
@@ -110,7 +145,21 @@ async def _read_practitioner_window(directory, source_record, state, options, wi
                 transient=failure.transient,
                 deadline_reached=deadline_blocked,
                 retry_not_before=failure.retry_not_before,
-            )
+            ),
+        )
+    if not isinstance(payload, dict):
+        return None, pages, directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_resource_mismatch")
+    return payload, pages, None
+
+
+async def _read_practitioner_window(directory, source_record, state, options, window, resource_ids, pages):
+    """Read exact IDs through the shared pacing and deadline checks."""
+    resources = []
+    for resource_id in resource_ids:
+        url = f"{API_BASE}/Practitioner/{resource_id}"
+        resource_by_field, pages, failure = await _direct_request(directory, source_record, state, options, url, pages)
+        if failure is not None:
+            return failure
         if (
             not isinstance(resource_by_field, dict)
             or resource_by_field.get("resourceType") != "Practitioner"
@@ -119,6 +168,156 @@ async def _read_practitioner_window(directory, source_record, state, options, wi
         ):
             return directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_resource_mismatch")
         resources.append(resource_by_field)
+    return directory.LastUpdatedWindowFetch(tuple(resources), pages, True)
+
+
+async def verify_timed_out_organization_window(
+    directory, source_record, resource_type, config, state, options, window, fetched
+):
+    """Recover a bounded tail using scoped references and the original partition proof."""
+    if not (
+        directory._uses_v4_organization_partition(source_record, resource_type)
+        and directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+        == API_BASE
+        and _empty_gateway_timeout(fetched)
+        and (window.count or 0) > 0
+    ):
+        return fetched
+    from process.provider_directory_generic_source_adapters import source_organization_reference_ids
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    pending_windows = [leaf for leaf in state.plan.leaf_windows() if len(leaf.passes) < 2]
+    if (
+        not pending_windows
+        or any(leaf.count is None for leaf in pending_windows)
+        or sum(leaf.count for leaf in pending_windows) > ORGANIZATION_RECOVERY_LIMIT
+        or not is_source_storage_required()
+    ):
+        return fetched
+    if state.organization_recovery is None:
+        state.organization_recovery = OrganizationReferenceRecovery()
+    recovery = state.organization_recovery
+    async with recovery.lock:
+        pages, failure = await _recount_direct_window(directory, source_record, config, state, options, window, fetched)
+        if failure is not None:
+            return failure
+        if recovery.references is None:
+            recovery.references = await source_organization_reference_ids(
+                directory, state.context.dataset_id, API_BASE, ORGANIZATION_REFERENCE_LIMIT
+            )
+        if window.passes:
+            proof = await directory._load_partition_pass_proof(state.context, resource_type, window.window_id, 1)
+            ids = _organization_proof_ids(
+                directory, window.window_id, recovery.references, proof.source_fingerprints_by_id
+            )
+        else:
+            if recovery.new_window_ids is None:
+                recovery.new_window_ids, pages, failure = await _discover_organization_window_ids(
+                    directory, source_record, state, options, recovery.references, pending_windows, pages
+                )
+                if failure is not None:
+                    return failure
+            ids = dict.fromkeys(recovery.new_window_ids.get(window.window_id, ()))
+        if len(ids) != window.count:
+            return replace(fetched, pages_fetched=pages, first_page_gateway_timeout=True)
+        return await _read_organization_window(directory, source_record, state, options, window, ids, pages)
+
+
+async def _discover_organization_window_ids(
+    directory, source_record, state, options, references, pending_windows, pages
+):
+    # Discovery reuses IDs across windows. Every pass still fetches its own payload.
+    targets = [window for window in pending_windows if not window.passes and window.count]
+    ids_by_window = {window.window_id: [] for window in targets}
+    for resource_id in references:
+        url = f"{API_BASE}/Organization/{resource_id}"
+        resource, pages, failure = await _direct_request(
+            directory, source_record, state, options, url, pages, optional=True
+        )
+        if failure is not None:
+            return None, pages, failure
+        if resource is None:
+            continue
+        if not _matches_organization_id(resource, resource_id):
+            return (
+                None,
+                pages,
+                directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_resource_mismatch"),
+            )
+        for window in targets:
+            error = directory._last_updated_partition_resource_window_error(resource, window)
+            if error is None:
+                ids_by_window[window.window_id].append(resource_id)
+                break
+            if error != "resource_last_updated_outside_window":
+                return None, pages, directory.LastUpdatedWindowFetch((), pages, False, error=error)
+    return {window_id: tuple(window_ids) for window_id, window_ids in ids_by_window.items()}, pages, None
+
+
+def _matches_organization_id(resource, resource_id):
+    return (
+        isinstance(resource, dict)
+        and resource.get("resourceType") == "Organization"
+        and resource.get("id") == resource_id
+    )
+
+
+def _organization_matches_window(directory, resource, resource_id, window, fingerprint):
+    return (
+        _matches_organization_id(resource, resource_id)
+        and directory._last_updated_partition_resource_window_error(resource, window) is None
+        and (
+            fingerprint is None
+            or directory.fingerprint_resource(resource, directory.V4_ORGANIZATION_PARTITION_VOLATILE_PATHS)
+            == fingerprint
+        )
+    )
+
+
+def _single_search_resource(bundle):
+    if not isinstance(bundle, dict) or bundle.get("resourceType") != "Bundle" or bundle.get("type") != "searchset":
+        return None
+    links = bundle.get("link", [])
+    entries = bundle.get("entry")
+    if (
+        type(bundle.get("total", 1)) is not int
+        or bundle.get("total", 1) != 1
+        or not isinstance(links, list)
+        or any(not isinstance(link, dict) or link.get("relation") == "next" for link in links)
+        or not isinstance(entries, list)
+        or len(entries) != 1
+        or not isinstance(entries[0], dict)
+    ):
+        return None
+    search_metadata = entries[0].get("search", {})
+    if not isinstance(search_metadata, dict) or search_metadata.get("mode") not in (None, "match"):
+        return None
+    return entries[0].get("resource")
+
+
+async def _read_organization_window(directory, source_record, state, options, window, ids, pages):
+    resources = []
+    for resource_id, fingerprint in sorted(ids.items()):
+        resource = None
+        if fingerprint is not None:
+            url = f"{API_BASE}/Organization/{resource_id}"
+            resource, pages, failure = await _direct_request(
+                directory, source_record, state, options, url, pages, optional=True
+            )
+            if failure is not None:
+                return failure
+        if not _organization_matches_window(directory, resource, resource_id, window, fingerprint):
+            # A direct representation can differ from the resource returned by search.
+            query = urlencode({"_id": resource_id, "_count": 2})
+            bundle, pages, failure = await _direct_request(
+                directory, source_record, state, options, f"{API_BASE}/Organization?{query}", pages
+            )
+            if failure is not None:
+                return failure
+            resource = _single_search_resource(bundle)
+            if not _organization_matches_window(directory, resource, resource_id, window, fingerprint):
+                return directory.LastUpdatedWindowFetch((), pages, False, error="window_direct_resource_mismatch")
+        resources.append(resource)
     return directory.LastUpdatedWindowFetch(tuple(resources), pages, True)
 
 

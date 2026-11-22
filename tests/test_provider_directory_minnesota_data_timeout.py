@@ -4,9 +4,14 @@
 import asyncio
 import dataclasses
 import urllib.parse
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_generic_source_adapters as source_adapters
+from process import provider_directory_generic_source_policy as source_policy
 from tests.test_process_provider_directory_fhir_unit import (
     _last_updated_partition_test_bundle as bundle,
 )
@@ -188,3 +193,125 @@ async def test_cancelled_split_resumes_counting_without_refetching_parent(monkey
     assert written == []
     assert len(collection.data_requests) == 5
     assert collection.data_requests.count(collection.data_requests[0]) == 1
+
+
+def _organization_retry(monkeypatch, count=2):
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    plan = importer.PartitionPlan.create(
+        start, start + timedelta(days=1), ceiling=64, minimum_width=timedelta(seconds=1)
+    )
+    plan.observe_count("root", importer.CountObservation.exact(2))
+    state = importer.LastUpdatedPartitionState(
+        context=SimpleNamespace(dataset_id="fixture-dataset"),
+        plan=plan,
+        census=None,
+        start_url=f"{importer.bcbs_minnesota.API_BASE}/Organization",
+        pages_fetched=0,
+        rows_fetched=0,
+        deadline_at=None,
+    )
+    config = SimpleNamespace(page_count=50)
+    options = SimpleNamespace(timeout=3, cancel_ctx=None, cancel_task=None)
+    record = directory_source()
+    record["_resource_hash_contract"] = importer.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    timeout = importer.LastUpdatedWindowFetch((), 1, False, error="http_504", transient=True)
+    monkeypatch.setattr(importer, "_fetch_last_updated_partition_window", AsyncMock(return_value=timeout))
+    recount = AsyncMock(return_value=importer.LastUpdatedCountFetch(importer.CountObservation.exact(count)))
+    monkeypatch.setattr(importer, "_fetch_last_updated_partition_count", recount)
+    monkeypatch.setattr(source_policy, "is_source_storage_required", lambda: True)
+    references = AsyncMock(return_value=("org-a", "org-b", "org-outside"))
+    monkeypatch.setattr(source_adapters, "source_organization_reference_ids", references)
+    return record, state, config, options, recount, references
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search_matches_proof", [True, False])
+async def test_organization_direct_retry_keeps_independent_passes(monkeypatch, search_matches_proof):
+    source_record, state, config, options, recount, references = _organization_retry(monkeypatch)
+    window = state.plan.windows["root"]
+    organizations_by_id = {
+        key: {"resourceType": "Organization", "id": key, "name": key, "meta": {"lastUpdated": stamp}}
+        for key, stamp in (
+            ("org-a", "2024-01-01T00:00:00Z"),
+            ("org-b", "2024-01-01T12:00:00Z"),
+            ("org-outside", "2024-01-02T00:00:00Z"),
+        )
+    }
+    requests = []
+
+    async def read(_record, url, _initial, **_kwargs):
+        request = urllib.parse.urlsplit(url)
+        if request.query:
+            query = urllib.parse.parse_qs(request.query)
+            assert query["_count"] == ["2"]
+            [key] = query["_id"]
+            requests.append(("search", key))
+            organization_by_field = organizations_by_id[key]
+            if window.passes and not search_matches_proof:
+                organization_by_field = {**organization_by_field, "name": "changed in search too"}
+            return (200, bundle([organization_by_field], total=1), None, 1), False
+        key = request.path.rsplit("/", 1)[-1]
+        requests.append(("read", key))
+        organization_by_field = organizations_by_id[key]
+        if key == "org-b":
+            organization_by_field = {**organization_by_field, "name": "different point representation"}
+        return (200, organization_by_field, None, 1), False
+
+    monkeypatch.setattr(importer, "_fetch_cooldown_checkpoint_page", read)
+    _, first = await importer._fetch_partition_window_for_pass(
+        source_record, "Organization", config, state, options, window
+    )
+    assert first.complete and first.resources == (organizations_by_id["org-a"], organizations_by_id["org-b"])
+    assert requests == [
+        ("read", "org-a"),
+        ("read", "org-b"),
+        ("read", "org-outside"),
+        ("search", "org-a"),
+        ("search", "org-b"),
+    ]
+    _, ordered, _, fingerprints = importer._v4_partition_resource_bindings(first.resources, window.window_id)
+    state.plan.record_pass(window.window_id, 1, ordered, complete=True, bounded=False)
+    proof = AsyncMock(return_value=SimpleNamespace(source_fingerprints_by_id=fingerprints))
+    monkeypatch.setattr(importer, "_load_partition_pass_proof", proof)
+    _, second = await importer._fetch_partition_window_for_pass(
+        source_record, "Organization", config, state, options, window
+    )
+    assert requests[5:] == [("read", "org-a"), ("read", "org-b"), ("search", "org-b")]
+    assert recount.await_count == 2
+    references.assert_awaited_once()
+    proof.assert_awaited_once()
+    if search_matches_proof:
+        assert second.complete and second.resources == first.resources
+    else:
+        assert not second.complete and not second.resources
+        assert second.error == "window_direct_resource_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_organization_direct_retry_requires_independent_count(monkeypatch):
+    record, state, config, options, recount, references = _organization_retry(monkeypatch, count=3)
+    _, outcome = await importer._fetch_partition_window_for_pass(
+        record, "Organization", config, state, options, state.plan.windows["root"]
+    )
+    assert not outcome.complete and outcome.error == "window_direct_count_mismatch"
+    recount.assert_awaited_once()
+    references.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_organization_reference_set_can_still_split_first_page_timeout(monkeypatch):
+    record, state, config, options, recount, references = _organization_retry(monkeypatch)
+    references.return_value = ()
+    save = AsyncMock()
+    monkeypatch.setattr(importer, "_save_last_updated_partition_plan", save)
+    window = state.plan.windows["root"]
+    fetched = await importer._fetch_partition_window_for_pass(record, "Organization", config, state, options, window)
+    assert fetched[1].error == "http_504" and fetched[1].pages_fetched == 2
+
+    failure = await importer._persist_fetched_partition_pass(
+        record, "Organization", object(), config, state, options, (window, 1), fetched
+    )
+    assert failure is None
+    assert window.state.value == "split"
+    assert state.pages_fetched == save.await_args.kwargs["pages_processed"] == 2
+    recount.assert_awaited_once()

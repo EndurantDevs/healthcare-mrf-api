@@ -291,7 +291,12 @@ async def fetch_window_for_pass(directory, source_record, resource_type, config,
         cancel_task=fetch_options.cancel_task,
         deadline_at=state.deadline_at,
     )
-    return request_url, await bcbs_minnesota.verify_timed_out_practitioner_window(
+    recovery = (
+        bcbs_minnesota.verify_timed_out_organization_window
+        if resource_type == "Organization"
+        else bcbs_minnesota.verify_timed_out_practitioner_window
+    )
+    return request_url, await recovery(
         directory, source_record, resource_type, config, state, fetch_options, window, window_fetch
     )
 

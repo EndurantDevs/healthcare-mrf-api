@@ -1844,6 +1844,7 @@ class LastUpdatedWindowFetch:
     transient: bool = False
     deadline_reached: bool = False
     retry_not_before: str | None = None
+    first_page_gateway_timeout: bool = False
 
 
 @dataclass(frozen=True)
@@ -1901,6 +1902,7 @@ class LastUpdatedPartitionState:
     pages_fetched: int
     rows_fetched: int
     deadline_at: float | None
+    organization_recovery: bcbs_minnesota.OrganizationReferenceRecovery | None = None
 
 
 @dataclass(frozen=True)
@@ -48312,8 +48314,7 @@ def _uses_v4_organization_partition(
     resource_type: str,
 ) -> bool:
     """Return whether repeated Organization observations are composable."""
-
-    return bool(
+    return (
         resource_type == "Organization"
         and source_record.get("_resource_hash_contract") == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
     )
@@ -50274,7 +50275,6 @@ async def _partition_window_retry_result(
     window_fetch: LastUpdatedWindowFetch,
 ) -> ResourceFetchResult:
     """Persist retry state without accepting an incomplete partition window."""
-
     return await _saved_partition_retry_result(
         model,
         resource_type,
