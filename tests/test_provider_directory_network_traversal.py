@@ -68,7 +68,7 @@ async def test_native_network_traversal_discovers_and_reconciles_without_plan_id
         ]
     )
     monkeypatch.setattr(directory, "_fetch_source_json", fetch)
-    owner_work, roots_work = walk.seed_work(src)
+    owner_work, roots_work = walk.seed_work(src)[:2]
     owner_result = await walk.step(directory, src, owner_work, timeout=10, page_count=100)
     assert [entry["resource"] for entry in owner_result["entries"]] == [owner]
     root_result = await walk.step(directory, src, roots_work, timeout=10, page_count=100)
@@ -91,6 +91,26 @@ async def test_native_network_traversal_discovers_and_reconciles_without_plan_id
         institution
     ]
     assert not org_batch["frontier"]
+
+
+@pytest.mark.asyncio
+async def test_qualified_name_search_finds_network_outside_brand_roots(monkeypatch):
+    src = source()
+    org = organization("independent", owner=walk.CONFIG["owner_reference"])
+    org["name"] = "Independent member network"
+    fetch = AsyncMock(return_value=response([org]))
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    additional_roots = walk.seed_work(src)[2:]
+    assert [item["key"] for item in additional_roots] == list("ABCDEFGHIJLMNOPRSTUVWXY012345789")
+    selected = next(item for item in additional_roots if item["key"] == "I")
+    result = await walk.step(directory, src, selected, timeout=5, page_count=100)
+    assert result["ids"] == ["independent"]
+    assert result["frontier"] == [{"kind": "organization", "key": "independent", "url": None, "payload": {}}]
+    assert "name=I&type=ntwk" in fetch.await_args.args[1]
+    src["metadata_json"][walk.METADATA_KEY] = dict(walk.LEGACY_CONFIG)
+    assert [item["kind"] for item in walk.seed_work(src)] == ["owner", "roots"]
+    with pytest.raises(ValueError, match="unrecognized_query"):
+        await walk.step(directory, src, selected, timeout=5, page_count=100)
 
 
 @pytest.mark.asyncio

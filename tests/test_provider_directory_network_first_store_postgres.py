@@ -345,6 +345,37 @@ async def test_cleanup_requires_published_and_preserves_unrelated_tables(graph):
     await storage.cleanup_published(store.directory, candidate)
 
 
+async def test_overlapping_root_queries_resume_separately_and_deduplicate_organizations(graph):
+    store = graph.store
+    await store.prepare([work("roots", "A"), work("roots", "B")])
+    for key, ids in (("A", ["shared"]), ("B", ["shared", "isolated"])):
+        async with store.transaction():
+            [query] = await store.pending()
+            assert (query["kind"], query["key"]) == ("roots", key)
+            await store.apply(
+                [query], result(ids=ids, total=len(ids), frontier=[work("organization", i) for i in ids]), graph.persist
+            )
+    assert await store.pending() == []
+    assert [row["key"] for row in await store.pending(organizations=True)] == ["isolated", "shared"]
+    assert await graph.connection.fetchval(f"SELECT count(*) FROM {store.table('ids')}") == 3
+    assert await graph.connection.fetchval(f"SELECT count(*) FROM {store.table('roots')}") == 2
+
+
+async def test_organization_batch_with_one_stale_cursor_cannot_advance_other_rows(graph):
+    store = graph.store
+    await store.prepare([work("organization", key) for key in ("one", "two", "three")])
+    first, *others = await store.pending(organizations=True)
+    async with store.transaction():
+        await store.apply([first], result(), graph.persist)
+    with pytest.raises(ValueError, match="cursor_changed"):
+        async with store.transaction():
+            await store.apply([first, *others], result(), graph.persist)
+    assert await store.pending(organizations=True) == others
+    async with store.transaction():
+        await store.apply(others, result(), graph.persist)
+    assert await store.pending(organizations=True) == []
+
+
 async def test_unmeasured_chains_get_first_round_then_largest_total_first(graph):
     store = graph.store
     await store.prepare([work(key=key) for key in ("unmeasured", "small", "large")])
@@ -515,3 +546,179 @@ async def test_malformed_or_foreign_institution_reference_cannot_persist(graph, 
             await store.retain_entries([affiliation_by_field], graph.persist)
     async with store.transaction():
         assert await store.counts() == {}
+
+
+def _published_graph_fixture(graph):
+    """Describe the current institution-only edition used in publication tests."""
+    from process import provider_directory_network_snapshot_scope as scope
+    from process.provider_directory_network_traversal import CONFIG, SOURCE_ID
+    from tests.test_provider_directory_network_snapshot_scope import example
+
+    catalog = graph.schema + "_catalog"
+    edition = graph.schema + "_edition"
+    prior = graph.schema + "_prior"
+    dataset = SimpleNamespace(
+        dataset_id="candidate",
+        source_id=SOURCE_ID,
+        endpoint_id="endpoint",
+        evidence_run_id="root",
+        storage_schema=edition,
+        selected_resources=scope.RESOURCE_TYPES,
+        dataset_hash="a" * 64,
+    )
+    reviewed_scope = scope.make_scope(
+        root_name=CONFIG["name"],
+        owner_reference=CONFIG["owner_reference"],
+        discovery_counts=example()["discovery_counts"],
+        additional_names=list(CONFIG["name_search_characters"]),
+    )
+    diagnostics_by_type = {kind: {scope.SCOPE_KEY: reviewed_scope} for kind in scope.RESOURCE_TYPES}
+    metadata_by_field = {
+        "source_ids": [SOURCE_ID],
+        "selected_resources": list(scope.RESOURCE_TYPES),
+        "resource_diagnostics": diagnostics_by_type,
+        **scope.publication_scope_metadata(diagnostics_by_type),
+    }
+    cleanup_by_field = dict(
+        catalog_schema=catalog,
+        candidate_schema=graph.schema,
+        source_id=SOURCE_ID,
+        endpoint_id=dataset.endpoint_id,
+        dataset_id=dataset.dataset_id,
+        acquisition_root_run_id=dataset.evidence_run_id,
+        dataset_hash=dataset.dataset_hash,
+    )
+    return SimpleNamespace(dataset=dataset, options=cleanup_by_field, metadata=metadata_by_field, prior=prior)
+
+
+@pytest.fixture
+async def published_graph(graph, monkeypatch):
+    """Create the current and previous named editions in isolated test schemas."""
+    from process import provider_directory_named_edition as named
+
+    fixture = _published_graph_fixture(graph)
+    connection = graph.connection
+    dataset = fixture.dataset
+    catalog = fixture.options["catalog_schema"]
+    edition = dataset.storage_schema
+    prior = fixture.prior
+    monkeypatch.setattr(named, "POINTER_SCHEMA", catalog)
+    try:
+        for schema in (catalog, edition, prior):
+            await connection.execute(f'CREATE SCHEMA "{schema}"')
+            await connection.execute(
+                f'CREATE TABLE "{schema}".{named.HEADER}(dataset_id text PRIMARY KEY, endpoint_id text, '
+                "acquisition_root_run_id text, dataset_hash text, status text, is_current boolean, "
+                "published_at timestamptz, superseded_at timestamptz, resource_count bigint, publication_metadata_json jsonb)"
+            )
+        await connection.execute(
+            f'CREATE TABLE "{catalog}".{named.POINTER_TABLE}(catalog_schema text,endpoint_id text, dataset_id text, '
+            "schema_name text, previous_schema_name text, previous_dataset_id text, PRIMARY KEY(catalog_schema,endpoint_id))"
+        )
+        await connection.execute(
+            f'INSERT INTO "{catalog}".{named.POINTER_TABLE} VALUES($1,$2,$3,$4,$5,$6)',
+            catalog,
+            dataset.endpoint_id,
+            dataset.dataset_id,
+            edition,
+            prior,
+            "old",
+        )
+        await connection.execute(f'CREATE TABLE "{catalog}".provider_directory_source(source_id text,endpoint_id text)')
+        await connection.execute(
+            f'INSERT INTO "{catalog}".provider_directory_source VALUES($1,$2)', dataset.source_id, dataset.endpoint_id
+        )
+        for schema, dataset_id in ((edition, dataset.dataset_id), (prior, "old")):
+            await connection.execute(
+                f"INSERT INTO \"{schema}\".{named.HEADER} VALUES($1,$2,$3,$4,'published',true,now(),NULL,1,$5)",
+                dataset_id,
+                dataset.endpoint_id,
+                dataset.evidence_run_id,
+                dataset.dataset_hash,
+                json.dumps(fixture.metadata),
+            )
+        yield fixture
+    finally:
+        for schema in (prior, edition, catalog):
+            await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+async def test_followup_reads_exact_named_header_with_absent_or_stale_legacy_header(graph, published_graph):
+    from process import provider_directory_named_edition as named
+    from process import provider_directory_network_snapshot_scope as scope
+
+    connection, dataset = graph.connection, published_graph.dataset
+    catalog = published_graph.options["catalog_schema"]
+
+    @asynccontextmanager
+    async def snapshot(source_ids):
+        async with connection.transaction(isolation="repeatable_read", readonly=True):
+            yield await named.named_current_editions(connection, catalog, source_ids)
+
+    async def legacy_header(dataset_id):
+        row = await connection.fetchrow(f'SELECT * FROM "{catalog}".{named.HEADER} WHERE dataset_id=$1', dataset_id)
+        return dict(row) if row is not None else {}
+
+    directory = SimpleNamespace(
+        _artifact_selection_snapshot=snapshot, _endpoint_dataset_state=legacy_header, _json_object=storage.decoded
+    )
+    for legacy_present in (False, True):
+        if legacy_present:
+            await connection.execute(
+                f'INSERT INTO "{catalog}".{named.HEADER} SELECT * FROM "{dataset.storage_schema}".{named.HEADER}'
+            )
+            await connection.execute(f"UPDATE \"{catalog}\".{named.HEADER} SET publication_metadata_json='{{}}'")
+        followup = await scope.followup_scope_metadata(directory, dataset, {"dataset_id": dataset.dataset_id})
+        assert followup[scope.SCOPE_KEY] == published_graph.metadata[scope.SCOPE_KEY]
+        assert followup["endpoint_complete"] is False and followup["dataset_id"] == dataset.dataset_id
+
+    await connection.execute(
+        f'UPDATE "{dataset.storage_schema}".{named.HEADER} SET publication_metadata_json=$1',
+        json.dumps({"source_ids": [dataset.source_id]}),
+    )
+    with pytest.raises(RuntimeError, match="scope_invalid"):
+        await scope.followup_scope_metadata(directory, dataset, {})
+    await connection.execute(
+        f'UPDATE "{catalog}".{named.POINTER_TABLE} SET schema_name=previous_schema_name,dataset_id=previous_dataset_id'
+    )
+    with pytest.raises(RuntimeError, match="scope_invalid"):
+        await scope.followup_scope_metadata(directory, dataset, {})
+
+
+async def test_named_cleanup_requires_committed_matching_edition_and_preserves_predecessor(graph, published_graph):
+    from process import provider_directory_named_edition as named
+
+    connection, options = graph.connection, published_graph.options
+    store = storage.GraphStore(graph.store.directory, {**graph.store.source, "source_id": options["source_id"]})
+    other = storage.GraphStore(graph.store.directory, {**store.source, "_endpoint_dataset_id": "other"})
+    await store.prepare([])
+    await other.prepare([])
+    state = store.table("state")
+    with pytest.raises(ValueError, match="cleanup_candidate_changed"):
+        await storage.cleanup_named_published_graph(connection, **options)
+    await connection.execute(f"UPDATE {state} SET complete=true")
+    async with connection.transaction():
+        with pytest.raises(ValueError, match="cleanup_publication_required"):
+            await storage.cleanup_named_published_graph(connection, **options)
+    for change in ({"dataset_id": "old"}, {"acquisition_root_run_id": "wrong"}, {"dataset_hash": "b" * 64}):
+        with pytest.raises(ValueError, match="cleanup_publication_required"):
+            await storage.cleanup_named_published_graph(connection, **(options | change))
+
+    async def remaining_tables(candidate):
+        return await connection.fetchval(
+            "SELECT count(*) FROM pg_tables WHERE schemaname=$1 AND starts_with(tablename,$2)",
+            graph.schema,
+            candidate.prefix + "_",
+        )
+
+    assert await remaining_tables(store) == await remaining_tables(other) == 9
+    await storage.cleanup_named_published_graph(connection, **options)
+    await storage.cleanup_named_published_graph(connection, **options)
+    assert await remaining_tables(store) == 0 and await remaining_tables(other) == 9
+    assert await connection.fetchval(f'SELECT dataset_id FROM "{published_graph.prior}".{named.HEADER}') == "old"
+    assert (
+        await connection.fetchval(
+            f'SELECT previous_dataset_id FROM "{options["catalog_schema"]}".{named.POINTER_TABLE}'
+        )
+        == "old"
+    )

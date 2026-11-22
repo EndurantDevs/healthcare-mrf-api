@@ -16,6 +16,7 @@ import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -31,6 +32,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import registry_company_approval_fence as fence
 from process import registry_ptg_scope_engine as scope_engine
+from process.ptg_parts import result_archive_source_authority
 from process.ptg_parts.frozen_rate_binding import frozen_rate_binding_sha256
 from process.registry_ptg_producer_scope import (
     RegistryPTGProducerScopeError,
@@ -778,9 +780,9 @@ async def test_native_expired_deadline_never_checks_out_source_session(tmp_path,
 
 async def _wait_blocked_source_query(fixture, blocker_pid, journal):
     """Observe only the registered approver's actual snapshot custody query."""
-    async with fixture.engine.connect() as connection:
-        await connection.execution_options(isolation_level="AUTOCOMMIT")
-        async with asyncio.timeout(3):
+    async with asyncio.timeout(3):
+        async with fixture.engine.connect() as connection:
+            await connection.execution_options(isolation_level="AUTOCOMMIT")
             while True:
                 observation = (
                     (
@@ -812,7 +814,7 @@ async def _assert_source_query_failure(task, failure):
             await asyncio.wait_for(task, 3)
         return
     with pytest.raises(scope_engine.RegistryPTGScopeDeadlineExpired) as expired:
-        await asyncio.wait_for(task, 3)
+        await asyncio.wait_for(task, 6)
     assert expired.value.outcome_unknown is False
 
 
@@ -822,15 +824,20 @@ async def test_native_source_query_expiry_retires_physical_fence_without_append(
     app = _app_authority(monkeypatch)
     async with _native_scope(tmp_path) as fixture:
         envelope = await _approval(fixture)
+        # Allow the observer 3s to see the real row lock before either application or database expiry.
+        lock = result_archive_source_authority.acquire_ptg2_source_lifecycle_lock
+        monkeypatch.setattr(
+            result_archive_source_authority,
+            "acquire_ptg2_source_lifecycle_lock",
+            partial(lock, lock_timeout="8s", statement_timeout="8s"),
+        )
         task = None
         try:
             async with fixture.engine.begin() as blocker:
                 blocker_pid = await blocker.scalar(text("SELECT pg_backend_pid()"))
                 await blocker.execute(text(f"SELECT snapshot_id FROM {fixture.source.schema}.ptg2_snapshot FOR UPDATE"))
-                task = asyncio.create_task(
-                    # Expire before the unchanged native lifecycle lock timeout can fire.
-                    fixture.service.approve(envelope, deadline=asyncio.get_running_loop().time() + 0.25)
-                )
+                deadline = asyncio.get_running_loop().time() + 5 if failure == "deadline" else None
+                task = asyncio.create_task(fixture.service.approve(envelope, deadline=deadline))
                 pid = await _wait_blocked_source_query(fixture, blocker_pid, tmp_path / "source-query-observer.json")
                 assert not task.done()
                 await _assert_source_query_failure(task, failure)

@@ -657,9 +657,12 @@ non-importable coverage blockers from unresolved endpoint-discovery gaps.
 ### Excellus institutional network snapshots
 
 Select Excellus to acquire the network Organizations discovered from its public
-FHIR directory and their institutional affiliations. The importer begins with
-the carrier-name and network-type search, verifies native ownership and follows
-network references in canonical OrganizationAffiliation records. It reconciles
+FHIR directory and their institutional affiliations. It searches for network
+Organizations by carrier name and by each configured single character. The
+published scope lists the additional searches and the unverified characters.
+Each search follows its issued pages sequentially. The importer deduplicates
+the resulting Organizations, verifies native ownership and follows network
+references in canonical OrganizationAffiliation records. It reconciles
 each owned network's distinct affiliation IDs with the total reported by the
 server. An affiliation shared by two networks is stored once with both links.
 
@@ -673,6 +676,8 @@ with its cursor. The same candidate can resume if the upstream search is
 corrected. If the retained canonical resource itself must change, preserve the
 candidate for inspection and start a separately authorized replacement. Readers
 keep their previous published snapshot throughout acquisition and validation.
+After acquisition succeeds, the named publisher verifies the coverage recorded
+in the edition header and switches the current pointer in one transaction.
 
 ### Retained artifact byte access
 

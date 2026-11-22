@@ -2,6 +2,7 @@
 """Honest coverage labels for query-discovered institutional network snapshots."""
 
 from copy import deepcopy
+from string import ascii_uppercase, digits
 from typing import Any
 
 SCOPE_KEY = "network_institutional_scope"
@@ -27,7 +28,7 @@ def _require(valid):
         raise RuntimeError("provider_directory_network_snapshot_scope_invalid")
 
 
-def make_scope(*, root_name, owner_reference, discovery_counts):
+def make_scope(*, root_name, owner_reference, discovery_counts, additional_names=()):
     """Describe observed membership without promoting it to endpoint coverage."""
     _require(type(root_name) is str and bool(root_name.strip()) and root_name == root_name.strip())
     _require(
@@ -50,9 +51,17 @@ def make_scope(*, root_name, owner_reference, discovery_counts):
         and discovery_counts["membership_queries"] == discovery_counts["discovered_networks"]
         and discovery_counts["membership_queries_complete"] == discovery_counts["membership_queries"]
     )
+    query_by_parameter = {"resourceType": "Organization", "name": root_name, "type": "ntwk"}
+    _require(isinstance(additional_names, (list, tuple)))
+    if additional_names:
+        alphabet = ascii_uppercase + digits
+        _require(all(type(name) is str and len(name) == 1 and name in alphabet for name in additional_names))
+        _require(len(set(additional_names)) == len(additional_names) and root_name not in additional_names)
+        query_by_parameter["additional_name_queries"] = list(additional_names)
+        query_by_parameter["unverified_name_queries"] = [name for name in alphabet if name not in additional_names]
     return {
         "publication_kind": PUBLICATION_KIND,
-        "root_selection": {"resourceType": "Organization", "name": root_name, "type": "ntwk"},
+        "root_selection": query_by_parameter,
         "owner_reference": owner_reference,
         "network_membership": "observed_native_affiliation_references",
         "network_identity": "native_ntwk_coding_and_matching_partOf",
@@ -71,6 +80,7 @@ def validate_scope(value):
     _require(type(value) is dict and type(value.get("root_selection")) is dict)
     expected = make_scope(
         root_name=value["root_selection"].get("name"),
+        additional_names=value["root_selection"].get("additional_name_queries", ()),
         owner_reference=value.get("owner_reference"),
         discovery_counts=value.get("discovery_counts"),
     )
@@ -99,14 +109,57 @@ def publication_scope_metadata(diagnostics, *, required=False):
     }
 
 
-async def followup_scope_metadata(directory: Any, dataset: Any, followup: dict[str, Any]) -> dict[str, Any]:
-    """Attach validated durable scope to one exact published snapshot descriptor."""
-    if set(dataset.selected_resources) != set(RESOURCE_TYPES):
-        return followup
-    dataset_state = await directory._endpoint_dataset_state(dataset.dataset_id)
-    publication_metadata = directory._json_object(dataset_state.get("publication_metadata_json"))
-    if SCOPE_KEY not in publication_metadata:
-        return followup
+def published_header_scope(publication_metadata: dict[str, Any], *, source_id: str | None = None) -> dict[str, Any]:
+    """Check the immutable header against both resource diagnostics."""
+    from process.provider_directory_network_traversal import CONFIG, LEGACY_CONFIG, SOURCE_ID
+
     scope_metadata = publication_scope_metadata(publication_metadata.get("resource_diagnostics", {}), required=True)
-    _require(all(publication_metadata.get(key) == scope_value for key, scope_value in scope_metadata.items()))
-    return {**followup, **scope_metadata}
+    _require(
+        validate_scope(publication_metadata.get(SCOPE_KEY)) == scope_metadata[SCOPE_KEY]
+        and publication_metadata.get("publication_kind") == PUBLICATION_KIND
+        and publication_metadata.get("endpoint_complete") is False
+        and publication_metadata.get("endpoint_collection_complete") is False
+    )
+    if source_id == SOURCE_ID:
+        scope = scope_metadata[SCOPE_KEY]
+        selection = scope["root_selection"]
+        _require(
+            publication_metadata.get("source_ids") == [source_id]
+            and publication_metadata.get("selected_resources") == list(RESOURCE_TYPES)
+            and scope["owner_reference"] == LEGACY_CONFIG["owner_reference"]
+            and selection["name"] == LEGACY_CONFIG["name"]
+            and (
+                "additional_name_queries" not in selection
+                or selection["additional_name_queries"] == list(CONFIG["name_search_characters"])
+            )
+        )
+    return scope_metadata
+
+
+async def followup_scope_metadata(directory: Any, dataset: Any, followup: dict[str, Any]) -> dict[str, Any]:
+    """Attach validated coverage from the selected current edition."""
+    from process.provider_directory_network_traversal import SOURCE_ID
+
+    is_scoped_source = dataset.source_id == SOURCE_ID
+    if set(dataset.selected_resources) != set(RESOURCE_TYPES):
+        _require(not is_scoped_source)
+        return followup
+    if dataset.storage_schema is None:
+        header = await directory._endpoint_dataset_state(dataset.dataset_id)
+    else:
+        async with directory._artifact_selection_snapshot([dataset.source_id]) as editions:
+            _require(len(editions) == 1)
+            edition = editions[0]
+            _require(
+                edition.schema_name == dataset.storage_schema
+                and edition.dataset_id == dataset.dataset_id
+                and edition.endpoint_id == dataset.endpoint_id
+                and dataset.source_id in edition.source_ids
+                and edition.header["acquisition_root_run_id"] == dataset.evidence_run_id
+                and edition.header["dataset_hash"] == dataset.dataset_hash
+            )
+            header = edition.header
+    metadata = directory._json_object(header.get("publication_metadata_json"))
+    if not is_scoped_source and SCOPE_KEY not in metadata:
+        return followup
+    return {**followup, **published_header_scope(metadata, source_id=dataset.source_id)}

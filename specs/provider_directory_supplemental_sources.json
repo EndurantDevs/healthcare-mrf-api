@@ -339,6 +339,7 @@
       "provider_directory_fully_enumerable_resources": [],
       "provider_directory_network_snapshot": {
         "name": "Excellus",
+        "name_search_characters": "ABCDEFGHIJLMNOPRSTUVWXY012345789",
         "owner_reference": "Organization/10-40-0001"
       },
       "provider_directory_probe_resource": "Organization",

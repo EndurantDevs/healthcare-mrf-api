@@ -8,7 +8,8 @@ from process import provider_directory_affiliation_hydration as fhir
 SOURCE_ID = "pdfhir_16514e416a13c8b817e820bf"
 API_BASE = "https://fhir.excellusbcbs.com/fhir/api"
 METADATA_KEY = "provider_directory_network_snapshot"
-CONFIG = {"name": "Excellus", "owner_reference": "Organization/10-40-0001"}
+LEGACY_CONFIG = {"name": "Excellus", "owner_reference": "Organization/10-40-0001"}
+CONFIG = {**LEGACY_CONFIG, "name_search_characters": "ABCDEFGHIJLMNOPRSTUVWXY012345789"}
 RESOURCES = ("Organization", "OrganizationAffiliation")
 NETWORK_SYSTEM = "http://hl7.org/fhir/us/davinci-pdex-plan-net/CodeSystem/OrgTypeCS"
 
@@ -34,7 +35,7 @@ def is_source(source_record):
         source_record.get("source_id") == SOURCE_ID
         and source_record.get("api_base") == API_BASE
         and source_record.get("canonical_api_base") == API_BASE
-        and _config(source_record) == CONFIG
+        and _config(source_record) in (LEGACY_CONFIG, CONFIG)
     )
 
 
@@ -42,11 +43,17 @@ def _work(kind, key):
     return {"kind": kind, "key": key, "url": None, "payload": {}}
 
 
+def _root_names(source_record):
+    config = _config(source_record)
+    return (config["name"], *config.get("name_search_characters", ""))
+
+
 def seed_work(source_record):
-    """Schedule native owner verification and the typed network search."""
+    """Register every selected query before any directory pages are consumed."""
     if not is_source(source_record):
         raise ValueError("network_snapshot_source_mismatch")
-    return [_work("owner", CONFIG["owner_reference"].removeprefix("Organization/")), _work("roots", CONFIG["name"])]
+    owner = _work("owner", CONFIG["owner_reference"].removeprefix("Organization/"))
+    return [owner, *(_work("roots", name) for name in _root_names(source_record))]
 
 
 def _result(*, entries=(), frontier=(), memberships=(), ids=(), total=None, next_url=None, missing_ids=()):
@@ -93,7 +100,7 @@ async def step(host, source_record, work, *, timeout, page_count):
     count = min(100, page_count)
     if count < 1:
         raise ValueError("network_snapshot_invalid_page_count")
-    if kind == "roots" and key == CONFIG["name"]:
+    if kind == "roots" and key in _root_names(source_record):
         resource_type = "Organization"
         search_parameters_by_name = {"name": key, "type": "ntwk", "_count": count}
     elif kind == "network" and fhir.valid_id(key):
