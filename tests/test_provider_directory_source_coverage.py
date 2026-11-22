@@ -19,11 +19,14 @@ from process.provider_directory_source_coverage import (
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
-@pytest.mark.parametrize("api_base", [
-    INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-    MICHIGAN_PROVIDER_DIRECTORY_BASE,
-    MICHIGAN_PROVIDER_DIRECTORY_BASE + "/",
-])
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        MICHIGAN_PROVIDER_DIRECTORY_BASE,
+        MICHIGAN_PROVIDER_DIRECTORY_BASE + "/",
+    ],
+)
 @pytest.mark.parametrize("resource_type", sorted(importer.MICHIGAN_SUPPORTED_RESOURCES))
 def test_stale_full_metadata_cannot_admit_michigan_acquisition(api_base, resource_type):
     source_record_by_field = {
@@ -45,15 +48,14 @@ def test_michigan_is_skipped_without_aborting_healthy_sources():
         "api_base": "https://directory.example.test/fhir",
     }
     selected_sources, selection_metrics = importer._select_resource_import_sources(
-        [healthy_source_by_field, {"source_id": MICHIGAN_SOURCE_ID,
-                                 "api_base": MICHIGAN_PROVIDER_DIRECTORY_BASE}],
-        valid_source_ids=None, open_only=True, include_auth_required=False,
+        [healthy_source_by_field, {"source_id": MICHIGAN_SOURCE_ID, "api_base": MICHIGAN_PROVIDER_DIRECTORY_BASE}],
+        valid_source_ids=None,
+        open_only=True,
+        include_auth_required=False,
     )
     assert selected_sources == [healthy_source_by_field]
     assert selection_metrics["source_import_skipped_blocked_source"] == 1
-    assert selection_metrics[
-        "source_import_skipped_blocked_source_upstream_search_window_incomplete"
-    ] == 1
+    assert selection_metrics["source_import_skipped_blocked_source_upstream_search_window_incomplete"] == 1
 
 
 def _dataset_row(*, promote):
@@ -82,25 +84,31 @@ def _dataset_row(*, promote):
 def test_michigan_new_publication_is_blocked_but_current_slice_is_retained():
     with pytest.raises(RuntimeError, match="artifact_coverage_blocked"):
         importer._validate_provider_directory_artifact_datasets(
-            [_dataset_row(promote=True)], [MICHIGAN_SOURCE_ID],
+            [_dataset_row(promote=True)],
+            [MICHIGAN_SOURCE_ID],
             should_select_validated_candidates=True,
         )
     fence = importer._validate_provider_directory_artifact_datasets(
-        [_dataset_row(promote=False)], [MICHIGAN_SOURCE_ID],
+        [_dataset_row(promote=False)],
+        [MICHIGAN_SOURCE_ID],
     )
     assert fence.datasets[0].dataset_id == "synthetic-dataset"
     assert fence.datasets[0].is_current is True
     assert fence.datasets[0].promote_on_cutover is False
 
 
-@pytest.mark.parametrize(("api_base", "canonical_base"), [
-    ("https://directory.example.test/fhir", MICHIGAN_PROVIDER_DIRECTORY_BASE),
-    ("https://directory.example.test/fhir", MICHIGAN_PROVIDER_DIRECTORY_BASE + "/"),
-    (MICHIGAN_PROVIDER_DIRECTORY_BASE, "https://directory.example.test/fhir"),
-])
+@pytest.mark.parametrize(
+    ("api_base", "canonical_base"),
+    [
+        ("https://directory.example.test/fhir", MICHIGAN_PROVIDER_DIRECTORY_BASE),
+        ("https://directory.example.test/fhir", MICHIGAN_PROVIDER_DIRECTORY_BASE + "/"),
+        (MICHIGAN_PROVIDER_DIRECTORY_BASE, "https://directory.example.test/fhir"),
+    ],
+)
 def test_michigan_canonical_alias_cannot_bypass_acquisition_or_promotion(api_base, canonical_base):
     source_record_by_field = {
-        "source_id": "synthetic-canonical-alias", "api_base": api_base,
+        "source_id": "synthetic-canonical-alias",
+        "api_base": api_base,
         "canonical_api_base": canonical_base,
         "metadata_json": {"provider_directory_coverage_mode": "full"},
     }
@@ -114,11 +122,14 @@ def test_michigan_canonical_alias_cannot_bypass_acquisition_or_promotion(api_bas
         if promote:
             with pytest.raises(RuntimeError, match="artifact_coverage_blocked"):
                 importer._validate_provider_directory_artifact_datasets(
-                    [row], [source_record_by_field["source_id"]], should_select_validated_candidates=True,
+                    [row],
+                    [source_record_by_field["source_id"]],
+                    should_select_validated_candidates=True,
                 )
         else:
             fence = importer._validate_provider_directory_artifact_datasets(
-                [row], [source_record_by_field["source_id"]],
+                [row],
+                [source_record_by_field["source_id"]],
             )
             assert fence.datasets[0].is_current is True
             assert fence.datasets[0].promote_on_cutover is False
@@ -135,5 +146,11 @@ def test_catalog_warns_without_changing_held_profile_selection_authority():
             assert entry["coverage_warning"] == MICHIGAN_COVERAGE_WARNING
             assert entry["acquisition_blocked_reason"] == "upstream_search_window_incomplete"
         else:
-            assert "coverage_warning" not in entry
             assert "acquisition_blocked_reason" not in entry
+            if entry["entry_id"] == "delta-dental-provider-directory":
+                assert entry["source_ids"] == ["delta-dental-national-finder"]
+                assert entry["classification"] == "observation"
+                assert entry["profile_enabled"] is False
+                assert entry["coverage_warning"] == manifest["observation_entries"][0]["coverage_warning"]
+            else:
+                assert "coverage_warning" not in entry

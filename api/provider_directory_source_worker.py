@@ -388,12 +388,74 @@ def _proxy_fields(source_ids, endpoint_scope, route, *, policy=None):
     }
 
 
+def is_delta_observation_launch(launch):
+    """Recognize the exact nonpublication Delta source launch."""
+    from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN
+
+    return type(launch) is FHIRSourceWorkerLaunch and (launch.source_id, launch.endpoint_scope) == (
+        SOURCE_ID,
+        SOURCE_ORIGIN,
+    )
+
+
+def _is_delta_plan_mounted(spec, launch, launch_request=None):
+    from api.control_workers import _worker_job_secret_volumes
+    from process.delta_dental_directory_worker import MANIFEST_PATH
+
+    candidates = [
+        entry
+        for entry in _worker_job_secret_volumes(spec, launch, launch_request=launch_request)
+        if entry["volumeMount"]["mountPath"] == MANIFEST_PATH
+    ]
+    return len(candidates) == 1 and (
+        candidates[0]["volumeMount"].get("subPath") == "plan.json"
+        and candidates[0]["volumeMount"].get("readOnly") is True
+        and candidates[0]["volume"]["secret"]["secretName"] == launch.secret_name
+        and candidates[0]["volume"]["secret"].get("optional", False) is False
+    )
+
+
+def is_delta_route_available():
+    """Advertise a selected run only with a configured image and nonsecret proxy policy."""
+    from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN
+    from process.ext.source_http_proxy import SourceProxyError
+
+    try:
+        routes = [
+            route
+            for route in _configured_routes()
+            if route["root_run_id"] is None
+            and route["source_id"] == SOURCE_ID
+            and route["endpoint_scope"] == SOURCE_ORIGIN
+        ]
+        if len(routes) != 1 or not _proxy_fields([SOURCE_ID], SOURCE_ORIGIN, routes[0]):
+            return False
+        from api.control_workers import _BY_WORKER_CLASS
+
+        route = routes[0]
+        launch = FHIRSourceWorkerLaunch(
+            "",
+            "",
+            route["image"],
+            secret_name=route["secret_name"],
+            source_id=SOURCE_ID,
+            endpoint_scope=SOURCE_ORIGIN,
+        )
+        return _is_delta_plan_mounted(_BY_WORKER_CLASS[_WORKER_CLASS], launch)
+    except ValueError, SourceProxyError:
+        return False
+
+
 def _uses_source_http(params):
     """Keep recovery and local-only modes outside acquisition transport routing."""
     from process import provider_directory_serving_recovery as recovery
+    from process.delta_dental_directory_worker import is_delta_observation, require_observation_task
     from process.provider_directory_refresh_preset import apply_provider_directory_refresh_preset
 
     params = params if type(params) is dict else {}
+    if is_delta_observation(params):
+        require_observation_task(params)
+        return True
     effective_by_name = apply_provider_directory_refresh_preset(params)
     if recovery.is_recovery_request(_IMPORTER, effective_by_name) or any(
         bool(effective_by_name.get(name))
@@ -500,6 +562,17 @@ def require_fresh_ordinary_profile_launch(spec, launch_request):
     )
 
 
+def _require_delta_observation_route(params, route, policy):
+    """Require exact dedicated admission before accepting any Delta worker task."""
+    from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN
+    from process.delta_dental_directory_worker import is_delta_observation, require_observation_task
+
+    if is_delta_observation(params):
+        require_observation_task(params)
+        if route is None or not policy.use_proxy(SOURCE_ID, SOURCE_ORIGIN):
+            raise ValueError("delta_dental_finder_source_proxy_required")
+
+
 def admit_fhir_source_worker_launch(admitted_run):
     """Require the configured immutable source image and original queued identity."""
     if admitted_run.get("importer") != _IMPORTER:
@@ -533,6 +606,7 @@ def admit_fhir_source_worker_launch(admitted_run):
     policy = SourceProxyConfig.from_environment()
     _require_source_proxy_scope(policy, params_by_name)
     route = _source_route(admitted_run)
+    _require_delta_observation_route(params_by_name, route, policy)
     if route is not None:
         image = route["image"]
     if _IMAGE.fullmatch(image) is None:
@@ -940,7 +1014,16 @@ def source_proxy_environment(spec, launch_request, environment):
     }
     if [entry for entry in environment if entry["name"] == PROXY_POOL_ENV] != [expected_by_field]:
         raise ValueError("fhir_source_worker_proxy_configuration_invalid")
-    return _proxy_literal_environment(launch)
+    fields = _proxy_literal_environment(launch)
+    if is_delta_observation_launch(launch):
+        from process.delta_dental_directory_worker import MANIFEST_ENV, MANIFEST_PATH
+
+        if not _is_delta_plan_mounted(spec, launch, launch_request):
+            raise ValueError("delta_dental_finder_authorized_manifest_required")
+        if any(entry["name"] == MANIFEST_ENV for entry in environment):
+            raise ValueError("delta_dental_finder_authorized_manifest_changed")
+        fields.append({"name": MANIFEST_ENV, "value": MANIFEST_PATH})
+    return fields
 
 
 def source_proxy_annotations(spec, launch_request):
@@ -1077,6 +1160,26 @@ def _is_fhir_secret_scope(selection, worker_class):
     return worker_class == _WORKER_CLASS
 
 
+def is_observation_secret_allowed(selection, launch):
+    """Allow only trusted, purpose-scoped connection selectors for observation jobs."""
+    if not is_delta_observation_launch(launch):
+        return True
+    if selection.get("purposes") != [PURPOSE] or selection.get("optional", False) is not False:
+        return False
+    if selection.get("sourceProxyPool") is True:
+        return _is_fhir_secret_scope(selection, _WORKER_CLASS) and _is_launch_secret_selected(
+            selection,
+            launch,
+            allow_shared=True,
+        )
+    return (
+        selection.get("observationConnection") in ("control", "queue")
+        and selection.get("sharedForRoutes") is True
+        and _is_fhir_secret_scope(selection, _WORKER_CLASS)
+        and _is_launch_secret_selected(selection, launch, allow_shared=True)
+    )
+
+
 def is_fhir_source_secret_selected(selection, worker_class, launch_request):
     """Select source credentials only for the exact admitted FHIR queue purpose."""
     if not _is_fhir_secret_scope(selection, worker_class):
@@ -1139,6 +1242,10 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
             and containers[0]["securityContext"] == _worker_job_container_security_context()
             and containers[0]["image"] == launch.image
             and (expected_env is None or containers[0]["env"] == expected_env)
+            and (
+                not is_delta_observation_launch(launch)
+                or not any("secretRef" in source_ref for source_ref in containers[0].get("envFrom", []))
+            )
             and _is_proxy_job_matching(job, launch)
             and _fhir_source_identity_matches(job, launch)
             and containers[0].get("volumeMounts", []) == [volume["volumeMount"] for volume in volumes]

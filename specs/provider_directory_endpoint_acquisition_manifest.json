@@ -5,6 +5,19 @@
   "engine": "healthcare-mrf-api",
   "retest_results_url": "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json",
   "catalog_confirmation": null,
+  "observation_entries": [
+    {
+      "entry_id": "delta-dental-provider-directory",
+      "display_name": "Delta Dental National Dentist Finder",
+      "owner_id": "delta-dental",
+      "source_ids": ["delta-dental-national-finder"],
+      "canonical_base": "https://www.deltadental.com",
+      "classification": "observation",
+      "resource_profile": null,
+      "resources": [],
+      "coverage_warning": "The finder supplies bounded office observations under an authorized search plan. Result caps and unverified network or geographic coverage prevent treating these observations as a complete directory."
+    }
+  ],
   "support_documentation": {
     "schema_version": 1,
     "freshness_policy": {

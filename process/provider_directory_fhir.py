@@ -67679,10 +67679,10 @@ async def process_provider_directory_fhir_data(
     task: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
-    if "rooted_graph" in (task or {}):
-        from process.provider_directory_rooted_graph_worker import process_rooted_graph_task
+    from process.delta_dental_directory_worker import specialized_source_task
 
-        return await process_rooted_graph_task(sys.modules[__name__], ctx, task)
+    if (specialized := specialized_source_task(sys.modules[__name__], ctx, task)) is not None:
+        return await specialized
     from process.provider_directory_cms_source_runtime import CMSRegistrySourceInvocation
 
     registry_source_invocation = CMSRegistrySourceInvocation.from_context(ctx, task or {})
