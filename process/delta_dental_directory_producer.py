@@ -150,7 +150,17 @@ def require_delta_observed_task(task):
         or type(review_id) is not str
         or not re.fullmatch(r"[0-9a-f]{32}", review_id)
         or "delta_dental_directory_observation" in task
-        or "rooted_graph" in task
+        or any(
+            marker in task
+            for marker in (
+                "rooted_graph",
+                "provider_directory_serving_operation",
+                "provider_directory_serving_generation",
+                "provider_directory_profile_contract_id",
+                "provider_directory_profile_generation",
+                "provider_directory_profile_selection_attestation",
+            )
+        )
         or any(
             task.get(option)
             for option in (
@@ -170,6 +180,16 @@ def require_delta_observed_task(task):
                 "refresh_preset",
                 "resources",
                 "run_post_import_corroboration",
+                "publish_artifacts",
+                "publish_corroboration",
+                "validated_publication_candidate",
+                "defer_typed_materialization",
+                "seed_only",
+                "canonical_backfill_only",
+                "contact_backfill_only",
+                "dataset_followup_only",
+                "preset",
+                "source_query",
             )
         )
     ):

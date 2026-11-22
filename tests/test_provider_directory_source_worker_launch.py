@@ -1642,14 +1642,102 @@ def test_delta_review_uses_its_dedicated_route_without_proxy(monkeypatch):
     request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
     workers._bind_admitted_job(request, admitted_run_by_field)
     request.fhir_source_launch = launch
-    job = workers._worker_job_manifest(SPEC, request, launch.image)
-    assert job["metadata"]["annotations"]["healthporta.com/source-observed-review-id"] == review_id
-    container = job["spec"]["template"]["spec"]["containers"][0]
-    names = {entry["name"] for entry in container["env"]}
-    assert not names.intersection({source.PROXY_POOL_ENV, source.PROXY_BINDING_ENV, source.PROXY_POLICY_ENV})
-    assert "HLTHPRT_DELTA_DENTAL_FINDER_MANIFEST_PATH" not in names
+    _assert_review_job_isolation(monkeypatch, request, launch)
     with pytest.raises(ValueError):
         source.admit_fhir_source_worker_launch({**admitted_run_by_field, "params": {**params_by_name, "probe": True}})
     monkeypatch.setenv(source.ROUTES_ENV, json.dumps([capture_route_by_field]))
     with pytest.raises(ValueError, match="delta_observed_worker_route_required"):
         source.admit_fhir_source_worker_launch(admitted_run_by_field)
+
+
+def _configure_review_job_isolation(monkeypatch, launch):
+    """Configure ordinary defaults alongside the selected retained producer inputs."""
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "retained-cache")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "/work")
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "/work/retained-artifacts")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_VOLUME_NAME", "retained")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_CONFIGMAP", "public-config")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "broad-secret")
+    explicit_by_field = {
+        "name": "REVIEW_KEY",
+        "key": "review-key",
+        "secretName": launch.secret_name,
+        "workerClasses": [SPEC.worker_class],
+        "importers": ["provider-directory-fhir"],
+        "purposes": [source.PURPOSE],
+    }
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_ENV_JSON",
+        json.dumps(
+            [
+                explicit_by_field,
+                {**explicit_by_field, "name": "OTHER_ROUTE_KEY", "secretName": "capture-source-secret"},
+                {**explicit_by_field, "name": "SHARED_KEY", "secretName": "shared-secret", "sharedForRoutes": True},
+                {"name": "UNSCOPED_KEY", "key": "unscoped", "secretName": "broad-secret"},
+            ]
+        ),
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON",
+        json.dumps([{"secretName": "broad-secret", "mountPath": "/extra"}]),
+    )
+
+
+def _assert_review_job_isolation(monkeypatch, request, launch):
+    """Verify fresh and reused Jobs take exactly the same isolated shape."""
+    monkeypatch.delenv("HLTHPRT_WORKER_JOB_PVC_NAME", raising=False)
+    with pytest.raises(ValueError, match="delta_observed_worker_cache_required"):
+        workers._worker_job_manifest(SPEC, request, launch.image)
+
+    _configure_review_job_isolation(monkeypatch, launch)
+    job = workers._worker_job_manifest(SPEC, request, launch.image)
+    assert (
+        job["metadata"]["annotations"]["healthporta.com/source-observed-review-id"] == launch.delta_observed_review_id
+    )
+    pod = job["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    assert container["envFrom"] == [{"configMapRef": {"name": "public-config"}}]
+    assert pod["volumes"] == [
+        {
+            "name": "retained",
+            "persistentVolumeClaim": {"claimName": "retained-cache", "readOnly": True},
+        }
+    ]
+    assert container["volumeMounts"] == [
+        {
+            "name": "retained",
+            "mountPath": "/work/retained-artifacts/delta-dental-directory",
+            "subPath": "retained-artifacts/delta-dental-directory",
+            "readOnly": True,
+        }
+    ]
+    env_by_name = {entry["name"]: entry for entry in container["env"]}
+    assert env_by_name["REVIEW_KEY"]["valueFrom"]["secretKeyRef"] == {"name": launch.secret_name, "key": "review-key"}
+    assert env_by_name["SQLITE_TMPDIR"]["value"] == "/tmp"
+    assert env_by_name["HLTHPRT_IMPORT_STATUS_EVENT_URL"]["value"] == ""
+    assert not env_by_name.keys() & {
+        source.PROXY_POOL_ENV,
+        source.PROXY_BINDING_ENV,
+        source.PROXY_POLICY_ENV,
+        "HLTHPRT_DELTA_DENTAL_FINDER_MANIFEST_PATH",
+        "OTHER_ROUTE_KEY",
+        "SHARED_KEY",
+        "UNSCOPED_KEY",
+    }
+    assert source.is_fhir_source_job_matching(job, launch, request)
+    for changed in ("broad_secret", "cache_source", "cache_mount", "cache_scope", "review_id"):
+        mismatched_job = deepcopy(job)
+        mismatched_pod = mismatched_job["spec"]["template"]["spec"]
+        mismatched_container = mismatched_pod["containers"][0]
+        match changed:
+            case "broad_secret":
+                mismatched_container["envFrom"].append({"secretRef": {"name": "broad-secret"}})
+            case "cache_source":
+                mismatched_pod["volumes"][0]["persistentVolumeClaim"]["readOnly"] = False
+            case "cache_mount":
+                mismatched_container["volumeMounts"][0]["readOnly"] = False
+            case "cache_scope":
+                del mismatched_container["volumeMounts"][0]["subPath"]
+            case "review_id":
+                mismatched_job["metadata"]["annotations"]["healthporta.com/source-observed-review-id"] = "e" * 32
+        assert not source.is_fhir_source_job_matching(mismatched_job, launch, request)

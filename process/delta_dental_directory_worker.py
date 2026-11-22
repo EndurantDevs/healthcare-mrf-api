@@ -79,7 +79,18 @@ def specialized_source_task(directory, ctx, task):
 def require_observation_task(task):
     """Keep the explicit finder selector outside generic FHIR, Probe and Profile work."""
     if (
-        "delta_dental_observed_dataset" in task
+        any(
+            name in task
+            for name in (
+                "delta_dental_observed_dataset",
+                "delta_dental_observed_review_id",
+                "provider_directory_serving_operation",
+                "provider_directory_serving_generation",
+                "provider_directory_profile_contract_id",
+                "provider_directory_profile_generation",
+                "provider_directory_profile_selection_attestation",
+            )
+        )
         or task.get(OBSERVATION_FLAG) is not True
         or task.get("source_ids") != [SOURCE_ID]
         or task.get("provider_directory_endpoint_scope") != SOURCE_ENDPOINT
@@ -98,6 +109,12 @@ def require_observation_task(task):
                 "defer_typed_materialization",
                 "source_query",
                 "refresh_preset",
+                "preset",
+                "seed_only",
+                "canonical_backfill_only",
+                "contact_backfill_only",
+                "dataset_followup_only",
+                "import_completion",
                 "rehydrate_dataset_id",
                 "validated_publication_candidate",
             )

@@ -469,6 +469,16 @@ def is_delta_observation_launch(launch):
     )
 
 
+def is_delta_review_launch(launch):
+    """Identify a retained review admitted to an exact producer route."""
+    return type(launch) is FHIRSourceWorkerLaunch and bool(launch.delta_observed_review_id)
+
+
+def uses_isolated_delta_environment(launch):
+    """Limit both Delta worker paths to explicitly selected credentials."""
+    return is_delta_observation_launch(launch) or is_delta_review_launch(launch)
+
+
 def _is_delta_plan_mounted(spec, launch, launch_request=None):
     from api.control_workers import _worker_job_secret_volumes
     from process.delta_dental_directory_worker import MANIFEST_PATH
@@ -1249,7 +1259,18 @@ def _is_fhir_secret_scope(selection, worker_class):
 
 
 def is_observation_secret_allowed(selection, launch):
-    """Allow only trusted, purpose-scoped connection selectors for observation jobs."""
+    """Keep Delta credentials on the exact admitted purpose and route."""
+    if is_delta_review_launch(launch):
+        return (
+            selection.get("purposes") == [PURPOSE]
+            and selection.get("optional", False) is False
+            and "observationConnection" not in selection
+            and selection.get("sharedForRoutes", False) is False
+            and selection.get("sourceProxyPool", False) is False
+            and not _is_proxy_pool_reference(selection)
+            and _is_fhir_secret_scope(selection, _WORKER_CLASS)
+            and _is_launch_secret_selected(selection, launch)
+        )
     if not is_delta_observation_launch(launch):
         return "observationConnection" not in selection
     if selection.get("purposes") != [PURPOSE] or selection.get("optional", False) is not False:
@@ -1291,7 +1312,9 @@ def is_fhir_source_volume_selected(selection, worker_class, launch):
 
 
 def is_worker_secret_volume_allowed(selection, worker_class, launch):
-    """Keep Delta mounts on the selected plan and preserve ordinary mount selection."""
+    """Keep raw Delta on the selected plan and reviewed Delta on the retained cache."""
+    if is_delta_review_launch(launch):
+        return False
     if is_delta_observation_launch(launch):
         from process.delta_dental_directory_worker import MANIFEST_PATH
 
@@ -1326,7 +1349,10 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
         pod = template["spec"]
         containers = pod["containers"]
         security = pod["securityContext"]
-        volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(spec, launch, launch_request=launch_request)]
+        volumes = [
+            *_worker_job_pvc_volumes(launch),
+            *_worker_job_secret_volumes(spec, launch, launch_request=launch_request),
+        ]
         expected_security = _worker_job_pod_security_context(has_group_read_volume="fsGroup" in security)
         expected_security.update(runAsUser=10001, runAsGroup=10001)
         expected_env = None
@@ -1343,7 +1369,7 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
             and containers[0]["image"] == launch.image
             and (expected_env is None or containers[0]["env"] == expected_env)
             and (
-                not is_delta_observation_launch(launch)
+                not uses_isolated_delta_environment(launch)
                 or not any("secretRef" in source_ref for source_ref in containers[0].get("envFrom", []))
             )
             and _is_proxy_job_matching(job, launch)

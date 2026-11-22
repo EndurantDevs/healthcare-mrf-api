@@ -5581,3 +5581,117 @@ def test_address_refresh_payload_rejects_scalar_and_inherits_parent_option():
 def test_request_id_falls_back_to_request_attribute():
     request = types.SimpleNamespace(headers={}, id="request-fallback")
     assert control._request_id(request) == "request-fallback"
+
+
+@pytest.fixture
+def delta_observation_params():
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
+    from process.delta_dental_directory_worker import OBSERVATION_FLAG
+
+    return {
+        OBSERVATION_FLAG: True,
+        "source_ids": [SOURCE_ID],
+        "provider_directory_endpoint_scope": SOURCE_ENDPOINT,
+        "probe": False,
+        "import_resources": False,
+    }
+
+
+def test_delta_observation_uses_independent_scoped_admission(monkeypatch, delta_observation_params):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE", "1")
+    ordinary = _provider_directory_active_run("run_a", "pdfhir_a", "https://example.test/fhir")
+    other = _provider_directory_acquisition_params("pdfhir_b", "https://example.test/other")
+    delta_run_by_field = {"run_id": "run_delta", "params": delta_observation_params}
+    blocking = control_imports._provider_directory_blocking_run
+
+    assert blocking(delta_observation_params, [ordinary]) is None
+    assert blocking(other, [delta_run_by_field]) is None
+    assert blocking(delta_observation_params, [ordinary, delta_run_by_field]) == delta_run_by_field
+    assert blocking(other, [delta_run_by_field, ordinary]) == ordinary
+    assert blocking({"source_ids": []}, [delta_run_by_field]) == delta_run_by_field
+    unknown_run_by_field = {"run_id": "run_unknown", "params": {"source_ids": []}}
+    assert blocking(delta_observation_params, [unknown_run_by_field]) == unknown_run_by_field
+
+
+@pytest.mark.parametrize(
+    "alterations",
+    [
+        {"import_resources": True},
+        {"probe": True},
+        {"seed_only": True},
+        {"source_ids": ["delta-dental-national-finder", "pdfhir_other"]},
+        {"provider_directory_endpoint_scope": "https://example.test/fhir"},
+        {"delta_dental_directory_observation": False},
+        {"delta_dental_observed_review_id": "a" * 32},
+        {"provider_directory_serving_operation": "recover"},
+        {"provider_directory_profile_contract_id": "mixed"},
+        {
+            "provider_directory_acquisition_strategy": control_imports._PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY
+        },
+        {"provider_directory_census_cutoff": "2026-01-01T00:00:00Z"},
+    ],
+)
+def test_malformed_delta_observation_remains_exclusive(delta_observation_params, alterations):
+    requested_by_field = {**delta_observation_params, **alterations}
+    assert control_imports._provider_directory_operation(requested_by_field)[0] == (
+        control_imports._PROVIDER_DIRECTORY_EXCLUSIVE
+    )
+    active = _provider_directory_active_run("run_a", "pdfhir_a", "https://example.test/fhir")
+    assert control_imports._provider_directory_blocking_run(requested_by_field, [active]) == active
+    invalid_run_by_field = {"run_id": "run_invalid", "params": requested_by_field}
+    assert (
+        control_imports._provider_directory_blocking_run(active["params"], [invalid_run_by_field])
+        == invalid_run_by_field
+    )
+
+
+@pytest.fixture
+def delta_publication_params(delta_observation_params):
+    from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG
+    from process.delta_dental_directory_worker import OBSERVATION_FLAG
+
+    return {
+        **{key: field for key, field in delta_observation_params.items() if key != OBSERVATION_FLAG},
+        TASK_FLAG: True,
+        REVIEW_FIELD: "a" * 32,
+    }
+
+
+def test_reviewed_delta_publication_conflicts_only_with_matching_scope(
+    delta_observation_params, delta_publication_params
+):
+    endpoint = delta_publication_params["provider_directory_endpoint_scope"]
+    ordinary = _provider_directory_active_run("run_a", "pdfhir_a", "https://example.test/fhir")
+    alias = _provider_directory_active_run("run_alias", "pdfhir_alias", endpoint)
+    observation_by_field = {"run_id": "run_delta", "params": delta_observation_params}
+    publisher_by_field = {"run_id": "run_publish", "params": delta_publication_params}
+    unknown_by_field = {"run_id": "run_unknown", "params": {}}
+    blocking = control_imports._provider_directory_blocking_run
+
+    assert blocking(delta_publication_params, [ordinary]) is None
+    assert blocking(ordinary["params"], [publisher_by_field]) is None
+    assert blocking(delta_publication_params, [observation_by_field]) == observation_by_field
+    assert blocking(delta_observation_params, [publisher_by_field]) == publisher_by_field
+    assert blocking(delta_publication_params, [alias]) == alias
+    assert blocking(alias["params"], [publisher_by_field]) == publisher_by_field
+    assert blocking(delta_publication_params, [unknown_by_field]) == unknown_by_field
+    assert blocking({}, [publisher_by_field]) == publisher_by_field
+
+
+@pytest.mark.parametrize(
+    "alterations",
+    [
+        {"delta_dental_observed_dataset": False},
+        {"delta_dental_observed_review_id": "malformed"},
+        {"delta_dental_directory_observation": True},
+        {"publish_artifacts": True},
+        {"provider_directory_serving_generation": None},
+        {"provider_directory_profile_generation": None},
+    ],
+)
+def test_malformed_delta_publication_remains_exclusive(delta_publication_params, alterations):
+    requested_by_field = {**delta_publication_params, **alterations}
+    ordinary = _provider_directory_active_run("run_a", "pdfhir_a", "https://example.test/fhir")
+    invalid_by_field = {"run_id": "run_invalid", "params": requested_by_field}
+    assert control_imports._provider_directory_blocking_run(requested_by_field, [ordinary]) == ordinary
+    assert control_imports._provider_directory_blocking_run(ordinary["params"], [invalid_by_field]) == invalid_by_field

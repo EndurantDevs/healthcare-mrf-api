@@ -198,3 +198,22 @@ def provider_directory_source_catalog(
         "profile_source_count": len(profile_source_ids),
         "items": catalog_items,
     }
+
+
+def delta_directory_operation(params, is_census_control):
+    """Use exact reserved-scope validation before ordinary import classification."""
+    from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG, require_delta_observed_task
+    from process.delta_dental_directory_worker import is_delta_observation, require_observation_task
+
+    is_reviewed_publication = TASK_FLAG in params or REVIEW_FIELD in params
+    if not is_reviewed_publication and not is_delta_observation(params):
+        return None
+    if is_census_control(params) or params.get("provider_directory_census_cutoff") not in (None, ""):
+        return "exclusive", frozenset(), None
+    validate = require_delta_observed_task if is_reviewed_publication else require_observation_task
+    try:
+        validate(params)
+    except ValueError:
+        return "exclusive", frozenset(), None
+    kind = "scoped_artifact" if is_reviewed_publication else "delta_observation"
+    return kind, frozenset({DELTA_DENTAL_SOURCE_ID}), DELTA_DENTAL_ENDPOINT
