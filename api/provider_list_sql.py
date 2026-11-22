@@ -21,9 +21,11 @@ from api.network_address_scope import (
     current_network_address_scope,
     is_scoped_address_relation,
     scoped_address_parameters,
+    scoped_address_relation_sql,
 )
 from api.provider_directory_dataset_sql import named_source_data_sql
 from api.provider_profile_snapshot import provider_read_savepoint
+from api.provider_search_sql import ProviderPageSource
 from db.connection import ConnectionProxy
 from db.models import EntityAddressUnified, NPIAddress
 from process.custom_import.read_core import _local_statement_timeout
@@ -311,16 +313,18 @@ _OTHER_ZIP_PAGE_FILTERS = (
 def _provider_page_access(scope, filters, address_source, taxonomy_source, *, plain_sort, ordinary, native_only):
     """Choose NPI ordering and the office source for page discovery."""
     compact = scope is not None and scope.is_compact_network_selection
-    nationwide_page = compact and len(scope.network_ids) in (4, 5)
+    network_count = len(scope.network_ids) if compact else 0
+    is_nationwide_page = network_count in (4, 5)
     zip_code = filters.get("zip_code")
     location = zip_code or filters.get("city") or filters.get("state")
     computed = bool(filters.get("plan_network")) or (
-        plain_sort and ((ordinary and zip_code) or (compact and (location or nationwide_page)))
+        plain_sort and ((ordinary and zip_code) or (compact and (location or is_nationwide_page)))
     )
-    if not (nationwide_page and plain_sort and native_only and not location):
-        return computed, None, address_source
+    is_bounded_page = network_count == 3 and scope.manifest.supports_location_lookup
+    if not ((is_nationwide_page or is_bounded_page) and plain_sort and native_only and not location):
+        return computed, None, ProviderPageSource(address_source)
     if not filters["primary_only"] or len(filters["codes"] or ()) != 1:
-        return computed, None, address_source
+        return computed, None, ProviderPageSource(address_source)
     other_filters = (
         "classification",
         "section",
@@ -339,11 +343,14 @@ def _provider_page_access(scope, filters, address_source, taxonomy_source, *, pl
         "medication_codes_input",
     )
     if any(filters.get(key) for key in other_filters):
-        return computed, None, address_source
+        return computed, None, ProviderPageSource(address_source)
     from api.network_compact_address import compact_selected_offices
 
     keys, offices = compact_selected_offices(scope.manifest.compact_layout, scope.network_ids)
-    return computed, keys, f"{offices} as c {taxonomy_source}"
+    bounded_source = (
+        scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True) if is_bounded_page else None
+    )
+    return computed, keys, ProviderPageSource(f"{offices} as c {taxonomy_source}", bounded_source)
 
 
 def _provider_registry_page_cte(

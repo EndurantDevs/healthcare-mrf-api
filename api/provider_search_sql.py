@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from textwrap import dedent
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, NamedTuple, Sequence
 
 import sanic.exceptions
 
@@ -102,7 +102,7 @@ def relevance_page_sql(
 
 
 def provider_page_npis_sql(
-    address_source: str,
+    source: ProviderPageSource,
     provider_npi_sql: str,
     address_clauses: Sequence[str],
     zip_plan_scope: str | None,
@@ -111,15 +111,68 @@ def provider_page_npis_sql(
     plan_predicate = f"{provider_npi_sql} IN ({zip_plan_scope})" if zip_plan_scope is not None else None
     address_npis = f"""
     SELECT DISTINCT {provider_npi_sql} AS npi
-      FROM {address_source}
+      FROM {source.addresses}
      WHERE {" and ".join(clause for clause in address_clauses if clause != plan_predicate)}
     """
+    if source.bounded_addresses is not None:
+        return _bounded_primary_taxonomy_page_sql(
+            source.bounded_addresses, provider_npi_sql, address_clauses, address_npis
+        )
     if zip_plan_scope is None:
         return address_npis
     return f"""
     WITH location_npis AS MATERIALIZED ({address_npis})
     SELECT npi FROM location_npis
     WHERE npi IN ({zip_plan_scope})
+    """
+
+
+class ProviderPageSource(NamedTuple):
+    """The address source for discovery and its optional indexed lookup relation."""
+
+    addresses: str
+    bounded_addresses: str | None = None
+
+
+def _bounded_primary_taxonomy_page_sql(
+    address_relation: str,
+    provider_npi_sql: str,
+    address_clauses: Sequence[str],
+    staged_page: str,
+) -> str:
+    """Try an ordered taxonomy prefix before discovering all selected offices."""
+    # The prefix is exact once it fills the requested window or exhausts the taxonomy.
+    prefix_limit = 2048
+    page_end = "(CAST(:limit AS bigint) + CAST(:start AS bigint))"
+    taxonomy = taxonomy_codes_subquery("code = ANY(:codes)")
+    return f"""
+    WITH taxonomy_prefix AS MATERIALIZED (
+        SELECT DISTINCT provider_taxonomy.npi
+          FROM mrf.npi_taxonomy AS provider_taxonomy
+         WHERE provider_taxonomy.healthcare_provider_taxonomy_code = (CAST(:codes AS varchar[]))[1]
+           {primary_taxonomy_predicate("           ")}
+         ORDER BY provider_taxonomy.npi
+         LIMIT {prefix_limit}
+    ), prefix_matches AS MATERIALIZED (
+        SELECT candidate.npi
+          FROM taxonomy_prefix AS candidate
+         CROSS JOIN {taxonomy}
+          JOIN LATERAL (
+            SELECT 1 FROM {address_relation} AS c
+             WHERE {provider_npi_sql} = candidate.npi
+               AND {" AND ".join(address_clauses)}
+             LIMIT 1
+          ) AS matched_office ON TRUE
+         ORDER BY candidate.npi
+         LIMIT {page_end}
+    ), prefix_complete AS MATERIALIZED (
+        SELECT (SELECT COUNT(*) FROM prefix_matches) = {page_end}
+            OR (SELECT COUNT(*) FROM taxonomy_prefix) < {prefix_limit} AS sufficient
+    )
+    SELECT npi FROM prefix_matches WHERE (SELECT sufficient FROM prefix_complete)
+    UNION ALL
+    SELECT npi FROM ({staged_page}) AS staged_npis
+     WHERE NOT (SELECT sufficient FROM prefix_complete)
     """
 
 
