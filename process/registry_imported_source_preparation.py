@@ -5,8 +5,14 @@ from uuid import UUID
 
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_source_witness_contract import canonical_timestamp
-from process.network_fhir_typed_capture import TypedGraphAnchor, TypedGraphCaptureOptions, capture_typed_source_graph
+from process.network_fhir_typed_capture import (
+    TypedGraphAnchor,
+    TypedGraphCaptureOptions,
+    capture_typed_source_graph,
+    require_typed_graph_capture,
+)
 from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+from process.registry_fhir_catalog_sources import is_delta_positive_catalog_descriptor
 from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
 from process.registry_imported_membership_refresh import require_imported_catalog_inputs
 from process.registry_imported_source_reuse import (
@@ -122,6 +128,43 @@ async def _prepare_native_recipes(connection, runtime, generation, previous):
     return tuple(prepared_recipes)
 
 
+async def _require_cumulative_delta_pairs(connection, recipe, previous):
+    """Reject dropped or reassigned positive offices on the verified graph replacement."""
+    successor = recipe.source_pin
+    descriptor = successor.catalog_descriptor
+    if not is_delta_positive_catalog_descriptor(descriptor):
+        return
+    prior_pins = [
+        old.source_pin
+        for old in previous
+        if type(old.source_pin) is PinnedTypedFHIRMembershipSource
+        and is_delta_positive_catalog_descriptor(old.source_pin.catalog_descriptor)
+    ]
+    if not prior_pins:
+        return
+    if len(prior_pins) != 1:
+        raise ValueError("registry_delta_predecessor_ambiguous")
+    predecessor = prior_pins[0]
+    if (
+        predecessor.generation_id == successor.generation_id
+        or predecessor.catalog_descriptor["coordinates"]["dataset_id"] == descriptor["previous_dataset_id"]
+    ):
+        return
+    old_stage = await require_typed_graph_capture(connection, predecessor.capture, expected_anchor=predecessor.anchor)
+    new_stage = await require_typed_graph_capture(connection, successor.capture, expected_anchor=successor.anchor)
+    before, after = old_stage.relation("pairs"), new_stage.relation("pairs")
+    lost = await connection.fetchval(
+        f"""SELECT EXISTS (SELECT 1 FROM {before} AS old
+            WHERE NOT EXISTS (SELECT 1 FROM {after} AS new
+              WHERE (new.resource_type,new.resource_id,new.network_source_key,new.location_resource_id)
+                  = (old.resource_type,old.resource_id,old.network_source_key,old.location_resource_id)
+                AND (new.provider_system,new.provider_id,new.address_key,new.canonical_identity)
+                  = (old.provider_system,old.provider_id,old.address_key,old.canonical_identity)))"""
+    )
+    if lost:
+        raise ValueError("registry_delta_predecessor_positives_lost")
+
+
 async def prepare_imported_source_recipes(connection, *, request_id, envelope, source_runtime, control_schema):
     """Commit one batch; retain unchanged recipes and distinguish new artifacts from reused inputs."""
     if (
@@ -159,6 +202,7 @@ async def prepare_imported_source_recipes(connection, *, request_id, envelope, s
                 if matching_recipes
                 else await _prepare_recipe(connection, source_runtime, descriptor, observed_at)
             )
+            await _require_cumulative_delta_pairs(connection, recipe, previous)
             recipes.append(recipe)
             (created if is_new else reused).append(recipe.source_pin.capture["schema_name"])
         for recipe, is_new in await _prepare_native_recipes(connection, source_runtime, generation, previous):

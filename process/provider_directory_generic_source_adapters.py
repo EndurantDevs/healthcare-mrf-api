@@ -690,6 +690,11 @@ async def current_endpoint_dataset_record(directory, endpoint_id, *, exclude_dat
                     "dataset_id": header["dataset_id"],
                     "status": "published",
                     "resource_counts": metadata.get("source_summary_v1", {}).get("resource_counts"),
+                    **(
+                        {"delta_positive_observation_v1": metadata["delta_positive_observation_v1"]}
+                        if "delta_positive_observation_v1" in metadata
+                        else {}
+                    ),
                 }
     predecessor = await directory.db.first(
         f"""

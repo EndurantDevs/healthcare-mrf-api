@@ -2,6 +2,7 @@
 """Observe registered source data in a caller-owned read-only snapshot."""
 
 import copy
+import json
 import re
 from collections import deque
 from contextlib import contextmanager
@@ -73,6 +74,7 @@ async def _header(connection, profile, endpoint_id, dataset_id, require_current,
         "left(acquisition_root_run_id,65) AS root_run_id,"
         "json_typeof((publication_metadata_json->'resource_hash_contract')::json) AS hash_contract_type,"
         "left(publication_metadata_json->>'resource_hash_contract',129) AS resource_hash_contract,"
+        "left(publication_metadata_json->>'delta_positive_observation_v1',32769) AS delta_positive_observation_v1,"
         f"(SELECT count(*) FROM {relation} current_head WHERE current_head.endpoint_id=$1 AND current_head.is_current) "
         f"AS current_count FROM {relation} WHERE endpoint_id=$1 AND dataset_id=$2 LIMIT 2",
         endpoint_id,
@@ -245,6 +247,11 @@ async def collect_fhir_catalog_observation(connection, profile, *, endpoint_id, 
 
 
 def _receipt(header, families):
+    from process.delta_dental_directory_producer import METADATA_KEY
+
+    observed_coverage = header.get(METADATA_KEY)
+    if observed_coverage is not None and not 0 < len(observed_coverage) <= 32768:
+        _fail("delta_observed_coverage_bounds")
     publication_by_field = {
         field: header[field]
         for field in (
@@ -269,6 +276,7 @@ def _receipt(header, families):
             "contract": CATALOG_OBSERVATION_CONTRACT,
             "publication": publication_by_field,
             "families": families,
+            **({METADATA_KEY: json.loads(observed_coverage)} if observed_coverage is not None else {}),
         }
     )
 
@@ -292,6 +300,7 @@ def catalog_replacement_scope_sql(descriptor_sql):
 
 
 def _descriptor(profile, header, tables, registration, families):
+    from process.delta_dental_directory_producer import METADATA_KEY
     from process.registry_fhir_catalog_sources import PRODUCER
 
     source_uri, aliases = registration
@@ -309,7 +318,7 @@ def _descriptor(profile, header, tables, registration, families):
         "endpoint_id": header["endpoint_id"],
         "dataset_sha256": header["dataset_hash"],
         "source_uri": source_uri,
-        "complete": True,
+        "complete": header.get(METADATA_KEY) is None,
         "previous_dataset_id": header["previous_dataset_id"],
         "source_aliases": aliases,
         "native_read_profile": profile.document(),

@@ -15,6 +15,7 @@ from process.network_fhir_source_witness_contract import digest
 from process.registry_fhir_catalog_extraction import fhir_source_uri
 from process.registry_fhir_catalog_source_producer import open_source_owned_catalog_export
 from process.registry_fhir_catalog_sources import (
+    is_delta_positive_catalog_descriptor,
     parse_fhir_catalog_source_profile,
     validate_fhir_catalog_source_descriptor,
 )
@@ -49,9 +50,14 @@ def _edition_rank(descriptor):
 
 
 def preferred_fhir_editions(accepted):
-    """Select the latest complete publication per feed, preferring more rows on a date tie."""
+    """Select the latest admitted publication per feed, preferring more rows on a date tie."""
+    eligible_descriptors = [
+        descriptor
+        for descriptor in accepted
+        if descriptor["complete"] or is_delta_positive_catalog_descriptor(descriptor)
+    ]
     by_feed = {}
-    for descriptor in sorted((source for source in accepted if source["complete"]), key=_edition_rank):
+    for descriptor in sorted(eligible_descriptors, key=_edition_rank):
         by_feed[fhir_feed(descriptor)] = descriptor
     return list(by_feed.values())
 
@@ -266,7 +272,7 @@ async def _serving_catalog_observations(connection, control_schema):
         descriptor = json.loads(row["descriptor"])
         admission = descriptor.get("admission")
         if (
-            descriptor.get("complete") is True
+            (descriptor.get("complete") is True or is_delta_positive_catalog_descriptor(descriptor))
             and type(admission) is dict
             and admission.get("kind") == "catalog_observation"
         ):

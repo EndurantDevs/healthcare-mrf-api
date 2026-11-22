@@ -2132,6 +2132,7 @@ class EndpointDatasetCandidate:
     source_release: dict[str, Any] | None = None
     registry_network_binding_metadata: dict[str, Any] | None = None
     import_completion: dict[str, Any] | None = None
+    delta_observation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -56152,10 +56153,12 @@ def _provider_directory_api_endpoint_row(
     *,
     observed_at: datetime.datetime | None = None,
 ) -> dict[str, Any] | None:
+    from process.delta_dental_directory_producer import SOURCE_ID, observed_endpoint_row
+
+    if source_record.get("source_id") == SOURCE_ID:
+        return observed_endpoint_row(source_record, observed_at or _now())
     if _uses_uhc_official_file_connector(source_record):
-        return _uhc_official_file_endpoint_row(
-            observed_at=observed_at or _now(),
-        )
+        return _uhc_official_file_endpoint_row(observed_at=observed_at or _now())
     try:
         api_base, credential_json, endpoint_signature_items = _resource_import_group_key(source_record)
     except TypeError, UnicodeError, ValueError:
@@ -58391,7 +58394,6 @@ def _candidate_hash_metadata(
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
     """Return optional v3 hash identity fields for candidate metadata."""
-
     return candidate_hash_metadata(
         _candidate_proof_resource_scope(candidate),
         candidate.semantic_projection_as_of,
@@ -58404,7 +58406,6 @@ def _endpoint_dataset_candidate_metadata(
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
     """Build the immutable acquisition identity stored on a candidate."""
-
     metadata = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
@@ -58420,6 +58421,7 @@ def _endpoint_dataset_candidate_metadata(
         **_candidate_hash_metadata(candidate),
         **candidate_registry_network_metadata(candidate, _schema()),
         **({"source_release": candidate.source_release} if candidate.source_release is not None else {}),
+        **({"delta_positive_observation_v1": candidate.delta_observation} if candidate.delta_observation else {}),
     }
     if candidate.reviewed_root_policy is not None:
         metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] = candidate.reviewed_root_policy.document()
@@ -66658,7 +66660,6 @@ def _uhc_official_file_endpoint_row(
     observed_at: datetime.datetime,
 ) -> dict[str, Any]:
     """Build the non-FHIR transport identity for the official file dataset."""
-
     admitted = _admit_provider_directory_endpoint_components(
         canonical_api_base=UHC_PROVIDER_FILE_CATALOG_BASE,
         credential_descriptor_json={},
@@ -66694,7 +66695,6 @@ def _uhc_official_file_source_row(
     observed_at: datetime.datetime,
 ) -> dict[str, Any]:
     """Build the distinct corporate source row without FHIR URL semantics."""
-
     return {
         "source_id": UHC_RETAINED_SOURCE_ID,
         "org_name": UHC_PROVIDER_FILE_DISPLAY_NAME,

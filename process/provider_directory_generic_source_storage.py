@@ -318,6 +318,20 @@ def _require_named_source_identity(identity):
     metadata = identity["metadata"]
     _require_ordinary_source_metadata(metadata)
     _require(len(metadata["source_ids"]) == 1, "isolated_kind_unsupported")
+    if metadata["source_ids"] == ["delta-dental-national-finder"]:
+        from process.delta_dental_directory_producer import (
+            METADATA_KEY,
+            RESOURCE_TYPES,
+            validate_delta_positive_receipt,
+        )
+
+        validate_delta_positive_receipt(metadata.get(METADATA_KEY))
+        _require(
+            metadata["selected_resources"] == list(RESOURCE_TYPES)
+            and metadata["expected_resources"] == list(RESOURCE_TYPES),
+            "isolated_kind_unsupported",
+        )
+        return
     resources = named_source_resources(metadata.get("source_ids"))
     if resources is not None and metadata["source_ids"] != [VSP_SOURCE_ID]:
         _require(
@@ -438,6 +452,11 @@ def validate_handoff_completion(header):
 
     validate_metadata(header)
     _validate_handoff_recovery_completion(header)
+    metadata = _json(header.get("publication_metadata_json"))
+    if type(metadata) is dict and metadata.get("source_ids") == ["delta-dental-national-finder"]:
+        from process.delta_dental_directory_producer import METADATA_KEY, validate_delta_positive_receipt
+
+        validate_delta_positive_receipt(metadata.get(METADATA_KEY), resource_count=header["resource_count"])
     proof = _json(header["completion_proof_json"])
     if header["completion_proof_required_version"] is None:
         _require(proof is None, "completion_proof_unexpected")

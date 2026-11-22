@@ -63,6 +63,10 @@ def is_delta_observation(task):
 
 def specialized_source_task(directory, ctx, task):
     """Select independent directory workflows before the generic FHIR task."""
+    from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG, run_delta_observed_source
+
+    if type(task) is dict and (TASK_FLAG in task or REVIEW_FIELD in task):
+        return run_delta_observed_source(directory, ctx, task)
     if is_delta_observation(task):
         return run_delta_observation(directory, ctx, task)
     if "rooted_graph" in (task or {}):
@@ -75,7 +79,8 @@ def specialized_source_task(directory, ctx, task):
 def require_observation_task(task):
     """Keep the explicit finder selector outside generic FHIR, Probe and Profile work."""
     if (
-        task.get(OBSERVATION_FLAG) is not True
+        "delta_dental_observed_dataset" in task
+        or task.get(OBSERVATION_FLAG) is not True
         or task.get("source_ids") != [SOURCE_ID]
         or task.get("provider_directory_endpoint_scope") != SOURCE_ENDPOINT
         or task.get("probe") is not False

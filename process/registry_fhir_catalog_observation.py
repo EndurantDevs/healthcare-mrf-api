@@ -233,7 +233,9 @@ class FHIRCatalogObservationDigests:
 
 def validate_catalog_observation_receipt(receipt):
     """Validate the closed receipt while preserving independently absent old proofs."""
-    if type(receipt) is not dict or set(receipt) != _RECEIPT_FIELDS:
+    from process.delta_dental_directory_producer import METADATA_KEY
+
+    if type(receipt) is not dict or set(receipt) not in (_RECEIPT_FIELDS, _RECEIPT_FIELDS | {METADATA_KEY}):
         _fail()
     if (
         type(receipt["version"]) is not int
@@ -259,6 +261,15 @@ def validate_catalog_observation_receipt(receipt):
             _fail()
         _count(family["rows"])
         _digest(family["sha256"])
+    if METADATA_KEY in receipt:
+        from process.delta_dental_directory_producer import validate_delta_positive_receipt
+
+        coverage_by_field = receipt[METADATA_KEY]
+        validate_delta_positive_receipt(coverage_by_field, resource_count=publication["claimed_resource_count"])
+        if any(
+            count["rows"] != coverage_by_field["resource_counts"].get(family, 0) for family, count in families.items()
+        ):
+            _fail("delta_observed_resource_counts_changed")
     return json.loads(_canonical(receipt))
 
 

@@ -311,6 +311,9 @@ def _assert_explicit_shared_task_entry() -> None:
         if isinstance(node, ast.FunctionDef) and node.name == "specialized_source_task"
     )
     expected_routes = ast.parse(
+        "from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG, run_delta_observed_source\n"
+        "if type(task) is dict and (TASK_FLAG in task or REVIEW_FIELD in task):\n"
+        "    return run_delta_observed_source(directory, ctx, task)\n"
         "if is_delta_observation(task):\n"
         "    return run_delta_observation(directory, ctx, task)\n"
         'if "rooted_graph" in (task or {}):\n'

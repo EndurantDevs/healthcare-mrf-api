@@ -15,7 +15,10 @@ class PinnedTypedFHIRMembershipSource:
         from process.network_fhir_source_witness_contract import canonical, source_origin
         from process.network_fhir_typed_capture import TypedGraphAnchor, validate_typed_capture
         from process.network_fhir_typed_contract import require
-        from process.registry_fhir_catalog_sources import validate_fhir_catalog_source_descriptor
+        from process.registry_fhir_catalog_sources import (
+            is_delta_positive_catalog_descriptor,
+            validate_fhir_catalog_source_descriptor,
+        )
 
         capture = validate_typed_capture(self.capture)
         require(type(self.anchor) is TypedGraphAnchor, "recipe_anchor")
@@ -28,7 +31,11 @@ class PinnedTypedFHIRMembershipSource:
         require(catalog == capture["catalog_descriptor"], "recipe_catalog")
         origin = source_origin(capture["graph"]["origin"])
         coordinates = catalog["coordinates"]
-        require(catalog["profile"] == "published_normalized" and catalog["complete"] is True, "recipe_catalog")
+        require(
+            catalog["profile"] == "published_normalized"
+            and (catalog["complete"] is True or is_delta_positive_catalog_descriptor(catalog)),
+            "recipe_catalog",
+        )
         require(
             (
                 coordinates["dataset_schema"],
