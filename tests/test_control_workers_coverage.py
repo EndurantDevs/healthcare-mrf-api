@@ -347,7 +347,7 @@ def test_worker_manifest_sets_pod_identity_options(monkeypatch):
         "_worker_job_resources",
         lambda *_args: {},
     )
-    monkeypatch.setattr(control_workers, "_worker_job_pvc_volumes", lambda: [])
+    monkeypatch.setattr(control_workers, "_worker_job_pvc_volumes", lambda _launch=None: [])
     monkeypatch.setattr(
         control_workers,
         "_worker_job_secret_volumes",

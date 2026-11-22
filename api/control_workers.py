@@ -1424,7 +1424,7 @@ def _worker_job_container(
     resource_dict = _worker_job_resources(spec, launch_request)
     if resource_dict:
         container_dict["resources"] = resource_dict
-    pvc_volumes = _worker_job_pvc_volumes()
+    pvc_volumes = _worker_job_pvc_volumes(fhir_launch)
     from api.plan_pricing_worker_policy import pricing_worker_policy_volumes
 
     volumes = [
@@ -1438,9 +1438,9 @@ def _worker_job_container(
 
 
 def _worker_container_env_from(launch):
-    """Keep broad Secret imports off the observation-only worker."""
+    """Keep broad Secret imports off Delta observation and reviewed producer workers."""
     environment_refs = _worker_job_env_from()
-    if provider_directory_source_worker.is_delta_observation_launch(launch):
+    if provider_directory_source_worker.uses_isolated_delta_environment(launch):
         return [entry for entry in environment_refs if "secretRef" not in entry]
     return environment_refs
 
@@ -1454,8 +1454,10 @@ def _worker_source_policy_container(container_dict, volumes, fhir_source_launch)
             or "value" not in entry
             or _is_worker_policy_path_mounted(entry["value"], volumes)
         ]
-    if provider_directory_source_worker.is_delta_observation_launch(fhir_source_launch):
+    if provider_directory_source_worker.uses_isolated_delta_environment(fhir_source_launch):
         container_dict["env"].append({"name": "HLTHPRT_IMPORT_STATUS_EVENT_URL", "value": ""})
+    if provider_directory_source_worker.is_delta_review_launch(fhir_source_launch):
+        container_dict["env"].append({"name": "SQLITE_TMPDIR", "value": "/tmp"})
     return container_dict
 
 
@@ -1665,7 +1667,7 @@ def _worker_job_secret_env(
         return []
 
     observed_launch = getattr(launch_request, "fhir_source_launch", None)
-    if source_launch is None and provider_directory_source_worker.is_delta_observation_launch(observed_launch):
+    if source_launch is None and provider_directory_source_worker.uses_isolated_delta_environment(observed_launch):
         source_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(
             _BY_WORKER_CLASS[worker_class],
             launch_request,
@@ -1856,25 +1858,52 @@ def _normalize_resource_profile(profile: dict[str, Any]) -> dict[str, Any]:
     return resources_by_section
 
 
-def _worker_job_pvc_volumes() -> list[dict[str, Any]]:
+def _worker_job_pvc_volumes(launch=None) -> list[dict[str, Any]]:
+    is_reviewed_delta = provider_directory_source_worker.is_delta_review_launch(launch)
     claim_name = os.getenv("HLTHPRT_WORKER_JOB_PVC_NAME", "").strip()
     mount_path = os.getenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "").strip()
     if not claim_name or not mount_path:
+        if is_reviewed_delta:
+            raise ValueError("delta_observed_worker_cache_required")
         return []
 
+    claim_by_field: dict[str, str | bool] = {"claimName": claim_name}
+    mount_by_field = {"mountPath": mount_path}
+    if is_reviewed_delta:
+        claim_by_field["readOnly"] = True
+        mount_by_field = _delta_review_cache_mount(mount_path)
     volume_name = os.getenv("HLTHPRT_WORKER_JOB_PVC_VOLUME_NAME", "import-workdir").strip() or "import-workdir"
     return [
         {
             "volume": {
                 "name": volume_name,
-                "persistentVolumeClaim": {"claimName": claim_name},
+                "persistentVolumeClaim": claim_by_field,
             },
             "volumeMount": {
                 "name": volume_name,
-                "mountPath": mount_path,
+                **mount_by_field,
             },
         }
     ]
+
+
+def _delta_review_cache_mount(mount_path):
+    """Mount only the Delta directory from the existing shared artifact claim."""
+    claim_root = Path(mount_path)
+    artifact_root = Path(os.getenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", ""))
+    if (
+        not claim_root.is_absolute()
+        or not artifact_root.is_relative_to(claim_root)
+        or ".." in artifact_root.parts
+        or ".." in claim_root.parts
+    ):
+        raise ValueError("delta_observed_worker_cache_required")
+    delta_root = artifact_root / "delta-dental-directory"
+    return {
+        "mountPath": str(delta_root),
+        "subPath": str(delta_root.relative_to(claim_root)),
+        "readOnly": True,
+    }
 
 
 def _is_worker_class_selected(

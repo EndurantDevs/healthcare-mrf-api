@@ -2979,8 +2979,11 @@ def _provider_directory_operation(
     params: dict[str, Any],
     metrics: dict[str, Any] | None = None,
 ) -> tuple[str, frozenset[str], str | None]:
+    from api.provider_directory_sources import delta_directory_operation
     from process.provider_directory_serving_recovery import is_recovery_request
 
+    if (delta_operation := delta_directory_operation(params, _is_current_version_census_control)) is not None:
+        return delta_operation
     if is_recovery_request("provider-directory-fhir", params):
         return _PROVIDER_DIRECTORY_SCOPED_ARTIFACT, _provider_directory_source_ids(params["source_ids"]), None
     if _is_current_version_census_control(params):
@@ -3017,25 +3020,13 @@ def _provider_directory_operation(
     return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
 
 
-def _is_current_version_census_control(
-    params: dict[str, Any],
-) -> bool:
+def _is_current_version_census_control(params: dict[str, Any]) -> bool:
     raw_strategy = params.get("provider_directory_acquisition_strategy")
-    return bool(
-        raw_strategy
-        in {
-            ProviderDirectoryFHIRAcquisitionStrategy.CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS,
-            ProviderDirectoryFHIRAcquisitionStrategy.SERVER_ISSUED_TRAVERSAL_SUBSET,
-        }
-        or (
-            isinstance(raw_strategy, str)
-            and raw_strategy.strip()
-            in {
-                _PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY,
-                _PROVIDER_DIRECTORY_SERVER_ISSUED_SUBSET_STRATEGY,
-            }
-        )
-    )
+    strategies = {
+        _PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY,
+        _PROVIDER_DIRECTORY_SERVER_ISSUED_SUBSET_STRATEGY,
+    }
+    return raw_strategy in strategies or (isinstance(raw_strategy, str) and raw_strategy.strip() in strategies)
 
 
 def _reject_control_current_version_census(
@@ -3086,6 +3077,8 @@ def _has_provider_directory_operation_conflict(
 ) -> bool:
     requested_kind, requested_source_ids, requested_endpoint = requested_operation
     active_kind, active_source_ids, active_endpoint = active_operation
+    if requested_endpoint is not None and requested_endpoint == active_endpoint:
+        return True
     scoped_artifact_kinds = {
         _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
         _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
