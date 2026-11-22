@@ -17,6 +17,7 @@ from api.provider_directory_source_worker import is_delta_route_available
 from process import provider_directory_profile as profile_artifact
 from process.delta_dental_directory_json import SOURCE_ENDPOINT as DELTA_DENTAL_ENDPOINT
 from process.delta_dental_directory_json import SOURCE_ID as DELTA_DENTAL_SOURCE_ID
+from process.provider_directory_network_traversal import SOURCE_ID as NETWORK_SNAPSHOT_SOURCE_ID
 from process.provider_directory_publication_catalog_authority import (
     canonical_manifest_digest,
 )
@@ -29,8 +30,10 @@ from process.vsp_directory_contract import SOURCE_ID as VSP_DIRECTORY_SOURCE_ID
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 RUNNABLE_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition"})
-# The generic UHC Flex FHIR source is runnable; unified-profile inclusion stays a separate reviewed opt-in.
-PROFILE_OPT_IN_SOURCES = frozenset({"cms-npd", VSP_DIRECTORY_SOURCE_ID, "pdfhir_0b5cfd565c53364a73981dcb"})
+# These sources can publish an acquisition before separate Profile qualification.
+PROFILE_OPT_IN_SOURCES = frozenset(
+    {"cms-npd", VSP_DIRECTORY_SOURCE_ID, "pdfhir_0b5cfd565c53364a73981dcb", NETWORK_SNAPSHOT_SOURCE_ID}
+)
 PUBLIC_ENTRY_FIELDS = (
     "entry_id",
     "display_name",
@@ -78,6 +81,11 @@ def _public_catalog_entry(
         documented_resources if documented_resources is not None else executable_resources or []
     )
     catalog_entry_by_field["runnable"] = is_runnable
+    if source_ids == [NETWORK_SNAPSHOT_SOURCE_ID]:
+        catalog_entry_by_field["coverage_warning"] = (
+            "Networks discovered in the FHIR directory and their institutional affiliations. "
+            "Commercial market coverage and individual clinician membership are unverified."
+        )
     if any(acquisition_coverage_blocked_reason(source_id) for source_id in source_ids):
         catalog_entry_by_field["acquisition_blocked_reason"] = "upstream_search_window_incomplete"
         catalog_entry_by_field["coverage_warning"] = MICHIGAN_COVERAGE_WARNING

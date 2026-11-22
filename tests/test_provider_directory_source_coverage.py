@@ -152,5 +152,9 @@ def test_catalog_warns_without_changing_held_profile_selection_authority():
                 assert entry["classification"] == "observation"
                 assert entry["profile_enabled"] is False
                 assert entry["coverage_warning"] == manifest["observation_entries"][0]["coverage_warning"]
+            elif entry["entry_id"] == "excellus-provider-directory":
+                assert entry["classification"] == "acquisition" and entry["runnable"] is True
+                assert entry["profile_enabled"] is False
+                assert "institutional affiliations" in entry["coverage_warning"]
             else:
                 assert "coverage_warning" not in entry

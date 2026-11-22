@@ -311,5 +311,41 @@
     "requires_registration": false,
     "auth_type": "none",
     "source_detail": "Identity fields adapted from the Provider Directory DB, Mullan Institute for Health Workforce Equity, George Washington University (https://github.com/hltiunn/provider-directory-db/blob/1d55eebea5688258cc2b4a0b0b10855b8d8b9f15/data/provider_directory.db), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). The public directory endpoint is normalized to Optum Flex."
+  },
+  {
+    "id": "excellus-provider-directory",
+    "org_name": "Excellus BlueCross BlueShield",
+    "plan_name": null,
+    "api_base": "https://fhir.excellusbcbs.com/fhir/api",
+    "endpoint_organization": "https://fhir.excellusbcbs.com/fhir/api/Organization?name=Excellus&type=ntwk",
+    "auth_type": "none",
+    "requires_registration": false,
+    "fhir_version": "4.0.1",
+    "source": "excellus-provider-directory",
+    "source_detail": "official public Provider Directory FHIR API",
+    "source_url": "https://news.excellusbcbs.com/developer-info/interoperability-apis",
+    "metadata_json": {
+      "provider_directory_confirmed_base": "https://fhir.excellusbcbs.com/fhir/api",
+      "provider_directory_confirmed_metadata_url": "https://fhir.excellusbcbs.com/fhir/api/metadata",
+      "provider_directory_supported_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
+      "provider_directory_fully_enumerable_resources": [],
+      "provider_directory_network_snapshot": {
+        "name": "Excellus",
+        "owner_reference": "Organization/10-40-0001"
+      },
+      "provider_directory_probe_resource": "Organization",
+      "provider_directory_resource_scan_concurrency": 8,
+      "provider_directory_pagination_same_collection": true,
+      "provider_directory_coverage_mode": "network_institutional_snapshot",
+      "provider_directory_acquisition_enabled": true
+    }
   }
 ]

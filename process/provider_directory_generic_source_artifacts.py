@@ -2,12 +2,14 @@
 """Publish ordinary address overlays from one issued immutable REST Source."""
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from process import provider_directory_generic_source_policy as source
+from process import provider_directory_network_snapshot_scope as network_scope
 from process import provider_directory_profile_source_inputs as inputs
 from process import provider_directory_published_replacement_inputs as serving_inputs
 from process import provider_directory_published_source_replacement as replacement
@@ -215,6 +217,9 @@ def source_publication_request(directory, source_records, enabled):
             source_record_by_field["source_id"],
             request_lifecycle_by_field,
             getattr(source._FACTORY.get(), "policy", None),
+            directory._source_metadata(source_record_by_field).get(network_scope.SOURCE_CONFIG_KEY)
+            if hasattr(directory, "_source_metadata")
+            else source_record_by_field.get("metadata_json", {}).get(network_scope.SOURCE_CONFIG_KEY),
         )
     )
     try:
@@ -256,15 +261,33 @@ async def finalize_candidate(directory, candidate, diagnostics):
     """Keep validation intact; only the explicit REST scope publishes its Source."""
     if candidate is None:
         return None
+    selected = _SOURCE_ONLY.get()
+    config = selected[7] if selected is not None else None
+    scope_metadata = network_scope.publication_scope_metadata(diagnostics, required=config is not None)
+    if config is not None:
+        scope = scope_metadata[network_scope.SCOPE_KEY]
+        require_output(
+            type(config) is dict
+            and scope["root_selection"]["name"] == config.get("name")
+            and scope["owner_reference"] == config.get("owner_reference")
+            and set(candidate.selected_resources) == set(network_scope.RESOURCE_TYPES),
+            "network_snapshot_scope_changed",
+        )
     if directory._is_endpoint_dataset_publishable(candidate, diagnostics):
-        result = await directory._validate_endpoint_dataset_candidate(candidate, diagnostics)
-        if result.get("validated") is True and _SOURCE_ONLY.get() is not None:
+        validation_result = await directory._validate_endpoint_dataset_candidate(candidate, diagnostics)
+        if validation_result.get("validated") is True and _SOURCE_ONLY.get() is not None:
             await publish_source_candidate(directory, candidate)
-            return {**result, "published": True, "is_current": True, "status": directory.ENDPOINT_DATASET_PUBLISHED}
-        return result
+            return {
+                **validation_result,
+                **scope_metadata,
+                "published": True,
+                "is_current": True,
+                "status": directory.ENDPOINT_DATASET_PUBLISHED,
+            }
+        return validation_result
     status = (
         directory.ENDPOINT_DATASET_FAILED
-        if any(value.get("error") for value in diagnostics.values())
+        if any(resource_diagnostic.get("error") for resource_diagnostic in diagnostics.values())
         else directory.ENDPOINT_DATASET_INCOMPLETE
     )
     await directory._mark_endpoint_dataset_candidate(candidate, status, diagnostics)
@@ -309,6 +332,15 @@ async def publish_source_candidate(directory, candidate):
         )
         _require_scope(directory, candidate, selected, continuation)
         await continuation.capture(directory, candidate, selected)
+    if selected[7] is not None:
+        from process.provider_directory_network_first_store import cleanup_published
+
+        try:
+            await cleanup_published(directory, candidate)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Published network snapshot work cleanup remains pending", exc_info=True
+            )
 
 
 @dataclass(frozen=True)

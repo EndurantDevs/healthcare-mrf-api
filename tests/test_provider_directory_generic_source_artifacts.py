@@ -560,6 +560,23 @@ def test_source_publication_requires_genuine_followup():
 
 
 @pytest.mark.asyncio
+async def test_network_snapshot_requires_scope_even_when_both_diagnostics_omit_it(case):
+    candidate = SimpleNamespace(dataset_id="dataset", source_ids=("source_a",))
+    case.directory._is_endpoint_dataset_publishable = lambda *_: True
+    case.directory._validate_endpoint_dataset_candidate = AsyncMock(return_value={"validated": True})
+    source_by_field = {
+        "source_id": "source_a",
+        "metadata_json": {
+            artifacts.network_scope.SOURCE_CONFIG_KEY: {"name": "Example", "owner_reference": "Organization/owner"}
+        },
+    }
+    with artifacts.source_publication_request(case.directory, [source_by_field], True):
+        with pytest.raises(RuntimeError, match="network_snapshot_scope_invalid"):
+            await artifacts.finalize_candidate(case.directory, candidate, {})
+    case.directory._validate_endpoint_dataset_candidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_source_only_publication_uses_validated_candidate_and_closes_inherited_scope(case, monkeypatch):
     from process import provider_directory_source_local_publication as publication
 
