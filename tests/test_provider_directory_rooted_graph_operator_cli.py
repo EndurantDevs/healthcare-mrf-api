@@ -297,19 +297,28 @@ def _assert_explicit_shared_task_entry() -> None:
         for node in tree.body
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "process_provider_directory_fhir_data"
     )
-    dispatch = entry.body[1]
-    assert isinstance(dispatch, ast.If)
-    assert dispatch.orelse == []
-    assert ast.dump(dispatch.test) == ast.dump(ast.parse('"rooted_graph" in (task or {})', mode="eval").body)
-    assert len(dispatch.body) == 2
-    imported, returned = dispatch.body
-    assert isinstance(imported, ast.ImportFrom)
-    assert imported.module == "process.provider_directory_rooted_graph_worker"
-    assert [(alias.name, alias.asname) for alias in imported.names] == [("process_rooted_graph_task", None)]
-    assert isinstance(returned, ast.Return) and isinstance(returned.value, ast.Await)
-    assert isinstance(returned.value.value, ast.Call)
-    assert isinstance(returned.value.value.func, ast.Name)
-    assert returned.value.value.func.id == "process_rooted_graph_task"
+    expected_entry = ast.parse(
+        "from process.delta_dental_directory_worker import specialized_source_task\n"
+        "if (specialized := specialized_source_task(sys.modules[__name__], ctx, task)) is not None:\n"
+        "    return await specialized\n"
+    )
+    assert [ast.dump(node) for node in entry.body[1:3]] == [ast.dump(node) for node in expected_entry.body]
+
+    router_tree = ast.parse((ROOT / "process" / "delta_dental_directory_worker.py").read_text(encoding="utf-8"))
+    router = next(
+        node
+        for node in router_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "specialized_source_task"
+    )
+    expected_routes = ast.parse(
+        "if is_delta_observation(task):\n"
+        "    return run_delta_observation(directory, ctx, task)\n"
+        'if "rooted_graph" in (task or {}):\n'
+        "    from process.provider_directory_rooted_graph_worker import process_rooted_graph_task\n"
+        "    return process_rooted_graph_task(directory, ctx, task)\n"
+        "return None\n"
+    )
+    assert [ast.dump(node) for node in router.body[1:]] == [ast.dump(node) for node in expected_routes.body]
 
 
 def test_operator_is_packaged_but_not_scheduled_or_publicly_activated() -> None:

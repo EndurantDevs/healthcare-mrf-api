@@ -13,7 +13,10 @@ from api.provider_directory_rooted_fhir_publication import (
     is_rooted_fhir_catalog_entry,
     unavailable_rooted_fhir_publication,
 )
+from api.provider_directory_source_worker import is_delta_route_available
 from process import provider_directory_profile as profile_artifact
+from process.delta_dental_directory_browser import SOURCE_ID as DELTA_DENTAL_SOURCE_ID
+from process.delta_dental_directory_browser import SOURCE_ORIGIN as DELTA_DENTAL_ORIGIN
 from process.provider_directory_publication_catalog_authority import (
     canonical_manifest_digest,
 )
@@ -121,6 +124,36 @@ def _validated_catalog_items(
     return catalog_items, runnable_source_ids
 
 
+def _append_observation_entries(items, observations):
+    """Expose the exact observation contract outside the FHIR acquisition catalog."""
+    if observations == []:
+        return
+    if not isinstance(observations, list) or len(observations) != 1 or not isinstance(observations[0], dict):
+        raise RuntimeError("provider_directory_source_manifest_invalid")
+    entry = observations[0]
+    if (
+        set(entry) != {*PUBLIC_ENTRY_FIELDS, "coverage_warning"}
+        or entry["entry_id"] != "delta-dental-provider-directory"
+        or entry["owner_id"] != "delta-dental"
+        or entry["source_ids"] != [DELTA_DENTAL_SOURCE_ID]
+        or entry["canonical_base"] != DELTA_DENTAL_ORIGIN
+        or entry["classification"] != "observation"
+        or entry["resources"] != []
+        or entry["resource_profile"] is not None
+        or not all(type(entry[name]) is str and entry[name].strip() for name in ("display_name", "coverage_warning"))
+        or any(item["entry_id"] == entry["entry_id"] or DELTA_DENTAL_SOURCE_ID in item["source_ids"] for item in items)
+    ):
+        raise RuntimeError("provider_directory_source_manifest_invalid")
+    items.append(
+        {
+            **entry,
+            "supported_resources": [],
+            "profile_enabled": False,
+            "runnable": is_delta_route_available(),
+        }
+    )
+
+
 def provider_directory_source_catalog(
     manifest_path: Path = DEFAULT_MANIFEST,
 ) -> dict[str, Any]:
@@ -147,6 +180,7 @@ def provider_directory_source_catalog(
     required_profile_source_ids = (runnable_source_ids - PROFILE_OPT_IN_SOURCES) | nonrunnable_profile_source_ids
     if required_profile_source_ids != profile_source_ids - PROFILE_OPT_IN_SOURCES:
         raise RuntimeError("provider_directory_profile_source_catalog_drift")
+    _append_observation_entries(catalog_items, manifest.get("observation_entries", []))
     return {
         "schema_version": 1,
         "campaign_id": manifest.get("campaign_id"),

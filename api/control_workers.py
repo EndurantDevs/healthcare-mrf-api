@@ -1418,7 +1418,7 @@ def _worker_job_container(
         container_dict.update(
             image=aca_launch.image, command=list(registry_aca_source_worker.COMMAND), workingDir="/app"
         )
-    env_from_list = _worker_job_env_from()
+    env_from_list = _worker_container_env_from(fhir_launch)
     if env_from_list:
         container_dict["envFrom"] = env_from_list
     resource_dict = _worker_job_resources(spec, launch_request)
@@ -1435,6 +1435,14 @@ def _worker_job_container(
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
     return _worker_source_policy_container(container_dict, volumes, fhir_launch), volumes, run_id
+
+
+def _worker_container_env_from(launch):
+    """Keep broad Secret imports off the observation-only worker."""
+    environment_refs = _worker_job_env_from()
+    if provider_directory_source_worker.is_delta_observation_launch(launch):
+        return [entry for entry in environment_refs if "secretRef" not in entry]
+    return environment_refs
 
 
 def _worker_source_policy_container(container_dict, volumes, fhir_source_launch):
@@ -1640,6 +1648,7 @@ def _worker_job_secret_env(
     worker_class: str | None = None,
     *,
     launch_request: dict[str, Any] | None = None,
+    source_launch=None,
 ) -> list[dict[str, Any]]:
     """Build explicitly named worker environment values from secret keys."""
 
@@ -1653,9 +1662,17 @@ def _worker_job_secret_env(
     if not isinstance(secret_env_spec_list, list):
         return []
 
+    observed_launch = getattr(launch_request, "fhir_source_launch", None)
+    if source_launch is None and provider_directory_source_worker.is_delta_observation_launch(observed_launch):
+        source_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(
+            _BY_WORKER_CLASS[worker_class],
+            launch_request,
+        )
     environment_by_name: dict[str, dict[str, Any]] = {}
     for secret_env_spec in secret_env_spec_list:
         if not isinstance(secret_env_spec, dict):
+            continue
+        if not provider_directory_source_worker.is_observation_secret_allowed(secret_env_spec, source_launch):
             continue
         if not _is_worker_class_selected(secret_env_spec, worker_class):
             continue

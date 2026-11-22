@@ -4734,8 +4734,9 @@ _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE = [
 ]
 
 
-def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
+def test_provider_directory_source_catalog_exposes_all_reviewed_sources(monkeypatch):
     """Expose every reviewed source while preserving execution fences."""
+    monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_ROUTES_JSON", raising=False)
     catalog = provider_directory_source_catalog()
     runnable_items = [entry for entry in catalog["items"] if entry["runnable"]]
     nonrunnable_items = [entry for entry in catalog["items"] if not entry["runnable"]]
@@ -4744,7 +4745,7 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (59, 46, 46)
+    ) == (60, 46, 46)
     assert len(catalog["catalog_digest"]) == 64
     assert len(runnable_items) == 46
     assert {entry["entry_id"] for entry in runnable_items if not entry["profile_enabled"]} == {
@@ -4752,7 +4753,7 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         "vsp-provider-directory",
     }
     assert all(entry["supported_resources"] == entry["resources"] for entry in runnable_items)
-    assert len(nonrunnable_items) == 13
+    assert len(nonrunnable_items) == 14
     probe_items = [entry for entry in nonrunnable_items if entry["classification"] == "probe_only"]
     assert len(probe_items) == 12
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
@@ -4790,6 +4791,24 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         "molina",
         "pacificsource",
     }
+
+
+def test_delta_catalog_exposes_bounded_observations(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_ROUTES_JSON", raising=False)
+    delta = next(
+        entry
+        for entry in provider_directory_source_catalog()["items"]
+        if entry["entry_id"] == "delta-dental-provider-directory"
+    )
+
+    assert delta["source_ids"] == ["delta-dental-national-finder"]
+    assert delta["classification"] == "observation"
+    assert delta["runnable"] is False
+    assert delta["profile_enabled"] is False
+    assert delta["resource_profile"] is None
+    assert delta["resources"] == delta["supported_resources"] == []
+    assert "bounded office observations" in delta["coverage_warning"]
+    assert "complete directory" in delta["coverage_warning"]
 
 
 def test_provider_directory_catalog_enables_cms_profile_source():
