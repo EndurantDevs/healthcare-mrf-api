@@ -351,7 +351,8 @@ async def test_geo_inclusion_keeps_native_page_and_private_anchor(monkeypatch, i
 
 
 @pytest.mark.asyncio
-async def test_geo_scope_preserves_cursor_binding_and_exact_hydration(monkeypatch):
+@pytest.mark.parametrize("require_match", [False, True])
+async def test_geo_scope_preserves_cursor_binding_and_exact_hydration(monkeypatch, require_match):
     session = _Session()
     observed = _install_geo_service(monkeypatch, session)
     scoped_relations = []
@@ -364,6 +365,7 @@ async def test_geo_scope_preserves_cursor_binding_and_exact_hydration(monkeypatc
         async def scope(same_session, **arguments):
             assert same_session is session and arguments["prepared"] is original
             assert arguments["query"] is preparer.query
+            assert arguments["use_default_roots"] is require_match
             assert "native_eligible_geo" in str(arguments["native_entity_scope"])
             return scoped
 
@@ -379,7 +381,7 @@ async def test_geo_scope_preserves_cursor_binding_and_exact_hydration(monkeypatc
         return _geo_reply([])
 
     monkeypatch.setattr(geo, "_geo_page", page)
-    reply = await geo.serve_custom_import_provider_geo(_request(), session)
+    reply = await geo.serve_custom_import_provider_geo(_request(_body(require_match=require_match)), session)
 
     assert reply.status == 200 and not session.rolled_back
     assert observed["hydration"][0]["prepared"] is scoped_relations[0]

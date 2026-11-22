@@ -227,7 +227,9 @@ async def _read_geo_payload(request, session, parsed, verified, cursor_secret, t
         query=query,
     )
     context = ProviderImportQuery(prepared, compile_npi_entity_relation(prepared.statement), query.require_match)
-    scope_preparer = _ProviderScopePreparer(session, service, authorization, pinned_target, query, prepared)
+    scope_preparer = _ProviderScopePreparer(
+        session, service, authorization, pinned_target, query, prepared, use_default_roots=query.require_match
+    )
     binding = _GeoCursorBinding(
         session,
         pinned_target,
