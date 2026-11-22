@@ -409,6 +409,62 @@ async def source_retry_rows(directory, dataset_id, resource_type, *, payload_has
         ]
 
 
+async def source_organization_reference_ids(directory, dataset_id, api_base, limit):
+    """Find referenced IDs without a completed two-pass Organization row."""
+    from process.provider_directory_generic_source_policy import bound_publisher
+
+    async with source_transaction(directory.db):
+        candidate = await resolve_existing_source_candidate(directory.db, directory, dataset_id)
+        publisher = bound_publisher()
+        connection, policy = publisher.connection, publisher.policy
+        binding = await _locked(connection, policy, candidate.identity, phases=("loading",), lock="KEY SHARE")
+        table = storage_relation(policy.schema, binding["tables"]["resource_input"]["name"])
+        reference_rows = await connection.fetch(
+            f"""
+            WITH active AS NOT MATERIALIZED (
+                SELECT resource_type, resource_id, payload_json FROM {table}
+                WHERE dataset_id=$1 AND batch_ordinal<=$2
+                  AND batch_ordinal>greatest($3::bigint,coalesce(($4::jsonb->>resource_type)::bigint,0))
+            ), refs AS (
+                SELECT DISTINCT reference FROM active
+                CROSS JOIN LATERAL (VALUES
+                    (CASE resource_type
+                        WHEN 'OrganizationAffiliation' THEN payload_json->>'organization_ref'
+                        WHEN 'PractitionerRole' THEN payload_json->>'organization_ref'
+                        WHEN 'Location' THEN payload_json->>'managing_organization_ref'
+                        WHEN 'HealthcareService' THEN payload_json->>'provided_by_ref'
+                        WHEN 'InsurancePlan' THEN payload_json->>'owned_by_ref'
+                    END),
+                    (CASE resource_type
+                        WHEN 'OrganizationAffiliation' THEN payload_json->>'participating_organization_ref'
+                        WHEN 'InsurancePlan' THEN payload_json->>'administered_by_ref'
+                    END)
+                ) AS found(reference)
+                WHERE resource_type IN ('OrganizationAffiliation','PractitionerRole','Location',
+                    'HealthcareService','InsurancePlan') AND reference IS NOT NULL
+            ), ids AS (
+                SELECT (regexp_match(
+                    CASE WHEN starts_with(reference,$5 || '/Organization/')
+                         THEN substr(reference,length($5)+2) ELSE reference END,
+                    '^(?:Organization/)?([A-Za-z0-9.-]{{1,64}})$'))[1]
+                    AS resource_id FROM refs
+            )
+            SELECT resource_id FROM ids WHERE resource_id NOT IN ('.','..')
+            EXCEPT SELECT resource_id FROM active WHERE resource_type='Organization'
+            ORDER BY resource_id LIMIT $6
+            """,
+            dataset_id,
+            binding["ordinal"],
+            binding["resets"].get("*", 0),
+            json.dumps(binding["resets"]),
+            api_base,
+            limit + 1,
+        )
+    return (
+        tuple(reference_row["resource_id"] for reference_row in reference_rows) if len(reference_rows) <= limit else ()
+    )
+
+
 def _family_callbacks(directory, candidate):
     prepare_content, merge_content = _resource_callbacks(directory, candidate)
 

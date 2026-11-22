@@ -422,6 +422,25 @@ async def test_retry_reader_pins_before_family_lock_and_bounds_committed_batches
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("limit, expected", [(2, ("first", "second")), (1, ())])
+async def test_organization_reference_reader_pins_capture_and_refuses_truncation(monkeypatch, limit, expected):
+    async with _loading_count_case(monkeypatch) as case:
+        case.native.fetch.return_value = [{"resource_id": "first"}, {"resource_id": "second"}]
+        base = "https://example.test/fhir"
+
+        assert await adapters.source_organization_reference_ids(case.directory, "dataset", base, limit) == expected
+
+        query, dataset, ordinal, global_reset, resets, selected_base, bound = case.native.fetch.await_args.args
+        binding = case.header["candidate_storage_json"]
+        assert (dataset, ordinal, global_reset) == ("dataset", binding["ordinal"], binding["resets"].get("*", 0))
+        assert storage._json(resets) == binding["resets"]
+        assert (selected_base, bound) == (base, limit + 1)
+        assert "[A-Za-z0-9.-]{1,64}" in query
+        assert "EXCEPT SELECT resource_id FROM active WHERE resource_type='Organization'" in query
+        case.native.copy_records_to_table.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fault", [None, "hash", "orphan", "missing"])
 async def test_partition_counts_stream_original_antijoins(monkeypatch, fault):
     """Historical counts retain latest observations and exact marker anti-join failures."""
