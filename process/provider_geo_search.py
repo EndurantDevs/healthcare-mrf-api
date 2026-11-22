@@ -40,6 +40,7 @@ LEGACY_SEARCH_COLUMNS = frozenset(
     }
 )
 SEARCH_COLUMNS = LEGACY_SEARCH_COLUMNS | {"zip5", "postal_code"}
+ENTITY_TYPE_COLUMN = "entity_type_code"
 # Same switch as api.endpoint.npi.GEO_SERVICE_LOCATIONS_ENV; a test keeps them equal.
 GEO_SERVICE_LOCATIONS_ENV = "HLTHPRT_GEO_INCLUDE_SERVICE_LOCATIONS"
 _SERVICE_LOCATION_TYPES = ("primary", "secondary", "practice", "site")
@@ -103,6 +104,15 @@ def input_keys_sql(schema: str) -> tuple[str, str]:
     )
 
 
+def geo_entity_type_column_available(relation: str) -> str:
+    """Check for the optional integer column on a trusted regclass expression."""
+    return (
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+        f"WHERE attrelid = {relation} AND attname = '{ENTITY_TYPE_COLUMN}' "
+        "AND attnum > 0 AND NOT attisdropped AND atttypid = 'pg_catalog.int4'::pg_catalog.regtype)"
+    )
+
+
 def _state(schema: str) -> str:
     return storage_relation(schema, STATE_TABLE)
 
@@ -111,7 +121,7 @@ _STAGE_COLUMNS = {
     "addresses": "npi bigint NOT NULL, address_key uuid NOT NULL, location_key text NOT NULL, "
     "lat numeric(11,8) NOT NULL, long numeric(11,8) NOT NULL, state_name text, type text NOT NULL, "
     "address_precision text, taxonomy_array integer[], zip5 text, postal_code text",
-    "npis": "npi bigint NOT NULL",
+    "npis": f"npi bigint NOT NULL, {ENTITY_TYPE_COLUMN} integer",
     "primary": "npi bigint NOT NULL, code text NOT NULL",
 }
 
@@ -146,7 +156,8 @@ SELECT a.npi, a.address_key, a.location_key, a.lat, a.long, a.state_name, a.type
         (
             "npi",
             "d",
-            f"INSERT INTO {relation_by_stage['npis']} SELECT d.npi FROM {storage_relation(schema, 'npi')} AS d "
+            f"INSERT INTO {relation_by_stage['npis']} SELECT d.npi, d.{ENTITY_TYPE_COLUMN} "
+            f"FROM {storage_relation(schema, 'npi')} AS d "
             "WHERE {block_range}",
             NPI_COPY_PACE,
         ),
@@ -173,14 +184,14 @@ def _projection_sql(schema: str, load_table: str, table: str) -> str:
     relation_by_stage = {stage: storage_relation(schema, name) for stage, name in _stage_tables(load_table).items()}
     return f"""CREATE TABLE {storage_relation(schema, table)} AS
 WITH eligible AS (
-    SELECT a.*,
+    SELECT a.*, d.{ENTITY_TYPE_COLUMN},
            row_number() OVER (
                PARTITION BY a.npi, a.address_key, a.lat, a.long, a.state_name, a.taxonomy_array,
                             COALESCE(a.zip5, LEFT(COALESCE(a.postal_code, ''), 5))
                ORDER BY {_TYPE_RANK}, a.location_key
            ) AS group_rank
       FROM {relation_by_stage["addresses"]} AS a
-     WHERE EXISTS (SELECT 1 FROM {relation_by_stage["npis"]} AS d WHERE d.npi = a.npi)
+      JOIN {relation_by_stage["npis"]} AS d ON d.npi = a.npi
 ), primary_taxonomy AS (
     SELECT t.npi, array_agg(DISTINCT t.code ORDER BY t.code) AS codes
       FROM {relation_by_stage["primary"]} AS t
@@ -189,7 +200,7 @@ WITH eligible AS (
     -- Keep the preferred row per provider address, point, taxonomy set and effective ZIP.
     -- Use a distinct count for addresses with several such rows.
     SELECT e.npi, e.address_key, e.location_key, e.lat, e.long, e.state_name, e.type, e.address_precision,
-           e.taxonomy_array, e.zip5, e.postal_code,
+           e.taxonomy_array, e.zip5, e.postal_code, e.{ENTITY_TYPE_COLUMN},
            primary_taxonomy.codes AS primary_taxonomy_codes,
            public.Geography(public.ST_MakePoint(e.long::double precision, e.lat::double precision)) AS geo,
            count(*) OVER (PARTITION BY e.npi, e.address_key) > 1 AS shares_identity
@@ -247,13 +258,16 @@ async def _grant_address_readers(connection, schema: str, relation: str) -> None
 
 async def _is_current(connection, schema: str, *, uses_service_locations: bool) -> bool:
     address_sql, npi_sql = input_keys_sql(schema)
+    current_relation = "pg_catalog.to_regclass(pg_catalog.format('%I.%I', $3::text, s.table_name))"
     return bool(
         await connection.fetchval(
             f"""SELECT EXISTS (SELECT 1 FROM {_state(schema)} AS s
                  WHERE s.is_current AND s.layout = $2 AND s.include_service_locations = $1
-                   AND s.address_input = ({address_sql}) AND s.npi_input = ({npi_sql}))""",
+                   AND s.address_input = ({address_sql}) AND s.npi_input = ({npi_sql})
+                   AND {geo_entity_type_column_available(current_relation)})""",
             uses_service_locations,
             LAYOUT,
+            schema,
         )
     )
 
