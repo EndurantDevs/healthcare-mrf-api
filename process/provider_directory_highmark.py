@@ -25,6 +25,30 @@ PARTITIONS = {
 API_BASES = frozenset(f"{API_ROOT}/{partition}" for partition in PARTITIONS)
 
 
+def has_exact_role_census_key(directory, source_record, resource, api_base):
+    """Authorize the census only with a header key bound to this exact tenant."""
+    if (
+        resource != "PractitionerRole"
+        or api_base not in CHUNKED_API_BASES
+        or source_record.get("auth_type") != "api_key"
+        or source_record.get("requires_api_key") is not True
+        or directory.source_proxy.selected_run(directory, source_record) is not None
+    ):
+        return False
+    credential_spec = directory._credential_spec_for_source(source_record)
+    api_key = credential_spec.get("api_key")
+    return (
+        set(credential_spec) == {"api_key", "_matched_by"}
+        and credential_spec["_matched_by"] == [f"api_bases:{api_base}"]
+        and isinstance(api_key, dict)
+        and set(api_key) == {"header", "value"}
+        and isinstance(api_key["header"], str)
+        and api_key["header"].lower() == KEY_HEADER.lower()
+        and isinstance(api_key["value"], str)
+        and directory._api_key_header(credential_spec) is not None
+    )
+
+
 def _role_partition_acquisition(partition):
     if partition not in CHUNKED_PARTITIONS:
         return {}

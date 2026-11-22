@@ -192,8 +192,8 @@ async def _tails(directory, source_record, resource, model, config, state, optio
     return None
 
 
-def _is_unfiltered_start(directory, source_record, resource, start_url, base):
-    """Only an unfiltered anonymous collection can certify endpoint coverage."""
+def _is_unfiltered_start(directory, source_record, resource, start_url, base, *, has_reviewed_key=False):
+    """Require the exact unfiltered collection and its reviewed access mode."""
     start = urllib.parse.urlsplit(start_url)
     origin = urllib.parse.urlsplit(base)
     query = urllib.parse.parse_qs(start.query, keep_blank_values=True)
@@ -207,8 +207,13 @@ def _is_unfiltered_start(directory, source_record, resource, start_url, base):
         or start.fragment
         or set(query) - {"_count", "_format"}
         or any(len(values) != 1 for values in query.values())
-        or directory._has_source_declared_credentialed_access(source_record)
-        or directory._credential_spec_for_source(source_record)
+        or (
+            not has_reviewed_key
+            and (
+                directory._has_source_declared_credentialed_access(source_record)
+                or directory._credential_spec_for_source(source_record)
+            )
+        )
     )
 
 

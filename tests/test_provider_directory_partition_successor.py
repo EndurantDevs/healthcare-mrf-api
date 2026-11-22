@@ -281,9 +281,38 @@ def _drifted_partition_case(case):
     return counts, config
 
 
+def _rejected_highmark_case(case):
+    counts, _ = _drifted_partition_case(case)
+    base = f"{directory.highmark.API_ROOT}/HMDE"
+    for checkpoint in case.checkpoints:
+        checkpoint["canonical_api_base"] = base
+    source = directory._source_row_from_seed(
+        next(row for row in directory.highmark.seed_rows(directory.DEFAULT_RESOURCES) if row["api_base"] == base)
+    )
+    config, _ = directory._last_updated_partition_config(source, "PractitionerRole")
+    end = datetime.datetime(2024, 1, 2, tzinfo=datetime.UTC)
+    pristine_plan = directory._new_last_updated_partition_plan(replace(config, end=end))
+    case.checkpoints[0].update(
+        resource_type="PractitionerRole:LastUpdatedPartition",
+        pages_processed=0,
+        start_url_hash=directory._last_updated_partition_start_hash("PractitionerRole", config),
+        next_url=directory._last_updated_partition_checkpoint_payload(
+            config,
+            pristine_plan,
+            directory.LastUpdatedCompletenessCensus(failure="leaf_unfiltered_contract_required"),
+        ),
+    )
+    for field in ("selected_resources", "expected_resources"):
+        resources = ["PractitionerRole", "InsurancePlan"]
+        case.header["candidate_storage_json"]["identity"]["metadata"][field] = resources
+        case.header["publication_metadata_json"][field] = resources
+    return {name.replace("Organization", "PractitionerRole"): count for name, count in counts.items()}, config
+
+
 @pytest.mark.asyncio
-async def test_partition_successor_renews_only_failed_pre_data_census_once(case):
-    counts, config = _drifted_partition_case(case)
+@pytest.mark.parametrize("fixture", [_drifted_partition_case, _rejected_highmark_case], ids=["drift", "keyed-census"])
+async def test_partition_successor_renews_only_failed_pre_data_census_once(case, fixture):
+    counts, config = fixture(case)
     original, sibling = deepcopy(case.checkpoints)
     execute = case.connection.execute.side_effect
     archived_plans = []
@@ -313,7 +342,7 @@ async def test_partition_successor_renews_only_failed_pre_data_census_once(case)
     receipt = await _transition(case, counts)
     assert receipt["rows"] == 1
     assert case.checkpoints[1] == sibling
-    assert case.checkpoints[0]["pages_processed"] == 4
+    assert case.checkpoints[0]["pages_processed"] == original["pages_processed"]
     before = directory._last_updated_partition_resume_from_checkpoint(original["next_url"], config)
     renewed = directory._last_updated_partition_resume_from_checkpoint(case.checkpoints[0]["next_url"], config)
     assert renewed.plan.status is directory.PlanStatus.COUNTING
@@ -331,6 +360,17 @@ async def test_partition_successor_renews_only_failed_pre_data_census_once(case)
     ]
     assert (await _transition(case, counts, manifest_replay=True))["already_applied"] is True
     assert len(archived_plans) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence", [{"pages_processed": 1}, {"rows_processed": 1}, {"completeness_json": {"proof": 1}}]
+)
+async def test_partition_successor_rejects_highmark_renewal_after_progress(case, evidence):
+    counts, _ = _rejected_highmark_case(case)
+    case.checkpoints[0].update(evidence)
+    with pytest.raises(GenericCandidateError, match="transition_partition_checkpoint_changed"):
+        await _transition(case, counts)
 
 
 @pytest.mark.asyncio

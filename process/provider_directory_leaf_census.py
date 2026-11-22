@@ -7,9 +7,11 @@ import re
 import sys
 
 from process import provider_directory_capped_partition as shared
+from process import provider_directory_highmark as highmark
 from process.provider_directory_time_partition import CountObservation, WindowState, parse_utc_instant
 
 CONTRACT = "unfiltered-leaf-sum-v1"
+UNFILTERED_CONTRACT_REQUIRED = "leaf_unfiltered_contract_required"
 
 
 def mode(settings):
@@ -155,8 +157,11 @@ async def _resume_refinements(directory, resource, model, config, state):
 async def pre_census(directory, source_record, resource, model, config, state, options):
     """Count the whole endpoint, then plan disjoint leaves without a root count."""
     base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    if not shared._is_unfiltered_start(directory, source_record, resource, state.start_url, base):
-        return await shared._failure(directory, resource, model, config, state, "leaf_unfiltered_contract_required")
+    has_reviewed_key = highmark.has_exact_role_census_key(directory, source_record, resource, base)
+    if not shared._is_unfiltered_start(
+        directory, source_record, resource, state.start_url, base, has_reviewed_key=has_reviewed_key
+    ):
+        return await shared._failure(directory, resource, model, config, state, UNFILTERED_CONTRACT_REQUIRED)
     if state.census.leaf_sum is None:
         state.census.leaf_sum = {"contract": CONTRACT, "count_pre": None, "count_post": None, "refinements": {}}
     await shared._check_cancel(directory, options)
