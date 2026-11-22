@@ -110,9 +110,24 @@ def test_snapshot_selection_is_bound_to_endpoint_and_acquisition_contracts():
         )
 
 
-def test_normal_catalog_exposes_an_acquisition_only_network_snapshot():
+def test_normal_catalog_exposes_an_acquisition_only_network_snapshot(monkeypatch):
+    from api.provider_directory_source_worker import ROUTES_ENV
     from api.provider_directory_sources import provider_directory_source_catalog
 
+    monkeypatch.setenv(
+        ROUTES_ENV,
+        json.dumps(
+            [
+                {
+                    "root_run_id": None,
+                    "source_id": _source()["source_id"],
+                    "endpoint_scope": BASE,
+                    "image": "ghcr.io/example/worker@sha256:" + "a" * 64,
+                    "secret_name": "source-runtime",
+                }
+            ]
+        ),
+    )
     item = next(item for item in provider_directory_source_catalog()["items"] if item["entry_id"] == ENTRY_ID)
     assert item["runnable"] is True and item["profile_enabled"] is False
     assert item["supported_resources"] == item["resources"] == ["Organization", "OrganizationAffiliation"]
