@@ -55,6 +55,9 @@ async def test_selected_office_page(monkeypatch, size, extra, staged, computed, 
     if bounded:
         assert "bucket_members OFFSET 0" in selection
         assert "COUNT(*) FROM prefix_matches" in selection and "COUNT(*) FROM taxonomy_prefix" in selection
+        budget = "GREATEST(2048, LEAST(64, (CAST(:limit AS bigint) + CAST(:start AS bigint))) * 128)"
+        assert f"LIMIT {budget}" in selection and f"< {budget}" in selection
+        assert "SUM(ref.row_count)" in selection and "FROM selected_membership_bound" in selection
         assert "WHERE NOT (SELECT sufficient FROM prefix_complete)" in selection
     elif staged and size != 3:
         assert "SELECT DISTINCT location_key" in selection

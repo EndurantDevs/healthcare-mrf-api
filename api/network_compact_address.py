@@ -40,15 +40,23 @@ def compact_address_read_relations(layout):
 def _membership_arms(layout, *, selected, location_lookup=False):
     arms = []
     for index, artifact in enumerate(layout.artifacts):
+        ref_map = _relation(layout.ref_map)
         edge = compact_identifier(artifact.schema_name) + ".network_office_edge"
         selector = "AND ref.network_id=ANY(CAST(:_canonical_network_ids AS integer[]))" if selected else ""
+        artifact_filter = f"ref.artifact_candidate_id=CAST(:_compact_artifact_{index} AS uuid)"
+        if selected and location_lookup:
+            # Probe the location index once with all selected slices in its bucket.
+            arms.append(f"""SELECT edge.location_key FROM ONLY {edge} edge
+                WHERE edge.location_key=office.location_key AND edge.slice_id=ANY(ARRAY(
+                    SELECT ref.slice_id FROM ONLY {ref_map} ref
+                    WHERE {artifact_filter} {selector}
+                    AND ref.office_bucket=(get_byte(sha256(convert_to(office.location_key,'UTF8')),0)&63)
+                ))""")
+            continue
         projected = "edge.location_key" if selected else "ref.network_id"
         office = "" if selected else "AND edge.location_key=office.location_key"
-        if selected and location_lookup:
-            office = "AND edge.location_key=office.location_key AND ref.office_bucket=(get_byte(sha256(convert_to(office.location_key,'UTF8')),0)&63)"
-        arms.append(f"""SELECT {projected} FROM ONLY {_relation(layout.ref_map)} ref JOIN ONLY {edge} edge
-            ON edge.slice_id=ref.slice_id WHERE ref.artifact_candidate_id=CAST(:_compact_artifact_{index} AS uuid)
-            {office} {selector}""")
+        arms.append(f"""SELECT {projected} FROM ONLY {ref_map} ref JOIN ONLY {edge} edge
+            ON edge.slice_id=ref.slice_id WHERE {artifact_filter} {office} {selector}""")
     memberships = " UNION ALL ".join(arms)
     if selected and location_lookup and memberships:
         # Keep membership probes inside each already-bounded office lookup.
@@ -98,7 +106,11 @@ def compact_selected_offices(layout, network_ids):
     selected = _membership_arms(layout, selected=True)
     if not selected:
         selected = "SELECT NULL::text AS location_key WHERE FALSE"
-    keys = f"selected_office_keys AS MATERIALIZED (SELECT DISTINCT location_key FROM ({selected}) selected)"
+    keys = f"""selected_office_keys AS MATERIALIZED (SELECT DISTINCT location_key FROM ({selected}) selected),
+        selected_membership_bound AS MATERIALIZED (
+            SELECT COALESCE(SUM(ref.row_count),0) AS upper_bound FROM ONLY {_relation(layout.ref_map)} ref
+            WHERE ref.network_id=ANY(CAST(:_canonical_network_ids AS integer[]))
+        )"""
     columns = ",".join(
         compact_identifier(col.name)
         for col in EntityAddressUnified.__table__.columns

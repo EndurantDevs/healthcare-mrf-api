@@ -121,6 +121,33 @@ async def test_staged_offices_match_scoped_rows(compact_db):
         ]
 
 
+async def _assert_sparse_taxonomy_pages(connection, statement, params):
+    """Check exact small and wide pages and verify that the wide prefix never scans."""
+    for first, last in [(1200000000, 1200004095), (1200004096, 1200008191)]:
+        await connection.execute(
+            text(
+                "INSERT INTO npi_taxonomy SELECT npi, 'TESTCODE', 'Y' "
+                "FROM generate_series(CAST(:first AS bigint), CAST(:last AS bigint)) npi"
+            ),
+            {"first": first, "last": last},
+        )
+        for limit in (1, 51):
+            page_rows = await connection.execute(statement, params | {"start": 1, "limit": limit})
+            assert page_rows.scalars().all() == [2222222222]
+    explain = text(f"EXPLAIN (ANALYZE, FORMAT JSON) {statement.text}")
+    plan = (await connection.execute(explain, params | {"start": 1, "limit": 51})).scalar_one()
+    pending_nodes = [(plan[0]["Plan"], False)]
+    has_prefix_scan = False
+    while pending_nodes:
+        node, is_in_prefix = pending_nodes.pop()
+        is_in_prefix = is_in_prefix or node.get("Subplan Name") == "CTE taxonomy_prefix"
+        pending_nodes.extend((child, is_in_prefix) for child in node.get("Plans", ()))
+        if is_in_prefix and node.get("Relation Name") == "npi_taxonomy":
+            has_prefix_scan = True
+            assert node["Actual Loops"] == 0
+    assert has_prefix_scan
+
+
 @pytest.mark.asyncio
 async def test_three_network_taxonomy_pages_use_exact_office_eligibility(compact_db):
     db, layout = compact_db, compact_db.second_layout
@@ -167,12 +194,7 @@ async def test_three_network_taxonomy_pages_use_exact_office_eligibility(compact
             for lookup_relation in (None, bounded):
                 page_rows = await connection.execute(page(lookup_relation), request)
                 assert page_rows.scalars().all() == expected
-        await connection.execute(
-            text("INSERT INTO npi_taxonomy SELECT npi, 'TESTCODE', 'Y' FROM generate_series(1200000000,1200002047) npi")
-        )
-        assert (await connection.execute(page(bounded), params | {"start": 1, "limit": 1})).scalars().all() == [
-            2222222222
-        ]
+        await _assert_sparse_taxonomy_pages(connection, page(bounded), params)
 
 
 @pytest.mark.asyncio

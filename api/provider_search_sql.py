@@ -142,8 +142,10 @@ def _bounded_primary_taxonomy_page_sql(
 ) -> str:
     """Try an ordered taxonomy prefix before discovering all selected offices."""
     # The prefix is exact once it fills the requested window or exhausts the taxonomy.
-    prefix_limit = 2048
     page_end = "(CAST(:limit AS bigint) + CAST(:start AS bigint))"
+    prefix_limit = f"GREATEST(2048, LEAST(64, {page_end}) * 128)"
+    # Small memberships cannot fill the window, and the staged query can read them directly.
+    can_fill = f"(SELECT upper_bound >= {page_end} FROM selected_membership_bound)"
     taxonomy = taxonomy_codes_subquery("code = ANY(:codes)")
     return f"""
     WITH taxonomy_prefix AS MATERIALIZED (
@@ -151,6 +153,7 @@ def _bounded_primary_taxonomy_page_sql(
           FROM mrf.npi_taxonomy AS provider_taxonomy
          WHERE provider_taxonomy.healthcare_provider_taxonomy_code = (CAST(:codes AS varchar[]))[1]
            {primary_taxonomy_predicate("           ")}
+           AND {can_fill}
          ORDER BY provider_taxonomy.npi
          LIMIT {prefix_limit}
     ), prefix_matches AS MATERIALIZED (
@@ -166,8 +169,10 @@ def _bounded_primary_taxonomy_page_sql(
          ORDER BY candidate.npi
          LIMIT {page_end}
     ), prefix_complete AS MATERIALIZED (
-        SELECT (SELECT COUNT(*) FROM prefix_matches) = {page_end}
-            OR (SELECT COUNT(*) FROM taxonomy_prefix) < {prefix_limit} AS sufficient
+        SELECT {can_fill} AND (
+            (SELECT COUNT(*) FROM prefix_matches) = {page_end}
+            OR (SELECT COUNT(*) FROM taxonomy_prefix) < {prefix_limit}
+        ) AS sufficient
     )
     SELECT npi FROM prefix_matches WHERE (SELECT sufficient FROM prefix_complete)
     UNION ALL
