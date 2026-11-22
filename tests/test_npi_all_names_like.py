@@ -196,7 +196,10 @@ async def test_get_all_taxonomy_page_ordering(
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
     if scope_kind is not None:
         scope = NetworkAddressReadScope(
-            manifest=types.SimpleNamespace(compact_layout=None if scope_kind == "heap" else object()),
+            manifest=types.SimpleNamespace(
+                compact_layout=None if scope_kind == "heap" else object(),
+                supports_location_lookup=False,
+            ),
             network_ids=None if scope_kind == "unselected" else tuple(range(1, selected_count + 1)),
             address_relation=object(),
             legacy_checksums=(123,) if scope_kind == "legacy" else None,

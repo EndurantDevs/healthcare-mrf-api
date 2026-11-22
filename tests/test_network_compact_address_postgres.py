@@ -27,6 +27,12 @@ from api.network_compact_address import (
     compact_selected_offices,
 )
 from api.network_read_execution import qualified_relation_sql
+from api.provider_search_sql import (
+    ProviderPageSource,
+    provider_page_npis_sql,
+    provider_taxonomy_lateral_join,
+    taxonomy_codes_subquery,
+)
 from db.models import EntityAddressUnified
 from process.network_compact_layout import (
     CompactAddressRelation,
@@ -98,6 +104,8 @@ async def test_shared_generations_keep_exact_offices(compact_db):
 async def test_staged_offices_match_scoped_rows(compact_db):
     db, layout = compact_db, compact_db.second_layout
     for network_ids, names in (
+        ((7, 42, 99), ["manual override", "manual custom"]),
+        ((4, 5, 88), []),
         ((7, 42, 88, 99), ["manual override", "manual custom"]),
         ((4, 5, 6, 88), []),
     ):
@@ -110,6 +118,60 @@ async def test_staged_offices_match_scoped_rows(compact_db):
         assert [row["entity_name"] for row in rows] == names
         assert rows == [
             {key: value for key, value in row.items() if key != "canonical_network_ids"} for row in ordinary
+        ]
+
+
+@pytest.mark.asyncio
+async def test_three_network_taxonomy_pages_use_exact_office_eligibility(compact_db):
+    db, layout = compact_db, compact_db.second_layout
+    network_ids = (7, 42, 99)
+    keys, offices = compact_selected_offices(layout, network_ids)
+    bounded = compact_address_relation_sql(layout, network_ids=network_ids, location_lookup=True)
+    provider_npi = "COALESCE(c.npi, c.inferred_npi)"
+    taxonomy = taxonomy_codes_subquery("code = ANY(:codes)")
+    primary_match = provider_taxonomy_lateral_join(provider_npi_sql=provider_npi, primary_only=True)
+    staged_source = f"{offices} AS c CROSS JOIN {taxonomy} {primary_match}"
+    eligibility_clauses = ["c.taxonomy_array && q.int_codes", "c.type = 'practice'"]
+    params = compact_address_parameters(layout) | {"_canonical_network_ids": list(network_ids), "codes": ["TESTCODE"]}
+
+    def page(bounded_source):
+        npis = provider_page_npis_sql(
+            ProviderPageSource(staged_source, bounded_source), provider_npi, eligibility_clauses, None
+        ).replace("mrf.", "pg_temp.")
+        return text(f"WITH {keys}, page AS ({npis} ORDER BY npi LIMIT :limit OFFSET :start) SELECT npi FROM page")
+
+    async with db.engine.begin() as connection:
+        await connection.execute(text("CREATE TEMP TABLE nucc_taxonomy (code varchar, int_code integer)"))
+        await connection.execute(
+            text(
+                "CREATE TEMP TABLE npi_taxonomy (npi bigint, "
+                "healthcare_provider_taxonomy_code varchar, "
+                "healthcare_provider_primary_taxonomy_switch varchar)"
+            )
+        )
+        await connection.execute(text("INSERT INTO nucc_taxonomy VALUES ('TESTCODE', 3)"))
+        await connection.execute(
+            text(
+                "INSERT INTO npi_taxonomy VALUES (1111111111, 'TESTCODE', 'y'), (1111111111, 'TESTCODE', 'Y'), "
+                "(2222222222, 'TESTCODE', 'Y'), (3333333333, 'TESTCODE', 'Y')"
+            )
+        )
+        await connection.execute(
+            text(
+                f'UPDATE "{layout.custom.schema_name}".entity_address_unified SET taxonomy_array=ARRAY[3], '
+                "inferred_npi=npi, npi=NULL"
+            )
+        )
+        for offset, expected in [(0, [1111111111]), (1, [2222222222]), (2, [])]:
+            request = params | {"start": offset, "limit": 1}
+            for lookup_relation in (None, bounded):
+                page_rows = await connection.execute(page(lookup_relation), request)
+                assert page_rows.scalars().all() == expected
+        await connection.execute(
+            text("INSERT INTO npi_taxonomy SELECT npi, 'TESTCODE', 'Y' FROM generate_series(1200000000,1200002047) npi")
+        )
+        assert (await connection.execute(page(bounded), params | {"start": 1, "limit": 1})).scalars().all() == [
+            2222222222
         ]
 
 
