@@ -55,7 +55,6 @@ from api.provider_directory_profile_capacity_preflight import (
 from api.provider_directory_profile_selection_attestation import (
     register_profile_selection_route,
 )
-from api.provider_directory_sources import provider_directory_source_catalog
 from api.uhc_provider_file_catalog import register_uhc_provider_file_catalog_routes
 from db.models import ProviderDirectorySource, db
 from process.provider_directory_named_edition import named_editions_for_session
@@ -115,8 +114,8 @@ async def control_provider_directory_sources(request):
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
             editions = await named_editions_for_session(session, str(ProviderDirectorySource.__table__.schema))
             catalog_map = await provider_directory_control_catalog(editions=editions, allow_optional_fallback=False)
-    except _OptionalCatalogProjectionError:
-        catalog_map = provider_directory_source_catalog()
+    except _OptionalCatalogProjectionError as error:
+        catalog_map = error.catalog_map
     return response.json(catalog_map)
 
 

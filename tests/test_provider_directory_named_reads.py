@@ -210,7 +210,7 @@ async def test_source_catalog_named_lookup_failure_does_not_fall_back(monkeypatc
     projection = AsyncMock(side_effect=AssertionError("projection after failed named lookup"))
     fallback = Mock(side_effect=AssertionError("fallback after failed named lookup"))
     monkeypatch.setattr(control, "provider_directory_control_catalog", projection)
-    monkeypatch.setattr(control, "provider_directory_source_catalog", fallback)
+    monkeypatch.setattr(catalog, "provider_directory_source_catalog", fallback)
     with pytest.raises(RuntimeError, match="invalid named header"):
         await control.control_provider_directory_sources(SimpleNamespace())
     assert rollback_events == [True]

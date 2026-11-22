@@ -201,8 +201,17 @@ def _catalog_projection(database, state, stage, payload):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failed_stage", ("selection", "outcomes", "cms"))
-async def test_catalog_optional_timeout_rolls_back_before_fallback(monkeypatch, failed_stage):
+@pytest.mark.parametrize(
+    ("failed_stage", "completed_projections", "retained_fields"),
+    (
+        ("outcomes", (), {}),
+        ("cms", ("outcomes",), {"outcomes": True}),
+        ("selection", ("outcomes", "cms"), {"outcomes": True, "cms_serving_candidate": {"candidate": True}}),
+    ),
+)
+async def test_catalog_optional_timeout_rolls_back_before_fallback(
+    monkeypatch, failed_stage, completed_projections, retained_fields
+):
     from api import control
     from api import provider_directory_control_catalog as catalog
 
@@ -214,15 +223,16 @@ async def test_catalog_optional_timeout_rolls_back_before_fallback(monkeypatch, 
         database.engine = engine
         database.session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-        def static_catalog():
-            if state.cancelled and not state.first_response_finished:
-                assert database._transaction_binding() is None
-            return static_map
+        serialize = control.response.json
+
+        def finished_transaction_response(catalog_map):
+            assert database._transaction_binding() is None
+            return serialize(catalog_map)
 
         monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-control-token")
         monkeypatch.setattr(control, "db", database)
-        monkeypatch.setattr(control, "provider_directory_source_catalog", static_catalog)
-        monkeypatch.setattr(catalog, "provider_directory_source_catalog", static_catalog)
+        monkeypatch.setattr(control, "response", SimpleNamespace(json=finished_transaction_response))
+        monkeypatch.setattr(catalog, "provider_directory_source_catalog", lambda: static_map)
         for name, stage, projection_value in (
             ("current_profile_selection_request", "selection", {"selected": True}),
             ("enrich_provider_directory_source_catalog", "outcomes", {**static_map, "outcomes": True}),
@@ -238,11 +248,8 @@ async def test_catalog_optional_timeout_rolls_back_before_fallback(monkeypatch, 
         request = SimpleNamespace(headers={"Authorization": "Bearer synthetic-control-token"})
         try:
             catalog_response = await control.control_provider_directory_sources(request)
-            assert json.loads(catalog_response.body) == static_map and state.cancelled
-            assert (
-                state.reads
-                == ["selection", "outcomes", "cms"][: ["selection", "outcomes", "cms"].index(failed_stage) + 1]
-            )
+            assert json.loads(catalog_response.body) == {**static_map, **retained_fields} and state.cancelled
+            assert state.reads == [*completed_projections, failed_stage]
             assert database._transaction_binding() is None
             state.first_response_finished = True
             catalog_response = await control.control_provider_directory_sources(request)

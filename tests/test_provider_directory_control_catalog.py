@@ -45,8 +45,17 @@ async def _owned_catalog_transaction(state, events):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failed_stage", ("selection", "outcomes", "cms"))
-async def test_owned_catalog_timeout_rolls_back_before_static_fallback(monkeypatch, failed_stage):
+@pytest.mark.parametrize(
+    ("failed_stage", "completed_projections", "retained_fields"),
+    (
+        ("outcomes", (), {}),
+        ("cms", ("outcomes",), {"outcomes": True}),
+        ("selection", ("outcomes", "cms"), {"outcomes": True, "cms_serving_candidate": {"candidate": True}}),
+    ),
+)
+async def test_owned_catalog_timeout_rolls_back_and_preserves_completed_reads(
+    monkeypatch, failed_stage, completed_projections, retained_fields
+):
     from api import control
 
     static_map = {"catalog_digest": "a" * 64, "items": []}
@@ -75,7 +84,6 @@ async def test_owned_catalog_timeout_rolls_back_before_static_fallback(monkeypat
     monkeypatch.setattr(control, "_require_control_auth", lambda _request: None)
     monkeypatch.setattr(control.db, "transaction", lambda: _owned_catalog_transaction(state, events))
     monkeypatch.setattr(control, "named_editions_for_session", AsyncMock(return_value=("named",)))
-    monkeypatch.setattr(control, "provider_directory_source_catalog", static_catalog)
     monkeypatch.setattr(control_catalog, "provider_directory_source_catalog", static_catalog)
     monkeypatch.setattr(
         control_catalog, "current_profile_selection_request", projection("selection", {"selected": True})
@@ -94,9 +102,8 @@ async def test_owned_catalog_timeout_rolls_back_before_static_fallback(monkeypat
         monkeypatch.setattr(control_catalog, setting, 0.01)
 
     catalog_response = await control.control_provider_directory_sources(SimpleNamespace())
-    assert json.loads(catalog_response.body) == static_map
-    assert events[-2:] == ["rollback", "static-after-rollback"]
-    assert events.count("selection") == 1
+    assert json.loads(catalog_response.body) == {**static_map, **retained_fields}
+    assert events == ["static-in-transaction", *completed_projections, failed_stage, "rollback"]
     assert not state.active and not state.poisoned
     catalog_response = await control.control_provider_directory_sources(SimpleNamespace())
     assert json.loads(catalog_response.body) == {
