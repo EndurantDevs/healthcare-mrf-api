@@ -23,24 +23,17 @@ _CMS_CANDIDATE_TIMEOUT_SECONDS = 5.0
 
 
 class _OptionalCatalogProjectionError(RuntimeError):
-    """An owning transaction must roll back before static catalog fallback."""
+    """Carry completed catalog reads past the owning transaction's rollback."""
+
+    def __init__(self, message: str, catalog_map: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.catalog_map = catalog_map
 
 
 async def provider_directory_control_catalog(editions=(), *, allow_optional_fallback: bool = True) -> dict[str, Any]:
     """Project optional fields; transaction owners defer fallback until rollback."""
 
     static_map = provider_directory_source_catalog()
-    selection_payload = None
-    try:
-        async with asyncio.timeout(_SELECTION_PROJECTION_TIMEOUT_SECONDS):
-            selection_payload = await current_profile_selection_request(static_map)
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "Provider Directory selection projection failed",
-            exc_info=True,
-        )
-        if not allow_optional_fallback:
-            raise _OptionalCatalogProjectionError("selection projection failed") from None
     try:
         async with asyncio.timeout(_OUTCOME_ENRICHMENT_TIMEOUT_SECONDS):
             catalog_map = await enrich_provider_directory_source_catalog(static_map, editions=editions)
@@ -50,13 +43,8 @@ async def provider_directory_control_catalog(editions=(), *, allow_optional_fall
             exc_info=True,
         )
         if not allow_optional_fallback:
-            raise _OptionalCatalogProjectionError("outcome enrichment failed") from None
+            raise _OptionalCatalogProjectionError("outcome enrichment failed", static_map) from None
         catalog_map = static_map
-    if selection_payload is not None:
-        catalog_map = {
-            **catalog_map,
-            "profile_selection_request": selection_payload,
-        }
     try:
         async with asyncio.timeout(_CMS_CANDIDATE_TIMEOUT_SECONDS):
             candidate = await cms_serving_candidate(static_map)
@@ -65,5 +53,17 @@ async def provider_directory_control_catalog(editions=(), *, allow_optional_fall
     except Exception:
         logging.getLogger(__name__).warning("CMS candidate projection failed", exc_info=True)
         if not allow_optional_fallback:
-            raise _OptionalCatalogProjectionError("CMS candidate projection failed") from None
+            raise _OptionalCatalogProjectionError("CMS candidate projection failed", catalog_map) from None
+    try:
+        async with asyncio.timeout(_SELECTION_PROJECTION_TIMEOUT_SECONDS):
+            selection_payload = await current_profile_selection_request(static_map)
+        if selection_payload is not None:
+            catalog_map = {**catalog_map, "profile_selection_request": selection_payload}
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Provider Directory selection projection failed",
+            exc_info=True,
+        )
+        if not allow_optional_fallback:
+            raise _OptionalCatalogProjectionError("selection projection failed", catalog_map) from None
     return catalog_map
