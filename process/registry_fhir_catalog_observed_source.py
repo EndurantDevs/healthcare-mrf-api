@@ -135,9 +135,15 @@ async def _registration(connection, profile, endpoint_id):
     return source_uri, source_aliases
 
 
+def fhir_catalog_family_key(dataset, tables, source_uri):
+    """Identify facts for one admitted resource relation and source URI."""
+    resource = tables["resource"]
+    return (*dataset, resource["schema"], resource["name"], source_uri)
+
+
 @contextmanager
 def known_fhir_catalog_families(families_by_dataset):
-    """Reuse admitted content facts for (dataset id, dataset sha256) pairs while observing inside this scope."""
+    """Reuse admitted facts for the same immutable dataset, resource relation and source URI."""
     token = _KNOWN_FAMILIES.set(dict(families_by_dataset))
     try:
         yield
@@ -147,7 +153,7 @@ def known_fhir_catalog_families(families_by_dataset):
 
 async def _observed_families(connection, profile, dataset, tables, source_uri):
     # A published dataset never changes, so the families its earlier admission recorded still describe it.
-    known = (_KNOWN_FAMILIES.get() or {}).get(dataset)
+    known = (_KNOWN_FAMILIES.get() or {}).get(fhir_catalog_family_key(dataset, tables, source_uri))
     if known is not None:
         return copy.deepcopy(known)
     return await _facts(connection, profile, dataset[0], tables, source_uri)

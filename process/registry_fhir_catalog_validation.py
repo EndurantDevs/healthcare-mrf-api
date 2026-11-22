@@ -226,31 +226,50 @@ def _source_document(row):
         row[field] = timestamp.astimezone(timezone.utc).isoformat()
 
 
+# Group resource keys separately so the observation primary key can supply the order.
 _SET_SQL = """WITH observation_counts AS (
- SELECT source_generation,count(*) AS observations,count(DISTINCT(resource_type,resource_id)) AS resources
- FROM {namespace}.registry_fhir_catalog_observation GROUP BY source_generation
+ SELECT source_generation,sum(observations)::bigint AS observations,count(*) AS resources
+ FROM (
+   SELECT source_generation,resource_type,resource_id,count(*) AS observations
+   FROM {namespace}.registry_fhir_catalog_observation
+   GROUP BY source_generation,resource_type,resource_id
+ ) resources GROUP BY source_generation
 ), vector AS (
  SELECT * FROM jsonb_to_recordset($3::jsonb) AS selected(source_generation text,source_id text,status text)
+), matched_sources AS (
+ SELECT b.metadata_generation,b.binding_id,s.source_generation
+ FROM {namespace}.registry_fhir_catalog_binding b
+ JOIN {namespace}.registry_fhir_catalog_source s ON s.source_generation=left(b.document_json->>'evidence_id',64)
+ WHERE b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key')
+ UNION
+ SELECT b.metadata_generation,b.binding_id,s.source_generation
+ FROM {namespace}.registry_fhir_catalog_binding b
+ JOIN {namespace}.registry_fhir_catalog_source s
+   ON s.source_generation=b.document_json->'source_scope'->>'source_generation'
+ WHERE (s.descriptor_json->>'contract'='registry-native-network-source-v1'
+     AND b.document_json->>'producer_id'='registry-native-network-source-v1')
+    OR (b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' AND s.profile='published_normalized')
+ UNION
+ SELECT b.metadata_generation,b.binding_id,s.source_generation
+ FROM {namespace}.registry_fhir_catalog_binding b
+ JOIN {namespace}.registry_fhir_catalog_source s
+   ON s.descriptor_json->>'capture_sha256'=b.document_json->'source_scope'->>'capture_sha256'
+ WHERE b.document_json->'source_scope' ? 'insurance_plan_id'
+   AND s.profile='retained_normalized'
+   AND NOT EXISTS(SELECT FROM unnest(ARRAY['source_system','source_id','dataset_schema','dataset_id','producer_id','edition_id']) field
+       WHERE b.document_json->>field IS DISTINCT FROM s.descriptor_json->'coordinates'->>field)
 ), source_bindings AS (
- SELECT b.*,s.source_generation AS matched_generation,s.descriptor_json,s.accepted_at,v.status AS source_status,
+ SELECT b.*,s.source_generation AS matched_generation,s.accepted_at,v.status AS source_status,
+   s.descriptor_json->'coordinates' AS source_coordinates,
+   s.descriptor_json->>'profile' AS source_profile,s.descriptor_json->'complete' AS source_complete,
    coalesce(s.descriptor_json->>'contract'='registry-native-network-source-v1',false) AS is_native,
    b.document_json->'source_scope' ? 'insurance_plan_id' AS is_product,
    coalesce(b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1',false) AS is_tier,
    count(s.source_generation) OVER(PARTITION BY b.binding_id) AS source_matches
  FROM {namespace}.registry_fhir_catalog_binding b
- LEFT JOIN {namespace}.registry_fhir_catalog_source s
-   ON b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key')
-   OR (s.descriptor_json->>'contract'='registry-native-network-source-v1'
-     AND b.document_json->>'producer_id'='registry-native-network-source-v1'
-     AND b.document_json->'source_scope'->>'source_generation'=s.source_generation)
-   OR (b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' AND s.profile='published_normalized'
-     AND b.document_json->'source_scope'->>'source_generation'=s.source_generation)
-   OR (b.document_json->'source_scope' ? 'insurance_plan_id'
-     AND s.profile='retained_normalized'
-     AND s.descriptor_json->>'capture_sha256'=b.document_json->'source_scope'->>'capture_sha256'
-     AND NOT EXISTS(SELECT FROM unnest(ARRAY['source_system','source_id','dataset_schema','dataset_id','producer_id','edition_id']) field
-       WHERE b.document_json->>field IS DISTINCT FROM s.descriptor_json->'coordinates'->>field))
- LEFT JOIN vector v ON v.source_generation=s.source_generation
+ LEFT JOIN matched_sources m USING(metadata_generation,binding_id)
+ LEFT JOIN {namespace}.registry_fhir_catalog_source s ON s.source_generation=m.source_generation
+ LEFT JOIN vector v ON v.source_generation=m.source_generation
 )
 SELECT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_network n
  LEFT JOIN {control}.network_registry_identity i USING(network_id)
@@ -273,6 +292,7 @@ OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
          OR (b.is_product AND o.resource_type='InsurancePlan'
            AND o.resource_id=b.document_json->'source_scope'->>'insurance_plan_id'
            AND o.document_json->>'scope_path' ~ '^/normalized_aggregate/(0|[1-9][0-9]*)$'))
+       AND coalesce(o.document_json->>'plan_resource_id','') = coalesce(r.document_json->'plan'->>'resource_id','')
        AND o.document_json->>'plan_resource_id' IS NOT DISTINCT FROM r.document_json->'plan'->>'resource_id'
        AND (o.document_json->>'plan_resource_id' IS NULL OR (
          r.document_json->'plan'->>'scope_path'=o.resource_type||'/'||o.resource_id||(o.document_json->>'scope_path')
@@ -297,19 +317,19 @@ OR EXISTS(SELECT FROM source_bindings b
    AND product.approved_revision=$2 AND product.record_kind='network_binding' AND product.record_key=b.binding_id::text
  WHERE n.network_id IS NULL OR b.metadata_generation<>$1 OR b.matched_generation IS NULL
    OR b.source_matches<>1
-   OR b.source_id IS DISTINCT FROM b.descriptor_json->'coordinates'->>'source_id'
+   OR b.source_id IS DISTINCT FROM b.source_coordinates->>'source_id'
    OR (NOT b.is_product AND NOT b.is_tier AND NOT b.is_native AND (b.document_json->'source_scope'->>'organization_id') IS DISTINCT FROM (b.document_json->>'source_key'))
    OR (b.document_json->>'producer_id'='registry-fhir-catalog-v1' AND (
      b.document_json->'source_scope'->>'source_generation' IS DISTINCT FROM b.matched_generation
-     OR coalesce(b.descriptor_json->>'profile','') NOT IN ('published_normalized','legacy_published_normalized')))
+     OR coalesce(b.source_profile,'') NOT IN ('published_normalized','legacy_published_normalized')))
    OR (NOT b.is_product AND NOT b.is_tier AND NOT b.is_native AND (b.document_json->>'evidence_sha256') IS DISTINCT FROM (o.document_json->>'source_hash'))
    OR (b.is_product AND (product.record_key IS NULL
      OR product.record_json->'archived' IS DISTINCT FROM 'false'::jsonb
      OR product.record_json->>'network_id' IS DISTINCT FROM b.network_id::text
      OR product.record_json->'source_scope_json' IS DISTINCT FROM b.document_json->'source_scope'
      OR product.record_revision::text IS DISTINCT FROM b.document_json->>'revision'
-     OR b.descriptor_json->>'profile' IS DISTINCT FROM 'retained_normalized'
-     OR b.descriptor_json->'complete' IS DISTINCT FROM 'true'::jsonb
+     OR b.source_profile IS DISTINCT FROM 'retained_normalized'
+     OR b.source_complete IS DISTINCT FROM 'true'::jsonb
      OR b.document_json->'source_scope'->>'product_network_id' IS DISTINCT FROM b.network_id::text
      OR b.document_json->>'source_key' IS DISTINCT FROM 'InsurancePlan/'||(b.document_json->'source_scope'->>'insurance_plan_id')
      OR EXISTS(SELECT FROM unnest(ARRAY['source_system','source_id','dataset_schema','dataset_id','producer_id','edition_id',
@@ -318,7 +338,7 @@ OR EXISTS(SELECT FROM source_bindings b
    OR (b.document_json->>'status') IS DISTINCT FROM b.source_status
    OR (b.document_json->>'accepted_at')::timestamptz IS DISTINCT FROM b.accepted_at
    OR EXISTS(SELECT FROM unnest(ARRAY['source_system','source_id','dataset_schema','dataset_id','producer_id','edition_id']) field
-     WHERE b.document_json->>field IS DISTINCT FROM b.descriptor_json->'coordinates'->>field))
+     WHERE b.document_json->>field IS DISTINCT FROM b.source_coordinates->>field))
 OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_observation o
  LEFT JOIN {namespace}.registry_fhir_catalog_source s USING(source_generation) WHERE s.source_generation IS NULL)
 OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_source s

@@ -497,6 +497,32 @@ async def test_source_count_and_input_tamper_refuse(metadata_custody):
 
 
 @pytest.mark.asyncio
+async def test_set_validation_counts_resources_by_type_and_id(metadata_custody):
+    fixture = metadata_custody
+    snapshot = await seed_observations(fixture, 1)
+    namespace = f'"{fixture.target.schema_name}"'
+    observation = f"{namespace}.registry_fhir_catalog_observation"
+    source = f"{namespace}.registry_fhir_catalog_source"
+    await fixture.connection.execute(
+        f"INSERT INTO {observation} "
+        "SELECT source_generation,resource_type,resource_id,observation_kind,1,document_json "
+        f"FROM {observation} WHERE ordinal=0"
+    )
+    await fixture.connection.execute(
+        f"INSERT INTO {observation} "
+        "SELECT source_generation,'InsurancePlan',resource_id,'edge',0,document_json "
+        f"FROM {observation} WHERE ordinal=0"
+    )
+    await fixture.connection.execute(f"UPDATE {source} SET source_rows=2,observation_rows=3")
+    arguments = (fixture.connection, namespace, snapshot["metadata_generation"], snapshot, fixture.control_schema)
+    await validation._validate_sets(*arguments)
+    for assignment in ("source_rows=1,observation_rows=3", "source_rows=2,observation_rows=2"):
+        await fixture.connection.execute(f"UPDATE {source} SET {assignment}")
+        with pytest.raises(ValueError, match="set_validation_failed"):
+            await validation._validate_sets(*arguments)
+
+
+@pytest.mark.asyncio
 async def test_committed_writer_is_validated_after_fence(metadata_custody):
     fixture = metadata_custody
     snapshot = expected_snapshot(fixture)

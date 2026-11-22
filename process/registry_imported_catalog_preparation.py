@@ -210,15 +210,18 @@ def imported_catalog_accounting(inventory):
 
 async def prepare_imported_catalog_snapshot(config, loader, source_pool, sealer_pool, *, source_export, inventory):
     """Use existing isolated preparation, native validation and freeze; publication remains with the caller."""
+    from process.registry_fhir_catalog_observed_source import known_fhir_catalog_families
     from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot
+    from process.registry_imported_source_inventory import catalog_observation_families
 
     if type(inventory) is not ImportedSourceInventory:
         raise ValueError("registry_imported_catalog_inventory_invalid")
     token = _INVENTORY.set(inventory)
     try:
-        snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
-            config, loader, source_pool, sealer_pool, source_export=source_export
-        )
+        with known_fhir_catalog_families(catalog_observation_families(inventory.fhir_descriptors)):
+            snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+                config, loader, source_pool, sealer_pool, source_export=source_export
+            )
     finally:
         _INVENTORY.reset(token)
     prepared = previous if snapshot is None else snapshot

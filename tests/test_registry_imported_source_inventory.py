@@ -442,8 +442,14 @@ async def test_published_catalog_families_key_complete_observations_by_dataset_a
         ),
     )
     descriptors = await inventory._serving_catalog_observations(connection, "registry")
-    key = (admitted["coordinates"]["dataset_id"], admitted["dataset_sha256"])
-    assert inventory._catalog_families(descriptors) == {key: admitted["admission"]["families"]}
+    key = (
+        admitted["coordinates"]["dataset_id"],
+        admitted["dataset_sha256"],
+        admitted["tables"]["resource"]["schema"],
+        admitted["tables"]["resource"]["name"],
+        admitted["source_uri"],
+    )
+    assert inventory.catalog_observation_families(descriptors) == {key: admitted["admission"]["families"]}
     assert "network_serving_control" in connection.fetchval.call_args.args[0]
     connection.fetchval.return_value = None
     assert await inventory._serving_catalog_observations(connection, "registry") == ()
@@ -455,10 +461,20 @@ async def test_known_families_replace_scans_of_unchanged_datasets(monkeypatch):
 
     scan = AsyncMock(return_value={"scanned": True})
     monkeypatch.setattr(observed, "_facts", scan)
-    known_by_dataset = {("dataset", "a" * 64): {"InsurancePlan": {"rows": 1}}}
-    with observed.known_fhir_catalog_families(known_by_dataset):
-        reused = await observed._observed_families(object(), object(), ("dataset", "a" * 64), {}, "uri")
-        changed = await observed._observed_families(object(), object(), ("dataset", "b" * 64), {}, "uri")
-    assert reused == {"InsurancePlan": {"rows": 1}} and reused is not known_by_dataset[("dataset", "a" * 64)]
-    assert changed == {"scanned": True} and scan.await_count == 1
-    assert await observed._observed_families(object(), object(), ("dataset", "a" * 64), {}, "uri") == {"scanned": True}
+    dataset = ("dataset", "a" * 64)
+    tables_by_kind = {"resource": {"schema": "sample", "name": "resource"}}
+    facts_by_family = {"InsurancePlan": {"rows": 1}}
+    key = observed.fhir_catalog_family_key(dataset, tables_by_kind, "uri")
+    with observed.known_fhir_catalog_families({key: facts_by_family}):
+        reused = await observed._observed_families(object(), object(), dataset, tables_by_kind, "uri")
+        for updated_dataset, updated_tables, uri in (
+            (("dataset", "b" * 64), tables_by_kind, "uri"),
+            (dataset, {"resource": {"schema": "other", "name": "resource"}}, "uri"),
+            (dataset, tables_by_kind, "changed-uri"),
+        ):
+            assert await observed._observed_families(object(), object(), updated_dataset, updated_tables, uri) == {
+                "scanned": True
+            }
+        assert scan.await_count == 3
+    assert reused == facts_by_family and reused is not facts_by_family
+    assert await observed._observed_families(object(), object(), dataset, tables_by_kind, "uri") == {"scanned": True}
