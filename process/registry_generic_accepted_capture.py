@@ -22,6 +22,7 @@ from process.provider_directory_admission_seal import (
     ProviderDirectoryAdmissionSeal,
 )
 from process.provider_directory_fhir_subset_canonical import canonical_payload_sha256
+from process.provider_directory_generic_source_storage import HANDOFF_METADATA_PROJECTION
 from process.provider_directory_resource_hash import SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
 from process.provider_directory_source_summary import validate_fhir_source_summary
 
@@ -80,7 +81,7 @@ async def _current_header(driver, schema_name, source_id, endpoint_id):
     header_rows = await driver.fetch(
         f"""SELECT d.dataset_id,d.endpoint_id,d.acquisition_root_run_id,d.dataset_hash,d.resource_count,
         d.candidate_storage_json,d.completion_proof_required_version,d.completion_proof_sha256,
-        d.previous_dataset_id,d.status,d.published_at,d.is_current,
+        d.previous_dataset_id,d.status,d.published_at,d.is_current,{HANDOFF_METADATA_PROJECTION},
         d.publication_metadata_sha256,d.content_proof_admission_version,d.content_proof_admission_kind,
         d.content_proof_admission_sha256,d.content_proof_resource_types,
         CASE WHEN octet_length(d.publication_metadata_summary_json::text)<=$3
@@ -204,7 +205,8 @@ async def is_original_generic_capture_current(driver, capture):
     current_headers = await driver.fetch(
         f"""SELECT d.dataset_id,d.endpoint_id,d.dataset_hash,d.acquisition_root_run_id,d.publication_metadata_sha256,
         d.content_proof_admission_sha256,d.candidate_storage_json,d.completion_proof_required_version,
-        d.completion_proof_sha256,d.previous_dataset_id,d.status,d.published_at,d.is_current,d.resource_count
+        d.completion_proof_sha256,d.previous_dataset_id,d.status,d.published_at,d.is_current,d.resource_count,
+        {HANDOFF_METADATA_PROJECTION}
         FROM {namespace}.provider_directory_endpoint_dataset d
         JOIN {namespace}.provider_directory_source s ON s.endpoint_id=d.endpoint_id
         WHERE s.source_id=$1 AND s.endpoint_id=$2 AND d.is_current AND d.status='published'

@@ -60,6 +60,7 @@ from process.provider_directory_admission_seal import (
 from process.provider_directory_admission_stream import _copy_field_reader
 from process.provider_directory_fhir_subset_canonical import canonical_payload_sha256
 from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+from process.provider_directory_generic_source_storage import HANDOFF_METADATA_PROJECTION
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
@@ -168,7 +169,7 @@ async def _origin_header(reader, origin):
         "SELECT endpoint_id,acquisition_root_run_id,dataset_hash,status,published_at,is_current,resource_count,"
         "to_jsonb(d)->>'previous_dataset_id' AS previous_dataset_id,"
         "to_jsonb(d)->>'completion_proof_sha256' AS completion_proof_sha256,"
-        "candidate_storage_json,completion_proof_required_version,publication_metadata_sha256,"
+        f"candidate_storage_json,completion_proof_required_version,publication_metadata_sha256,{HANDOFF_METADATA_PROJECTION},"
         "content_proof_admission_version,content_proof_admission_kind,content_proof_admission_sha256,content_proof_resource_types,"
         "CASE WHEN octet_length(publication_metadata_summary_json::text)<="
         + str(ADMISSION_METADATA_SUMMARY_MAX_BYTES)

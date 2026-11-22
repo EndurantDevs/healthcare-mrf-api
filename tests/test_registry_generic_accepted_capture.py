@@ -131,6 +131,7 @@ async def test_metadata_current_capture_accepts_exact_published_binding_without_
     )
     assert await accepted.is_original_generic_capture_current(driver, value) is True
     assert await accepted.is_original_generic_capture_current(driver, retained()) is False
+    assert all(storage.HANDOFF_METADATA_PROJECTION in call.args[0] for call in driver.fetch.await_args_list)
     header_by_field["dataset_hash"] = "0" * 64
     assert await accepted.is_original_generic_capture_current(driver, value) is False
 
@@ -147,6 +148,7 @@ async def test_native_snapshot_rejects_unmatched_acquisition_metadata():
     query, *arguments = reader.fetchrow.await_args.args
     selected_fields = {field.strip() for field in query.partition("NOT EXISTS")[0].removeprefix("SELECT ").split(",")}
     assert set(storage.HANDOFF_HEADER_FIELDS) <= selected_fields
+    assert storage.HANDOFF_METADATA_PROJECTION in query
     assert "jsonb_each($2::jsonb)" in query and "publication_metadata_json->acquisition.key" in query
     assert json.loads(arguments[-1]) == binding["identity"]["metadata"]
 

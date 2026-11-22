@@ -95,6 +95,7 @@ from process import provider_directory_cms_desired_fence as cms_desired_fence
 from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_generic_source_adapters as source_adapters
 from process import provider_directory_highmark as highmark
+from process import provider_directory_import_completion as import_completion_policy
 from process import provider_directory_leaf_census as leaf_census
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
@@ -2128,6 +2129,7 @@ class EndpointDatasetCandidate:
     proof_resource_scope: tuple[str, ...] | None = None
     source_release: dict[str, Any] | None = None
     registry_network_binding_metadata: dict[str, Any] | None = None
+    import_completion: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -62064,29 +62066,7 @@ def _is_endpoint_dataset_publishable(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
 ) -> bool:
-    if candidate.expected_resources and candidate.selected_resources != candidate.expected_resources:
-        return False
-    for resource_type in candidate.selected_resources:
-        diagnostic = diagnostics.get(resource_type)
-        if (
-            not diagnostic
-            or diagnostic.get("complete") is not True
-            or diagnostic.get("error")
-            or diagnostic.get("bounded")
-            or diagnostic.get("next_url_remaining")
-        ):
-            return False
-        if not timestamp_recovery.diagnostic_is_complete(
-            diagnostic,
-            expected={
-                "dataset_id": candidate.dataset_id,
-                "acquisition_root_run_id": candidate.acquisition_root_run_id,
-                "resource_type": resource_type,
-                **({"source_id": candidate.source_ids[0]} if len(candidate.source_ids) == 1 else {}),
-            },
-        ):
-            return False
-    return True
+    return import_completion_policy.is_publishable(sys.modules[__name__], candidate, diagnostics)
 
 
 async def _mark_endpoint_dataset_candidate(
@@ -64293,6 +64273,7 @@ def _dataset_validation_metadata(
         diagnostics,
         dataset_hash=content_proof.dataset_hash,
         resource_count=content_proof.resource_count,
+        **import_completion_policy.metadata(candidate, content_proof),
         bulk_transaction_times=bulk_transaction_times,
         **{
             PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY: (
@@ -64783,31 +64764,7 @@ def _finalized_endpoint_dataset_import_summary(
     candidate: EndpointDatasetCandidate,
     resource_completion: dict[str, set[str]] | None = None,
 ) -> ResourceImportGroupResult:
-    _assert_finalized_endpoint_dataset_replay(candidate)
-    finalized_metadata, state_name = _finalized_endpoint_dataset_metadata(candidate)
-    assert finalized_metadata is not None
-    persisted_diagnostics = finalized_metadata["resource_diagnostics"]
-    diagnostics_by_resource = {
-        resource_type: dict(persisted_diagnostics[resource_type])
-        for resource_type in candidate.selected_resources
-        if isinstance(persisted_diagnostics.get(resource_type), dict)
-    }
-    if set(diagnostics_by_resource) != set(candidate.selected_resources):
-        raise RuntimeError(f"provider_directory_endpoint_dataset_{state_name}_diagnostics_incomplete")
-    if not _is_endpoint_dataset_publishable(candidate, diagnostics_by_resource):
-        raise RuntimeError(f"provider_directory_endpoint_dataset_{state_name}_completion_proof_invalid")
-    if resource_completion is not None:
-        for resource_type in candidate.selected_resources:
-            resource_completion.setdefault(resource_type, set()).update(candidate.source_ids)
-    return (
-        list(candidate.source_ids),
-        diagnostics_by_resource,
-        {resource_type: 0 for resource_type in candidate.selected_resources},
-        {},
-        {},
-        {},
-        {},
-    )
+    return import_completion_policy.finalized_import_summary(sys.modules[__name__], candidate, resource_completion)
 
 
 def _is_finalized_endpoint_dataset_candidate(
@@ -65671,9 +65628,33 @@ async def _import_resources(
     require_complete_resources: bool = False,
     restart_expired_current_census_slice: bool = True,
     allow_retained_pagination_reset: bool = True,
+    import_completion: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     """Import resources into the provider-directory snapshot."""
     from process.provider_directory_generic_source_completion import record_candidate_handoff
+
+    if import_completion is not None:
+        from process.import_completion_policy import validate_completion_request
+
+        validate_completion_request(import_completion)
+        if (
+            not defer_typed_materialization
+            or not is_pagination_checkpointing_enabled
+            or stale_cleanup
+            or bulk_export
+            or per_resource_limit
+            or page_limit
+            or linked_resource_limit
+            or len(source_records) != 1
+            or retry_of_run_id != import_completion["retry_of_run_id"]
+            or any(
+                _uses_alohr_graphql_connector(selected_source)
+                or _uses_uhc_official_file_connector(selected_source)
+                or vsp_directory.is_source(selected_source)
+                for selected_source in source_records
+            )
+        ):
+            raise ValueError("provider_directory_import_completion_mode_invalid")
 
     if defer_typed_materialization:
         if not is_pagination_checkpointing_enabled:
@@ -66309,6 +66290,31 @@ async def _import_resources(
         await record_candidate_handoff(sys.modules[__name__], candidate, source_candidate_handoffs)
         return import_summary
 
+    async def import_candidate_group(candidate, source_records, resume_required, diagnostics_by_resource):
+        """Validate settled input and record only its genuine committed handoff."""
+        await prepare_retained_prefix(sys.modules[__name__], candidate, resource_import_cancellation)
+        if import_completion is not None:
+            try:
+                candidate, retained_diagnostics = await import_completion_policy.retained_completion(
+                    sys.modules[__name__], candidate, import_completion, retry_of_run_id=retry_of_run_id
+                )
+            except ValueError as error:
+                raise import_completion_policy.CompletionNotAccepted(str(error)) from error
+            import_summary = (list(candidate.source_ids), retained_diagnostics, {}, {}, {}, {}, {})
+        else:
+            import_summary = await import_one_group(source_records, resume_required)
+        diagnostics_by_resource.update(import_summary[1])
+        if resume_required:
+            await resource_import_cancellation.check()
+            assert pagination_resume_required is not None
+            pagination_resume_required.update(resume_required)
+            return import_summary
+        await _validate_and_finalize_import_candidate(
+            candidate, source_records, diagnostics_by_resource, resource_import_cancellation
+        )
+        await record_candidate_handoff(sys.modules[__name__], candidate, source_candidate_handoffs)
+        return import_summary
+
     async def run_guarded_group(
         source_records: list[dict[str, Any]],
         prepared_source_lists: list[list[dict[str, Any]]],
@@ -66329,42 +66335,22 @@ async def _import_resources(
             allow_retained_pagination_reset=allow_retained_pagination_reset,
         )
         prepared_source_lists[0] = prepared_source_records
+        import_completion_policy.require_candidate_request(candidate, import_completion)
         if _is_finalized_endpoint_dataset_candidate(candidate):
             assert candidate is not None
             return await replay_finalized_candidate(candidate, prepared_source_records)
         diagnostics_by_resource: dict[str, dict[str, Any]] = {}
         try:
-            await prepare_retained_prefix(sys.modules[__name__], candidate, resource_import_cancellation)
-            import_summary = await import_one_group(prepared_source_records, group_resume_required)
-            diagnostics_by_resource = import_summary[1]
-            if group_resume_required:
-                await resource_import_cancellation.check()
-                assert pagination_resume_required is not None
-                pagination_resume_required.update(group_resume_required)
-                return import_summary
-            await _validate_and_finalize_import_candidate(
-                candidate,
-                prepared_source_records,
-                diagnostics_by_resource,
-                resource_import_cancellation,
+            return await import_candidate_group(
+                candidate, prepared_source_records, group_resume_required, diagnostics_by_resource
             )
-            await record_candidate_handoff(sys.modules[__name__], candidate, source_candidate_handoffs)
-            return import_summary
+        except import_completion_policy.CompletionNotAccepted:
+            raise
         except ProviderDirectoryPaginationTerminalFailure as failure:
-            await _retain_and_abandon_terminal_failure(
-                candidate,
-                prepared_source_records,
-                run_id,
-                failure,
-                guard_lease,
-            )
+            await _retain_and_abandon_terminal_failure(candidate, prepared_source_records, run_id, failure, guard_lease)
             raise
         except BaseException as failure:
-            await _mark_failed_endpoint_dataset_without_masking(
-                candidate,
-                diagnostics_by_resource,
-                failure,
-            )
+            await _mark_failed_endpoint_dataset_without_masking(candidate, diagnostics_by_resource, failure)
             raise
 
     async def run_with_limit(source_records: list[dict[str, Any]]) -> ResourceImportGroupResult:
@@ -68371,6 +68357,7 @@ async def process_provider_directory_fhir_data(
                     require_complete_resources=(full_refresh and resource_limit <= 0 and page_limit <= 0),
                     restart_expired_current_census_slice=(restart_expired_current_census_slice),
                     allow_retained_pagination_reset=allow_retained_pagination_reset,
+                    import_completion=task.get("import_completion"),
                 )
             if retry_not_before_by_resource:
                 metrics_by_key["provider_directory_retry_not_before_by_resource"] = dict(

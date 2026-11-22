@@ -46,7 +46,7 @@ def _named_published_binding(header, binding, catalog_schema):
         header["status"] in {"published", "superseded"}
         and header["published_at"] is not None
         and header["is_current"] is (header["status"] == "published")
-        and {field: header[field] for field in storage.HANDOFF_HEADER_FIELDS} == binding["admission"]
+        and storage.handoff_header(header) == binding["admission"]
     )
     return binding
 
@@ -71,7 +71,7 @@ async def _require_header_binding(reader, origin, binding):
     header = await reader.fetchrow(
         f"SELECT candidate_storage_json,completion_proof_required_version,endpoint_id,acquisition_root_run_id,"
         "dataset_hash,status,published_at,is_current,resource_count,previous_dataset_id,completion_proof_sha256,"
-        "content_proof_admission_sha256,"
+        f"content_proof_admission_sha256,{storage.HANDOFF_METADATA_PROJECTION},"
         "NOT EXISTS(SELECT FROM jsonb_each($2::jsonb) acquisition(key,value) "
         "WHERE coalesce(d.publication_metadata_json->acquisition.key,'null'::jsonb) "
         "IS DISTINCT FROM acquisition.value) AS metadata_matches "
