@@ -8284,7 +8284,7 @@ async def list_providers(
             )
         )
     )
-    broad_name_total_deferred = (
+    plain_name_search = (
         current_network_address_scope() is None
         and import_context is None
         and native_npis is None
@@ -8313,10 +8313,10 @@ async def list_providers(
                 response_format,
                 procedure_internal_codes,
                 medication_internal_codes,
-                plan_release_id_raw,
             ]
         )
     )
+    broad_name_total_deferred = plain_name_search and not plan_release_id_raw
     inline_name_taxonomy_total = (
         import_context is None
         and native_npis is None
@@ -9184,7 +9184,7 @@ async def list_providers(
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
         use_bounded_broad_name_page = (
-            page_import_context is None and native_npis is None and broad_name_total_deferred and order_by == "npi"
+            page_import_context is None and native_npis is None and plain_name_search and order_by == "npi"
         )
         use_name_relevance_exists = is_ordinary_provider_query and broad_name_total_deferred and view_mode == "card"
         if npi_where:

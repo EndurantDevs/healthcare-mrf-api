@@ -746,8 +746,8 @@ async def test_get_all_rejects_invalid_primary_only():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("zip_code", [None, "84001"])
-async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch, zip_code):
+@pytest.mark.parametrize(("zip_code", "name_query"), [(None, None), (None, "clinic"), ("84001", None)])
+async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch, zip_code, name_query):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
@@ -772,6 +772,7 @@ async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch, zip_cod
                 "limit": "10",
                 "start": "0",
                 **({"zip_code": zip_code, "city": "Example City", "state": "UT"} if zip_code else {}),
+                **({"q": name_query} if name_query else {}),
             }
         )
     )
@@ -788,6 +789,11 @@ async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch, zip_cod
     )
     assert ("location_npis AS MATERIALIZED" in page_sql) is (zip_code is not None)
     assert "location_npis AS MATERIALIZED" not in count_sql
+    if name_query:
+        assert "filtered_npi AS MATERIALIZED" not in page_sql
+        assert "filtered_npi AS MATERIALIZED" in count_sql
+        assert "AND EXISTS (" in page_sql
+        assert page_sql.index(scoped_sql) < page_sql.index("ORDER BY b.npi") < page_sql.index("LIMIT :limit")
     if zip_code:
         location_sql, membership_sql = page_sql.split("SELECT npi FROM location_npis", 1)
         assert scoped_sql not in location_sql
