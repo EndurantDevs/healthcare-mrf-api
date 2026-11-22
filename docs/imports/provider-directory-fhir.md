@@ -654,6 +654,26 @@ non-importable coverage blockers from unresolved endpoint-discovery gaps.
 - `provider_directory_organization_affiliation`
 - `provider_directory_endpoint`
 
+### Excellus institutional network snapshots
+
+Select Excellus to acquire the network Organizations discovered from its public
+FHIR directory and their institutional affiliations. The importer begins with
+the carrier-name and network-type search, verifies native ownership and follows
+network references in canonical OrganizationAffiliation records. It reconciles
+each owned network's distinct affiliation IDs with the total reported by the
+server. An affiliation shared by two networks is stored once with both links.
+
+The snapshot records unresolved references. Its institution count includes
+distinct resolved Organizations named in an affiliation's `organization` or
+`participatingOrganization` field. Commercial market coverage, product
+coverage and individual clinician participation remain unverified.
+
+A membership page that contradicts an already retained affiliation rolls back
+with its cursor. The same candidate can resume if the upstream search is
+corrected. If the retained canonical resource itself must change, preserve the
+candidate for inspection and start a separately authorized replacement. Readers
+keep their previous published snapshot throughout acquisition and validation.
+
 ### Retained artifact byte access
 
 `HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT` is mandatory for retained artifact

@@ -100,6 +100,8 @@ from process import provider_directory_leaf_census as leaf_census
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
 from process import provider_directory_named_edition as named_source_editions
+from process import provider_directory_network_first_intake as network_first
+from process import provider_directory_network_traversal as network_traversal
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_pacificsource as pacificsource
 from process import provider_directory_postal_checkpoint as postal_checkpoint
@@ -3690,34 +3692,7 @@ def _resource_acquisition_blocked_reason(
     requested_resource_types: list[str] | tuple[str, ...] | None = None,
 ) -> str | None:
     """Return the catalog safety reason that forbids generic resource import."""
-    coverage_issue = acquisition_coverage_blocked_reason(
-        _clean_text(source_record.get("source_id")),
-        _canonical_base(source_record.get("api_base")),
-        _canonical_base(source_record.get("canonical_api_base")),
-    )
-    if coverage_issue is not None:
-        return coverage_issue
-    validation_status = (_clean_text(source_record.get("last_validated_status")) or "").lower()
-    if validation_status == "shared_backend_unverified":
-        return "shared_backend_unverified"
-    has_partition_opt_in = _has_partition_configs_for_resources(
-        source_record,
-        requested_resource_types,
-    )
-    if _source_coverage_mode(source_record) == "probe_only" and not has_partition_opt_in:
-        return "coverage_mode_probe_only"
-    fully_enumerable_resources = _source_metadata(source_record).get("provider_directory_fully_enumerable_resources")
-    if (
-        isinstance(fully_enumerable_resources, list)
-        and not fully_enumerable_resources
-        and not has_partition_opt_in
-        and not (
-            (contract := current_version_census_contract(source_record)) is not None
-            and contract.is_server_issued_subset_v3
-        )
-    ):
-        return "fully_enumerable_resources_empty"
-    return None
+    return source_selection.acquisition_blocked_reason(sys.modules[__name__], source_record, requested_resource_types)
 
 
 def _assert_resource_acquisition_allowed(
@@ -5030,7 +5005,11 @@ def _source_rows_allowed_for_probe(
     return [
         source_record
         for source_record in source_rows
-        if not _is_manual_only_source(source_record) or current_version_census_contract(source_record) is not None
+        if (not _is_manual_only_source(source_record) or current_version_census_contract(source_record) is not None)
+        and (
+            not network_traversal.is_registered_origin(source_record)
+            or (network_traversal.is_source(source_record) and is_source_storage_required())
+        )
     ]
 
 
@@ -5059,24 +5038,7 @@ def _initial_resource_import_source_decision(
     requested_resource_types: list[str] | None,
 ) -> ResourceImportSourceDecision | None:
     """Return a fail-closed decision before probe and auth evaluation."""
-
-    if not _canonical_base(source_record.get("api_base")):
-        return ResourceImportSourceDecision("source_import_skipped_missing_api_base", None, "", False, False)
-    if _is_manual_only_source(source_record) and current_version_census_contract(source_record) is None:
-        return ResourceImportSourceDecision("source_import_skipped_manual_only", None, "", False, False)
-    blocked_reason = _resource_acquisition_blocked_reason(
-        source_record,
-        requested_resource_types,
-    )
-    if blocked_reason:
-        return ResourceImportSourceDecision(
-            "source_import_skipped_blocked_source",
-            blocked_reason,
-            "",
-            False,
-            False,
-        )
-    return None
+    return source_selection.initial_import_decision(sys.modules[__name__], source_record, requested_resource_types)
 
 
 def _resource_import_source_decision(
@@ -17134,7 +17096,11 @@ def _source_contract_metadata_keys(
     """Preserve legacy tuples while binding explicit traversal controls."""
 
     base_keys = ARTIFACT_SOURCE_CONTRACT_METADATA_KEYS if artifact else TWIN_ROOT_ACQUISITION_METADATA_KEYS
-    for key in ("provider_directory_pagination_same_collection", "provider_directory_opaque_cursor_census"):
+    for key in (
+        "provider_directory_pagination_same_collection",
+        "provider_directory_opaque_cursor_census",
+        network_traversal.METADATA_KEY,
+    ):
         if key in metadata:
             base_keys += (key,)
     is_subset_shape = bool(
@@ -23079,13 +23045,16 @@ async def _source_local_dataset_followup_if_current(
     dataset_hash = _clean_text(dataset.dataset_hash)
     if endpoint_id is None or dataset_id is None or dataset_hash is None:
         return None
-    return _provider_directory_dataset_followup(
+    followup = _provider_directory_dataset_followup(
         source_id=source_id,
         endpoint_id=endpoint_id,
         dataset_id=dataset_id,
         dataset_hash=dataset_hash,
         parent_run_id=expected_root_run_id,
     )
+    from process import provider_directory_network_snapshot_scope as network_scope
+
+    return await network_scope.followup_scope_metadata(sys.modules[__name__], dataset, followup)
 
 
 def _has_dataset_publication_followup_trigger(
@@ -40288,7 +40257,7 @@ async def _fetch_source_json(
         "request_not_attempted",
         0,
     )
-    candidate_urls = _source_fetch_candidate_urls(url)
+    candidate_urls = [url] if network_traversal.is_source(source_record) else _source_fetch_candidate_urls(url)
     retry_count = 0
     for candidate_index, candidate_url in enumerate(candidate_urls):
         (
@@ -51405,6 +51374,8 @@ async def _fetch_resource_rows(
     timing_progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> ResourceFetchResult | None:
     """Fetch resource rows for provider-directory ingestion."""
+    if network_traversal.is_registered_origin(source_record):
+        raise ValueError("network_snapshot_requires_group_intake")
     _report_resource_fetch_timing(timing_progress_callback, "initializing")
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
@@ -56586,6 +56557,7 @@ def _pagination_checkpoint_scope_identity(
         or bool(last_updated_partition_config)
         or census_contract is not None
         or is_opaque_cursor_census
+        or isinstance(_source_metadata(source_record).get("provider_directory_network_snapshot"), dict)
     )
     if not (source_ids and (vsp_directory.is_source(source_record) or supports_checkpoint) and canonical_api_base):
         return None
@@ -56603,6 +56575,8 @@ def _pagination_checkpoint_scope_identity(
         "source_ids": sorted(set(source_ids)),
         "resource_group": _resource_import_group_key(source_record),
     }
+    if _source_metadata(source_record).get("provider_directory_network_snapshot") is not None:
+        scope_payload_dict["network_snapshot"] = _source_metadata(source_record)["provider_directory_network_snapshot"]
     if _source_metadata(source_record).get("provider_directory_pagination_same_collection") is True:
         scope_payload_dict["pagination_same_collection"] = True
     if last_updated_partition_config:
@@ -59642,32 +59616,8 @@ def _endpoint_dataset_selected_resources(
     source_records: list[dict[str, Any]],
     requested_resources: list[str],
 ) -> list[str]:
-    source_record = _compatibility_storage_source(source_records)
-    supported_resources = _source_supported_resource_types(source_record)
-    fully_enumerable_resources = _source_fully_enumerable_resource_types(source_record)
-    subset_contract = current_version_census_contract(source_record)
-    if subset_contract is not None and subset_contract.is_server_issued_subset_v3:
-        fully_enumerable_resources = None
-    if _uses_alohr_graphql_connector(source_record):
-        supported_resources = set(ALOHR_GRAPHQL_RESOURCE_TYPES)
-    unique_requested_resources = list(dict.fromkeys(requested_resources))
-    eligible_resources = supported_resources
-    if fully_enumerable_resources is not None:
-        partition_resources = {
-            resource_type
-            for resource_type in _last_updated_partition_resource_configs(source_record)
-            if resource_type in DEFAULT_RESOURCES
-            and _last_updated_partition_config(source_record, resource_type)[0] is not None
-        }
-        enumerable_resources = fully_enumerable_resources.union(partition_resources)
-        eligible_resources = (
-            enumerable_resources
-            if eligible_resources is None
-            else eligible_resources.intersection(enumerable_resources)
-        )
-    if eligible_resources is None:
-        return unique_requested_resources
-    return [resource_type for resource_type in unique_requested_resources if resource_type in eligible_resources]
+    """Select the resource families eligible for this endpoint dataset."""
+    return source_selection.selected_dataset_resources(sys.modules[__name__], source_records, requested_resources)
 
 
 def _endpoint_dataset_expected_resources(
@@ -62023,6 +61973,9 @@ def _endpoint_dataset_publication_metadata(
         "reused_from_checkpoint": candidate.reused_from_checkpoint,
         **extra,
     }
+    from process.provider_directory_network_snapshot_scope import publication_scope_metadata
+
+    metadata.update(publication_scope_metadata(diagnostics))
     metadata["completion_proof_v1"] = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "terminal_run_id": candidate.import_run_id,
@@ -65903,6 +65856,43 @@ async def _import_resources(
                 ),
             )
 
+        if network_first.is_source(sys.modules[__name__], partition_source):
+            network_first.require(
+                len(source_ids) == 1
+                and set(resources) == set(network_first.RESOURCE_TYPES)
+                and defer_typed_materialization
+                and per_resource_limit == page_limit == linked_resource_limit == 0
+                and not stale_cleanup
+                and not bulk_export,
+                "full_deferred_acquisition_required",
+            )
+
+            async def capture_progress(details):
+                """Expose graph chain counts through normal worker progress."""
+                async with progress_lock:
+                    active_group_by_key[group_key]["network_graph"] = details
+                    active_group_by_key[group_key]["resource_scan_concurrency_requested"] = details[
+                        "concurrency_requested"
+                    ]
+                    active_group_by_key[group_key]["resource_scan_concurrency_effective"] = details[
+                        "http_concurrency_peak"
+                    ]
+                await report_progress()
+
+            import_summary = await network_first.import_group(
+                sys.modules[__name__],
+                partition_source,
+                network_first.IntakeOptions(
+                    run_id, timeout, page_count, resource_deadline_seconds, resource_scan_concurrency
+                ),
+                persist=persist_resource_rows,
+                progress_callback=capture_progress,
+                cancel_check=resource_import_cancellation.check,
+            )
+            for resource in network_first.RESOURCE_TYPES:
+                if resource_completion is not None:
+                    resource_completion.setdefault(resource, set()).update(source_ids)
+            return import_summary
         if vsp_directory.is_source(partition_source):
             vsp_directory.require(
                 source_ids == [vsp_directory.SOURCE_ID]

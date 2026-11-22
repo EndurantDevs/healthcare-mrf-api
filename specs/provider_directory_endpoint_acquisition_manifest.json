@@ -29,6 +29,7 @@
     "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
+      "excellus-provider-directory": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-22", "method": "rest", "limitation": "The scoped snapshot follows typed network Organizations from the carrier-name search and checks native ownership. It reads institutional affiliations by network and resolves canonical references. Commercial market coverage and individual clinician membership are unverified. Plans are optional. Other carrier origins remain separate."},
       "highmark-hm": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
       "highmark-hmpams": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
       "highmark-hmwvms": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
@@ -153,6 +154,19 @@
     }
   },
   "entries": [
+    {
+      "entry_id": "excellus-provider-directory",
+      "display_name": "Excellus BlueCross BlueShield",
+      "owner_id": "excellus",
+      "source_ids": [
+        "pdfhir_16514e416a13c8b817e820bf"
+      ],
+      "canonical_base": "https://fhir.excellusbcbs.com/fhir/api",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "A2",
+      "resources": ["Organization", "OrganizationAffiliation"]
+    },
     {
       "entry_id": "iowa-medicaid",
       "display_name": "Iowa Medicaid",

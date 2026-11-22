@@ -86,9 +86,13 @@ def is_credentialed_rest_source(directory, source_record):
 
 def retry_after_limit(directory, source_record):
     """Retain full server delays for reviewed transport and explicit census contracts."""
+    from process import provider_directory_network_traversal
+
     return (
         None
-        if is_credentialed_rest_source(directory, source_record) or uses_census_retry_policy(directory, source_record)
+        if is_credentialed_rest_source(directory, source_record)
+        or uses_census_retry_policy(directory, source_record)
+        or provider_directory_network_traversal.is_source(source_record)
         else 600.0
     )
 
@@ -441,16 +445,16 @@ def probe_flush_every():
         return 50
 
 
-def resource_endpoint_signature(directory, source):
+def resource_endpoint_signature(directory, source_record):
     """Keep ordinary endpoint identities stable and strict aliases in separate scans."""
     signature_items = tuple(
-        (field, directory._clean_text(source.get(field)) or "")
+        (field, directory._clean_text(source_record.get(field)) or "")
         for field in sorted(directory.RESOURCE_ENDPOINT_FIELDS.values())
     )
     connector_contract = (
         vsp_directory.endpoint_contract()
-        if vsp_directory.is_source(source)
-        else directory._alohr_graphql_acquisition_contract(source)
+        if vsp_directory.is_source(source_record)
+        else directory._alohr_graphql_acquisition_contract(source_record)
     )
     if connector_contract is not None:
         signature_items += (
@@ -459,7 +463,7 @@ def resource_endpoint_signature(directory, source):
                 directory._stable_identity_json(connector_contract),
             ),
         )
-    census_contract = directory.current_version_census_contract(source)
+    census_contract = directory.current_version_census_contract(source_record)
     if census_contract is not None:
         signature_items += (
             (
@@ -467,7 +471,10 @@ def resource_endpoint_signature(directory, source):
                 directory._stable_identity_json(census_contract.identity()),
             ),
         )
-    if directory._source_metadata(source).get("provider_directory_pagination_same_collection") is True:
+    network_snapshot = directory._source_metadata(source_record).get("provider_directory_network_snapshot")
+    if network_snapshot is not None:
+        signature_items += (("provider_directory_network_snapshot", directory._stable_identity_json(network_snapshot)),)
+    if directory._source_metadata(source_record).get("provider_directory_pagination_same_collection") is True:
         signature_items += (("provider_directory_pagination_same_collection", "true"),)
     return signature_items
 
@@ -524,9 +531,17 @@ async def fetch_same_collection(directory, source_record, url, *, timeout):
         session = directory._rest_page_prefetch_session(source_record, url)
     if session is None:
         raise RuntimeError("provider_directory_pagination_anonymous_session_required")
-    return await directory._fetch_json_with_source_session(
-        session, url, timeout=timeout, allow_redirects=False, preserve_url_bytes=True
-    )
+    observation = source_record.get("_http_concurrency_observation")
+    if observation is not None:
+        observation["active"] += 1
+        observation["peak"] = max(observation["peak"], observation["active"])
+    try:
+        return await directory._fetch_json_with_source_session(
+            session, url, timeout=timeout, allow_redirects=False, preserve_url_bytes=True
+        )
+    finally:
+        if observation is not None:
+            observation["active"] -= 1
 
 
 def pagination_host_key(directory, url_or_host: str | None) -> str | None:
@@ -831,6 +846,9 @@ def resource_import_selection_metrics(source_count: int) -> dict[str, int]:
         "source_import_skipped_blocked_source": 0,
         "source_import_skipped_blocked_source_shared_backend_unverified": 0,
         "source_import_skipped_blocked_source_coverage_mode_probe_only": 0,
+        "source_import_skipped_blocked_source_network_snapshot_named_source_required": 0,
+        "source_import_skipped_blocked_source_network_snapshot_exact_resources_required": 0,
+        "source_import_skipped_blocked_source_network_snapshot_source_mismatch": 0,
         "source_import_skipped_blocked_source_fully_enumerable_resources_empty": 0,
         "source_import_skipped_blocked_source_upstream_search_window_incomplete": 0,
         "source_import_skipped_missing_api_base": 0,
@@ -1268,3 +1286,108 @@ def read_retest_results(
     if not isinstance(retest_results, list):
         raise RuntimeError(f"Provider Directory retest results at {path} must be a JSON object/list with results.")
     return retest_document, retest_results
+
+
+def acquisition_blocked_reason(directory, source_record, requested_resource_types):
+    """Return the catalog safety reason that forbids generic resource import."""
+    coverage_issue = directory.acquisition_coverage_blocked_reason(
+        directory._clean_text(source_record.get("source_id")),
+        directory._canonical_base(source_record.get("api_base")),
+        directory._canonical_base(source_record.get("canonical_api_base")),
+    )
+    if coverage_issue is not None:
+        return coverage_issue
+    validation_status = (directory._clean_text(source_record.get("last_validated_status")) or "").lower()
+    if validation_status == "shared_backend_unverified":
+        return "shared_backend_unverified"
+    has_partition_opt_in = directory._has_partition_configs_for_resources(
+        source_record,
+        requested_resource_types,
+    )
+    if directory.network_traversal.is_registered_origin(source_record):
+        if not directory.network_traversal.is_source(source_record):
+            return "network_snapshot_source_mismatch"
+        if requested_resource_types is not None and set(requested_resource_types) != set(
+            directory.network_traversal.RESOURCES
+        ):
+            return "network_snapshot_exact_resources_required"
+        return None
+    if directory._source_coverage_mode(source_record) == "probe_only" and not has_partition_opt_in:
+        return "coverage_mode_probe_only"
+    fully_enumerable_resources = directory._source_metadata(source_record).get(
+        "provider_directory_fully_enumerable_resources"
+    )
+    if (
+        isinstance(fully_enumerable_resources, list)
+        and not fully_enumerable_resources
+        and not has_partition_opt_in
+        and not (
+            (contract := directory.current_version_census_contract(source_record)) is not None
+            and contract.is_server_issued_subset_v3
+        )
+    ):
+        return "fully_enumerable_resources_empty"
+    return None
+
+
+def initial_import_decision(directory, source_record, requested_resource_types):
+    """Return a fail-closed decision before probe and auth evaluation."""
+
+    if not directory._canonical_base(source_record.get("api_base")):
+        return directory.ResourceImportSourceDecision("source_import_skipped_missing_api_base", None, "", False, False)
+    if directory.network_traversal.is_registered_origin(source_record) and (
+        not directory.is_source_storage_required() or not requested_resource_types
+    ):
+        return directory.ResourceImportSourceDecision(
+            "source_import_skipped_blocked_source", "network_snapshot_named_source_required", "", False, False
+        )
+    if (
+        directory._is_manual_only_source(source_record)
+        and directory.current_version_census_contract(source_record) is None
+    ):
+        return directory.ResourceImportSourceDecision("source_import_skipped_manual_only", None, "", False, False)
+    blocked_reason = directory._resource_acquisition_blocked_reason(
+        source_record,
+        requested_resource_types,
+    )
+    if blocked_reason:
+        return directory.ResourceImportSourceDecision(
+            "source_import_skipped_blocked_source",
+            blocked_reason,
+            "",
+            False,
+            False,
+        )
+    return None
+
+
+def selected_dataset_resources(directory, source_records, requested_resources):
+    """Select the resource families eligible for this endpoint dataset."""
+    source_record = directory._compatibility_storage_source(source_records)
+    supported_resources = directory._source_supported_resource_types(source_record)
+    fully_enumerable_resources = directory._source_fully_enumerable_resource_types(source_record)
+    if directory.network_traversal.is_source(source_record):
+        fully_enumerable_resources = set(directory.network_traversal.RESOURCES)
+    subset_contract = directory.current_version_census_contract(source_record)
+    if subset_contract is not None and subset_contract.is_server_issued_subset_v3:
+        fully_enumerable_resources = None
+    if directory._uses_alohr_graphql_connector(source_record):
+        supported_resources = set(directory.ALOHR_GRAPHQL_RESOURCE_TYPES)
+    unique_requested_resources = list(dict.fromkeys(requested_resources))
+    eligible_resources = supported_resources
+    if fully_enumerable_resources is not None:
+        partition_resources = {
+            resource_type
+            for resource_type in directory._last_updated_partition_resource_configs(source_record)
+            if resource_type in directory.DEFAULT_RESOURCES
+            and directory._last_updated_partition_config(source_record, resource_type)[0] is not None
+        }
+        enumerable_resources = fully_enumerable_resources.union(partition_resources)
+        eligible_resources = (
+            enumerable_resources
+            if eligible_resources is None
+            else eligible_resources.intersection(enumerable_resources)
+        )
+    if eligible_resources is None:
+        return unique_requested_resources
+    return [resource_type for resource_type in unique_requested_resources if resource_type in eligible_resources]

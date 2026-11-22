@@ -24,6 +24,53 @@ def _published_artifact_dataset(**overrides):
     return importer.ProviderDirectoryArtifactDataset(**dataset_by_name)
 
 
+@pytest.mark.asyncio
+async def test_network_snapshot_followup_keeps_durable_coverage(monkeypatch):
+    from process import provider_directory_network_snapshot_scope as scope
+
+    snapshot_scope = scope.make_scope(
+        root_name="Example",
+        owner_reference="Organization/owner",
+        discovery_counts={
+            "owned_network_roots": 1,
+            "affiliations": 3,
+            "discovered_networks": 1,
+            "unresolved_networks": 2,
+            "membership_queries": 1,
+            "membership_queries_complete": 1,
+            "participating_organizations": 3,
+            "unresolved_organization_references": 2,
+        },
+    )
+    diagnostics_by_resource = {kind: {scope.SCOPE_KEY: snapshot_scope} for kind in scope.RESOURCE_TYPES}
+    labels = scope.publication_scope_metadata(diagnostics_by_resource)
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(
+            return_value=importer.ProviderDirectoryArtifactDatasetFence(
+                (_published_artifact_dataset(selected_resources=scope.RESOURCE_TYPES),)
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_state",
+        AsyncMock(
+            return_value={
+                "publication_metadata_json": {**labels, "resource_diagnostics": diagnostics_by_resource},
+            }
+        ),
+    )
+    followup_descriptor = await importer._source_local_dataset_followup_if_current(
+        source_ids=["source-current"],
+        expected_acquisition_root_run_id="run-root",
+    )
+    assert followup_descriptor[scope.SCOPE_KEY] == snapshot_scope
+    assert followup_descriptor["endpoint_complete"] is False
+    assert followup_descriptor["dataset_hash"] == "a" * 64
+
+
 def test_dataset_fence_requires_exact_source_run_scope():
     entity_address_unified._validate_provider_directory_dataset_fence_scope(
         dataset_id="dataset-current",
