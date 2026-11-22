@@ -110,10 +110,10 @@ async def test_private_scoped_capture_export(tmp_path):
     assert unbound_by_field["address"] is None and unbound_by_field["memberships"] == []
     assert unbound_by_field["network_labels"] == ["Delta Dental PPO"]
 
-    async def unexpected_browser():
-        pytest.fail("retained replay must not open a browser")
+    async def unexpected_egress(*_arguments):
+        pytest.fail("retained replay must not contact the source")
 
     capture = FinderCapturePlan(tmp_path, "example", "example-edition", (search,), plan_id="replay")
-    metrics_by_name = await _capture(capture, check, open_page=unexpected_browser, check_transport=lambda: None)
+    metrics_by_name = await _capture(capture, check, fetch_page=unexpected_egress)
     assert metrics_by_name["card_observations"] == 2
     assert metrics_by_name["office_observations"] == 1

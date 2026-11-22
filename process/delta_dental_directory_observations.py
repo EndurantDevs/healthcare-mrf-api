@@ -190,6 +190,15 @@ def parse_rendered_finder_page(raw, search, number):
     return FinderPage(search, number, total, cards)
 
 
+def parse_retained_finder_page(raw, search, number):
+    """Read a current JSON observation or a retained legacy Finder document."""
+    if raw.lstrip().startswith(b"{"):
+        from process.delta_dental_directory_json import parse_finder_json_page
+
+        return parse_finder_json_page(raw, search, number)
+    return parse_rendered_finder_page(raw, search, number)
+
+
 def qualify_rendered_finder(raw, *, include_observations=False):
     """Qualify retained rendered HTML without inferring geography, page number or identities."""
     total, radius, selector, cards = _rendered_finder(raw)
@@ -255,7 +264,7 @@ def export_retained_capture(database, output):
                     raise ValueError("delta_dental_finder_capture_scope_changed")
                 search = FinderSearch(selector, zip_code, radius)
                 try:
-                    page = parse_rendered_finder_page(raw, search, number)
+                    page = parse_retained_finder_page(raw, search, number)
                     validate_finder_page(page, search, number)
                 except ValueError:
                     counts["unparseable_pages"] += 1

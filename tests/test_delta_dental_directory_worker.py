@@ -11,13 +11,13 @@ from api import provider_directory_source_worker as launcher
 from api.provider_directory_source_worker import _uses_source_http
 from api.provider_directory_sources import provider_directory_source_catalog
 from process import delta_dental_directory_worker as worker
-from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN
+from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
 
 
 def _task():
     return {
         "source_ids": [SOURCE_ID],
-        "provider_directory_endpoint_scope": SOURCE_ORIGIN,
+        "provider_directory_endpoint_scope": SOURCE_ENDPOINT,
         "delta_dental_directory_observation": True,
         "probe": False,
         "import_resources": False,
@@ -106,7 +106,7 @@ def test_observation_has_no_fhir_resources():
     catalog = provider_directory_source_catalog()
     delta_entries = [entry for entry in catalog["items"] if entry["source_ids"] == [SOURCE_ID]]
     assert len(delta_entries) == 1
-    assert delta_entries[0]["canonical_base"] == SOURCE_ORIGIN
+    assert delta_entries[0]["canonical_base"] == SOURCE_ENDPOINT
     assert delta_entries[0]["classification"] == "observation"
     assert delta_entries[0]["resources"] == []
     assert delta_entries[0]["profile_enabled"] is False
@@ -148,16 +148,16 @@ async def test_hold_blocks_new_editions(tmp_path, monkeypatch):
     from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace
 
-    from process import delta_dental_directory_transport as transport
+    from process import delta_dental_directory_http as transport
     from process.ext.source_http_proxy import SourceProxyUnavailable
 
     attempted_launches = []
 
-    def unexpected_browser(*_args, **_options):
+    def unexpected_egress(*_args, **_options):
         attempted_launches.append(True)
         raise AssertionError("transport should not open")
 
-    monkeypatch.setattr(transport, "open_finder_page", unexpected_browser)
+    monkeypatch.setattr(transport, "open_finder_http", unexpected_egress)
     monkeypatch.setattr(worker, "_artifact_root", lambda: tmp_path)
     search = worker.FinderSearch("Delta Dental Premier", "01234", 30)
     monkeypatch.setattr(worker, "_authorized_plan", lambda: ("new-edition", (search,)))
@@ -210,7 +210,7 @@ def test_catalog_requires_scoped_route(monkeypatch):
         "image": "ghcr.io/example/directory@sha256:" + "a" * 64,
         "secret_name": "example-runtime",
         "source_id": SOURCE_ID,
-        "endpoint_scope": SOURCE_ORIGIN,
+        "endpoint_scope": SOURCE_ENDPOINT,
     }
     policy_by_field = {
         "version": 1,
@@ -218,7 +218,7 @@ def test_catalog_requires_scoped_route(monkeypatch):
         "sources": [
             {
                 "source_id": SOURCE_ID,
-                "endpoint_scope": SOURCE_ORIGIN,
+                "endpoint_scope": SOURCE_ENDPOINT,
                 "use_proxy": True,
             }
         ],
@@ -263,24 +263,34 @@ def test_lost_edition_blocks_redownload(tmp_path):
         worker._guard_retained_edition(capture)
 
 
-def test_observation_secret_refs_are_scoped(monkeypatch):
-    from api import control_workers
-
-    launch = launcher.FHIRSourceWorkerLaunch(
+@pytest.fixture
+def delta_launch():
+    """Use a synthetic exact observation launch in the secret selection checks."""
+    return launcher.FHIRSourceWorkerLaunch(
         "example-run",
         "example-job",
         "example-image",
         source_id=SOURCE_ID,
-        endpoint_scope=SOURCE_ORIGIN,
+        endpoint_scope=SOURCE_ENDPOINT,
         secret_name="example-runtime",
         pool_secret_name="example-pool",
     )
-    scope_by_field = {
+
+
+def _delta_secret_scope():
+    """Supply the exact Source worker purpose accepted by its selectors."""
+    return {
         "purposes": [launcher.PURPOSE],
         "importers": ["provider-directory-fhir"],
         "workerClasses": ["process.ProviderDirectoryFHIR"],
-        "sharedForRoutes": True,
     }
+
+
+def test_observation_secret_refs_are_scoped(monkeypatch, delta_launch):
+    """Only tagged control and queue connections can enter the observation environment."""
+    from api import control_workers
+
+    scope_by_field = _delta_secret_scope() | {"sharedForRoutes": True}
     selectors = [
         {
             **scope_by_field,
@@ -305,8 +315,48 @@ def test_observation_secret_refs_are_scoped(monkeypatch):
         },
     ]
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", json.dumps(selectors))
+    assert not launcher.is_observation_secret_allowed(selectors[0], None)
+    assert not launcher.is_observation_secret_allowed(selectors[1], None)
+    assert launcher.is_observation_secret_allowed(selectors[2], None)
     monkeypatch.setattr(control_workers, "_is_admitted_importer_selected", lambda *args: True)
-    assert control_workers._worker_job_secret_env("process.ProviderDirectoryFHIR", source_launch=launch) == [
+    assert control_workers._worker_job_secret_env("process.ProviderDirectoryFHIR", source_launch=delta_launch) == [
         {"name": "CONTROL_CONNECTION", "valueFrom": {"secretKeyRef": {"name": "example-control", "key": "control"}}},
         {"name": "QUEUE_CONNECTION", "valueFrom": {"secretKeyRef": {"name": "example-queue", "key": "queue"}}},
     ]
+
+
+def test_observation_mounts_only_the_selected_plan(monkeypatch, delta_launch):
+    """Unrelated credentials and even another source plan stay outside the job."""
+    from api import control_workers
+
+    plan_mount_by_field = {
+        **_delta_secret_scope(),
+        "secretName": delta_launch.secret_name,
+        "mountPath": worker.MANIFEST_PATH,
+        "subPath": "plan.json",
+        "readOnly": True,
+    }
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON",
+        json.dumps(
+            [
+                {"secretName": "example-default", "mountPath": "/var/run/example"},
+                plan_mount_by_field | {"secretName": "example-other-source"},
+                plan_mount_by_field,
+            ]
+        ),
+    )
+    worker_spec = control_workers._BY_WORKER_CLASS["process.ProviderDirectoryFHIR"]
+    [mount] = control_workers._worker_job_secret_volumes(worker_spec, delta_launch)
+    assert mount["volume"]["secret"] == {"secretName": delta_launch.secret_name}
+    assert mount["volumeMount"]["mountPath"] == worker.MANIFEST_PATH
+    assert mount["volumeMount"]["subPath"] == "plan.json"
+
+
+def test_observation_disables_the_inherited_status_event_route(delta_launch):
+    """Observation jobs report through Core status without the shared Control bearer."""
+    from api import control_workers
+
+    expected_by_field = {"name": "HLTHPRT_IMPORT_STATUS_EVENT_URL", "value": ""}
+    assert control_workers._worker_source_policy_container({"env": []}, [], delta_launch)["env"] == [expected_by_field]
+    assert control_workers._worker_source_policy_container({"env": []}, [], None)["env"] == []

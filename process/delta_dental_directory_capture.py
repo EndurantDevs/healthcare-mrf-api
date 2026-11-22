@@ -66,6 +66,8 @@ class FinderCard:
     practitioner_npi: str | None = None
     specialty: str | None = None
     phone: str | None = None
+    provider_office_id: str | None = None
+    office_npi: str | None = None
 
     def __post_init__(self):
         """Validate the observed source fields before retaining structured results."""
@@ -77,10 +79,10 @@ class FinderCard:
         for field in names:
             if not isinstance(field, str) or not field.strip():
                 raise ValueError("delta_dental_finder_card_invalid")
-        for field in (self.practitioner_id, self.office_id):
+        for field in (self.practitioner_id, self.office_id, self.provider_office_id):
             if field is not None and (not isinstance(field, str) or not field.strip() or field.strip() != field):
                 raise ValueError("delta_dental_finder_card_identity_invalid")
-        if self.practitioner_npi is not None and not is_valid_npi(self.practitioner_npi):
+        if any(value is not None and not is_valid_npi(value) for value in (self.practitioner_npi, self.office_npi)):
             raise ValueError("delta_dental_finder_card_npi_invalid")
 
     @property
@@ -102,6 +104,8 @@ class FinderPage:
     number: int
     displayed_total: int
     cards: tuple[FinderCard, ...]
+    single_response: bool = False
+    gaps: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,10 @@ def validate_finder_page(page, search, number, total=None):
         raise ValueError("delta_dental_finder_count_invalid")
     if total is not None and page.displayed_total != total:
         raise ValueError("delta_dental_finder_count_changed")
+    if page.single_response:
+        if number != 1 or len(page.cards) > page.displayed_total:
+            raise ValueError("delta_dental_finder_page_count_mismatch")
+        return
     count = min(PAGE_SIZE, max(0, page.displayed_total - (number - 1) * PAGE_SIZE))
     if len(page.cards) != count:
         raise ValueError("delta_dental_finder_page_count_mismatch")
@@ -164,6 +172,7 @@ async def _acquire_page(connection, search, number, previous_page, fetch_page, p
 def _window(search, pages, cached_pages, pagination_gap):
     """Account for unresolved scope without inferring insurer participation."""
     gaps = {pagination_gap} if pagination_gap else set()
+    gaps.update(reason for page in pages for reason in page.gaps)
     if pages[0].displayed_total == 0:
         gaps.add("empty_window_unverified")
     if pages[0].displayed_total == RESULT_CAP:
@@ -184,10 +193,14 @@ def _window(search, pages, cached_pages, pagination_gap):
                 gaps.add("missing_card_membership")
             if expected and expected.isdisjoint(card.memberships):
                 gaps.add("selected_network_not_observed")
-            if not card.practitioner_id or not card.office_id:
+            practitioner = card.practitioner_id or card.practitioner_npi
+            if card.provider_office_id:
+                identity = ("provider_office", card.provider_office_id)
+            elif practitioner and card.office_id:
+                identity = (practitioner, card.office_id)
+            else:
                 gaps.add("missing_publisher_identity")
                 continue
-            identity = card.practitioner_id, card.office_id
             if identity in identities:
                 gaps.add("repeated_office_card")
             identities.add(identity)
@@ -236,7 +249,7 @@ async def _window_pages(connection, search, fetch_page, parse_page):
     except FinderPaginationUnresolved as error:
         _record_window_gap(connection, key, str(error))
         return FinderWindow(search, (), frozenset({str(error)}), 0)
-    if first.displayed_total <= PAGE_SIZE:
+    if first.single_response or first.displayed_total <= PAGE_SIZE:
         return _window(search, [first], cached, None)
     if blocked is not None:
         return _window(search, [first], cached, blocked[0])

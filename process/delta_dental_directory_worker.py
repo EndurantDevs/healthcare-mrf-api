@@ -13,14 +13,17 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile, gettempdir
 
 from process.control_cancel import raise_if_cancelled
-from process.delta_dental_directory_browser import SOURCE_ID, SOURCE_ORIGIN, collect_finder_windows
 from process.delta_dental_directory_capture import (
     COMPOSITE_SELECTOR,
     FINDER_SELECTORS,
     NETWORK_LABELS,
     FinderCapturePlan,
+    FinderPaginationUnresolved,
     FinderSearch,
+    iter_finder_windows,
 )
+from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
+from process.delta_dental_directory_observations import parse_retained_finder_page
 from process.ext.source_http_proxy import SourceProxyUnavailable
 from process.provider_directory_source_proxy import enter_run, exit_run
 from process.ptg_parts.artifacts import PTG2ArtifactStore
@@ -70,7 +73,7 @@ def require_observation_task(task):
     if (
         task.get(OBSERVATION_FLAG) is not True
         or task.get("source_ids") != [SOURCE_ID]
-        or task.get("provider_directory_endpoint_scope") != SOURCE_ORIGIN
+        or task.get("provider_directory_endpoint_scope") != SOURCE_ENDPOINT
         or task.get("probe") is not False
         or "rooted_graph" in task
         or task.get("import_resources") is not False
@@ -236,7 +239,7 @@ def _observed_states(cards):
             yield state[1]
 
 
-async def _capture(plan, cancel_check, *, open_page, check_transport):
+async def _capture(plan, cancel_check, *, fetch_page):
     """Stream retained source observations into bounded aggregate run metrics."""
     count_by_network = Counter()
     count_by_gap = Counter()
@@ -244,15 +247,12 @@ async def _capture(plan, cancel_check, *, open_page, check_transport):
     searches_by_selector = Counter()
     incomplete_windows_by_selector = Counter()
     page_count = window_count = card_count = office_count = saved_pages = 0
-    counts_by_action = {}
     async with aclosing(
-        collect_finder_windows(
-            None,
+        iter_finder_windows(
             plan,
+            fetch_page=fetch_page,
+            parse_page=parse_retained_finder_page,
             cancel_check=cancel_check,
-            open_page=open_page,
-            verify_transport=check_transport,
-            stats=counts_by_action,
         )
     ) as windows:
         async for window in windows:
@@ -284,7 +284,6 @@ async def _capture(plan, cancel_check, *, open_page, check_transport):
         "regional_directory_coverage_verified": False,
         "commercial_advantage_coverage": "separate_regional_source_unverified",
         "gaps": dict(count_by_gap),
-        "browser_actions": counts_by_action,
     }
 
 
@@ -309,42 +308,38 @@ def _mark_egress_started(plan):
     _sync_artifact_directory(plan.root)
 
 
-async def _run_browser_capture(binding, plan, cancel_check, pause):
-    """Start the scoped browser only for an uncached request."""
-    from process.delta_dental_directory_transport import open_finder_page
+async def _run_http_capture(binding, plan, cancel_check, pause):
+    """Open the exact source proxy connection only for an uncached JSON search."""
+    from process.delta_dental_directory_http import open_finder_http
 
     _guard_retained_edition(plan)
-    transport_stats = dict.fromkeys(("origin_requests", "suppressed_requests", "asset_cache_hits"), 0)
+    counts_by_transport_action = {"origin_requests": 0}
     async with AsyncExitStack() as resources:
-        sessions = []
+        transports = []
 
         async def check_before_egress():
             """Fence new origin access even when cached replay may proceed."""
             await cancel_check()
             _enforce_destination_hold(plan.root)
 
-        async def open_page():
-            """Bind the first browser navigation to the prepared Source session."""
-            await check_before_egress()
-            _mark_egress_started(plan)
-            session = await resources.enter_async_context(
-                open_finder_page(
-                    binding,
-                    pause=pause,
-                    cancel_check=check_before_egress,
-                    stats=transport_stats,
+        async def fetch_page(search, number, previous_page):
+            """Avoid combining a later Portal response with a retained HTML page."""
+            if number != 1 or previous_page is not None:
+                raise FinderPaginationUnresolved("legacy_window_remaining_page_unavailable")
+            if not transports:
+                await check_before_egress()
+                _mark_egress_started(plan)
+                transports.append(
+                    await resources.enter_async_context(
+                        open_finder_http(
+                            binding, pause=pause, cancel_check=check_before_egress, stats=counts_by_transport_action
+                        )
+                    )
                 )
-            )
-            sessions.append(session)
-            return session.page
+            return await transports[0](search, number, previous_page)
 
-        def check_transport():
-            """Raise a denial before preserving newly rendered evidence."""
-            if sessions:
-                sessions[0].check()
-
-        summary = await _capture(plan, cancel_check, open_page=open_page, check_transport=check_transport)
-    summary["transport"] = transport_stats
+        summary = await _capture(plan, cancel_check, fetch_page=fetch_page)
+    summary["transport"] = counts_by_transport_action
     return summary
 
 
@@ -359,7 +354,7 @@ def _require_run_id(ctx, task):
 
 
 async def run_delta_observation(directory, ctx, task):
-    """Require a scoped proxy before opening a browser for a protected edition."""
+    """Require a scoped proxy before acquiring a protected directory edition."""
     require_observation_task(task)
     run_id = _require_run_id(ctx, task)
     capture_id, searches = _authorized_plan()
@@ -389,9 +384,9 @@ async def run_delta_observation(directory, ctx, task):
         )
 
     try:
-        source_by_field = {"source_id": SOURCE_ID, "api_base": SOURCE_ORIGIN, "canonical_api_base": SOURCE_ORIGIN}
+        source_by_field = {"source_id": SOURCE_ID, "api_base": SOURCE_ENDPOINT, "canonical_api_base": SOURCE_ENDPOINT}
         await cancel_check()
-        await scope.prepare([source_by_field], endpoint_scope=SOURCE_ORIGIN)
+        await scope.prepare([source_by_field], endpoint_scope=SOURCE_ENDPOINT)
         binding = scope.bindings.get(SOURCE_ID)
         if binding is None or scope.credentials.get(SOURCE_ID):
             raise ValueError("delta_dental_finder_source_proxy_required")
@@ -406,7 +401,7 @@ async def run_delta_observation(directory, ctx, task):
             resume=resume,
             allow_unstarted_resume=resume and not _egress_marker(capture_root, f"run-{lineage}").is_file(),
         )
-        summary = await _run_browser_capture(binding, plan, cancel_check, pause)
+        summary = await _run_http_capture(binding, plan, cancel_check, pause)
         return {
             "status": "succeeded",
             "delta_dental_directory_observation": summary,
