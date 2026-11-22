@@ -234,7 +234,7 @@ async def _observe_current_inventory(runtime):
             if runtime.control_schema is None
             else await _serving_catalog_observations(connection, runtime.control_schema)
         )
-        with known_fhir_catalog_families(_catalog_families(prior)):
+        with known_fhir_catalog_families(catalog_observation_families(prior)):
             observed = await observe_imported_source_inventory(
                 connection,
                 config=runtime.config,
@@ -280,10 +280,18 @@ async def _serving_catalog_observations(connection, control_schema):
     return tuple(descriptors)
 
 
-def _catalog_families(descriptors):
+def catalog_observation_families(descriptors):
+    """Index admitted resource-family facts by their immutable inputs."""
+    from process.registry_fhir_catalog_observed_source import fhir_catalog_family_key
+
     return {
-        (descriptor["coordinates"]["dataset_id"], descriptor["dataset_sha256"]): descriptor["admission"]["families"]
+        fhir_catalog_family_key(
+            (descriptor["coordinates"]["dataset_id"], descriptor["dataset_sha256"]),
+            descriptor["tables"],
+            descriptor["source_uri"],
+        ): descriptor["admission"]["families"]
         for descriptor in descriptors
+        if descriptor.get("admission", {}).get("kind") == "catalog_observation"
     }
 
 

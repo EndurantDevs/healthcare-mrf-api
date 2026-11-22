@@ -117,7 +117,8 @@ def table_sql(namespace, table, *, trigram_schema="public"):
         "registry_fhir_catalog_observation": (
             (
                 "registry_fhir_catalog_observation_network_idx",
-                "(source_generation,(document_json->>'network_resource_id')) WHERE observation_kind='edge'",
+                "(source_generation,(document_json->>'network_resource_id'),"
+                "(coalesce(document_json->>'plan_resource_id',''))) WHERE observation_kind='edge'",
             ),
         ),
         "registry_fhir_catalog_network": (
