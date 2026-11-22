@@ -11,7 +11,7 @@ from ijson.backends import python as ijson_python
 from process import network_fhir_retained_capture as retained
 from process import provider_directory_admission_validation as admission
 from process import provider_directory_proof_store as proofs
-from process.network_fhir_retained_capture_contract import REFUSAL, SEMANTIC_PROFILE, is_sha256
+from process.network_fhir_retained_capture_contract import REFUSAL, SEMANTIC_PROFILE, is_sha256, text
 from process.network_fhir_source_witness_contract import (
     ADMITTED_LEGACY_PROFILE,
     ADMITTED_TRANSPORT_PROFILE,
@@ -255,15 +255,18 @@ def _summary(summary, origin):
         if origin.admission_profile == ADMITTED_UHC_PROFILE
         else SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID
     )
+    expected_by_field = {
+        "dataset_id": origin.dataset_id,
+        "endpoint_id": origin.endpoint_id,
+        "acquisition_root_run_id": origin.root_run_id,
+        "dataset_hash": origin.dataset_sha256,
+    }
+    # Admitted legacy metadata preserves the acquisition's original source ID.
+    if origin.admission_profile != ADMITTED_LEGACY_PROFILE:
+        expected_by_field["source_ids"] = [origin.source_id]
     summary = validate_semantic_source_summary(
         summary,
-        expected_by_field={
-            "source_ids": [origin.source_id],
-            "dataset_id": origin.dataset_id,
-            "endpoint_id": origin.endpoint_id,
-            "acquisition_root_run_id": origin.root_run_id,
-            "dataset_hash": origin.dataset_sha256,
-        },
+        expected_by_field=expected_by_field,
         expected_semantic_contract_id=contract,
     )
     require(
@@ -271,6 +274,10 @@ def _summary(summary, origin):
         and summary["resource_counts"] == dict(origin.resource_counts)
         and summary["resource_hashes"] == dict(origin.resource_hashes)
     )
+    source_ids = summary["source_ids"]
+    require(len(source_ids) == 1)
+    text(source_ids[0], 64)
+    return source_ids
 
 
 @contextmanager
@@ -315,8 +322,8 @@ def _validate_metadata(stream, origin, header):
     metadata = stream.metadata
     require(metadata.get("resource_hash_contract", "transport_bound_v1") == HASH_CONTRACTS[origin.admission_profile])
     require(metadata.get("semantic_projection_as_of") == origin.semantic_projection_as_of)
-    require(metadata.get("source_ids") == [origin.source_id])
-    _summary(metadata.get("source_summary_v1"), origin)
+    source_ids = _summary(metadata.get("source_summary_v1"), origin)
+    require(metadata.get("source_ids") == source_ids)
     _plan_summary(metadata, origin)
     if origin.admission_profile in {OBSERVED_LEGACY_PROFILE, OBSERVED_SEMANTIC_PROFILE}:
         require(not stream.proof_header and UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY not in metadata)
