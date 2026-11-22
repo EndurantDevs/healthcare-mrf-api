@@ -163,18 +163,17 @@ async def test_exact_followup_reconciles_only_matching_publication(monkeypatch):
     lock_fence.assert_awaited_once_with(resolve_fence.return_value)
     cutover_alias.assert_awaited_once_with(resolve_fence.return_value)
 
-    resolve_fence.return_value = importer.ProviderDirectoryArtifactDatasetFence(
-        (_published_artifact_dataset(evidence_run_id="run-changed"),)
-    )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="published_source_alias_fence_changed",
-    ):
-        await importer.ensure_provider_directory_published_source_alias(
-            source_id="source-current",
-            expected_dataset_id="dataset-current",
-            expected_root_run_id="run-root",
-        )
+    for datasets in ((), (_published_artifact_dataset(evidence_run_id="run-changed"),)):
+        resolve_fence.return_value = importer.ProviderDirectoryArtifactDatasetFence(datasets)
+        with pytest.raises(
+            importer.ProviderDirectoryArtifactBuildStale,
+            match="published_source_alias_fence_changed",
+        ):
+            await importer.ensure_provider_directory_published_source_alias(
+                source_id="source-current",
+                expected_dataset_id="dataset-current",
+                expected_root_run_id="run-root",
+            )
     assert lock_fence.await_count == 1
     assert cutover_alias.await_count == 1
 

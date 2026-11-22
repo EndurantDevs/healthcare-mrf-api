@@ -392,6 +392,24 @@ async def test_partition_chain_skips_completed_and_stops_on_split(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_partition_chain_keeps_cursor_when_page_budget_is_exhausted():
+    request = _partition_page_request(fetch_options=_partition_options(max_pages=1))
+    request.state.page_count = 1
+    chain = fhir.PartitionChainRequest(
+        source_record=request.source_record,
+        resource_type=request.resource_type,
+        start_url_queue=request.start_url_queue,
+        state=request.state,
+        request_url=request.current_url,
+        fetch_options=request.fetch_options,
+    )
+
+    assert await fhir._should_continue_partition_chain(chain, request.current_url) is False
+    assert request.state.hard_page_limit_reached and request.state.next_url_remaining
+    assert chain.page_identities == []
+
+
+@pytest.mark.asyncio
 async def test_partition_enqueue_and_plan_resume_identity_edges(monkeypatch):
     state = fhir.PartitionFetchState(
         result_model=fhir.ProviderDirectoryOrganization,

@@ -180,6 +180,12 @@ async def test_recovery_uses_fresh_search_commits_overlap_and_reuses_completed_p
     diagnostic = importer._resource_fetch_diagnostic(result, rows_written=2)
     assert recovery.diagnostic_is_complete(diagnostic)
     assert "old%2B%2F" not in repr(diagnostic) and diagnostic["source_fetch"] is None
+    stats_by_type = {}
+    importer._record_resource_fetch_stats(
+        stats_by_type, "Organization", result, bulk_export_selection=importer.BULK_EXPORT_SELECTION_NOT_REQUESTED
+    )
+    assert stats_by_type["Organization"]["timestamp_recovery_traversal_completed_sources"] == 1
+    assert stats_by_type["Organization"]["collection_complete_sources"] == 0
     repeated = await _fetch(state)
     assert repeated.complete and repeated.rows_written == 0 and repeated.fetch_mode == recovery.FETCH_MODE
     assert state.fetch.await_count == 2 and state.summary_read.await_count == 1
@@ -260,14 +266,16 @@ async def test_valid_ordinary_retained_cursor_never_starts_timestamp_recovery(mo
 
 
 @pytest.mark.asyncio
-async def test_completed_recovery_binds_outer_start_hash_before_zero_fetch_reuse(monkeypatch):
-    state = _reader(monkeypatch)
+@pytest.mark.parametrize("complete", [False, True])
+async def test_recovery_binds_outer_cursor_before_reusing_it(monkeypatch, complete):
+    state = _reader(monkeypatch, body=None if complete else _bundle(_resource("new", 6)))
     await _fetch(state)
     checkpoint = state.checkpoint
+    assert checkpoint["complete"] is complete
     start_hash = hashlib.sha256((BASE + "/Organization?_count=20").encode()).hexdigest()
     stored_checkpoint_by_field = {
         **checkpoint,
-        "state": "complete",
+        "state": "complete" if complete else "active",
         "source_ids": list(state.context.source_ids),
         "dataset_id": state.context.dataset_id,
         "acquisition_root_run_id": state.context.acquisition_root_run_id,
@@ -277,11 +285,17 @@ async def test_completed_recovery_binds_outer_start_hash_before_zero_fetch_reuse
         "recent_cursor_hashes": list(checkpoint["recent_url_hashes"]),
         "completeness_json": checkpoint["completeness"],
     }
-    assert importer._compatible_pagination_resume_state(stored_checkpoint_by_field, state.context, start_hash).complete
-    with pytest.raises(ValueError, match="start_url_changed"):
-        importer._compatible_pagination_resume_state(
-            stored_checkpoint_by_field | {"start_url_hash": "0" * 64}, state.context, start_hash
-        )
+    resumed = importer._compatible_pagination_resume_state(stored_checkpoint_by_field, state.context, start_hash)
+    assert resumed.complete is complete and resumed.next_url == checkpoint["next_url"]
+    if complete:
+        for alteration, error in (
+            ({"start_url_hash": "0" * 64}, "start_url_changed"),
+            ({"recent_cursor_hashes": ["0" * 64]}, "terminal_request_changed"),
+        ):
+            with pytest.raises(ValueError, match=error):
+                importer._compatible_pagination_resume_state(
+                    stored_checkpoint_by_field | alteration, state.context, start_hash
+                )
 
 
 @pytest.mark.asyncio
