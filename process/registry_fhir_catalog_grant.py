@@ -37,6 +37,7 @@ from process.registry_fhir_catalog_sources import (
     MAX_PAGE,
     FHIRCatalogSourceReadProfile,
     fhir_catalog_source_generation,
+    is_delta_positive_catalog_descriptor,
     require_current_fhir_catalog_sources,
     validate_fhir_catalog_source_descriptor,
 )
@@ -362,9 +363,8 @@ def fhir_catalog_admitted_current_sources(grant, vector, descriptors):
                 continue
             if descriptor["profile"] == "retained_normalized":
                 continue
-            if (
-                canonical_json(descriptor["native_read_profile"]) not in allowed_profiles
-                or descriptor["complete"] is not True
+            if canonical_json(descriptor["native_read_profile"]) not in allowed_profiles or (
+                descriptor["complete"] is not True and not is_delta_positive_catalog_descriptor(descriptor)
             ):
                 _fail("source_not_admitted")
             if descriptor["admission"]["kind"] == "catalog_observation":

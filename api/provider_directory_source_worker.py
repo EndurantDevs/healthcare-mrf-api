@@ -17,6 +17,9 @@ PURPOSE = "provider-directory-source"
 COMMAND = ["/usr/local/bin/fhir-source-worker"]
 IMAGE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_IMAGE"
 ROUTES_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_ROUTES_JSON"
+_ACQUISITION_ROUTE_FIELDS = frozenset(
+    {"allow_retained_retries", "proxy_pool_transition", "proxy_pool", "delta_dental_observed_review_id"}
+)
 PROXY_POOL_SECRET_ENV = "HLTHPRT_HTTP_PROXY_POOL_SECRET_NAME"
 PROXY_POOL_REVISION_ENV = "HLTHPRT_HTTP_PROXY_POOL_REVISION"
 PROXY_POLICY_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_POLICY_JSON"
@@ -59,6 +62,7 @@ class FHIRSourceWorkerLaunch:
     pool_secret_name: str = ""
     proxy_cooldowns_json: str = ""
     proxy_pool_transition: ProxyPoolTransition | None = None
+    delta_observed_review_id: str = ""
 
 
 def _route_proxy_pool(route):
@@ -140,6 +144,25 @@ class FHIRSourcePublicationLaunch(FHIRSourceWorkerLaunch):
     handoff_sha256: str = ""
 
 
+def _delta_observed_route_review(route):
+    """Keep the observed publication route distinct from provider-data capture."""
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
+    from process.delta_dental_directory_producer import REVIEW_FIELD
+
+    if REVIEW_FIELD not in route:
+        return ""
+    review_id = route[REVIEW_FIELD]
+    if (
+        (route["source_id"], route["endpoint_scope"]) != (SOURCE_ID, SOURCE_ENDPOINT)
+        or type(review_id) is not str
+        or not re.fullmatch(r"[0-9a-f]{32}", review_id)
+        or "proxy_pool_transition" in route
+        or "proxy_pool" in route
+    ):
+        raise ValueError("fhir_source_worker_route_invalid")
+    return review_id
+
+
 def _configured_routes(*, setting=ROUTES_ENV):
     """Validate the complete server-owned route inventory before selection."""
     raw = os.getenv(setting, "").strip()
@@ -152,12 +175,12 @@ def _configured_routes(*, setting=ROUTES_ENV):
     max_routes = 64 if setting == ROUTES_ENV else 32
     if type(routes) is not list or len(routes) > max_routes:
         raise ValueError("fhir_source_worker_route_invalid")
+    optional_fields = _ACQUISITION_ROUTE_FIELDS if setting == ROUTES_ENV else set()
     identities = set()
-    extra_fields = {"allow_retained_retries", "proxy_pool_transition", "proxy_pool"} if setting == ROUTES_ENV else set()
     for route in routes:
         if (
             type(route) is not dict
-            or set(route) - extra_fields != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
+            or set(route) - optional_fields != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
             or "allow_retained_retries" in route
             and (
                 setting != ROUTES_ENV
@@ -182,7 +205,10 @@ def _configured_routes(*, setting=ROUTES_ENV):
             )
         ):
             raise ValueError("fhir_source_worker_route_invalid")
-        route_identity_fields = tuple(route[key] for key in ("root_run_id", "source_id", "endpoint_scope"))
+        route_identity_fields = (
+            *tuple(route[key] for key in ("root_run_id", "source_id", "endpoint_scope")),
+            _delta_observed_route_review(route),
+        )
         if route_identity_fields in identities:
             raise ValueError("fhir_source_worker_route_invalid")
         identities.add(route_identity_fields)
@@ -215,7 +241,13 @@ def _source_route(admitted_run, *, routes=None):
     """Preserve an exact original route before selecting fresh or retry execution."""
     params = admitted_run.get("params")
     params = params if type(params) is dict else {}
-    routes = _configured_routes() if routes is None else routes
+    from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG, require_delta_observed_task
+
+    review_id = require_delta_observed_task(params) if TASK_FLAG in params or REVIEW_FIELD in params else ""
+    configured = _configured_routes() if routes is None else routes
+    routes = [route for route in configured if _delta_observed_route_review(route) == review_id]
+    if review_id and not routes:
+        raise ValueError("delta_observed_worker_route_required")
     root = admitted_run.get("run_id")
     root_routes = [route for route in routes if route["root_run_id"] == root]
     if not root_routes:
@@ -266,7 +298,7 @@ def _fresh_source_route(admitted_run, params, routes, *, root=None):
     ]
     if not candidates:
         return None
-    if not _uses_source_http(params):
+    if not (_uses_source_http(params) or _delta_observed_route_review(candidates[0])):
         return None
     matches = [
         route
@@ -298,7 +330,11 @@ def _fresh_source_route(admitted_run, params, routes, *, root=None):
 
 def _configured_launch_route(launch):
     """Revalidate the exact current executor, preserving explicit-root precedence."""
-    routes = _configured_routes()
+    routes = [
+        route
+        for route in _configured_routes()
+        if _delta_observed_route_review(route) == launch.delta_observed_review_id
+    ]
     candidates = [route for route in routes if route["root_run_id"] == launch.root_run_id]
     if not candidates:
         candidates = [
@@ -422,9 +458,14 @@ def is_delta_observation_launch(launch):
     """Recognize the exact nonpublication Delta source launch."""
     from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
 
-    return type(launch) is FHIRSourceWorkerLaunch and (launch.source_id, launch.endpoint_scope) == (
-        SOURCE_ID,
-        SOURCE_ENDPOINT,
+    return (
+        type(launch) is FHIRSourceWorkerLaunch
+        and not launch.delta_observed_review_id
+        and (launch.source_id, launch.endpoint_scope)
+        == (
+            SOURCE_ID,
+            SOURCE_ENDPOINT,
+        )
     )
 
 
@@ -455,6 +496,7 @@ def is_delta_route_available():
             route
             for route in _configured_routes()
             if route["root_run_id"] is None
+            and not _delta_observed_route_review(route)
             and route["source_id"] == SOURCE_ID
             and route["endpoint_scope"] == SOURCE_ENDPOINT
         ]
@@ -483,6 +525,11 @@ def _uses_source_http(params):
     from process.provider_directory_refresh_preset import apply_provider_directory_refresh_preset
 
     params = params if type(params) is dict else {}
+    from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG, require_delta_observed_task
+
+    if TASK_FLAG in params or REVIEW_FIELD in params:
+        require_delta_observed_task(params)
+        return False
     if is_delta_observation(params):
         require_observation_task(params)
         return True
@@ -595,9 +642,13 @@ def require_fresh_ordinary_profile_launch(spec, launch_request):
 def _require_delta_observation_route(params, route, policy):
     """Require exact dedicated admission before accepting any Delta worker task."""
     from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
+    from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG, require_delta_observed_task
     from process.delta_dental_directory_worker import is_delta_observation, require_observation_task
 
-    if is_delta_observation(params):
+    if type(params) is dict and (TASK_FLAG in params or REVIEW_FIELD in params):
+        if route is None or _delta_observed_route_review(route) != require_delta_observed_task(params):
+            raise ValueError("delta_observed_worker_route_required")
+    elif is_delta_observation(params):
         require_observation_task(params)
         if route is None or not policy.use_proxy(SOURCE_ID, SOURCE_ENDPOINT):
             raise ValueError("delta_dental_finder_source_proxy_required")
@@ -637,8 +688,7 @@ def admit_fhir_source_worker_launch(admitted_run):
     _require_source_proxy_scope(policy, params_by_name)
     route = _source_route(admitted_run)
     _require_delta_observation_route(params_by_name, route, policy)
-    if route is not None:
-        image = route["image"]
+    image = route["image"] if route is not None else image
     if _IMAGE.fullmatch(image) is None:
         raise ValueError("fhir_source_worker_admission_unavailable")
     root = (route["root_run_id"] or params_by_name.get("provider_directory_pagination_root_run_id")) if route else ""
@@ -651,6 +701,7 @@ def admit_fhir_source_worker_launch(admitted_run):
         route["source_id"] if route else "",
         route["endpoint_scope"] if route else "",
         (params_by_name.get("retry_of_run_id") or "") if root else "",
+        delta_observed_review_id=_delta_observed_route_review(route) if route else "",
         **(
             _proxy_fields(
                 params_by_name.get("source_ids") if type(params_by_name) is dict else None,
@@ -853,7 +904,9 @@ def _require_proxy_launch(launch):
             raise ValueError("fhir_source_worker_admission_unavailable")
         return
     route = _configured_launch_route(launch)
-    expected = _proxy_fields([launch.source_id], launch.endpoint_scope, route)
+    expected = (
+        {} if launch.delta_observed_review_id else _proxy_fields([launch.source_id], launch.endpoint_scope, route)
+    )
     if fields != tuple(expected.get(name, "") for name in ("policy_revision", "pool_revision", "pool_secret_name")):
         raise ValueError("fhir_source_worker_admission_unavailable")
     if launch.proxy_pool_transition != expected.get("proxy_pool_transition"):
@@ -1109,6 +1162,11 @@ def _source_route_annotations(launch):
     return {
         "healthporta.com/source-id": launch.source_id,
         "healthporta.com/source-endpoint-scope": launch.endpoint_scope,
+        **(
+            {"healthporta.com/source-observed-review-id": launch.delta_observed_review_id}
+            if launch.delta_observed_review_id
+            else {}
+        ),
     }
 
 
@@ -1315,6 +1373,8 @@ def _fhir_source_identity_matches(job, launch):
         == route_annotations.get("healthporta.com/source-id", "")
         and job["metadata"]["annotations"].get("healthporta.com/source-endpoint-scope", "")
         == route_annotations.get("healthporta.com/source-endpoint-scope", "")
+        and job["metadata"]["annotations"].get("healthporta.com/source-observed-review-id", "")
+        == route_annotations.get("healthporta.com/source-observed-review-id", "")
         and container["command"] == COMMAND
         and container["workingDir"] == "/app"
         and (container.get("args") == ["publish"] if is_publication else not container.get("args"))

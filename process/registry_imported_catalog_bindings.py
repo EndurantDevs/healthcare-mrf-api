@@ -10,6 +10,7 @@ from process.network_approved_membership_source import ApprovedMembershipSource,
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_fhir_catalog_sources import (
     fhir_catalog_source_generation,
+    is_delta_positive_catalog_descriptor,
     validate_fhir_catalog_source_descriptor,
 )
 
@@ -48,7 +49,7 @@ async def published_fhir_catalog_bindings_sql(connection, scope, approved, coord
     descriptor = validate_fhir_catalog_source_descriptor(descriptor)
     if (
         descriptor["profile"] != "published_normalized"
-        or descriptor.get("complete") is not True
+        or (descriptor.get("complete") is not True and not is_delta_positive_catalog_descriptor(descriptor))
         or descriptor["coordinates"]
         != dict(zip(coordinates.__dataclass_fields__, coordinates.sql_parameters, strict=True))
     ):

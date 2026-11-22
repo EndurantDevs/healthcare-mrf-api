@@ -1593,3 +1593,63 @@ async def test_original_route_checks_native_identity_before_job_lookup(
     assert outcome["status"] == "failed"
     native_connection.all.assert_awaited_once()
     assert api_calls == []
+
+
+def test_delta_review_uses_its_dedicated_route_without_proxy(monkeypatch):
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
+    from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG
+
+    review_id = "f" * 32
+    params_by_name = {
+        "source_ids": [SOURCE_ID],
+        "provider_directory_endpoint_scope": SOURCE_ENDPOINT,
+        REVIEW_FIELD: review_id,
+        TASK_FLAG: True,
+    }
+    capture_route_by_field = {
+        "root_run_id": None,
+        "source_id": SOURCE_ID,
+        "endpoint_scope": SOURCE_ENDPOINT,
+        "image": IMAGE,
+        "secret_name": "capture-source-secret",
+    }
+    producer_route_by_field = {
+        **capture_route_by_field,
+        REVIEW_FIELD: review_id,
+        "image": ORDINARY_IMAGE,
+        "secret_name": "producer-secret",
+    }
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([capture_route_by_field, producer_route_by_field]))
+    monkeypatch.setenv(
+        source.PROXY_POLICY_ENV,
+        json.dumps(
+            {
+                "version": 1,
+                "revision": "v1",
+                "sources": [{"source_id": SOURCE_ID, "endpoint_scope": SOURCE_ENDPOINT, "use_proxy": True}],
+            }
+        ),
+    )
+    admitted_run_by_field = {**_recorded(), "retry_of_run_id": None, "params": params_by_name}
+    launch = source.admit_fhir_source_worker_launch(admitted_run_by_field)
+    assert launch.image == ORDINARY_IMAGE
+    assert launch.secret_name == "producer-secret"
+    assert launch.delta_observed_review_id == review_id
+    assert not launch.pool_secret_name
+    assert not source.is_delta_observation_launch(launch)
+    assert source._source_route_annotations(launch)["healthporta.com/source-observed-review-id"] == review_id
+    source._require_proxy_launch(launch)
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, admitted_run_by_field)
+    request.fhir_source_launch = launch
+    job = workers._worker_job_manifest(SPEC, request, launch.image)
+    assert job["metadata"]["annotations"]["healthporta.com/source-observed-review-id"] == review_id
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    names = {entry["name"] for entry in container["env"]}
+    assert not names.intersection({source.PROXY_POOL_ENV, source.PROXY_BINDING_ENV, source.PROXY_POLICY_ENV})
+    assert "HLTHPRT_DELTA_DENTAL_FINDER_MANIFEST_PATH" not in names
+    with pytest.raises(ValueError):
+        source.admit_fhir_source_worker_launch({**admitted_run_by_field, "params": {**params_by_name, "probe": True}})
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([capture_route_by_field]))
+    with pytest.raises(ValueError, match="delta_observed_worker_route_required"):
+        source.admit_fhir_source_worker_launch(admitted_run_by_field)

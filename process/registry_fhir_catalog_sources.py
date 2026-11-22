@@ -119,6 +119,22 @@ def parse_fhir_catalog_source_profile(document):
 _profile = parse_fhir_catalog_source_profile
 
 
+def is_delta_positive_catalog_descriptor(descriptor):
+    """Identify the reserved positive scope on an already validated source descriptor."""
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
+    from process.delta_dental_directory_producer import DELTA_OBSERVED_ENDPOINT_ID, METADATA_KEY
+
+    return (
+        descriptor.get("profile") == "published_normalized"
+        and descriptor.get("source_aliases") == [SOURCE_ID]
+        and descriptor.get("source_uri") == SOURCE_ENDPOINT
+        and descriptor.get("endpoint_id") == DELTA_OBSERVED_ENDPOINT_ID
+        and descriptor.get("complete") is False
+        and descriptor["admission"].get("kind") == "catalog_observation"
+        and METADATA_KEY in descriptor["admission"]
+    )
+
+
 def validate_fhir_catalog_source_descriptor(descriptor):
     """Validate logical source coordinates, named inputs and content observation evidence."""
     from process.registry_native_network_catalog import is_native_catalog_source, validate_native_catalog_descriptor
@@ -157,8 +173,7 @@ def validate_fhir_catalog_source_descriptor(descriptor):
         and descriptor_by_field["admission"].get("kind") == "catalog_observation"
     ):
         descriptor_by_field["admission"] = validate_catalog_observation_receipt(descriptor_by_field["admission"])
-        if descriptor_by_field["complete"] is not True:
-            _fail("observation_invalid")
+        _validate_delta_catalog_scope(descriptor_by_field, aliases)
         content_digest = catalog_observation_descriptor_digest(descriptor_by_field)
         if is_legacy:
             descriptor_by_field.update(
@@ -171,8 +186,32 @@ def validate_fhir_catalog_source_descriptor(descriptor):
         ):
             _fail("observation_invalid")
     else:
+        from process.delta_dental_directory_json import SOURCE_ID as DELTA_SOURCE
+
+        if DELTA_SOURCE in aliases:
+            _fail("observation_invalid")
         _validate_content_admission(descriptor_by_field["admission"], descriptor_by_field)
     return descriptor_by_field
+
+
+def _validate_delta_catalog_scope(descriptor, aliases):
+    """Prevent scope laundering through a different source, endpoint or completeness flag."""
+    from process.delta_dental_directory_json import SOURCE_ENDPOINT as DELTA_ENDPOINT
+    from process.delta_dental_directory_json import SOURCE_ID as DELTA_SOURCE
+    from process.delta_dental_directory_producer import DELTA_OBSERVED_ENDPOINT_ID, METADATA_KEY
+
+    has_positive_scope = METADATA_KEY in descriptor["admission"]
+    is_delta = (
+        aliases == [DELTA_SOURCE]
+        and descriptor["source_uri"] == DELTA_ENDPOINT
+        and descriptor["endpoint_id"] == DELTA_OBSERVED_ENDPOINT_ID
+    )
+    if (
+        has_positive_scope != is_delta
+        or (DELTA_SOURCE in aliases and not is_delta)
+        or descriptor["complete"] == has_positive_scope
+    ):
+        _fail("observation_invalid")
 
 
 def _normalize_fhir_catalog_descriptor(descriptor_by_field):

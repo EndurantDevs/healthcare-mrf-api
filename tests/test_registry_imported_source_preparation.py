@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -286,3 +287,58 @@ async def test_native_partial_capture_schemas_rollback_before_caller_continues(p
         for schema in reversed(created_schemas):
             await case.connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
         await case.connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_predecessor", "new_address", "is_rejected"),
+    [("source-B", "Suite 2", False), ("source-A", "Suite 1", False), ("source-A", "Suite 2", True)],
+)
+async def test_delta_registry_guard_runs_only_for_diverged_generation(
+    monkeypatch, source_predecessor, new_address, is_rejected
+):
+    def observed_pin(generation, dataset_id, predecessor=None):
+        pin = object.__new__(preparation.PinnedTypedFHIRMembershipSource)
+        object.__setattr__(pin, "capture", {"capture_sha256": generation})
+        object.__setattr__(pin, "anchor", object())
+        object.__setattr__(
+            pin,
+            "catalog_descriptor",
+            {
+                "coordinates": {"dataset_id": dataset_id},
+                "previous_dataset_id": predecessor,
+            },
+        )
+        return pin
+
+    published = observed_pin("before", "source-B")
+    candidate = observed_pin("after", "source-C", source_predecessor)
+    monkeypatch.setattr(preparation, "is_delta_positive_catalog_descriptor", lambda _descriptor: True)
+
+    async def graph_stage(_connection, capture, *, expected_anchor):
+        assert expected_anchor in {published.anchor, candidate.anchor}
+        return SimpleNamespace(relation=lambda kind: capture["capture_sha256"] + "_" + kind)
+
+    monkeypatch.setattr(preparation, "require_typed_graph_capture", graph_stage)
+    previous = [SimpleNamespace(source_pin=published)]
+    pending = SimpleNamespace(source_pin=candidate)
+    columns = """resource_type,resource_id,network_source_key,location_resource_id,
+                 provider_system,provider_id,address_key,canonical_identity"""
+    with sqlite3.connect(":memory:") as database:
+        for table_name, address in (("before_pairs", "Suite 1"), ("after_pairs", new_address)):
+            database.execute(f"CREATE TABLE {table_name} ({columns})")
+            database.execute(
+                f"INSERT INTO {table_name} VALUES (?,?,?,?,?,?,?,?)",
+                ("PractitionerRole", "role-1", "network-1", "office-1", "npi", "1234567893", "address", address),
+            )
+
+        async def existing_pair_query(statement):
+            return database.execute(statement).fetchone()[0]
+
+        connection = SimpleNamespace(fetchval=AsyncMock(side_effect=existing_pair_query))
+        if is_rejected:
+            with pytest.raises(ValueError, match="registry_delta_predecessor_positives_lost"):
+                await preparation._require_cumulative_delta_pairs(connection, pending, previous)
+        else:
+            await preparation._require_cumulative_delta_pairs(connection, pending, previous)
+        assert connection.fetchval.await_count == int(source_predecessor != "source-B")
