@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from urllib.parse import urlsplit
 
+from asyncpg import InsufficientPrivilegeError, InvalidSchemaNameError, UndefinedTableError
+
 from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import PROJECTOR_VERSION
 from process.network_cms_registry_address_capture import native_driver
@@ -244,12 +246,11 @@ async def _observe_current_inventory(runtime):
         await lock_aca_source_tables(
             connection, runtime.config.aca_source_schema, ("plan_npi_raw", "plan", "plan_networktier", "issuer")
         )
-        prior = (
-            ()
-            if runtime.control_schema is None
-            else await _serving_catalog_observations(connection, runtime.control_schema)
-        )
-        with known_fhir_catalog_families(catalog_observation_families(prior)):
+        prior = checkpoint = ()
+        if runtime.control_schema is not None:
+            prior = await _serving_catalog_observations(connection, runtime.control_schema)
+            checkpoint = await _checkpoint_catalog_observations(connection, runtime.control_schema)
+        with known_fhir_catalog_families(catalog_observation_families(checkpoint + prior)):
             observed = await observe_imported_source_inventory(
                 connection,
                 config=runtime.config,
@@ -269,18 +270,40 @@ async def _observe_current_inventory(runtime):
 
 
 async def _serving_catalog_observations(connection, control_schema):
-    """Read editions and cached families from the catalog that preparation will copy."""
+    """Read the catalog that preparation will copy."""
     control = storage_identifier(control_schema)
     schema = await connection.fetchval(
         f"SELECT c.schema_name FROM {control}.network_serving_control s "
         f"JOIN {control}.registry_fhir_catalog_snapshot c USING (metadata_generation) "
         "WHERE s.id=1 AND c.published_at IS NOT NULL"
     )
+    return () if schema is None else await _catalog_observations(connection, schema)
+
+
+async def _checkpoint_catalog_observations(connection, control_schema):
+    """Reuse family facts from a validated, unpublished catalog."""
+    control = storage_identifier(control_schema)
+    schema = await connection.fetchval(
+        f"SELECT schema_name FROM {control}.registry_fhir_catalog_snapshot "
+        "WHERE published_at IS NULL AND accounting_json ? 'imported_source_inventory' "
+        "AND accounting_json ? 'registry_fhir_catalog_source' "
+        "ORDER BY as_of DESC, metadata_approved_revision DESC, metadata_generation DESC LIMIT 1"
+    )
     if schema is None:
         return ()
+    try:
+        # Preserve the inventory snapshot when retention removes the optional catalog.
+        async with connection.transaction():
+            return await _catalog_observations(connection, schema)
+    except UndefinedTableError, InvalidSchemaNameError, InsufficientPrivilegeError:
+        return ()
+
+
+async def _catalog_observations(connection, schema):
     rows = await connection.fetch(
         f"SELECT descriptor_json::text AS descriptor FROM {storage_identifier(schema)}.registry_fhir_catalog_source "
-        f"WHERE profile='published_normalized' LIMIT {MAX_SOURCES + 1}"
+        "WHERE profile='published_normalized' AND descriptor_json->'coordinates'->>'source_system'='fhir' "
+        f"AND descriptor_json->'admission'->>'kind'='catalog_observation' LIMIT {MAX_SOURCES + 1}"
     )
     descriptors = []
     for row in rows:
