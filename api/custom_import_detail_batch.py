@@ -10,6 +10,7 @@ from api.signed_request_reader import signed_request_reader
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_FULL_FAMILY_PAGE_SIZE,
+    MAX_GROUPED_DETAIL_RESPONSE_BYTES,
     CustomImportReadUnavailableError,
     ExtensionReadAuthorization,
 )
@@ -84,7 +85,11 @@ async def _read_batch_payload(session, parsed, npi_values, verified):
     """Reuse the authorized page hydrator and retain one null for every absence."""
 
     pinned = await transport._resolve_pinned_target(session, parsed.target)
-    service = CustomImportReadService(authorizer=transport._TransportAuthorizer(verified, pinned))
+    is_grouped = parsed.grouped_entity_selection is not None
+    service = CustomImportReadService(
+        authorizer=transport._TransportAuthorizer(verified, pinned),
+        grouped_detail_batch=is_grouped,
+    )
     authorization = ExtensionReadAuthorization(verified.credential)
     query = NpiEntityRelationQuery(
         context_filters=parsed.context,
@@ -107,17 +112,22 @@ async def _read_batch_payload(session, parsed, npi_values, verified):
     )
     if type(imported) is not dict or not set(imported) <= set(npi_values):
         raise CustomImportReadUnavailableError("detail batch identities are unavailable")
+    family_response_bytes = MAX_GROUPED_DETAIL_RESPONSE_BYTES if is_grouped else transport._MAX_RESPONSE_BYTES
     provider_items = []
     for provider_npi in npi_values:
         imported_family = imported.get(provider_npi)
         family = None if imported_family is None else transport._detail_payload(imported_family, parsed.target)
-        if len(transport._canonical_json_bytes(family)) > transport._MAX_RESPONSE_BYTES:
+        if len(transport._canonical_json_bytes(family)) > family_response_bytes:
             raise CustomImportReadUnavailableError("detail batch family exceeds its bound")
         provider_items.append({"npi": provider_npi, "custom_import": family})
     encoded = transport._canonical_json_bytes(
         {"target": transport._target_document(parsed.target), "items": provider_items}
     )
-    if len(encoded) > (len(npi_values) + 1) * transport._MAX_RESPONSE_BYTES:
+    maximum = min(
+        (len(npi_values) + 1) * family_response_bytes,
+        (MAX_FULL_FAMILY_PAGE_SIZE + 1) * transport._MAX_RESPONSE_BYTES,
+    )
+    if len(encoded) > maximum:
         raise CustomImportReadUnavailableError("detail batch response exceeds its bound")
     await verify_published_generation(session, pinned)
     return encoded

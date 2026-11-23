@@ -340,9 +340,20 @@ async def _page(session, target, query):
 
 
 @pytest.mark.asyncio
-async def test_signed_exact_batch_hydrates_full_families_without_membership_filtering(monkeypatch):
+@pytest.mark.parametrize("extra_children", (0, 320))
+async def test_signed_exact_batch_hydrates_full_families_without_membership_filtering(monkeypatch, extra_children):
     http_fixture._install_keyring(monkeypatch, install_fake_reader=False)
-    async with _case(monkeypatch=monkeypatch) as (case, pinned_target):
+    children = _children() + [
+        {
+            "rate_npi": _A,
+            "rate_period": 2024,
+            "rate_segment": "segment_a",
+            "service_code": f"{index:04d}" + "x" * 810,
+            "amount": Decimal("2"),
+        }
+        for index in range(extra_children)
+    ]
+    async with _case(children=children, monkeypatch=monkeypatch) as (case, pinned_target):
         external_target_map = transport._target_document(_external_target(pinned_target))
         npi_values = [_B, "1999999999", _A]
         body = transport._canonical_json_bytes(
@@ -371,7 +382,24 @@ async def test_signed_exact_batch_hydrates_full_families_without_membership_filt
         imported = provider_items[2]["custom_import"]
         assert imported["projection"] == "full_family" and imported["selection"]["value"] == 2024
         assert [family["group_value"] for family in imported["families"]] == ["segment_a", "segment_b"]
-        assert sum(len(family["children"]) for family in imported["families"]) == 2
+        assert sum(len(family["children"]) for family in imported["families"]) == extra_children + 2
+        if extra_children:
+            payload_bytes = len(transport._canonical_json_bytes(imported))
+            assert 256 * 1024 < payload_bytes < 512 * 1024
+            single_request_map = dict(json.loads(body), entity={"adapter_id": "npi", "value": _A})
+            single_request_map.pop("entities")
+            single_body = transport._canonical_json_bytes(single_request_map)
+            path = transport.CUSTOM_IMPORT_DETAIL_PATH
+            single_request = http_fixture._Request(
+                single_body,
+                http_fixture._resigned_headers(body=single_body, path=path, target=external_target_map),
+                path=path,
+            )
+            async with case.sessions() as session:
+                single = await transport.serve_custom_import_detail(single_request, session)
+                assert not session.in_transaction()
+            assert single.status == 200
+            assert json.loads(single.body) == imported
 
 
 @asynccontextmanager

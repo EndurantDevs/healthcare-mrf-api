@@ -69,13 +69,15 @@ def _install(monkeypatch, session, imported=None, *, failure=None, finality_fail
         return await fixtures._resolved_target(same_session, target)
 
     class BatchHydrationService:
-        def __init__(self, *, authorizer):
+        def __init__(self, *, authorizer, grouped_detail_batch):
             self.authorizer = authorizer
+            self.grouped_detail_batch = grouped_detail_batch
 
         async def prepare_npi_entity_relation(self, same_session, *, authorization, target, query):
             assert same_session is session
             assert self.authorizer.authorize(authorization, target=target).value == "a" * 64
             assert query.require_match is False and query.filters == () and query.order_terms is None
+            assert self.grouped_detail_batch is (query.grouped_entity_selection is not None)
             session.events.append("prepare")
             return query
 
@@ -138,6 +140,39 @@ async def test_batch_reuses_authorized_hydration_and_preserves_order_absence_and
     assert imported_family["children"][0]["fields"][0]["value"] == 7
     assert reply.headers["cache-control"] == "private, no-store"
     assert session.events == ["begin", "snapshot", "bounded", "resolve", "prepare", "hydrate", "finality", "end"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("grouped_family", "size", "status"),
+    [
+        (False, 300 * 1024, 503),
+        (True, 300 * 1024, 200),
+        (True, 512 * 1024, 503),
+    ],
+)
+async def test_signed_detail_batch_wire_budget(monkeypatch, grouped_family, size, status):
+    session = _Session()
+    family = SimpleNamespace(
+        root_fields=(ReadFieldValue("payload", "string", "value", "a" * size),),
+        children=(),
+    )
+    body = _body()
+    if grouped_family:
+        family = EntityFamilySet(
+            None, "full_family", "period", 2024, (("segment_a", family),), ("segment_b",), "b" * 64, "c" * 64
+        )
+        body = _body(grouped_entity_selection=grouped.selection_document())
+    _install(monkeypatch, session, {_VALUES[1]: family})
+    reply = await batch.serve_custom_import_detail_batch(_request(body), session)
+    assert reply.status == status
+    if status == 200:
+        items = json.loads(reply.body)["items"]
+        assert [item["npi"] for item in items] == list(_VALUES)
+        assert items[0]["custom_import"] is None
+        assert items[1]["custom_import"]["families"][0]["root_fields"][0]["value"] == "a" * size
+    else:
+        assert b'"items"' not in reply.body and "finality" not in session.events
 
 
 @pytest.mark.asyncio

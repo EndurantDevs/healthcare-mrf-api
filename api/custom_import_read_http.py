@@ -29,6 +29,7 @@ from process.custom_import.failure_diagnostics import _failure_chain, _static_at
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_FAMILY_RESPONSE_BYTES,
+    MAX_GROUPED_DETAIL_RESPONSE_BYTES,
     CustomImportReadAuthorizationError,
     CustomImportReadCursorError,
     CustomImportReadEntityAbsentError,
@@ -1082,7 +1083,7 @@ async def _serve_grouped_detail(session, parsed, verified):
         except CustomImportReadEntityAbsentError:
             return _error(404, detail=_ENTITY_ABSENT_ERROR)
         encoded = orjson.dumps(_detail_payload(detail, parsed.target))
-        if len(encoded) > _MAX_RESPONSE_BYTES:
+        if len(encoded) > MAX_GROUPED_DETAIL_RESPONSE_BYTES:
             raise CustomImportReadUnavailableError("custom import response exceeds the bound")
         return _response(encoded, 200)
 
