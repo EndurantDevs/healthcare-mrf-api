@@ -10,7 +10,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 
 from process.delta_dental_directory_capture import MAX_PAGE_BYTES, NETWORK_LABELS, RESULT_CAP, FinderSearch
-from process.delta_dental_directory_json import SOURCE_ID, _office_card
+from process.delta_dental_directory_json import SOURCE_ID, _office_card, canonical_office_zip
 
 _PLAN_NET = "http://hl7.org/fhir/us/davinci-pdex-plan-net/StructureDefinition/"
 _SOURCE = f"urn:{SOURCE_ID}:"
@@ -43,11 +43,11 @@ _STAGE = """
 CREATE TEMP TABLE windows (
     selector TEXT, zip TEXT, radius REAL, PRIMARY KEY(selector, zip, radius)
 ) WITHOUT ROWID;
-CREATE TEMP TABLE office (id TEXT PRIMARY KEY, address TEXT) WITHOUT ROWID;
+CREATE TEMP TABLE office (id TEXT PRIMARY KEY, office_number TEXT, address TEXT) WITHOUT ROWID;
 CREATE TEMP TABLE relation (id TEXT PRIMARY KEY, npi TEXT, office_id TEXT) WITHOUT ROWID;
 CREATE TEMP TABLE membership (id TEXT, product TEXT, PRIMARY KEY(id, product)) WITHOUT ROWID;
 CREATE TEMP VIEW positive AS
-SELECT relation.id, npi, office_id, address, membership.product
+SELECT relation.id, npi, office_id, office_number, address, membership.product
 FROM relation JOIN office ON office_id = office.id JOIN membership ON relation.id = membership.id
 WHERE npi IS NOT NULL AND address IS NOT NULL;
 """
@@ -113,6 +113,10 @@ def _structured_address(record):
         if not isinstance(raw, str) or not raw.strip() or len(raw) > 512 or not raw.isprintable():
             return None
         address_by_field[field] = raw.strip()
+    postal = canonical_office_zip(address_by_field["postalCode"])
+    if postal is None:
+        return None
+    address_by_field["postalCode"] = postal
     lines = [address_by_field.pop("first")]
     if unit := address_by_field.pop("second", None):
         lines.append(unit)
@@ -133,15 +137,17 @@ def _stage_record(connection, provider_office, products, counts):
     ):
         counts["unresolved_rows"] += 1
         return
+    office_identity = json.dumps((card.office_id, address), separators=(",", ":"))
+    office_id = hashlib.sha256(office_identity.encode()).hexdigest()[:48]
     connection.execute(
-        """INSERT INTO office VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET address=NULL
-        WHERE office.address IS NOT excluded.address""",
-        (card.office_id, address),
+        """INSERT INTO office VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET address=NULL
+        WHERE office.office_number IS NOT excluded.office_number OR office.address IS NOT excluded.address""",
+        (office_id, card.office_id, address),
     )
     connection.execute(
         """INSERT INTO relation VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET npi=NULL
         WHERE npi IS NOT excluded.npi OR office_id IS NOT excluded.office_id""",
-        (card.provider_office_id, card.practitioner_npi, card.office_id),
+        (card.provider_office_id, card.practitioner_npi, office_id),
     )
     if gaps:
         counts["malformed_product_rows"] += 1
@@ -216,11 +222,14 @@ def _stage_windows(connection, products, counts, digest, stop_requested):
 
 def _resources(connection):
     """Yield the same sorted normalized resource protocol as ordinary source producers."""
-    for office_id, address in connection.execute("SELECT DISTINCT office_id, address FROM positive ORDER BY office_id"):
+    for office_id, office_number, address in connection.execute(
+        "SELECT DISTINCT office_id, office_number, address FROM positive ORDER BY office_id"
+    ):
         yield {
             "resourceType": "Location",
             "id": f"delta-office-{office_id}",
             "identifier": [{"system": _SOURCE + "office-id", "value": office_id}],
+            "extension": [{"url": _SOURCE + "publisher-office-number", "valueString": office_number}],
             "address": json.loads(address),
         }
     for (product,) in connection.execute("SELECT DISTINCT product FROM positive ORDER BY product"):

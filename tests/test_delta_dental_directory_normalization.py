@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from datetime import date
 from types import SimpleNamespace
@@ -6,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from process.delta_dental_directory_capture import _create_capture_tables
-from process.delta_dental_directory_json import SOURCE_ID
-from process.delta_dental_directory_normalization import normalized_delta_capture
+from process.delta_dental_directory_json import SOURCE_ID, _office_card
+from process.delta_dental_directory_normalization import _structured_address, normalized_delta_capture
 from process.provider_directory_fhir import parse_fhir_resource
 
 _EDITION = "a" * 64
@@ -16,7 +17,7 @@ _PREMIER = "Delta Dental Premier"
 _LINEAGE = "root-synthetic"
 
 
-def _office(relation=11, office=100, unit="Unit 3", npi="1234567893", products=(_PPO,)):
+def _office(relation=11, office=100, unit="Unit 3", npi="1234567893", products=(_PPO,), *, postal="00123"):
     return {
         "providerServiceOfficeId": relation,
         "providerNPI": npi,
@@ -28,7 +29,7 @@ def _office(relation=11, office=100, unit="Unit 3", npi="1234567893", products=(
                 "streetAddressLine2": unit,
                 "city": "Example",
                 "stateType": "MI",
-                "zipCode": "00123",
+                "zipCode": postal,
             },
         },
         "products": [{"productType": value} for value in products],
@@ -48,13 +49,13 @@ def _capture(tmp_path):
             ],
         )
         first_records = [
-            _office(products=(_PPO, _PREMIER)),
-            _office(relation=12, office=200, unit="Unit 4"),
+            _office(products=(_PPO, _PREMIER), postal="001234567"),
+            _office(relation=12, office=100, unit="Unit 4"),
             _office(relation=13, office=300),
             _office(relation=14, office=400, npi="1234567890"),
             _office(relation=15, office=500, products=("Unknown product", f"{_PPO} ")),
         ]
-        second_records = [_office(), _office(relation=13, office=300, unit="Different unit")] * 50
+        second_records = [_office(postal="00123-4567"), _office(relation=13, office=300, unit="Different unit")] * 50
         connection.executemany(
             "INSERT INTO finder_page VALUES (?, ?, 30, 1, ?)",
             [
@@ -68,6 +69,17 @@ def _capture(tmp_path):
         )
         connection.execute("INSERT INTO finder_gap VALUES (?, ?, 30, ?)", (_PPO, "00125", "example_gap"))
     return database
+
+
+@pytest.mark.parametrize(
+    "postal", ["00123456", "0012345678", "00123-456", "00123 4567", "００１２３４５６７", 123456789]
+)
+def test_office_rejects_malformed_postal_codes(postal):
+    """Malformed ZIPs cannot become addresses in capture or reviewed output."""
+    office_by_field = _office(postal=postal)
+    card, _gaps = _office_card(office_by_field)
+    assert card.address is None
+    assert _structured_address(office_by_field) is None
 
 
 def test_source_resources_are_deterministic_positive_observations(tmp_path):
@@ -88,18 +100,77 @@ def test_source_resources_are_deterministic_positive_observations(tmp_path):
     assert proof["deduplicated_memberships"] == 100
     resources_by_key = {(resource["resourceType"], resource["id"]): resource for resource in resources}
     assert list(resources_by_key) == sorted(resources_by_key)
-    assert resources_by_key["Location", "delta-office-100"]["address"]["line"] == ["1 Example Way", "Unit 3"]
+    office_by_suite = {
+        resource["address"]["line"][1]: resource for resource in resources if resource["resourceType"] == "Location"
+    }
+    first_office = office_by_suite["Unit 3"]
+    second_office = office_by_suite["Unit 4"]
+    first_office_key = "Location", first_office["id"]
+    assert re.fullmatch(r"delta-office-[0-9a-f]{48}", first_office["id"])
+    for office in (first_office, second_office):
+        assert office["identifier"] == [
+            {"system": f"urn:{SOURCE_ID}:office-id", "value": office["id"].removeprefix("delta-office-")}
+        ]
+        assert office["extension"] == [{"url": f"urn:{SOURCE_ID}:publisher-office-number", "valueString": "100"}]
+    assert first_office["identifier"] != second_office["identifier"]
+    assert first_office["address"]["line"] == ["1 Example Way", "Unit 3"]
+    assert first_office["address"]["postalCode"] == "00123-4567"
+    assert second_office["address"]["postalCode"] == "00123"
     assert len(resources_by_key["PractitionerRole", "delta-role-11"]["extension"]) == 2
     assert len(resources_by_key["PractitionerRole", "delta-role-12"]["extension"]) == 1
     parsed_rows_by_key = {
         key: parse_fhir_resource(SOURCE_ID, resource)[1] for key, resource in resources_by_key.items()
     }
-    assert parsed_rows_by_key["Location", "delta-office-100"]["second_line"] == "Unit 3"
-    assert parsed_rows_by_key["Location", "delta-office-100"]["country_code"] == "US"
+    assert parsed_rows_by_key[first_office_key]["second_line"] == "Unit 3"
+    assert parsed_rows_by_key[first_office_key]["country_code"] == "US"
     assert parsed_rows_by_key["Practitioner", "delta-npi-1234567893"]["npi"] == 1234567893
     role = parsed_rows_by_key["PractitionerRole", "delta-role-11"]
-    assert role["location_refs"] == ["Location/delta-office-100"]
+    assert role["location_refs"] == [f"Location/{first_office['id']}"]
     assert role["network_refs"] == ["Organization/delta-network-ppo", "Organization/delta-network-premier"]
+
+
+def test_role_identity_quarantines_conflicting_observations(tmp_path):
+    """Keep distinct offices and reject role-ID reuse across a site or NPI change."""
+    database = _capture(tmp_path)
+    different_street = _office(relation=13)
+    different_street["serviceOffice"]["location"]["streetAddress"] = "2 Example Way"
+    consistent_records = [
+        _office(relation=11),
+        _office(relation=12, office=200),
+        different_street,
+    ]
+    conflicting_records = [
+        _office(relation=14),
+        _office(relation=14, npi="1234567802", products=(_PREMIER,)),
+        _office(relation=15),
+        _office(relation=15, unit="Unit 5", products=(_PREMIER,)),
+        _office(relation=14),
+        _office(relation=15),
+    ]
+    options_by_name = {"edition": _EDITION, "lineage": _LINEAGE, "reviewed_products": frozenset({_PPO, _PREMIER})}
+    resource_sets = []
+    for ordered_records in (
+        consistent_records + conflicting_records,
+        list(reversed(consistent_records + conflicting_records)),
+    ):
+        with sqlite3.connect(database) as connection:
+            connection.execute("DELETE FROM finder_page")
+            connection.execute(
+                "INSERT INTO finder_page VALUES (?, '00123', 30, 1, ?)",
+                (_PPO, json.dumps({"providerResults": ordered_records}).encode()),
+            )
+        with normalized_delta_capture(database, **options_by_name) as capture:
+            resource_sets.append(list(capture.iter_resources()))
+            assert capture.proof["conflicting_memberships"] == 4
+    resources, reordered_resources = resource_sets
+    assert resources == reordered_resources
+    locations_by_reference = {
+        f"Location/{resource['id']}": resource for resource in resources if resource["resourceType"] == "Location"
+    }
+    roles_by_id = {resource["id"]: resource for resource in resources if resource["resourceType"] == "PractitionerRole"}
+    assert len(locations_by_reference) == 3
+    assert set(roles_by_id) == {"delta-role-11", "delta-role-12", "delta-role-13"}
+    assert set(locations_by_reference) == {role["location"][0]["reference"] for role in roles_by_id.values()}
 
 
 @pytest.mark.parametrize("invalid_kind", ["html", "additional_page", "mixed_edition"])
@@ -125,13 +196,19 @@ def test_cumulative_lineages_keep_positive_roles_and_deduplicate_windows(tmp_pat
             (json.dumps([_EDITION, [[_PPO, "00123", 30], [_PPO, "00126", 30]]]),),
         )
     with normalized_delta_capture(
+        database, edition=_EDITION, lineage=_LINEAGE, reviewed_products=frozenset({_PPO})
+    ) as first_capture:
+        prior_ids = {resource["id"] for resource in first_capture.iter_resources()}
+    with normalized_delta_capture(
         database, edition=_EDITION, lineage=(_LINEAGE, "other-synthetic"), reviewed_products=frozenset({_PPO})
     ) as capture:
         assert capture.proof["planned_windows"] == 4
         assert capture.proof["observed_windows"] == 3
         assert capture.proof["publisher_rows"] == 106
         assert capture.resource_counts["PractitionerRole"] == 3
-        assert "delta-role-19" in {resource["id"] for resource in capture.iter_resources()}
+        expanded_ids = {resource["id"] for resource in capture.iter_resources()}
+        assert prior_ids < expanded_ids
+        assert "delta-role-19" in expanded_ids
 
 
 def test_catalog_admits_only_exact_delta_positive_scope(tmp_path):

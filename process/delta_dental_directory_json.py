@@ -57,6 +57,14 @@ def _text(value):
     return None
 
 
+def canonical_office_zip(value):
+    """Keep ZIP5 and spell either ZIP+4 format with a hyphen."""
+    postal = _text(value)
+    if re.fullmatch(r"[0-9]{9}", postal or ""):
+        return f"{postal[:5]}-{postal[5:]}"
+    return postal if re.fullmatch(r"[0-9]{5}(?:-[0-9]{4})?", postal or "") else None
+
+
 def _address(office):
     location = office.get("location")
     if not isinstance(location, dict):
@@ -64,13 +72,8 @@ def _address(office):
     street = _text(location.get("streetAddress"))
     city = _text(location.get("city"))
     state = _text(location.get("stateType"))
-    postal = _text(location.get("zipCode"))
-    if (
-        not street
-        or not city
-        or not re.fullmatch("[A-Z]{2}", state or "")
-        or not re.fullmatch(r"[0-9]{5}(?:-[0-9]{4})?", postal or "")
-    ):
+    postal = canonical_office_zip(location.get("zipCode"))
+    if not street or not city or not re.fullmatch("[A-Z]{2}", state or "") or not postal:
         return None
     second_line = _text(location.get("streetAddressLine2"))
     return ", ".join(part for part in (street, second_line, city, f"{state} {postal}") if part)
