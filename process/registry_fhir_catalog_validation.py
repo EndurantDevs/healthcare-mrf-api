@@ -260,7 +260,7 @@ _SET_SQL = """WITH vector AS (
  ) m
  LEFT JOIN {namespace}.registry_fhir_catalog_source s ON s.source_generation=m.matched_generation
  LEFT JOIN vector v ON v.source_generation=m.matched_generation
-), relationship_bindings AS MATERIALIZED (
+), relationship_bindings AS NOT MATERIALIZED (
  SELECT metadata_generation,network_id,binding_id,source_id,matched_generation,is_native,is_product,is_tier,
    document_json->>'source_key' AS source_key,document_json->'source_scope'->>'insurance_plan_id' AS insurance_plan_id
  FROM source_bindings
@@ -271,7 +271,13 @@ SELECT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_network n
  WHERE i.network_id IS NULL OR n.metadata_generation<>$1
    OR n.archived IS DISTINCT FROM coalesce((a.record_json->>'archived')::boolean,false))
 OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
- LEFT JOIN relationship_bindings b USING(metadata_generation,network_id,binding_id,source_id)
+ LEFT JOIN LATERAL (
+   SELECT candidate.* FROM relationship_bindings candidate
+   WHERE candidate.metadata_generation=r.metadata_generation AND candidate.binding_id=r.binding_id
+     AND candidate.network_id=r.network_id AND candidate.source_id=r.source_id
+   -- Probe one binding key so a batched hash cannot spill the wide relationship input.
+   OFFSET 0
+ ) b ON true
  WHERE NOT coalesce((SELECT true FROM {namespace}.registry_fhir_catalog_network n
    WHERE n.metadata_generation=r.metadata_generation AND n.network_id=r.network_id LIMIT 1),false)
    OR r.metadata_generation<>$1
