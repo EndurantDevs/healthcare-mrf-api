@@ -41,6 +41,7 @@ from process.ptg_parts.frozen_rate_privacy import (
     project_frozen_status_event,
 )
 from process.redis_config import build_redis_settings
+from process.registry_network_import_progress import NetworkImportFailure
 
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 _CONTROL_RUN_MARKED = True
@@ -444,11 +445,13 @@ async def control_single_job_start(
             target_module=target_module,
         )
         if committed_result is None:
+            progress = exc.progress if isinstance(exc, NetworkImportFailure) else {}
             await mark_control_run(
                 run_id,
                 status="failed",
-                phase_detail=f"{target_function} failed",
-                progress_message="failed",
+                phase_detail=progress.get("phase", f"{target_function} failed"),
+                progress_message=progress.get("message", "failed"),
+                progress=progress or None,
                 error=_control_failure_error(exc),
                 metrics=_terminal_metrics_from_context(ctx.get("context")),
                 attempt_id=attempt_id,

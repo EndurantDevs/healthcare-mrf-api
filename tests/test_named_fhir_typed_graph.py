@@ -261,6 +261,48 @@ async def test_copied_legacy_typed_reference_keeps_catalog_generation_without_da
         )
 
 
+@pytest.mark.parametrize("mode", ["frozen", "missing", "changed", "unfrozen", "explicit"])
+async def test_mapped_capture_rebind_reads_content_only_outside_frozen_inventory(monkeypatch, mode):
+    import json
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+
+    from process import network_fhir_typed_capture as captures
+    from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
+    from process.registry_source_recipe_composition import RegistrySourceRecipeStage
+    from process.registry_source_recipe_store import decode_registry_source_recipes
+    from process.registry_typed_source_stage import TypedOfficeMatches, rebind_typed_producer_stage
+
+    stored, generation = _legacy_typed_recipe()
+    (recipe,) = decode_registry_source_recipes([stored])
+    pin = recipe.source_pin
+    comment = stored["source_pin"]["capture"]
+    if mode == "changed":
+        comment["content"]["pairs"]["sha256"] = "0" * 64
+    metadata = None if mode == "missing" else captures.LEGACY_COMMENT + json.dumps(comment)
+    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value=metadata))
+    full_read = AsyncMock(return_value=pin.capture["content"])
+    monkeypatch.setattr(captures, "_content", full_read)
+    read = await captures.load_typed_graph_capture(connection, pin.capture, expected_anchor=pin.anchor)
+    mapping = SimpleNamespace(source_stage=read, require_ready=Mock())
+    offices = TypedOfficeMatches("offices", "a" * 64, "b" * 64, None, (), (mapping,))
+    stage = RegistrySourceRecipeStage("members", 1, 0, "c" * 64, contribution_revision=4, office_matches=offices)
+    has_frozen_inventory = mode in {"frozen", "missing", "changed"}
+    scope = (
+        None
+        if mode == "explicit"
+        else PublishedFHIRCatalogBindingScope(generation, "d" * 64 if has_frozen_inventory else None)
+    )
+    outcome = {
+        "missing": pytest.raises(RuntimeError, match="reference_unavailable"),
+        "changed": pytest.raises(TypedFHIRGraphError, match="reference_context"),
+    }.get(mode, nullcontext())
+    with outcome:
+        await rebind_typed_producer_stage(connection, stage, catalog_bindings=scope)
+    assert connection.fetchval.await_count == int(has_frozen_inventory)
+    assert full_read.await_count == (1 if has_frozen_inventory else 2)
+
+
 @pytest.mark.parametrize("approved_generation_matches", [False, True])
 async def test_legacy_typed_mapping_uses_original_client_catalog_scope(monkeypatch, approved_generation_matches):
     from unittest.mock import AsyncMock

@@ -515,17 +515,39 @@ async def record_typed_source_offices(
     return receipt
 
 
-async def rebind_typed_producer_stage(connection, stage):
-    """Reload declared capture names and compare content in the producer copy transaction."""
-    from process.network_fhir_typed_capture import TypedGraphRead, load_typed_graph_capture
+async def rebind_typed_producer_stage(connection, stage, *, catalog_bindings=None):
+    """Reopen frozen editions used by the mapped workspace in the copy transaction."""
+    from process.network_fhir_typed_capture import (
+        TypedGraphRead,
+        load_typed_graph_capture,
+        resolve_typed_graph_capture_reference,
+        typed_capture_catalog_generation,
+    )
 
     require(is_typed_source_stage(stage), "stage_kind")
     require(connection.is_in_transaction(), "transaction_required")
     for mapping in stage.office_matches.mappings:
-        source = mapping.source_stage
-        require(type(source) is TypedGraphRead, "producer_rebind")
-        source.require_ready()
-        mapping.source_stage = await load_typed_graph_capture(connection, source.capture, expected_anchor=source.anchor)
+        source_read = mapping.source_stage
+        require(type(source_read) is TypedGraphRead, "producer_rebind")
+        source_read.require_ready()
+        if catalog_bindings is not None and catalog_bindings.prepared_inventory_token is not None:
+            try:
+                capture = await resolve_typed_graph_capture_reference(
+                    connection,
+                    expected_anchor=source_read.anchor,
+                    capture_sha256=source_read.capture["capture_sha256"],
+                    catalog_generation=typed_capture_catalog_generation(source_read.capture),
+                )
+            except ValueError as error:
+                if str(error) == "registry_fhir_typed_reference_metadata":
+                    # A capture lost between transactions leaves its publication request retryable.
+                    raise RuntimeError("registry_fhir_typed_reference_unavailable") from error
+                raise
+            require(capture == source_read.capture, "reference_context")
+        else:
+            mapping.source_stage = await load_typed_graph_capture(
+                connection, source_read.capture, expected_anchor=source_read.anchor
+            )
         mapping.require_ready()
 
 

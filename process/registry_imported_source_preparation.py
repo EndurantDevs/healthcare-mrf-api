@@ -26,6 +26,7 @@ from process.registry_imported_source_reuse import (
     is_compatible_typed_recipe,
     predecessor_recipes,
 )
+from process.registry_network_import_progress import NETWORK_PROGRESS, network_import_stage
 from process.registry_source_recipe_composition import SourceWitnessRuntime
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -207,6 +208,10 @@ async def _cancel_capture_workers(workers):
 async def _prepare_fhir_recipes(capture_transaction, runtime, descriptors, observed_at, previous):
     """Use one genuine export per worker and return recipes in the pinned inventory order."""
     eligible_descriptors = [descriptor for descriptor in descriptors if not is_practitioner_enrichment(descriptor)]
+    progress = NETWORK_PROGRESS.get()
+    if progress is not None:
+        progress.total = len(eligible_descriptors)
+        await network_import_stage("FHIR graph capture")
     indexed_descriptors = list(enumerate(eligible_descriptors))
     exports = runtime.capture_source_exports or (runtime.source_export,)
     if len(exports) > 1:
@@ -223,9 +228,17 @@ async def _prepare_fhir_recipes(capture_transaction, runtime, descriptors, obser
                 recipes_by_index[index] = await _capture_or_reuse_fhir(
                     capture_transaction, capture_runtime, descriptor, observed_at, previous
                 )
-            except BaseException:
+            except BaseException as error:
                 pending_descriptors.clear()
+                if progress is not None and isinstance(error, Exception):
+                    progress.source_failed(index, descriptor, error)
                 raise
+            if progress is not None:
+                if recipes_by_index[index][1]:
+                    progress.committed += 1
+                else:
+                    progress.reused += 1
+                await progress.emit()
 
     if len(exports) == 1:
         await capture_worker(exports[0])
@@ -266,9 +279,11 @@ async def prepare_imported_source_recipes(capture_transaction, *, request_id, en
         observed_at = canonical_timestamp(await connection.fetchval("SELECT transaction_timestamp()"))
 
     fhir_recipes = await _prepare_fhir_recipes(capture_transaction, source_runtime, descriptors, observed_at, previous)
+    await network_import_stage("Native source preparation")
     native_recipes = await _prepare_native_recipes(capture_transaction, source_runtime, generation, previous)
     recipes, created, reused = [], [], []
     for recipe, is_new in (*fhir_recipes, *native_recipes):
         recipes.append(recipe)
         (created if is_new else reused).append(recipe.source_pin.capture["schema_name"])
+    await network_import_stage("Membership publication")
     return ImportedSourcePreparation(tuple(recipes), tuple(created), tuple(reused))
