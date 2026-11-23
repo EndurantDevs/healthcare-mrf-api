@@ -239,10 +239,11 @@ async def prepare_imported_catalog_snapshot(config, loader, source_pool, sealer_
     finally:
         _INVENTORY.reset(token)
     prepared = previous if snapshot is None else snapshot
-    if prepared is None or prepared["accounting_json"].get(INPUT_KEY, {}).get("token") != inventory.token:
+    token = inventory.at_date(accounting.get("resumed_snapshot_as_of", inventory.effective_date)).token
+    if prepared is None or prepared["accounting_json"].get(INPUT_KEY, {}).get("token") != token:
         raise ValueError("registry_imported_catalog_preparation_changed")
     return ImportedCatalogPreparation(
-        inventory.token, prepared["metadata_generation"], prepared["schema_name"], prepared, previous, accounting
+        token, prepared["metadata_generation"], prepared["schema_name"], prepared, previous, accounting
     )
 
 

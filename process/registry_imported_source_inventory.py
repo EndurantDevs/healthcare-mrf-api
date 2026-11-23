@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from functools import cached_property
 from urllib.parse import urlsplit
 
 from asyncpg import InsufficientPrivilegeError, InvalidSchemaNameError, UndefinedTableError
@@ -135,6 +136,18 @@ class ImportedSourceInventory:
         """Decode a fresh complete metadata document."""
         return json.loads(self.document_json)
 
+    @cached_property
+    def effective_date(self):
+        """Expose the effective date after the worker chooses its catalog."""
+        return self.document["effective_date"]
+
+    def at_date(self, effective_date):
+        """Keep the observed inputs and use the given effective date."""
+        if effective_date == self.effective_date:
+            return self
+        document_by_field = {**self.document, "effective_date": effective_date}
+        return ImportedSourceInventory(json.dumps(document_by_field, sort_keys=True, separators=(",", ":")))
+
     @property
     def token(self):
         """Bind logical source heads, effective date and transformation policies."""
@@ -210,7 +223,7 @@ def current_imported_effective_date(fallback=None):
     """Keep one ordinary run's policy date while direct callers retain their observed-date default."""
     runtime = _RUNTIME.get()
     if runtime is not None:
-        return runtime.effective_date
+        return runtime.observed[0].effective_date if runtime.observed else runtime.effective_date
     return fallback if fallback is not None else datetime.now(timezone.utc).date().isoformat()
 
 

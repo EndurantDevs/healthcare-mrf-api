@@ -170,7 +170,10 @@ async def prepare_network_import_catalog(catalog, runtime, cleanup):
                 source_export=runtime.catalog_export,
                 inventory=inventory,
             )
-            return await _finish_import_catalog(catalog, runtime, prepared, sealer_pool)
+            finished = await _finish_import_catalog(catalog, runtime, prepared, sealer_pool)
+            if finished.inventory_token != inventory.token:
+                runtime.inventory.observed[0] = inventory.at_date(finished.snapshot["as_of"].isoformat())
+            return finished
         finally:
             await loader.execute("SELECT pg_advisory_unlock(hashtextextended($1,0))", key)
 

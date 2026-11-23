@@ -393,6 +393,7 @@ async def _stage_catalog_candidate(config, loader, source_reads, staged, disposi
         config.grant,
         snapshot["metadata_generation"],
         expected_snapshot=snapshot,
+        imported_inventory=imported_inventory,
         previous_generation=None if previous is None else previous["metadata_generation"],
     )
     if retained is not None:
@@ -691,7 +692,26 @@ def _validate_catalog_sources(accepted, previous):
         raise ValueError("registry_fhir_catalog_duplicate_source_profile")
 
 
-async def _reusable_catalog_snapshot(loader, grant, generation, *, expected_snapshot=None, previous_generation=None):
+def _is_pending_catalog_reusable(pending, expected, imported_inventory):
+    if imported_inventory is not None:
+        from process.registry_imported_catalog_preparation import imported_catalog_accounting
+
+        dated = imported_inventory.at_date(pending["as_of"].isoformat())
+        expected_by_field = {
+            **expected,
+            "as_of": pending["as_of"],
+            "accounting_json": imported_catalog_accounting(dated),
+        }
+        return metadata_generation(expected_by_field) == pending["metadata_generation"]
+    expected_inputs, pending_inputs = snapshot_inputs(expected), snapshot_inputs(pending)
+    expected_inputs.pop("as_of")
+    pending_inputs.pop("as_of")
+    return pending_inputs == expected_inputs
+
+
+async def _reusable_catalog_snapshot(
+    loader, grant, generation, *, expected_snapshot=None, previous_generation=None, imported_inventory=None
+):
     if generation is None:
         return None
     control = storage_identifier(grant.control_schema)
@@ -713,13 +733,10 @@ async def _reusable_catalog_snapshot(loader, grant, generation, *, expected_snap
         )
         if pending is not None:
             preparation = catalog_snapshot_preparation(pending)
-            expected_inputs, pending_inputs = snapshot_inputs(expected_snapshot), snapshot_inputs(pending)
-            expected_inputs.pop("as_of")
-            pending_inputs.pop("as_of")
             if (
                 preparation is not None
                 and preparation["previous_metadata_generation"] == previous_generation
-                and pending_inputs == expected_inputs
+                and _is_pending_catalog_reusable(pending, expected_snapshot, imported_inventory)
             ):
                 if metadata_generation(pending) != pending["metadata_generation"]:
                     raise ValueError("registry_fhir_catalog_preparation_inputs_changed")

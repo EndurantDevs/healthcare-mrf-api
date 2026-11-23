@@ -325,15 +325,18 @@ def _expected():
 
 
 @pytest.mark.parametrize("original", ["on", "off"])
-@pytest.mark.parametrize("readonly", [False, True])
-async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connection, original, readonly):
+@pytest.mark.parametrize(("readonly", "prepared"), [(False, False), (True, False), (False, True)])
+async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connection, original, readonly, prepared):
     connection, _admin = planner_connection
     stage, selected = await _fixture(connection)
     await connection.execute("SELECT set_config('enable_nestloop',$1,false)", original)
     async with connection.transaction(isolation="repeatable_read", readonly=readonly):
         nested = "off" if original == "on" else "on"
         await connection.execute("SELECT set_config('enable_nestloop',$1,true)", nested)
-        totals = await mapping._map_pair_rows(connection, stage, selected, _BINDINGS, _ARGUMENTS)
+        bindings, arguments = _BINDINGS, _ARGUMENTS
+        if prepared:
+            bindings, arguments = await mapping._prepare_mapping_bindings(connection, bindings, arguments)
+        totals = await mapping._map_pair_rows(connection, stage, selected, bindings, arguments)
         expected_totals, expected_rows = _expected()
         assert totals == expected_totals
         await mapping._require_mapping_counts(connection, stage, selected, totals)
@@ -346,6 +349,8 @@ async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connecti
         assert await connection.fetchval("SHOW enable_nestloop") == nested
         assert await connection.fetchval("SHOW transaction_read_only") == ("on" if readonly else "off")
     assert await connection.fetchval("SHOW enable_nestloop") == original
+    if prepared:
+        assert await connection.fetchval("SELECT to_regclass($1)", bindings.relation) is None
 
 
 async def test_pair_plan_duplicate_bindings_still_fail_count_closure_and_rollback(planner_connection):
