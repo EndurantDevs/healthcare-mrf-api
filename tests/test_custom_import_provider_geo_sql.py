@@ -173,6 +173,29 @@ def test_imported_geo_without_order_keeps_membership_as_a_subplan():
     assert str(statements.page).count(membership) == 1
 
 
+@pytest.mark.parametrize("scenario", ("required", "optional", "ranked", "linked", "legacy", "all_taxonomies"))
+def test_imported_geo_defers_taxonomy_index_for_required_unordered_primary_search(scenario):
+    query = _imported_geo_query()
+    nearby = replace(
+        query.nearby,
+        primary_only=scenario != "all_taxonomies",
+        use_taxonomy_filter=True,
+        search_table_sql="mrf.fixture_geo_projection" if scenario != "legacy" else None,
+        search_provider_facts=scenario != "legacy",
+    )
+    statements = geo_sql.build_imported_geo_statements(
+        _context(direction="asc" if scenario in {"optional", "ranked"} else None, require_match=scenario != "optional"),
+        replace(query, nearby=nearby, cursor_anchor=("1000000002", _SECOND_ADDRESS_KEY)),
+        plan_member_sql="SELECT npi FROM mrf.fixture_plan_members" if scenario == "linked" else None,
+    )
+    overlap = "a.taxonomy_array && (SELECT ARRAY_AGG(int_code) FROM mrf.nucc_taxonomy WHERE 1=1)"
+    expected = f"COALESCE({overlap}, FALSE)" if scenario == "required" else overlap
+    for statement in (statements.count, statements.anchor, statements.page):
+        assert f"AND {expected}" in str(statement)
+        if scenario == "required":
+            assert "AND a.primary_taxonomy_codes &&" in str(statement)
+
+
 def test_geo_score_scope_uses_every_native_provider():
     scope = geo_sql.native_geo_entity_scope()
 

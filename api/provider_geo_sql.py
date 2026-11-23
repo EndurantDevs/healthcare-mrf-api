@@ -222,7 +222,13 @@ def _common_ctes(
         projected_plan_membership = plan_member_sql
         non_plan_clause, _ = nearby_extra_clauses(extra_filters, None, 0)
         nearby = replace(nearby, extra_clause=non_plan_clause)
-    native_cte = _native_eligible_geo_cte(nearby, projected_plan_membership=projected_plan_membership)
+    native_cte = _native_eligible_geo_cte(
+        nearby,
+        projected_plan_membership=projected_plan_membership,
+        spatial_first=plan_member_sql is None
+        and import_context.require_match
+        and not import_context.prepared.normalized_order_terms,
+    )
     materialization = " MATERIALIZED" if import_context.require_match else ""
     relation_cte = f"{_IMPORT_RELATION} AS{materialization} ({import_context.compiled.sql})"
     eligible_cte = (
@@ -240,9 +246,11 @@ def native_geo_entity_scope():
     return select(native_geo.c.npi_code).distinct()
 
 
-def _native_eligible_geo_cte(nearby: NearbySqlQuery, *, projected_plan_membership: str | None = None) -> str:
+def _native_eligible_geo_cte(
+    nearby: NearbySqlQuery, *, projected_plan_membership: str | None = None, spatial_first: bool = False
+) -> str:
     on_search = bool(nearby.search_table_sql)
-    taxonomy_where = _taxonomy_filter_where(nearby, on_search=on_search)
+    taxonomy_where = _taxonomy_filter_where(nearby, on_search=on_search, spatial_first=spatial_first)
     npi_column, npi_join = _search_npi_source(nearby) if on_search else _LIVE_NPI_SOURCE
     row_keys = _address_row_key_columns(nearby.address_table_sql)
     address_key_columns = ",\n           ".join(f"a.{column} AS _geo_address_{column}" for column in row_keys)
@@ -339,13 +347,18 @@ def _selected_geo_cte(import_context: ProviderImportQuery) -> str:
     )
 
 
-def _taxonomy_filter_where(nearby: NearbySqlQuery, *, on_search: bool = False) -> str:
+def _taxonomy_filter_where(nearby: NearbySqlQuery, *, on_search: bool = False, spatial_first: bool = False) -> str:
     if not nearby.use_taxonomy_filter:
         return ""
-    # Uncorrelated subqueries run once as init plans, so the geo/taxonomy index can stop after one page.
+    # The uncorrelated taxonomy lookup runs once as an init plan.
     taxonomy_int_codes = f"(SELECT ARRAY_AGG(int_code) FROM mrf.nucc_taxonomy WHERE {nearby.taxonomy_conditions})"
-    taxonomy_where = f"\n       AND a.taxonomy_array && {taxonomy_int_codes}"
-    if nearby.primary_only and on_search and nearby.search_provider_facts:
+    taxonomy_match = f"a.taxonomy_array && {taxonomy_int_codes}"
+    typed_primary = nearby.primary_only and on_search and nearby.search_provider_facts
+    if spatial_first and typed_primary:
+        # Exact totals visit the whole radius. Keep overlap as a filter so the smaller spatial index can be used.
+        taxonomy_match = f"COALESCE({taxonomy_match}, FALSE)"
+    taxonomy_where = f"\n       AND {taxonomy_match}"
+    if typed_primary:
         taxonomy_where += (
             "\n       AND a.primary_taxonomy_codes && "
             f"ARRAY(SELECT CAST(code AS text) FROM mrf.nucc_taxonomy WHERE {nearby.taxonomy_conditions})"
