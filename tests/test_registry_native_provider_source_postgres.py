@@ -173,18 +173,24 @@ async def test_imported_native_preparation_reuses_the_exact_completed_capture(
     runtime = SimpleNamespace(catalog_bindings=scope, capture_owner_role=case.fixture.loader, runtime_roles=())
     monkeypatch.setattr(inventory, "current_imported_source_inventory", AsyncMock(return_value=selected_inventory))
 
-    async with case.writer.transaction():
-        assert await _prepare_native_recipes(case.writer, runtime, selected_inventory.token, (case.recipe,)) == (
-            (case.recipe, False),
+    @asynccontextmanager
+    async def capture_transaction():
+        async with case.writer.transaction():
+            yield case.writer
+
+    assert await _prepare_native_recipes(capture_transaction, runtime, selected_inventory.token, (case.recipe,)) == (
+        (case.recipe, False),
+    )
+    assert await _prepare_native_recipes(capture_transaction, runtime, selected_inventory.token, ()) == (
+        (case.recipe, False),
+    )
+    with pytest.raises(ValueError, match="catalog_changed"):
+        await _prepare_native_recipes(capture_transaction, runtime, "f" * 64, (case.recipe,))
+    with pytest.raises(ValueError, match="predecessor_ambiguous"):
+        await _prepare_native_recipes(
+            capture_transaction, runtime, selected_inventory.token, (case.recipe, case.recipe)
         )
-        assert await _prepare_native_recipes(case.writer, runtime, selected_inventory.token, ()) == (
-            (case.recipe, False),
-        )
-        with pytest.raises(ValueError, match="catalog_changed"):
-            await _prepare_native_recipes(case.writer, runtime, "f" * 64, (case.recipe,))
-        with pytest.raises(ValueError, match="predecessor_ambiguous"):
-            await _prepare_native_recipes(case.writer, runtime, selected_inventory.token, (case.recipe, case.recipe))
-        await providers.require_native_provider_capture(case.writer, case.recipe.source_pin)
+    await providers.require_native_provider_capture(case.writer, case.recipe.source_pin)
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -204,12 +205,57 @@ def test_practitioner_enrichment_does_not_replace_or_become_a_network_edition():
     assert inventory.select_fhir_editions([enrichment], [network]) == ([], [network])
 
 
+def test_catalog_keeps_distinct_practitioner_enrichment_without_displacing_network():
+    uri = "https://directory.example.test/tenant"
+    network = edition("network", "endpoint-network", uri, 1, 10)
+    enrichment = edition("enrichment", "endpoint-enrichment", uri, 2, 20)
+    enrichment["coordinates"]["source_id"] = UHC_FLEX_PRACTITIONER_SOURCE_ID
+    enrichment["source_aliases"] = [UHC_FLEX_PRACTITIONER_SOURCE_ID]
+
+    select_catalog = partial(inventory.select_fhir_editions, include_practitioner_enrichment=True)
+    assert select_catalog([network, enrichment], ()) == ([network], [])
+    assert select_catalog([enrichment], [network]) == ([], [network])
+    assert select_catalog([network], [enrichment]) == ([network], [])
+
+    enrichment["source_uri"] = "https://directory.example.test/enrichment"
+    assert select_catalog([network, enrichment], ()) == ([enrichment, network], [])
+
+
 def test_current_feed_retires_typed_predecessor_from_a_different_registration():
     previous = _recipe()
     descriptor = previous.source_pin.catalog_descriptor
     winner = edition("winner", "another-registration", descriptor["source_uri"], 2, 20)
     observed = SimpleNamespace(fhir_descriptors=(winner,), carried_fhir_descriptors=(), superseded_fhir_endpoints=())
     assert inventory.retained_unavailable_fhir_recipes([previous], observed) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_carried", [False, True])
+async def test_practitioner_enrichment_preserves_legacy_network_on_same_feed(is_carried):
+    previous = _recipe()
+    descriptor = previous.source_pin.catalog_descriptor
+    enrichment = edition("enrichment", "enrichment-registration", descriptor["source_uri"], 2, 20)
+    enrichment["coordinates"]["source_id"] = UHC_FLEX_PRACTITIONER_SOURCE_ID
+    enrichment["source_aliases"] = [UHC_FLEX_PRACTITIONER_SOURCE_ID]
+    observed = SimpleNamespace(
+        fhir_descriptors=() if is_carried else (enrichment,),
+        carried_fhir_descriptors=(enrichment,) if is_carried else (),
+        superseded_fhir_endpoints=(),
+    )
+    assert inventory.retained_unavailable_fhir_recipes([previous], observed) == (previous,)
+
+    connection = SimpleNamespace(
+        fetch=AsyncMock(return_value=[{"source_generation": "legacy", "descriptor": json.dumps(descriptor)}])
+    )
+    prior_catalog_by_field = {
+        "schema_name": "published_catalog",
+        "source_vector_json": [{"source_generation": "legacy", "status": "current"}],
+    }
+    catalog_token = catalog_preparation._INVENTORY.set(observed)
+    try:
+        assert await catalog_preparation.replaced_fhir_generations(connection, prior_catalog_by_field, ()) == ()
+    finally:
+        catalog_preparation._INVENTORY.reset(catalog_token)
 
 
 @pytest.mark.asyncio

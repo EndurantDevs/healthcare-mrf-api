@@ -238,6 +238,34 @@ async def test_installer_owns_original_factory_without_opening_a_capture(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_ordinary_capture_owns_four_independent_source_exports(monkeypatch):
+    active_exports = []
+    closed_exports = []
+
+    @asynccontextmanager
+    async def source_factory():
+        """Open a distinct export and check that each owner is closed."""
+        source_export = Mock()
+        active_exports.append(source_export)
+        try:
+            yield source_export
+        finally:
+            closed_exports.append(source_export)
+
+    module = ModuleType("directory_membership_runtime")
+    module.membership_source_export_runtime = source_factory
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    async with AsyncExitStack() as stack:
+        installed = await install_source_witness_runtime(_config(), stack, parallel_captures=True)
+        runtime = installed.initial_address_sources.source_witness_runtime
+        assert len(set(active_exports)) == 4
+        assert runtime.source_export is active_exports[0]
+        assert runtime.capture_source_exports == tuple(active_exports)
+        assert not closed_exports
+    assert closed_exports == list(reversed(active_exports))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("sampled", (False, True))
 async def test_installer_forwards_policy_only_for_explicit_server_mode(monkeypatch, sampled):
     events = []

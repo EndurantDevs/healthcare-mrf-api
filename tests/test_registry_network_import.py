@@ -384,9 +384,10 @@ def capture_preparation(monkeypatch):
         assert str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
         stage.repeatable_read = True
 
-    async def prepare(driver, **inputs):
-        assert driver is connection and stage.active and stage.repeatable_read
-        assert inputs["source_runtime"] is resolver.source_runtime and inputs["control_schema"] == "registry"
+    async def prepare(capture_transaction, **inputs):
+        async with capture_transaction() as driver:
+            assert driver is connection and stage.active and stage.repeatable_read
+            assert inputs["source_runtime"] is resolver.source_runtime and inputs["control_schema"] == "registry"
         return prepared_sources
 
     session = SimpleNamespace(begin=transaction, execute=execute)

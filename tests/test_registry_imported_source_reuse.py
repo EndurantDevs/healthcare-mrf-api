@@ -1,13 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Logical-edition reuse and committed metadata recovery never own retained cleanup."""
 
+import asyncio
 import json
 import os
 from copy import deepcopy
 from dataclasses import replace
 from time import perf_counter
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import asyncpg
@@ -17,19 +18,10 @@ from process import registry_imported_source_preparation as preparation
 from process import registry_imported_source_reuse as reuse
 from process.network_fhir_source_witness_contract import canonical, digest
 from process.network_fhir_typed_capture import COMPONENT, PREFIX
-from tests.test_registry_imported_source_preparation import prepare
+from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
+from tests.test_registry_imported_source_preparation import prepare, refresh_receipt
 from tests.test_registry_imported_source_preparation import prepared_case as prepared_case
 from tests.test_registry_typed_source_recipe import _recipe
-
-
-def refresh_receipt(descriptor):
-    from process.registry_fhir_catalog_observation import (
-        CATALOG_OBSERVATION_CONTRACT,
-        catalog_observation_descriptor_digest,
-    )
-
-    descriptor["accepted_receipt_sha256"] = catalog_observation_descriptor_digest(descriptor)
-    descriptor["accepted_receipt_id"] = CATALOG_OBSERVATION_CONTRACT + ":" + descriptor["accepted_receipt_sha256"]
 
 
 def add_source(case, source_id):
@@ -91,6 +83,84 @@ async def test_only_changed_source_opens_factory_and_creates_capture(prepared_ca
     ] == ["alias-c"]
 
 
+@pytest.mark.asyncio
+async def test_practitioner_enrichment_stays_in_catalog_without_graph(prepared_case):
+    case = prepared_case
+    enrichment = add_source(case, UHC_FLEX_PRACTITIONER_SOURCE_ID)
+    for family in enrichment["admission"]["families"].values():
+        family["rows"] = 0
+    refresh_receipt(enrichment)
+
+    result = await prepare(case)
+
+    assert enrichment in case.descriptors
+    assert [recipe.binding_coordinates.source_id for recipe in result.recipes] == [case.origin.source_id]
+    preparation.capture_typed_source_graph.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "refused", "canceled"])
+async def test_four_workers_keep_order_and_drain_pending_captures(prepared_case, monkeypatch, outcome):
+    """Keep source order and drain each active capture once on failure or cancellation."""
+    descriptors = [
+        {
+            "coordinates": {"source_id": f"source-{index}"},
+            "admission": {"publication": {"claimed_resource_count": index}},
+        }
+        for index in range(8)
+    ]
+    runtime = replace(prepared_case.runtime, capture_source_exports=tuple(Mock() for _ in range(4)))
+    capacity_reached, blocked = asyncio.Event(), asyncio.Event()
+    cleanup_started, allow_cleanup = asyncio.Event(), asyncio.Event()
+    active_exports = set()
+    started_sources = []
+
+    async def capture(_transaction, capture_runtime, descriptor, _observed_at, _previous):
+        """Simulate four independent exports, then finish or refuse the leading source."""
+        source_id = descriptor["coordinates"]["source_id"]
+        started_sources.append(source_id)
+        source_export = capture_runtime.source_export
+        assert source_export not in active_exports
+        active_exports.add(source_export)
+        if len(active_exports) == 4:
+            capacity_reached.set()
+        try:
+            await capacity_reached.wait()
+            if outcome == "refused" and source_id == "source-7":
+                raise ValueError("source refused")
+            if outcome != "completed":
+                await blocked.wait()
+            return source_id, True
+        finally:
+            if outcome == "canceled":
+                cleanup_started.set()
+                await allow_cleanup.wait()
+                assert asyncio.current_task().cancelling() == 1
+            active_exports.remove(source_export)
+
+    monkeypatch.setattr(preparation, "_capture_or_reuse_fhir", capture)
+    largest_source_ids = ["source-7", "source-6", "source-5", "source-4"]
+    async with asyncio.timeout(10):
+        prepare_fhir = preparation._prepare_fhir_recipes(None, runtime, descriptors, "2026-10-01", ())
+        if outcome == "refused":
+            with pytest.raises(ValueError, match="source refused"):
+                await prepare_fhir
+        elif outcome == "canceled":
+            capture_task = asyncio.create_task(prepare_fhir)
+            await capacity_reached.wait()
+            capture_task.cancel()
+            await cleanup_started.wait()
+            capture_task.cancel()
+            allow_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await capture_task
+        else:
+            prepared_recipes = await prepare_fhir
+            assert [source_id for source_id, _created in prepared_recipes] == [f"source-{index}" for index in range(8)]
+    assert (started_sources[:4] if outcome == "completed" else started_sources) == largest_source_ids
+    assert active_exports == set()
+
+
 def test_date_and_policy_invalidate_stable_source_name(monkeypatch):
     recipe = _recipe()
     descriptor = recipe.source_pin.catalog_descriptor
@@ -109,7 +179,7 @@ def test_source_semantic_date_remains_effective_across_later_requests():
 
 
 @pytest.mark.asyncio
-async def test_failed_new_source_batch_never_takes_retained_schema_cleanup(prepared_case, monkeypatch):
+async def test_failed_new_source_keeps_completed_and_predecessor_schemas(prepared_case, monkeypatch):
     case = prepared_case
     retained = _recipe()
     add_source(case, "alias-c")
@@ -118,7 +188,7 @@ async def test_failed_new_source_batch_never_takes_retained_schema_cleanup(prepa
     case.state["capture_failure"] = ValueError("source refusal")
     with pytest.raises(ValueError, match="source refusal"):
         await prepare(case)
-    assert case.schemas == []
+    assert case.schemas == [case.captured[0]["schema_name"]]
     assert retained.source_pin.capture["schema_name"] not in [
         PREFIX + arguments["capture_options"].expected_anchor.capture_id.replace("-", "")
         for kind, arguments in case.events
@@ -222,14 +292,12 @@ async def test_committed_preparation_recovers_after_new_connection_without_recap
     normalized_dsn = dsn.replace("postgresql+asyncpg://", "postgresql://")
     case.connection = await asyncpg.connect(normalized_dsn)
     try:
-        async with case.connection.transaction():
-            first = await prepare(case)
+        first = await prepare(case)
         await case.connection.close()
         case.connection = await asyncpg.connect(normalized_dsn)
         case.request_id = uuid4()
         case.events.clear()
-        async with case.connection.transaction():
-            recovered = await prepare(case)
+        recovered = await prepare(case)
         assert recovered.recipes == first.recipes
         assert recovered.created_schemas == () and recovered.reused_schemas == first.created_schemas
         assert len(created_schemas) == 1

@@ -5,7 +5,11 @@ from dataclasses import dataclass, replace
 
 from process.network_fhir_sampled_validation import SemanticSamplingPolicy
 from process.registry_fhir_catalog_sources import parse_fhir_catalog_source_profile
-from process.registry_source_recipe_composition import SourceWitnessRuntime, validate_source_witness_configuration
+from process.registry_source_recipe_composition import (
+    IMPORTED_FHIR_CAPTURE_WORKERS,
+    SourceWitnessRuntime,
+    validate_source_witness_configuration,
+)
 
 
 @dataclass(frozen=True, repr=False)
@@ -56,7 +60,9 @@ def parse_source_witness_config(document):
     )
 
 
-async def install_source_witness_runtime(config, resources, *, membership_refresh_request_id=None):
+async def install_source_witness_runtime(
+    config, resources, *, membership_refresh_request_id=None, parallel_captures=False
+):
     """Close the original membership factory after all worker callbacks and owned pools drain."""
     settings = config.source_witness
     address_sources = config.initial_address_sources
@@ -77,13 +83,17 @@ async def install_source_witness_runtime(config, resources, *, membership_refres
         raise ValueError("registry_source_witness_factory_unavailable") from None
     if not callable(membership_source_export_runtime):
         raise ValueError("registry_source_witness_factory_unavailable")
-    source_export = await resources.enter_async_context(membership_source_export_runtime())
+    capture_width = IMPORTED_FHIR_CAPTURE_WORKERS if parallel_captures else 1
+    source_exports = [
+        await resources.enter_async_context(membership_source_export_runtime()) for _ in range(capture_width)
+    ]
     runtime = SourceWitnessRuntime(
-        source_export,
+        source_exports[0],
         settings.source_profiles,
         settings.capture_owner_role,
         settings.runtime_roles,
         **({"semantic_policy": settings.semantic_policy} if settings.semantic_policy is not None else {}),
+        **({"capture_source_exports": tuple(source_exports)} if parallel_captures else {}),
     )
     return replace(
         config, source_witness=None, initial_address_sources=replace(address_sources, source_witness_runtime=runtime)

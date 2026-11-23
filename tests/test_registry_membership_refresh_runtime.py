@@ -7,7 +7,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx
@@ -690,6 +690,7 @@ async def test_imported_worker_opens_capture_only_after_reading_its_admitted_cat
         (FHIRCatalogSourceReadProfile("directory", "directory"),),
         "candidate_owner",
         ("network_reader",),
+        capture_source_exports=tuple(Mock() for _ in range(4)),
     )
     config = SimpleNamespace(
         initial_address_sources=SimpleNamespace(source_witness_runtime=source_runtime),
@@ -719,8 +720,8 @@ async def test_imported_worker_opens_capture_only_after_reading_its_admitted_cat
         finally:
             lifecycle_closed.set()
 
-    def worker_sessions(_config, _cleanup, url):
-        allocated_urls.append(url)
+    def worker_sessions(_config, _cleanup, url, *, pool_size=1):
+        allocated_urls.append((url, pool_size))
         if url is config.lifecycle_url:
             return lifecycle_session
         assert lifecycle_closed.is_set()
@@ -733,11 +734,11 @@ async def test_imported_worker_opens_capture_only_after_reading_its_admitted_cat
             assert captures is capture_sessions
             assert installed.source_export is source_runtime.source_export
             assert installed.catalog_bindings == PublishedFHIRCatalogBindingScope("d" * 64, "f" * 64)
-            assert allocated_urls == [config.lifecycle_url, config.custody_url]
+            assert allocated_urls == [(config.lifecycle_url, 1), (config.custody_url, 4)]
         else:
             with pytest.raises(RegistryMembershipRefreshUnavailable):
                 await runtime._imported_worker_sources(settings, config, cleanup, request_id)
-            assert allocated_urls == [config.lifecycle_url]
+            assert allocated_urls == [(config.lifecycle_url, 1)]
     assert driver.fetchrow.await_args.args[1:] == (request_id,)
 
 
