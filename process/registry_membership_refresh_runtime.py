@@ -511,12 +511,12 @@ class _SourceResolver:
         self.prepared_recipes = ()
         self.created_schemas = ()
 
-    async def prepare_sources(self, connection, record):
+    async def prepare_sources(self, connection, request_record):
         """Prepare only this admitted request once; retain its owned candidate schemas for cleanup."""
         from process.registry_imported_source_preparation import prepare_imported_source_recipes
         from process.registry_membership_refresh_queue import validated_membership_refresh_request_record
 
-        envelope = validated_membership_refresh_request_record(record)
+        envelope = validated_membership_refresh_request_record(request_record)
         command = envelope["command"]
         digest = membership_refresh_command_sha256(command)
         if self.prepared_command is not None:
@@ -526,15 +526,21 @@ class _SourceResolver:
         if self.source_runtime is None or self.capture_sessions is None:
             raise _unavailable()
         await require_imported_catalog_inputs(connection, command, self.resources.settings.control_schema)
-        async with self.capture_sessions() as session, session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            prepared = await prepare_imported_source_recipes(
-                await _driver(session),
-                request_id=record["request_id"],
-                envelope=envelope,
-                source_runtime=self.source_runtime,
-                control_schema=self.resources.settings.control_schema,
-            )
+
+        @asynccontextmanager
+        async def capture_transaction():
+            """Open a fresh repeatable-read transaction for one capture."""
+            async with self.capture_sessions() as session, session.begin():
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                yield await _driver(session)
+
+        prepared = await prepare_imported_source_recipes(
+            capture_transaction,
+            request_id=request_record["request_id"],
+            envelope=envelope,
+            source_runtime=self.source_runtime,
+            control_schema=self.resources.settings.control_schema,
+        )
         self.prepared_recipes = prepared.recipes
         self.created_schemas = prepared.created_schemas
         self.prepared_command = digest
@@ -1047,7 +1053,9 @@ async def _imported_worker_sources(settings, worker_config, cleanup, request_id)
         semantic_policy=None,
         semantic_validation=None,
     )
-    captures = _worker_sessions(worker_config, cleanup, worker_config.custody_url)
+    captures = _worker_sessions(
+        worker_config, cleanup, worker_config.custody_url, pool_size=len(source_runtime.capture_source_exports) or 1
+    )
     return source_runtime, captures
 
 

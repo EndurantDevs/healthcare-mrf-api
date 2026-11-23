@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Source preparation keeps factory-selected origins and rolls back incomplete batches."""
+"""Source preparation keeps factory-selected origins and checkpoints complete graphs."""
 
 import asyncio
 import os
@@ -20,10 +20,19 @@ from process import registry_imported_source_preparation as preparation
 from process.network_fhir_source_witness_contract import digest, source_origin
 from process.network_fhir_typed_capture import PREFIX
 from process.network_fhir_typed_contract import graph_document
+from process.registry_fhir_catalog_observation import (
+    CATALOG_OBSERVATION_CONTRACT,
+    catalog_observation_descriptor_digest,
+)
 from process.registry_fhir_catalog_sources import parse_fhir_catalog_source_profile
 from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
 from process.registry_source_recipe_composition import SourceWitnessRuntime
 from tests.test_registry_typed_source_recipe import _recipe
+
+
+def refresh_receipt(descriptor):
+    descriptor["accepted_receipt_sha256"] = catalog_observation_descriptor_digest(descriptor)
+    descriptor["accepted_receipt_id"] = CATALOG_OBSERVATION_CONTRACT + ":" + descriptor["accepted_receipt_sha256"]
 
 
 async def _capture_document(case, factory, writer, **arguments):
@@ -73,7 +82,7 @@ def _preparation_contexts(state_by_field, schemas, events, origins_by_id):
             state_by_field["source_open"] = False
 
     @asynccontextmanager
-    async def transaction():
+    async def transaction(**_options):
         previous = list(schemas)
         events.append(("savepoint", None))
         try:
@@ -140,8 +149,13 @@ def prepared_case(monkeypatch):
 
 
 async def prepare(case):
+    @asynccontextmanager
+    async def capture_transaction():
+        async with case.connection.transaction(isolation="repeatable_read"):
+            yield case.connection
+
     return await preparation.prepare_imported_source_recipes(
-        case.connection,
+        capture_transaction,
         request_id=case.request_id,
         envelope=case.envelope,
         source_runtime=case.runtime,
@@ -157,7 +171,7 @@ async def test_genuine_selected_origin_closes_before_persistent_capture(prepared
     preparation_result = await prepare(case)
     recipes = preparation_result.recipes
     case.inputs.assert_awaited_once_with(case.connection, case.envelope["command"], "registry")
-    metadata = case.events[1]
+    metadata = case.events[3]
     assert metadata == (
         "source_open",
         {
@@ -169,6 +183,8 @@ async def test_genuine_selected_origin_closes_before_persistent_capture(prepared
     )
     assert [event[0] for event in case.events] == [
         "savepoint",
+        "release",
+        "savepoint",
         "source_open",
         "source_close",
         "capture",
@@ -176,7 +192,7 @@ async def test_genuine_selected_origin_closes_before_persistent_capture(prepared
         "source_close",
         "release",
     ]
-    capture_arguments = case.events[3][1]
+    capture_arguments = case.events[5][1]
     assert capture_arguments["reviewed_origin"] is case.origin
     assert capture_arguments["membership_as_of"] == case.origin.semantic_projection_as_of
     expected = preparation.imported_source_capture_id(case.descriptors[0], case.origin.semantic_projection_as_of)
@@ -215,7 +231,7 @@ async def test_changed_factory_origin_never_reaches_capture(prepared_case, monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [ValueError("source refusal"), asyncio.CancelledError()])
-async def test_failure_or_cancellation_rolls_back_the_entire_preparation_batch(prepared_case, failure):
+async def test_failure_or_cancellation_keeps_completed_preparation(prepared_case, failure):
     case = prepared_case
     second = deepcopy(case.descriptors[0])
     second["coordinates"]["source_id"] = "alias-c"
@@ -226,7 +242,8 @@ async def test_failure_or_cancellation_rolls_back_the_entire_preparation_batch(p
     with pytest.raises(type(failure)):
         await prepare(case)
     assert preparation.capture_typed_source_graph.await_count == 2
-    assert case.schemas == [] and case.events[-1][0] == "rollback" and not case.state["source_open"]
+    assert case.schemas == [case.captured[0]["schema_name"]]
+    assert case.events[-1][0] == "rollback" and not case.state["source_open"]
 
 
 @pytest.mark.asyncio
@@ -251,17 +268,24 @@ async def test_mismatched_catalog_scope_fails_before_source_selection(prepared_c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [ValueError("source refusal"), asyncio.CancelledError()])
-async def test_native_partial_capture_schemas_rollback_before_caller_continues(prepared_case, monkeypatch, failure):
+async def test_database_keeps_only_completed_capture_after_later_failure(prepared_case, monkeypatch, failure):
     dsn = os.getenv("NETWORK_REGISTRY_TEST_DSN")
     if not dsn:
         pytest.skip("NETWORK_REGISTRY_TEST_DSN must explicitly select an isolated database")
     case = prepared_case
     case.request_id = uuid4()
+    dataset_id = str(uuid4())
+    case.descriptors[0]["coordinates"].update(dataset_id=dataset_id, edition_id=dataset_id)
+    case.origins[case.origin.source_id] = replace(case.origin, dataset_id=dataset_id)
     second = deepcopy(case.descriptors[0])
     second["coordinates"]["source_id"] = "alias-c"
     second["source_aliases"] = ["alias-c", "alias-d"]
     case.descriptors.append(second)
-    case.origins["alias-c"] = replace(case.origin, source_id="alias-c", source_aliases=("alias-c", "alias-d"))
+    case.origins["alias-c"] = replace(
+        case.origin, dataset_id=dataset_id, source_id="alias-c", source_aliases=("alias-c", "alias-d")
+    )
+    for descriptor in case.descriptors:
+        refresh_receipt(descriptor)
     case.state["capture_failure"] = failure
     created_schemas = []
     original = preparation.capture_typed_source_graph
@@ -276,13 +300,12 @@ async def test_native_partial_capture_schemas_rollback_before_caller_continues(p
     monkeypatch.setattr(preparation, "capture_typed_source_graph", capture)
     case.connection = await asyncpg.connect(dsn.replace("postgresql+asyncpg://", "postgresql://"))
     try:
-        async with case.connection.transaction():
-            with pytest.raises(type(failure)):
-                await prepare(case)
-            assert len(created_schemas) == 2 and case.connection.is_in_transaction()
-            assert not await case.connection.fetchval(
-                "SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname=ANY($1::text[]))", created_schemas
-            )
+        with pytest.raises(type(failure)):
+            await prepare(case)
+        assert len(created_schemas) == 2 and not case.connection.is_in_transaction()
+        assert await case.connection.fetchval(
+            "SELECT array_agg(nspname) FROM pg_namespace WHERE nspname=ANY($1::text[])", created_schemas
+        ) == [created_schemas[0]]
     finally:
         for schema in reversed(created_schemas):
             await case.connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')

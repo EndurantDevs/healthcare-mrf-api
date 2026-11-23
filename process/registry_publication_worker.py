@@ -399,8 +399,8 @@ def _summary(result_by_name):
     return summary_by_field
 
 
-def _worker_sessions(config, stack, url):
-    """Own one qualified genuine session factory for the selected existing login."""
+def _worker_sessions(config, stack, url, *, pool_size=1):
+    """Own one bounded session factory for the selected existing login."""
     engine = create_async_engine(
         url,
         connect_args={
@@ -411,7 +411,7 @@ def _worker_sessions(config, stack, url):
             "server_settings": config.sql_limits.server_settings(),
         },
         pool_timeout=config.sql_limits.connect_timeout_seconds,
-        pool_size=1,
+        pool_size=pool_size,
         max_overflow=0,
         hide_parameters=True,
     )
@@ -683,7 +683,10 @@ async def run_registry_publication_worker(config, *, membership_refresh_request_
         _invalid()
     async with AsyncExitStack() as stack:
         config = await install_source_witness_runtime(
-            config, stack, membership_refresh_request_id=membership_refresh_request_id
+            config,
+            stack,
+            membership_refresh_request_id=membership_refresh_request_id,
+            parallel_captures=freeze_preparation is not None,
         )
         if membership_refresh_request_id is None:
             if config.app_origin is None:

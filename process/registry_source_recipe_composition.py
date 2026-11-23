@@ -56,6 +56,7 @@ from process.registry_source_recipe_store import canonical_registry_source_recip
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 OFFICE_MAPPING_KEY = "registry_retained_fhir_office_mapping"
+IMPORTED_FHIR_CAPTURE_WORKERS = 4
 
 
 class RegistrySourceCompositionError(ValueError):
@@ -116,6 +117,7 @@ class SourceWitnessRuntime:
     semantic_policy: object = None
     census_outsiders: tuple[str, ...] = ()
     catalog_bindings: object = None
+    capture_source_exports: tuple = ()
 
     def __post_init__(self):
         if self.catalog_bindings is not None:
@@ -124,7 +126,15 @@ class SourceWitnessRuntime:
             if type(self.catalog_bindings) is not PublishedFHIRCatalogBindingScope:
                 raise RegistrySourceCompositionError("registry_source_imported_catalog_scope_invalid")
             self.catalog_bindings.__post_init__()
-        if not callable(self.source_export):
+        if (
+            not callable(self.source_export)
+            or type(self.capture_source_exports) is not tuple
+            or self.capture_source_exports
+            and (
+                len(self.capture_source_exports) != IMPORTED_FHIR_CAPTURE_WORKERS
+                or not all(callable(export) for export in self.capture_source_exports)
+            )
+        ):
             raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
         validate_source_witness_configuration(self.source_profiles, self.capture_owner_role, self.runtime_roles)
         if (

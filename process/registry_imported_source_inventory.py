@@ -39,10 +39,16 @@ def fhir_feed(descriptor):
     return parsed._replace(netloc=parsed.netloc.lower()).geturl()
 
 
+def is_practitioner_enrichment(descriptor):
+    """Recognize the dedicated practitioner-only publisher."""
+    return descriptor["coordinates"]["source_id"] == UHC_FLEX_PRACTITIONER_SOURCE_ID
+
+
 def _edition_rank(descriptor):
     publication = (descriptor.get("admission") or {}).get("publication", {})
     stamp = publication.get("published_at")
     return (
+        not is_practitioner_enrichment(descriptor),
         datetime.fromisoformat(stamp) if stamp else datetime.min.replace(tzinfo=timezone.utc),
         publication.get("claimed_resource_count", 0),
         descriptor["endpoint_id"],
@@ -50,13 +56,12 @@ def _edition_rank(descriptor):
     )
 
 
-def preferred_fhir_editions(accepted):
-    """Select the latest admitted network edition per feed, preferring more rows on a date tie."""
-    # The exact-NPI feed enriches practitioners and supplies no network coverage.
+def preferred_fhir_editions(accepted, *, include_practitioner_enrichment=False):
+    """Select one edition per feed, with network editions ahead of practitioner enrichment."""
     eligible_descriptors = [
         descriptor
         for descriptor in accepted
-        if descriptor["coordinates"]["source_id"] != UHC_FLEX_PRACTITIONER_SOURCE_ID
+        if (include_practitioner_enrichment or not is_practitioner_enrichment(descriptor))
         and (descriptor["complete"] or is_delta_positive_catalog_descriptor(descriptor))
     ]
     by_feed = {}
@@ -65,11 +70,18 @@ def preferred_fhir_editions(accepted):
     return list(by_feed.values())
 
 
-def select_fhir_editions(observed, previous):
-    """Prefer current input unless the feed already has a newer approved edition."""
-    retained_by_feed = {fhir_feed(descriptor): descriptor for descriptor in preferred_fhir_editions(previous)}
+def select_fhir_editions(observed, previous, *, include_practitioner_enrichment=False):
+    """Prefer current input unless the feed already has a higher-ranked approved edition."""
+    retained_by_feed = {
+        fhir_feed(descriptor): descriptor
+        for descriptor in preferred_fhir_editions(
+            previous, include_practitioner_enrichment=include_practitioner_enrichment
+        )
+    }
     selected_editions = []
-    for descriptor in preferred_fhir_editions(observed):
+    for descriptor in preferred_fhir_editions(
+        observed, include_practitioner_enrichment=include_practitioner_enrichment
+    ):
         key = fhir_feed(descriptor)
         if key not in retained_by_feed or _edition_rank(descriptor) >= _edition_rank(retained_by_feed[key]):
             selected_editions.append(descriptor)
@@ -471,7 +483,7 @@ async def observe_imported_source_inventory(
     if await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}:
         raise ValueError("registry_imported_inventory_scope_invalid")
     observed, unavailable = await _fhir_inventory(connection, config, catalog_export)
-    descriptors, carried = select_fhir_editions(observed, previous_fhir)
+    descriptors, carried = select_fhir_editions(observed, previous_fhir, include_practitioner_enrichment=True)
     superseded = {descriptor["endpoint_id"] for descriptor in (*observed, *previous_fhir)} - {
         descriptor["endpoint_id"] for descriptor in (*descriptors, *carried)
     }
@@ -515,11 +527,18 @@ def retained_unavailable_fhir_recipes(previous, inventory):
     from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_physical_source
     from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 
-    current_endpoints = {descriptor["endpoint_id"] for descriptor in inventory.fhir_descriptors}
+    current_networks = [
+        descriptor for descriptor in inventory.fhir_descriptors if not is_practitioner_enrichment(descriptor)
+    ]
+    current_endpoints = {descriptor["endpoint_id"] for descriptor in current_networks}
     current_endpoints.update(inventory.superseded_fhir_endpoints)
-    current_source_ids = {descriptor["coordinates"]["source_id"] for descriptor in inventory.fhir_descriptors}
-    current_feeds = {fhir_feed(descriptor) for descriptor in inventory.fhir_descriptors}
-    carried_by_feed = {fhir_feed(descriptor): descriptor for descriptor in inventory.carried_fhir_descriptors}
+    current_source_ids = {descriptor["coordinates"]["source_id"] for descriptor in current_networks}
+    current_feeds = {fhir_feed(descriptor) for descriptor in current_networks}
+    carried_by_feed = {
+        fhir_feed(descriptor): descriptor
+        for descriptor in inventory.carried_fhir_descriptors
+        if not is_practitioner_enrichment(descriptor)
+    }
     carried_by_endpoint = {descriptor["endpoint_id"]: descriptor for descriptor in carried_by_feed.values()}
     retained_recipes = []
     for recipe in previous:

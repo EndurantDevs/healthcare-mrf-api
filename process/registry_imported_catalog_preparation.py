@@ -13,7 +13,12 @@ from process.registry_fhir_catalog_sources import (
     fhir_catalog_source_generation,
     validate_fhir_catalog_source_descriptor,
 )
-from process.registry_imported_source_inventory import ImportedSourceInventory, fhir_feed, select_fhir_editions
+from process.registry_imported_source_inventory import (
+    ImportedSourceInventory,
+    fhir_feed,
+    is_practitioner_enrichment,
+    select_fhir_editions,
+)
 from process.registry_imported_source_reuse import source_edition
 from process.registry_native_network_catalog import native_catalog_descriptor, native_catalog_rows, native_network_ids
 
@@ -69,6 +74,11 @@ async def replaced_fhir_generations(connection, previous, accepted):
     descriptors = inventory.fhir_descriptors
     if not descriptors and not carried_by_feed:
         return ()
+    enrichment_feeds = {
+        fhir_feed(descriptor)
+        for descriptor in (*descriptors, *inventory.carried_fhir_descriptors)
+        if is_practitioner_enrichment(descriptor)
+    }
     feeds = {fhir_feed(descriptor) for descriptor in descriptors}
     endpoints = {descriptor["endpoint_id"] for descriptor in descriptors} | set(inventory.superseded_fhir_endpoints)
     selected_generations = [fhir_catalog_source_generation(disposition.descriptor) for disposition in accepted]
@@ -87,6 +97,8 @@ async def replaced_fhir_generations(connection, previous, accepted):
     for prior_source in sorted(prior_sources, key=lambda prior: prior["source_generation"] not in current_generations):
         descriptor = json.loads(prior_source["descriptor"])
         feed = fhir_feed(descriptor)
+        if feed in enrichment_feeds and not is_practitioner_enrichment(descriptor):
+            continue
         if (
             feed in carried_by_feed
             and feed not in retained_feeds
@@ -172,7 +184,9 @@ def select_preparation_fhir_sources(inventory, accepted):
     """Project only the recognized current edition of each directory feed."""
     published_sources = [source for source in accepted if source.descriptor["profile"] == "published_normalized"]
     preferred, _ = select_fhir_editions(
-        [source.descriptor for source in published_sources], inventory.carried_fhir_descriptors
+        [source.descriptor for source in published_sources],
+        inventory.carried_fhir_descriptors,
+        include_practitioner_enrichment=True,
     )
     winners = {fhir_catalog_source_generation(descriptor) for descriptor in preferred}
     selected_sources = [

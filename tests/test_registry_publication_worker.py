@@ -635,16 +635,18 @@ async def test_named_worker_recovers_exact_queued_request(monkeypatch, named_wor
             named_worker_config, membership_refresh_request_id=request_id, freeze_preparation=freeze_preparation
         )
 
-    expected_events = [
-        "source open",
-        "lifecycle open",
-        "execution open",
-        "preparation open",
-        "preparation close",
-        "execution close",
-        "lifecycle close",
-        "source close",
-    ]
+    expected_events = (
+        ["source open"] * 4
+        + [
+            "lifecycle open",
+            "execution open",
+            "preparation open",
+            "preparation close",
+            "execution close",
+            "lifecycle close",
+        ]
+        + ["source close"] * 4
+    )
     with pytest.raises(OSError, match="worker interrupted"):
         await start()
     assert case.events == expected_events
