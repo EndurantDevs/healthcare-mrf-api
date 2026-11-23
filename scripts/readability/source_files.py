@@ -9,10 +9,16 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .config import (DEFAULT_COMMENT_NOISE_PATTERNS, compile_suppression_patterns, is_matching_path_pattern,
-                     readability_options, threshold)
-from .function_visitor import FunctionVisitor
+from .config import (
+    DEFAULT_COMMENT_NOISE_PATTERNS,
+    compile_suppression_patterns,
+    is_matching_path_pattern,
+    readability_options,
+    threshold,
+)
 from .function_names import _FunctionNameCollector, confusable_function_name_issues
+from .function_visitor import FunctionVisitor
+from .importer_guards import collect_file_importer_guard_issues
 from .model import DEFAULT_ISSUE_CATEGORIES, Issue
 
 
@@ -43,7 +49,10 @@ def collect_issues(
         issues_by_category["huge_file_growth"].extend(
             _huge_file_growth_issues(repo_root, source_files, config, base_revision)
         )
-    return {category: sorted(values, key=lambda issue: issue.identifier) for category, values in issues_by_category.items()}
+    return {
+        category: sorted(category_issues, key=lambda issue: issue.identifier)
+        for category, category_issues in issues_by_category.items()
+    }
 
 
 def _iter_source_files(repo_root: Path, config: dict[str, Any]) -> list[Path]:
@@ -200,6 +209,7 @@ def _analyze_file(
     visitor.visit(tree)
     issues.extend(visitor.issues)
     issues.extend(_module_attribute_injection_issues(relative, tree, config))
+    issues.extend(collect_file_importer_guard_issues(relative, tree, config))
     return issues
 
 
@@ -228,14 +238,10 @@ def _module_attribute_injection_issues(
         if isinstance(node, ast.ImportFrom) and node.module is None
         for alias in node.names
     )
-    allowlisted_names = set(
-        readability_options(config).get("module_attribute_injection_allowlist", [])
-    )
+    allowlisted_names = set(readability_options(config).get("module_attribute_injection_allowlist", []))
     issues: list[Issue] = []
     for node in nodes:
-        issue = _assignment_injection_issue(
-            relative, node, module_aliases, allowlisted_names
-        )
+        issue = _assignment_injection_issue(relative, node, module_aliases, allowlisted_names)
         if issue:
             issues.append(issue)
         issues.extend(_namespace_copy_loop_issues(relative, node, allowlisted_names))
@@ -282,8 +288,7 @@ def _assignment_injection_issue(
                     allowlisted_names,
                 )
             if isinstance(assignment_target.value, ast.Name) and (
-                assignment_target.value.id in module_aliases
-                or re.fullmatch(r"_\w*facade", assignment_target.value.id)
+                assignment_target.value.id in module_aliases or re.fullmatch(r"_\w*facade", assignment_target.value.id)
             ):
                 return _injection_issue(
                     relative,
@@ -302,9 +307,7 @@ def _namespace_copy_loop_issues(
 ) -> list[Issue]:
     if not isinstance(node, (ast.For, ast.AsyncFor)):
         return []
-    referenced_names = {
-        child.id for child in ast.walk(node.iter) if isinstance(child, ast.Name)
-    }
+    referenced_names = {child.id for child in ast.walk(node.iter) if isinstance(child, ast.Name)}
     blocked_names = {
         "_SPLIT_IMPLEMENTATION_MODULES",
         "_STORE_MIXIN_MODULES",
@@ -313,11 +316,7 @@ def _namespace_copy_loop_issues(
     return [
         issue
         for name in sorted(referenced_names & blocked_names)
-        for issue in [
-            _injection_issue(
-                relative, node, "namespace_copy_loop", name, allowlisted_names
-            )
-        ]
+        for issue in [_injection_issue(relative, node, "namespace_copy_loop", name, allowlisted_names)]
         if issue
     ]
 
@@ -446,9 +445,7 @@ def _huge_file_growth_issues(
     )
     if verify_base.returncode:
         return [_huge_file_git_issue("base revision unavailable")]
-    renamed_base_path_by_current, rename_error = _renamed_base_path_by_current(
-        repo_root, base_revision
-    )
+    renamed_base_path_by_current, rename_error = _renamed_base_path_by_current(repo_root, base_revision)
     if rename_error:
         return [rename_error]
     issues: list[Issue] = []
@@ -480,9 +477,7 @@ def _huge_file_growth_issues(
     return issues
 
 
-_RUST_CFG_TEST = re.compile(
-    r"^\s*#\[\s*cfg\s*\(\s*(?:test|all\s*\(\s*test\s*,[^)]*\))\s*\)\s*\]\s*(.*)$"
-)
+_RUST_CFG_TEST = re.compile(r"^\s*#\[\s*cfg\s*\(\s*(?:test|all\s*\(\s*test\s*,[^)]*\))\s*\)\s*\]\s*(.*)$")
 _RUST_ATTRIBUTE = re.compile(r"^\s*#\[.*\]\s*$")
 _RUST_MODULE = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\b")
 
@@ -536,11 +531,11 @@ def _rust_brace_deltas(lines: list[str]) -> list[int]:
             raw_match = re.match(r"(?:br|cr|r)(#*)\"", line[index:])
             if raw_match:
                 hashes = raw_match.group(1)
-                string_terminator = f'\"{hashes}'
+                string_terminator = f'"{hashes}'
                 raw_string = True
                 index += raw_match.end()
                 continue
-            if line.startswith(('b\"', 'c\"'), index):
+            if line.startswith(('b"', 'c"'), index):
                 string_terminator = '"'
                 raw_string = False
                 escaped = False
@@ -608,9 +603,7 @@ def _rust_test_module_ranges(lines: list[str]) -> list[tuple[int, int]]:
 
 def _rust_non_test_line_count(path: Path) -> int:
     lines = path.read_text(encoding="utf-8").splitlines()
-    excluded_lines = sum(
-        end - start + 1 for start, end in _rust_test_module_ranges(lines)
-    )
+    excluded_lines = sum(end - start + 1 for start, end in _rust_test_module_ranges(lines))
     return len(lines) - excluded_lines
 
 

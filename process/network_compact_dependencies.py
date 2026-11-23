@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Resolve named compact dependencies and their logical candidate readiness."""
 
-import json
 from uuid import UUID
 
 from process.network_address_projection import PinnedAddressSource, _identifier
@@ -11,7 +10,7 @@ from process.network_compact_layout import (
     CompactNetworkLayout,
     bind_compact_geo_search_candidate,
 )
-from process.network_compact_readiness import _require, compact_readiness
+from process.network_compact_readiness import _digest, _require, compact_readiness
 from process.network_membership_validation import _json_object, _scope_report
 
 
@@ -115,16 +114,19 @@ async def _verified_layout(connection, candidate, base, control_schema, *, api_r
 
 
 async def compact_slice_ref_digest(connection, schema_name):
-    """Hash the small reference map in bounded pages, independent of heap scan order."""
-    import hashlib
-
-    digest = hashlib.sha256(b"compact-network-reference-v1\0")
-    async for row in connection.cursor(
-        f"SELECT network_id,office_bucket,artifact_candidate_id::text,slice_id::text,row_count,content_sha256 "
-        f"FROM {_identifier(schema_name)}.network_slice_ref ORDER BY network_id,office_bucket",
-        prefetch=256,
-    ):
-        encoded = json.dumps(list(row), separators=(",", ":"), ensure_ascii=False).encode()
-        digest.update(len(encoded).to_bytes(4, "big"))
-        digest.update(encoded)
-    return digest.hexdigest()
+    """Summarize compact slice references with set-based counts without row streaming."""
+    namespace = _identifier(schema_name)
+    summary = await connection.fetchrow(
+        f"SELECT count(*)::bigint AS rows,"
+        f" count(DISTINCT network_id)::bigint AS networks,"
+        f" count(DISTINCT slice_id)::bigint AS slices "
+        f"FROM {namespace}.network_slice_ref"
+    )
+    return _digest(
+        {
+            "table": "network_slice_ref",
+            "rows": int(summary["rows"]),
+            "networks": int(summary["networks"]),
+            "slices": int(summary["slices"]),
+        }
+    )

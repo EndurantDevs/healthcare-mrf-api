@@ -4,17 +4,30 @@
 import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from process.network_address_projection import PinnedAddressSource
 from process.network_compact_custom_offices import logical_compact_custom_scope
+from process.network_compact_dependencies import compact_slice_ref_digest
 from process.network_compact_readiness import NetworkCompactReadinessError, compact_readiness
 from process.network_membership_validation import (
     NetworkMembershipValidationError,
     _scope_report,
     _validated_replay,
 )
+
+
+async def test_compact_slice_accounting_reads_only_set_totals():
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={"rows": 12, "networks": 3, "slices": 4}))
+    recorded = await compact_slice_ref_digest(connection, "candidate_example")
+    connection.fetchrow.assert_awaited_once()
+    query = connection.fetchrow.await_args.args[0]
+    assert 'FROM "candidate_example".network_slice_ref' in query
+    assert "count(*)" in query and "count(DISTINCT slice_id)" in query
+    assert len(recorded) == 64
 
 
 def legacy_custom_receipt(current=None):

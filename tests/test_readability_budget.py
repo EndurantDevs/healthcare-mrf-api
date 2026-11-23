@@ -572,3 +572,169 @@ def test_repository_config_checks_migrations_but_excludes_their_file_lengths():
     migration = next((repo_root / "alembic" / "versions").glob("*.py"))
     assert migration in source_files._iter_source_files(repo_root, config)
     assert not source_files._is_file_length_path(migration.relative_to(repo_root).as_posix(), config)
+
+
+def _configure_importer_guard_repo(repo_root: Path) -> dict:
+    _write_config(repo_root)
+    config_by_field = json.loads((repo_root / "readability-budget.json").read_text(encoding="utf-8"))
+    config_by_field["source_roots"] = ["pkg", "process"]
+    config_by_field["readability"]["importer_guard_roots"] = ["process"]
+    config_by_field["readability"]["importer_guard_exclude_globs"] = ["process/excluded_*.py"]
+    (repo_root / "readability-budget.json").write_text(json.dumps(config_by_field), encoding="utf-8")
+    return config_by_field
+
+
+def test_importer_guards_allow_set_based_sql_and_line_shifts(tmp_path):
+    process_dir = tmp_path / "process"
+    process_dir.mkdir()
+    (process_dir / "clean_importer.py").write_text(
+        textwrap.dedent(
+            '''
+            import hashlib
+
+            async def copy_clean(connection):
+                """Copy validated rows with one set-based SQL statement."""
+                await connection.execute("INSERT INTO dst (id) SELECT id FROM src ON CONFLICT DO NOTHING")
+                return await connection.fetchval("SELECT count(*)::bigint FROM dst")
+
+            async def export_with_metadata(connection, metadata, destination):
+                """Write rows and fingerprint their separate metadata."""
+                metadata_digest = hashlib.sha256(metadata).hexdigest()
+                await connection.copy_from_query("SELECT id FROM src", output=destination.write, format="binary")
+                return metadata_digest
+
+            async def page_source_rows(connection, cursor_json):
+                """Read source pages without copying a prior snapshot."""
+                while True:
+                    rows = await connection.fetch("SELECT id FROM src WHERE id > $1 ORDER BY id LIMIT $2", cursor_json, 10)
+                    if not rows:
+                        break
+                    cursor_json = rows[-1]["id"]
+
+                    async def write_later():
+                        await connection.execute("INSERT INTO dst (id) VALUES ($1)", cursor_json)
+            '''
+        ),
+        encoding="utf-8",
+    )
+    (process_dir / "excluded_legacy.py").write_text(
+        'LEGACY_SQL = "SELECT relfilenode FROM pg_class"\n',
+        encoding="utf-8",
+    )
+    grandfathered = process_dir / "grandfathered.py"
+    grandfathered.write_text(
+        textwrap.dedent(
+            '''
+            def existing_check(connection):
+                """Baseline grandfathered check stays scope-keyed across line shifts."""
+                return connection.fetchval("SELECT pg_catalog.row_security_active(oid) FROM pg_class")
+            '''
+        ),
+        encoding="utf-8",
+    )
+    config_by_field = _configure_importer_guard_repo(tmp_path)
+    snapshot = readability_budget.build_snapshot(tmp_path, config_by_field)
+    assert snapshot["issue_counts"]["importer_paged_copy_loops"] == 0
+    assert [issue["path"] for issue in snapshot["issues"]["importer_custody_checks"]] == ["process/grandfathered.py"]
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
+
+    grandfathered.write_text("\n\n" + grandfathered.read_text(encoding="utf-8"), encoding="utf-8")
+    assert readability_budget.main(["--repo-root", str(tmp_path)]) == 0
+
+
+_BAD_IMPORTER_FIXTURE = textwrap.dedent(
+    '''
+    import hashlib
+
+    def check_filenode():
+        """Probe physical filenode."""
+        return "SELECT relfilenode FROM pg_class"
+
+    def check_rls():
+        """Probe row security."""
+        return "SELECT row_security_active(oid) FROM pg_class"
+
+    def check_owner():
+        """Probe relation owner."""
+        return "SELECT relowner FROM pg_class"
+
+    def check_triggers():
+        """Probe pg_trigger catalog."""
+        return "SELECT EXISTS(SELECT FROM pg_trigger)"
+
+    def verify_independent_source_contributions():
+        """Run forbidden multiset verifier."""
+        return True
+
+    async def rehash_copy(connection):
+        """Re-hash copied query output."""
+        folded = hashlib.sha256()
+        await connection.copy_from_query("SELECT id FROM src", output=folded.update, format="binary")
+
+    def paged_sql_limit():
+        """Run paged LIMIT copy SQL."""
+        return "INSERT INTO dst SELECT id FROM src ORDER BY id LIMIT $1"
+
+    def paged_sql_running_bytes():
+        """Run byte-windowed copy SQL."""
+        return "INSERT INTO dst SELECT id, running_bytes FROM windowed"
+
+    async def paged_loop(connection):
+        """Page copy loop with cursor state."""
+        cursor_json = None
+        while True:
+            batch = await connection.fetch("SELECT id FROM src ORDER BY id LIMIT $1", cursor_json)
+            if not batch:
+                break
+            await connection.execute("INSERT INTO dst (id) VALUES ($1)", batch[0]["id"])
+    async def paged_for(connection, cursors):
+        """Copy rows in a for loop over cursor values."""
+        for cursor_json in cursors:
+            batch = await connection.fetch("SELECT id FROM src ORDER BY id LIMIT $1", cursor_json)
+            await connection.executemany("INSERT INTO dst (id) VALUES ($1)", batch)
+
+    async def paged_async_for(connection, cursors):
+        """Copy rows in an async for loop over cursor values."""
+        async for cursor_json in cursors:
+            batch = await connection.fetch("SELECT id FROM src ORDER BY id LIMIT $1", cursor_json)
+            await connection.executemany("INSERT INTO dst (id) VALUES ($1)", batch)
+
+    async def paged_nested_loop(connection):
+        """Write individual rows inside an outer paging loop."""
+        cursor_json = None
+        while True:
+            batch = await connection.fetch("SELECT id FROM src ORDER BY id LIMIT $1", cursor_json)
+            if not batch:
+                break
+            for row in batch:
+                await connection.execute("INSERT INTO dst (id) VALUES ($1)", row["id"])
+            cursor_json = batch[-1]["id"]
+    '''
+)
+
+
+def test_importer_guards_block_custody_rehash_and_paged_copy_loops(tmp_path):
+    process_dir = tmp_path / "process"
+    process_dir.mkdir()
+    config_by_field = _configure_importer_guard_repo(tmp_path)
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
+
+    (process_dir / "bad_importers.py").write_text(_BAD_IMPORTER_FIXTURE, encoding="utf-8")
+    snapshot = readability_budget.build_snapshot(tmp_path, config_by_field)
+    custody_reasons = {issue["reason"] for issue in snapshot["issues"]["importer_custody_checks"]}
+    paged_reasons = {issue["reason"] for issue in snapshot["issues"]["importer_paged_copy_loops"]}
+    assert custody_reasons == {
+        "physical_filenode_check",
+        "row_security_custody_check",
+        "owner_or_acl_custody_check",
+        "catalog_hook_custody_check",
+        "forbidden_seal_or_multiset_verifier",
+        "copy_from_query_rehash",
+    }
+    assert paged_reasons == {"paged_copy_forward_sql", "python_paged_copy_loop"}
+    assert {
+        issue["function"]
+        for issue in snapshot["issues"]["importer_paged_copy_loops"]
+        if issue["reason"] == "python_paged_copy_loop"
+    } == {"paged_loop", "paged_for", "paged_async_for", "paged_nested_loop"}
+    assert readability_budget.main(["--repo-root", str(tmp_path)]) == 1

@@ -471,40 +471,28 @@ async def replace_fhir_catalog_relationships(connection, target, source_generati
 
 def _copy_sql(previous_schema, candidate_schema, table):
     columns = TABLE_COLUMNS[table]
-    keys = _KEYS[table]
-    order = ",".join(name + (' COLLATE "C"' if kind == "text" else "") for name, kind in keys)
-    compare = "(" + order + ")>(" + ",".join(f"${index + 1}::{kind}" for index, (_, kind) in enumerate(keys)) + ")"
     expressions = [
-        "$" + str(len(keys) + 3) + "::text"
+        "$1::text"
         if name == "metadata_generation"
         else 'document_json||\'{"status":"last_good"}\'::jsonb'
         if table.endswith("_binding") and name == "document_json"
         else name
         for name in columns
     ]
-    byte_size = "2+" + "+".join(
-        f"8+coalesce(greatest(octet_length(({expression})::text),pg_column_size({expression})),0)"
-        for expression in expressions
+    return (
+        f"INSERT INTO {candidate_schema}.{table} ({','.join(columns)}) "
+        f"SELECT {','.join(expressions)} FROM {previous_schema}.{table} "
+        f"WHERE $1::text IS NOT NULL {_conflict(table, columns, 'preserve')}"
     )
-    column_sql = ",".join(columns)
-    return f"""WITH ordered AS MATERIALIZED (
-      SELECT *,{byte_size} AS row_bytes FROM {previous_schema}.{table}
-      WHERE ($1::{keys[0][1]} IS NULL OR {compare}) AND ${len(keys) + 3}::text IS NOT NULL
-      ORDER BY {order} LIMIT ${len(keys) + 1}::integer
-    ), windowed AS MATERIALIZED (
-      SELECT *,sum(row_bytes) OVER(ORDER BY {order}) AS running_bytes FROM ordered
-    ), chosen AS MATERIALIZED (
-      SELECT * FROM windowed WHERE running_bytes+21<=${len(keys) + 2}::bigint
-    ), inserted AS (
-      INSERT INTO {candidate_schema}.{table} ({column_sql}) SELECT {",".join(expressions)} FROM chosen
-      {_conflict(table, columns, "preserve")} RETURNING 1
-    ) SELECT (SELECT count(*) FROM ordered)::bigint AS seen,
-      (SELECT row_bytes FROM ordered ORDER BY {order} LIMIT 1)::bigint AS first_bytes,
-      (SELECT count(*) FROM chosen)::bigint AS copied,
-      coalesce((SELECT sum(row_bytes) FROM chosen),0)::bigint+21 AS payload_bytes,
-      (SELECT jsonb_build_array({",".join(name for name, _ in keys)})::text FROM chosen
-        ORDER BY {",".join(name + (' COLLATE "C"' if kind == "text" else "") + " DESC" for name, kind in keys)} LIMIT 1) AS cursor_json,
-      (SELECT count(*) FROM inserted)::bigint AS affected"""
+
+
+def _previous_totals_sql(previous_schema, table_names):
+    selects = ",".join(
+        f"(SELECT jsonb_build_array(count(*),coalesce(sum(pg_column_size(stored)),0)::bigint)::text "
+        f"FROM {previous_schema}.{table} stored) AS {table}"
+        for table in table_names
+    )
+    return "SELECT " + selects
 
 
 async def copy_fhir_catalog_snapshot(
@@ -515,11 +503,8 @@ async def copy_fhir_catalog_snapshot(
     *,
     loader_role,
     control_schema,
-    max_rows=DEFAULT_ROWS,
-    max_bytes=DEFAULT_BYTES,
 ):
-    """Carry validated named metadata tables forward while preserving retained generations."""
-    _bounds(max_rows, max_bytes)
+    """Carry validated named metadata tables forward set-based while preserving retained generations."""
     _transaction(connection)
     _digest(metadata_generation)
     namespace = _target(copy_target)
@@ -528,30 +513,17 @@ async def copy_fhir_catalog_snapshot(
         _invalid("snapshot_immutable")
     await validate_fhir_catalog_snapshot_record(connection, previous_snapshot)
     accounting_by_name = {"input_rows": 0, "affected_rows": 0, "batches": 0, "payload_bytes": 0}
+    table_names = sorted(PHYSICAL_TABLES)
     async with connection.transaction():
         await _mutable(connection, copy_target, loader_role, control_schema)
-        for table in sorted(PHYSICAL_TABLES):
-            keys = _KEYS[table]
-            cursor_values = [None] * len(keys)
-            sql = _copy_sql(previous, namespace, table)
-            while True:
-                page = await connection.fetchrow(sql, *cursor_values, max_rows, max_bytes, metadata_generation)
-                if page["seen"] and page["first_bytes"] + 21 > max_bytes:
-                    _invalid("row_too_large")
-                if not page["copied"]:
-                    break
-                for name, key in (
-                    ("input_rows", "copied"),
-                    ("affected_rows", "affected"),
-                    ("payload_bytes", "payload_bytes"),
-                ):
-                    accounting_by_name[name] += page[key]
+        for table in table_names:
+            command_status = await connection.execute(_copy_sql(previous, namespace, table), metadata_generation)
+            accounting_by_name["affected_rows"] += int(command_status.rsplit(" ", 1)[-1])
+        totals_summary = await connection.fetchrow(_previous_totals_sql(previous, table_names))
+        for table in table_names:
+            row_count, relation_bytes = json.loads(totals_summary[table])
+            accounting_by_name["input_rows"] += row_count
+            if row_count:
                 accounting_by_name["batches"] += 1
-                cursor_values = json.loads(page["cursor_json"])
-                cursor_values = [
-                    UUID(key_value) if kind == "uuid" else key_value
-                    for key_value, (_, kind) in zip(cursor_values, keys, strict=True)
-                ]
-                if page["seen"] < max_rows and page["copied"] == page["seen"]:
-                    break
+                accounting_by_name["payload_bytes"] += relation_bytes
     return accounting_by_name

@@ -17,6 +17,8 @@ DEFAULT_ISSUE_CATEGORIES = (
     "deep_nesting",
     "function_name_shape",
     "global_state_usage",
+    "importer_custody_checks",
+    "importer_paged_copy_loops",
     "inline_suppressions",
     "huge_file_growth",
     "long_files",

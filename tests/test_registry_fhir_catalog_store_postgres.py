@@ -336,13 +336,11 @@ async def test_clone_keeps_all_metadata_and_last_good(storage_database, monkeypa
             NEW,
             loader_role=fixture.loader,
             control_schema=fixture.control,
-            max_rows=200,
-            max_bytes=65536,
         )
     verification.assert_awaited_once_with(counted, snapshot)
     assert accounting["input_rows"] == accounting["affected_rows"] == 4001
-    assert 20 <= accounting["batches"] < 40
-    assert counted.statements < 160
+    assert accounting["batches"] == 5
+    assert counted.statements < 20
     await assert_carried_rows(fixture, candidate)
     assert (
         await fixture.connection.fetchval(
@@ -441,26 +439,50 @@ async def test_modes_columns_and_json_are_explicit(storage_database):
 
 
 @pytest.mark.asyncio
-async def test_byte_windows_bound_native_clone(storage_database, monkeypatch):
+async def test_set_based_clone_rolls_back_all_tables_and_can_retry(storage_database, monkeypatch):
+    """A late-table copy failure rolls back every table, and retry preserves exact rows."""
     fixture = storage_database
     previous, candidate = await target(fixture), await target(fixture)
     await populate(fixture, previous, count=30)
     snapshot = await register(fixture, previous)
     monkeypatch.setattr(store, "validate_fhir_catalog_snapshot_record", AsyncMock())
+    copy_arguments = (fixture.connection, snapshot, candidate, NEW)
+    copy_options_by_name = {"loader_role": fixture.loader, "control_schema": fixture.control}
+    namespace = '"' + candidate.schema_name + '"'
+    await fixture.connection.execute(
+        f"ALTER TABLE {namespace}.registry_fhir_catalog_source ADD CONSTRAINT refuse_copy CHECK (source_id='rejected')"
+    )
     async with fixture.connection.transaction():
-        accounting = await store.copy_fhir_catalog_snapshot(
-            fixture.connection,
-            snapshot,
-            candidate,
-            NEW,
-            loader_role=fixture.loader,
-            control_schema=fixture.control,
-            max_rows=1000,
-            max_bytes=1536,
+        with pytest.raises(asyncpg.CheckViolationError, match="refuse_copy"):
+            await store.copy_fhir_catalog_snapshot(*copy_arguments, **copy_options_by_name)
+        for table in PHYSICAL_TABLES:
+            assert await fixture.connection.fetchval(f"SELECT count(*) FROM {namespace}.{table}") == 0
+        await fixture.connection.execute(
+            f"ALTER TABLE {namespace}.registry_fhir_catalog_source DROP CONSTRAINT refuse_copy"
         )
-    assert accounting["input_rows"] == 121
-    assert accounting["batches"] > 5
-    assert accounting["payload_bytes"] <= accounting["batches"] * 1536
+        accounting = await store.copy_fhir_catalog_snapshot(*copy_arguments, **copy_options_by_name)
+        retried = await store.copy_fhir_catalog_snapshot(*copy_arguments, **copy_options_by_name)
+    assert accounting["input_rows"] == accounting["affected_rows"] == 121
+    assert accounting["batches"] == len(PHYSICAL_TABLES)
+    assert accounting["payload_bytes"] > 0
+    assert retried == {**accounting, "affected_rows": 0}
+
+    for table in PHYSICAL_TABLES:
+        adjustments_by_field = {}
+        if table.endswith(("_network", "_binding", "_relationship")):
+            adjustments_by_field["metadata_generation"] = NEW
+        previous_relation = f'"{previous.schema_name}".{table}'
+        previous_rows = await fixture.connection.fetch(f"SELECT to_jsonb(rows)::text FROM {previous_relation} rows")
+        actual_rows = await fixture.connection.fetch(f"SELECT to_jsonb(rows)::text FROM {namespace}.{table} rows")
+        expected_rows = []
+        for previous_row in previous_rows:
+            document_by_field = {**json.loads(previous_row[0]), **adjustments_by_field}
+            if table.endswith("_binding"):
+                document_by_field["document_json"]["status"] = "last_good"
+            expected_rows.append(json.dumps(document_by_field, sort_keys=True))
+        assert sorted(json.dumps(json.loads(actual_row[0]), sort_keys=True) for actual_row in actual_rows) == sorted(
+            expected_rows
+        )
 
 
 @pytest.mark.asyncio
