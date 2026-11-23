@@ -3881,6 +3881,22 @@ fn typed_rate_parser_matches_strict_streaming_parser() {
     }
 }
 #[test]
+fn encoded_service_codes_match_native_arrays_in_both_rate_parsers() {
+    let native = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.5,"service_code":["22"," 11 ","11"]}]}"#;
+    let encoded = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.5,"service_code":"[\"22\",\" 11 \",\"11\"]"}]}"#;
+    let invalid = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.5,"service_code":"[\"11\",22]"}]}"#;
+    for v4 in [false, true] {
+        let expected = read_rate_lite_bytes_typed(native, v4).unwrap();
+        assert_eq!(read_rate_lite_bytes_typed(encoded, v4).unwrap(), expected);
+        assert_eq!(
+            read_rate_lite_bytes_streaming(encoded, v4).unwrap(),
+            expected
+        );
+        assert!(read_rate_lite_bytes_typed(invalid, v4).is_err());
+        assert!(read_rate_lite_bytes_streaming(invalid, v4).is_err());
+    }
+}
+#[test]
 fn expiration_date_requires_an_exact_gregorian_calendar_date() {
     for (raw, expected) in [
         (None, None),

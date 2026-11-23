@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::fmt::Display;
@@ -501,6 +502,51 @@ pub fn compare_canonical_decimal_text(left: &str, right: &str) -> Ordering {
             }
         }
     }
+}
+
+fn decode_service_codes(encoded: &str) -> io::Result<Vec<String>> {
+    serde_json::from_str(encoded).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "service_code text must encode an array of strings",
+        )
+    })
+}
+
+pub fn deserialize_service_codes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    struct ServiceCodes;
+
+    impl<'de> serde::de::Visitor<'de> for ServiceCodes {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of strings or a JSON string encoding that array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            Vec::deserialize(serde::de::value::SeqAccessDeserializer::new(sequence))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, encoded: &str) -> Result<Self::Value, E> {
+            decode_service_codes(encoded).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(ServiceCodes)
+}
+
+pub fn service_codes_from_reader<R: Read>(
+    json_reader: &mut JsonStreamReader<R>,
+) -> io::Result<Vec<String>> {
+    if json_reader.peek().map_err(to_io_error)? == ValueType::String {
+        return decode_service_codes(&json_reader.next_string().map_err(to_io_error)?);
+    }
+    strict_string_array_from_reader(json_reader, "service_code")
 }
 
 pub fn strict_string_array_from_reader<R: Read>(
