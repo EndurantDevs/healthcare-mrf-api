@@ -66,8 +66,9 @@ def start_fetch(source_record, index, base=BASE):
 async def test_concurrent_load_failures_share_one_reduction_only_for_optum(monkeypatch, base, allowance):
     """An old wave cannot successively halve Optum's allowance while its cursors drain."""
     network = BlockedRequests(12)
+    responses = ((503, {}, None, 0), (504, {}, None, 0), (None, {}, "TimeoutError", 0))
     for index in range(8):
-        network.results[index] = (503, {}, None, 0)
+        network.results[index] = responses[index % len(responses)]
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
     shared_source = source(base)
     assert request_concurrency_snapshot(shared_source) is None
@@ -90,9 +91,35 @@ async def test_concurrent_load_failures_share_one_reduction_only_for_optum(monke
                 network.results[8] = (None, {}, "request timed out", 0)
                 network.release[8].set()
                 assert await tasks[8] == network.results[8]
-                assert request_concurrency_snapshot(shared_source)["limit"] == 2
+                snapshot = request_concurrency_snapshot(shared_source)
+                assert snapshot["limit"] == 4
+                assert snapshot["transient_failures"] == 9
         finally:
             await finish(tasks)
+
+
+async def test_optum_sparse_transient_responses_keep_full_admission(monkeypatch):
+    """Failure observations age out of the pressure window between isolated faults."""
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    failure_by_index = {
+        0: (502, {}, None, 0),
+        31: (504, {}, None, 0),
+        63: (None, {}, "request timed out", 0),
+    }
+
+    async def fetch(_source, url, *, timeout):
+        return failure_by_index.get(int(url.rsplit("/", 1)[1]), SUCCESS)
+
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", fetch)
+    shared_source = source(base)
+    async with importer._source_http_session_scope(force=True, request_concurrency=32):
+        for index in range(65):
+            response = await importer._fetch_source_json_once(shared_source, f"{base}/{index}", timeout=1)
+            assert response == failure_by_index.get(index, SUCCESS)
+    snapshot = request_concurrency_snapshot(shared_source)
+    assert snapshot["limit"] == snapshot["capacity"] == 32
+    assert snapshot["reductions"] == snapshot["throttled_responses"] == 0
+    assert snapshot["transient_failures"] == len(failure_by_index)
 
 
 async def test_optum_recovers_only_after_healthy_time_at_capacity_and_pending_demand(monkeypatch, source_request_clock):
@@ -127,16 +154,15 @@ async def test_optum_recovers_only_after_healthy_time_at_capacity_and_pending_de
                 "request_time_ms": 0,
                 "reductions": 0,
                 "recoveries": 0,
+                "throttled_responses": 0,
+                "transient_failures": 0,
             }
             assert await complete(0, 1.0, (429, {}, None, 0)) == 1
             assert await complete(1, 40.0) == 1
             for _ in range(8):
                 assert await complete_next(1.0) == 1
             assert await complete_next(40.0, (200, {"resourceType": "OperationOutcome"}, None, 0)) == 1
-            assert await complete_next(31.0) == 1
-            for _ in range(6):
-                assert await complete_next() == 1
-            assert await complete_next() == 2
+            assert await complete_next(1.0) == 2
             for _ in range(12):
                 assert await complete_next(5.0) == 2
         finally:
@@ -146,7 +172,8 @@ async def test_optum_recovers_only_after_healthy_time_at_capacity_and_pending_de
     assert snapshot["active"] == snapshot["waiters"] == 0
     assert snapshot["started"] == snapshot["completed"]
     assert snapshot["reductions"] == snapshot["recoveries"] == 1
-    assert snapshot["request_time_ms"] >= 121_000
+    assert snapshot["throttled_responses"] == 1
+    assert snapshot["request_time_ms"] >= 90_000
 
 
 async def test_idle_time_and_uncontended_requests_cannot_raise_optum_allowance(monkeypatch, source_request_clock):
@@ -154,7 +181,7 @@ async def test_idle_time_and_uncontended_requests_cannot_raise_optum_allowance(m
     base = importer.UHC_PROVIDER_DIRECTORY_BASE
     shared_source = source(base)
     network = BlockedRequests(12)
-    network.results[0] = (504, {}, None, 0)
+    network.results[0] = (429, {}, None, 0)
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
     async with importer._source_http_session_scope(force=True, request_concurrency=2):
         for index in range(12):
@@ -169,6 +196,71 @@ async def test_idle_time_and_uncontended_requests_cannot_raise_optum_allowance(m
                 await finish([task])
     snapshot = request_concurrency_snapshot(shared_source)
     assert snapshot["limit"] == 1 and snapshot["recoveries"] == 0
+
+
+async def test_optum_delayed_throttle_cuts_a_recovered_limit(monkeypatch, source_request_clock):
+    """A pending throttle from a lower allowance still applies after recovery."""
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    shared_source = source(base)
+    network = BlockedRequests(16)
+    throttle = (429, {}, None, 0)
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
+    async with importer._source_http_session_scope(force=True, request_concurrency=4):
+        tasks = [start_fetch(dict(shared_source), index, base) for index in range(16)]
+        try:
+            initial_indices = await network.admissions(4)
+            network.results[initial_indices[0]] = throttle
+            for index in initial_indices:
+                network.release[index].set()
+                await tasks[index]
+            slow, next_index = await network.admissions(2)
+            for completed in range(8):
+                source_request_clock.now += 4
+                network.release[next_index].set()
+                assert await tasks[next_index] == SUCCESS
+                if completed < 7:
+                    (next_index,) = await network.admissions(1)
+            assert request_concurrency_snapshot(shared_source)["limit"] == 4
+            network.results[slow] = throttle
+            network.release[slow].set()
+            assert await tasks[slow] == throttle
+            snapshot = request_concurrency_snapshot(shared_source)
+            assert snapshot["limit"] == snapshot["reductions"] == snapshot["throttled_responses"] == 2
+        finally:
+            await finish(tasks)
+
+
+async def test_optum_stale_throttle_preserves_current_failure_window(monkeypatch):
+    """A throttle from a higher allowance cannot erase a new failure cluster."""
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    shared_source = source(base)
+    network = BlockedRequests(14)
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
+    async with importer._source_http_session_scope(force=True, request_concurrency=8):
+        tasks = [start_fetch(dict(shared_source), index, base) for index in range(14)]
+
+        async def complete(index, response=SUCCESS):
+            network.results[index] = response
+            network.release[index].set()
+            assert await tasks[index] == response
+            return request_concurrency_snapshot(shared_source)["limit"]
+
+        try:
+            await network.wait(range(8))
+            assert await complete(0, (503, {}, None, 0)) == 8
+            assert await complete(1, (503, {}, None, 0)) == 8
+            await network.wait([8, 9])
+            assert await complete(2, (503, {}, None, 0)) == 4
+            for index in (3, 4, 6, 7):
+                assert await complete(index) == 4
+            for index in (10, 11):
+                await network.wait([index])
+                assert await complete(index, (504, {}, None, 0)) == 4
+            await network.wait([12])
+            assert await complete(5, (429, {}, None, 0)) == 4
+            assert await complete(12, (None, {}, "ServerDisconnectedError", 0)) == 2
+        finally:
+            await finish(tasks)
 
 
 async def test_eight_inflight_requests_drain_before_reduced_allowance_admits_a_sibling(monkeypatch):
