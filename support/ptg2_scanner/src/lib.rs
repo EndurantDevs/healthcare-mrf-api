@@ -707,6 +707,10 @@ mod python_api {
             m
         )?)?;
         m.add_function(wrap_pyfunction!(provider_directory_rows_version, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            verify_provider_directory_merged_role_page_v1,
+            m
+        )?)?;
         m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         m.add_function(wrap_pyfunction!(intersect_sorted_u32_py, m)?)?;

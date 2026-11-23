@@ -61996,7 +61996,9 @@ def _endpoint_dataset_hash_page_sql(
                 :dataset_id, :after_resource_type, :after_resource_id
            )
         """
-    payload_projection = ", payload_json, acquired_resource_sha256" if include_payload_json else ""
+    payload_projection = (
+        ", CAST(payload_json AS text) AS payload_json_text, acquired_resource_sha256" if include_payload_json else ""
+    )
     relation = (
         _qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)
         if resource_relation is None
@@ -62023,53 +62025,16 @@ async def _endpoint_dataset_content_proof(
     resource_relation: tuple[str, str] | None = None,
 ) -> EndpointDatasetContentProof:
     """Hash an ordered dataset and each resource family with bounded pages."""
-    content_hash = hashlib.sha256()
-    resource_count = 0
-    resource_hasher_by_type = {resource_type: hashlib.sha256() for resource_type in resource_types}
-    resource_count_by_type = dict.fromkeys(resource_types, 0)
-    after_resource_type: str | None = None
-    after_resource_id: str | None = None
-    batch_size = max(1, ENDPOINT_DATASET_HASH_BATCH_SIZE)
-    if verify_payload_hashes:
-        # Bound raw JSON fetch/decode bursts as well as cooperative hash processing.
-        batch_size = min(batch_size, 1000)
-    while True:
-        resource_rows = await _endpoint_dataset_content_page(
-            connection,
-            dataset_id,
-            batch_size,
-            after_resource_type,
-            after_resource_id,
-            include_payload_json=verify_payload_hashes,
-            **({"resource_relation": resource_relation} if resource_relation is not None else {}),
-        )
-        if not resource_rows:
-            break
-        for resource_row in resource_rows:
-            if verify_payload_hashes:
-                _assert_endpoint_dataset_resource_payload_hash(
-                    resource_row,
-                    resource_hash_contract=resource_hash_contract,
-                )
-            if resource_count:
-                content_hash.update(b"\n")
-            identity = _endpoint_dataset_hash_identity(resource_row)
-            identity_bytes = _stable_identity_json(identity).encode("utf-8")
-            content_hash.update(identity_bytes)
-            resource_count += 1
-            resource_type = identity[0]
-            resource_hasher = resource_hasher_by_type.setdefault(resource_type, hashlib.sha256())
-            if resource_count_by_type.get(resource_type, 0):
-                resource_hasher.update(b"\n")
-            resource_hasher.update(identity_bytes)
-            resource_count_by_type[resource_type] = resource_count_by_type.get(resource_type, 0) + 1
-            if resource_count % 256 == 0:
-                await asyncio.sleep(0.001)
-        after_resource_type, after_resource_id, _payload_hash = _endpoint_dataset_hash_identity(resource_rows[-1])
-        if len(resource_rows) < batch_size:
-            break
-    return _completed_endpoint_dataset_content_proof(
-        content_hash, resource_count, resource_hasher_by_type, resource_count_by_type
+    from process.provider_directory_content_proof import endpoint_dataset_content_proof
+
+    return await endpoint_dataset_content_proof(
+        sys.modules[__name__],
+        connection,
+        dataset_id,
+        resource_types,
+        verify_payload_hashes=verify_payload_hashes,
+        resource_hash_contract=resource_hash_contract,
+        resource_relation=resource_relation,
     )
 
 
@@ -62111,11 +62076,14 @@ def _assert_endpoint_dataset_resource_payload_hash(
 ) -> None:
     resource_map = _pagination_checkpoint_row_mapping(resource_row)
     raw_payload = resource_map.get("payload_json")
-    if isinstance(raw_payload, str):
-        try:
+    try:
+        if "payload_json_text" in resource_map:
+            stored_text = resource_map["payload_json_text"]
+            raw_payload = json.loads(stored_text) if isinstance(stored_text, str) else None
+        if isinstance(raw_payload, str):
             raw_payload = json.loads(raw_payload)
-        except json.JSONDecodeError as exc:
-            raise ProviderDirectoryArtifactBuildStale("provider_directory_endpoint_dataset_payload_invalid") from exc
+    except json.JSONDecodeError as exc:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_endpoint_dataset_payload_invalid") from exc
     if not isinstance(raw_payload, dict):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_endpoint_dataset_payload_invalid")
     acquired_resource_sha256 = resource_map.get("acquired_resource_sha256")

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import inspect
@@ -11,6 +12,8 @@ import json
 import os
 import random
 import re
+from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +29,7 @@ role_merge = importlib.import_module("process.provider_directory_role_merge")
 storage = importlib.import_module("process.provider_directory_generic_source_storage")
 grouping = importlib.import_module("process.provider_directory_bulk_grouping")
 bulk_prepare = importlib.import_module("process.provider_directory_bulk_prepare")
+content_proof = importlib.import_module("process.provider_directory_content_proof")
 
 CONTRACTS = ("semantic_content_v4", "semantic_content_v3", "transport_neutral_v2", "transport_bound_v1")
 LOG_IDENTITY = directory._bulk_capability_log_identity("https://Bulk.Example.test/out/file_1.ndjson?sig=abc")
@@ -551,6 +555,101 @@ def _role_line(role_id, network, last_updated="2026-03-04T05:06:07Z"):
     role["meta"]["lastUpdated"] = last_updated
     role["identifier"][1]["value"] = "shared"
     return json.dumps(role).encode()
+
+
+def _stored_merged_role_row(index, contract, *, needs_float=False, is_wrapped=False):
+    payload_by_field = role_merge.merged_role_payload(
+        {
+            "practitioner_ref": f"Practitioner/{index}",
+            "location_refs": ["Location/office"],
+            "network_refs": ["Organization/network-b", "Organization/network-a"],
+            "fhir_meta": {"versionId": "1", "lastUpdated": "2026-01-02"},
+            "label": "Clínica 🏥",
+            "extension": {"weight": 1.25 if needs_float else index},
+        }
+    )
+    stored_json = json.dumps(payload_by_field, ensure_ascii=index % 2 == 0)
+    return {
+        "resource_type": "PractitionerRole",
+        "resource_id": payload_by_field["resource_id"],
+        "payload_hash": directory.resource_payload_sha256_for_contract(
+            payload_by_field, contract, resource_type="PractitionerRole"
+        ),
+        "payload_json_text": json.dumps(stored_json) if is_wrapped else stored_json,
+        "acquired_resource_sha256": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contract", CONTRACTS[:2])
+async def test_stored_merged_role_pages_match_reference_proof(monkeypatch, contract):
+    native = _compiled_export("verify_provider_directory_merged_role_page_v1")
+    float_role = _stored_merged_role_row(5, contract, needs_float=True)
+    wrapped_role = _stored_merged_role_row(6, contract, is_wrapped=True)
+    role_rows = [_stored_merged_role_row(index, contract) for index in (0, 1, 2, 3, 4, 7, 8, 9, 10)]
+    role_rows.extend((float_role, wrapped_role))
+    role_rows.sort(key=lambda role_row: role_row["resource_id"])
+    native_rows = [
+        (role_row["resource_id"], role_row["payload_hash"], role_row["payload_json_text"]) for role_row in role_rows
+    ]
+    assert native(native_rows)[1] == [
+        index for index, role_row in enumerate(role_rows) if role_row in (float_role, wrapped_role)
+    ]
+
+    async def page(_query, *, batch_size, after_resource_id="", **_parameters):
+        return [role_row for role_row in role_rows if role_row["resource_id"] > after_resource_id][:batch_size]
+
+    async def verify(encoder):
+        monkeypatch.setattr(content_proof, "_native_merged_role_encoder", lambda: encoder)
+        return await directory._endpoint_dataset_content_proof(
+            SimpleNamespace(all=page),
+            "dataset-1",
+            ("PractitionerRole", "Location"),
+            verify_payload_hashes=True,
+            resource_hash_contract=contract,
+        )
+
+    monkeypatch.setattr(directory, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 4)
+    reference = await verify(None)
+    assert await verify(native) == reference
+    assert reference.resource_counts == {"Location": 0, "PractitionerRole": len(role_rows)}
+    role_rows[-1]["payload_json_text"] = role_rows[-1]["payload_json_text"].replace(
+        "Organization/network-a", "Organization/changed"
+    )
+    for encoder in (native, None):
+        with pytest.raises(RuntimeError, match="payload_hash_mismatch"):
+            await verify(encoder)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_merged_role_page_drains_the_started_native_work():
+    role_by_field = {
+        "resource_type": "PractitionerRole",
+        "resource_id": "a" * 64,
+        "payload_hash": "b" * 64,
+        "payload_json_text": "{}",
+    }
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = Event()
+
+    def encode(_rows):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5)
+        return None
+
+    task = asyncio.create_task(
+        content_proof._verified_merged_role_page(directory, [role_by_field], encode, CONTRACTS[0])
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def test_single_line_union_equals_batch_path_union(tmp_path):

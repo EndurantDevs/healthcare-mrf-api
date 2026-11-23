@@ -181,3 +181,12 @@ fn prepare_provider_directory_row_lines_v1<'py>(
 fn provider_directory_rows_version() -> &'static str {
     crate::provider_directory_rows::CONTRACT
 }
+
+#[pyfunction]
+fn verify_provider_directory_merged_role_page_v1(
+    py: Python<'_>,
+    rows: Vec<(String, String, String)>,
+) -> Option<(Py<PyBytes>, Vec<usize>)> {
+    py.detach(|| crate::provider_directory_rows::verify_merged_role_page(&rows))
+        .map(|(identities, fallback)| (PyBytes::new(py, identities.as_bytes()).unbind(), fallback))
+}

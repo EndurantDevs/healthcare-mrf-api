@@ -413,6 +413,55 @@ fn contract_hash(payload: &Fields, contract: &str) -> Result<String, Unsupported
     hash_entries(entries(payload))
 }
 
+/// Validate stored merged roles, leaving ambiguous rows to the reference validator.
+/// The identity bytes have the same order and framing as the Python content proof.
+#[cfg(feature = "python")]
+pub(crate) fn verify_merged_role_page(
+    rows: &[(String, String, String)],
+) -> Option<(String, Vec<usize>)> {
+    use rayon::prelude::*;
+
+    if !rows
+        .iter()
+        .all(|(id, hash, _)| is_sha256_hex(id) && is_sha256_hex(hash))
+    {
+        return None;
+    }
+    let verified: Vec<_> = rows
+        .par_iter()
+        .map(|(id, hash, json)| {
+            fn verify(id: &str, hash: &str, json: &str) -> Result<bool, Unsupported> {
+                let Value::Object(payload) = value::decode_json(json)? else {
+                    return Ok(false);
+                };
+                Ok(
+                    matches!(get(&payload, "resource_id"), Value::Str(role_id) if role_id == id)
+                        && !payload.iter().any(|(name, _)| name == "merged_role_repeat")
+                        && merged_role_id(&payload)? == id
+                        && merged_role_components(&payload)?.1 == hash,
+                )
+            }
+            verify(id, hash, json).unwrap_or(false)
+        })
+        .collect();
+    let mut identities = String::new();
+    let mut fallback = Vec::new();
+    for (index, ((id, hash, _), verified)) in rows.iter().zip(verified).enumerate() {
+        if !verified {
+            fallback.push(index);
+        }
+        if index != 0 {
+            identities.push('\n');
+        }
+        identities.push_str("[\"PractitionerRole\",\"");
+        identities.push_str(id);
+        identities.push_str("\",\"");
+        identities.push_str(hash);
+        identities.push_str("\"]");
+    }
+    Some((identities, fallback))
+}
+
 /// `_dataset_payloads_by_resource_id` and `_endpoint_dataset_resource_rows`: one row per identity, sorted.
 fn retained_rows(payloads: Vec<Fields>, contract: &str) -> Result<Vec<PreparedRow>, Unsupported> {
     let mut by_identity: std::collections::HashMap<String, Fields> =
