@@ -38,9 +38,9 @@ def _retained_capture(source_by_field, *, row_count=1, content_sha256="b" * 64):
     return capture_by_field
 
 
-def native_recipe(ordinal):
+def native_recipe(ordinal, *, source_system="aca"):
     coordinates = RegistryNetworkSourceCoordinates(
-        "aca",
+        source_system,
         "selected-source-" + str(ordinal),
         "source_plans",
         "edition-one",

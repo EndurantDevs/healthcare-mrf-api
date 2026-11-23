@@ -42,7 +42,7 @@ def current_catalog_inventory():
 
 
 async def replaced_native_generations(connection, previous, accepted):
-    """Retire only complete native replacements, retaining absent or unavailable source identities."""
+    """Retire superseded native inputs and old automatically discovered PTG provider sets."""
     if previous is None:
         return ()
     source_ids = [
@@ -50,15 +50,18 @@ async def replaced_native_generations(connection, previous, accepted):
         for source in accepted
         if source.descriptor.get("contract") == "registry-native-network-source-v1"
     ]
-    if not source_ids:
+    is_ordinary_import = current_catalog_inventory() is not None
+    if not source_ids and not is_ordinary_import:
         return ()
     current_generations = [digest(source.descriptor) for source in accepted]
     rows = await connection.fetch(
         f"SELECT source_generation FROM {storage_identifier(previous['schema_name'])}.registry_fhir_catalog_source "
-        "WHERE descriptor_json->>'contract'='registry-native-network-source-v1' AND source_id=ANY($1::text[]) "
+        "WHERE descriptor_json->>'contract'='registry-native-network-source-v1' "
+        "AND (source_id=ANY($1::text[]) OR ($3 AND descriptor_json->'coordinates'->>'source_system'='ptg')) "
         "AND NOT(source_generation=ANY($2::text[]))",
         source_ids,
         current_generations,
+        is_ordinary_import,
     )
     return tuple(row["source_generation"] for row in rows)
 
