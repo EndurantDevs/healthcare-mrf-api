@@ -12,6 +12,7 @@ MAX_CALIBRATION_BYTES = 256 * 1024 * 1024
 MAX_ENCODED_BYTES = 384 * 1024 * 1024
 MAX_FRAME_BYTES = 40000
 NPI_BATCH = 100
+RAW_INDEX_PAGES_PER_RANGE = 16
 RAW_FIELDS = "npi,geo_cell,location_key,type,address_key,premise_key,address_source_mask,geo_assurance_version,geo_evidence_source_id"
 
 
@@ -88,7 +89,7 @@ class CodeInputOracle:
         )
         await self.session.execute(
             text(
-                "CREATE TEMP TABLE code_calibration_members(binding_ordinal integer,provider_set_key bigint,npi bigint,PRIMARY KEY(binding_ordinal,provider_set_key,npi)) ON COMMIT DROP"
+                "CREATE TEMP TABLE code_calibration_members(binding_ordinal integer,provider_set_key bigint,npi bigint,PRIMARY KEY(npi,binding_ordinal,provider_set_key)) ON COMMIT DROP"
             )
         )
         await self.session.execute(
@@ -99,13 +100,23 @@ class CodeInputOracle:
         for cell in self.identity["scope"]["geo_cells"]:
             await self._cell(serving, projection, cell)
         self.membership_count = int(await self.session.scalar(text("SELECT count(*) FROM code_calibration_members")))
-        block_size = int(await self.session.scalar(text("SELECT current_setting('block_size')::integer")))
-        # Allow 64 bytes per short ZIP/bigint key, plus eight pages for fixed B-tree overhead.
-        index_bytes = 64 * (self.work["raw_address"] + self.membership_count) + 8 * block_size
+        # Reserve one full page per BRIN summary, plus fixed overhead and rounding.
+        index_bytes = int(
+            await self.session.scalar(
+                text(
+                    "SELECT pg_relation_size('pg_temp.code_calibration_raw') / "
+                    f"{RAW_INDEX_PAGES_PER_RANGE} + 9 * current_setting('block_size')::integer"
+                )
+            )
+        )
         await require_budget(self.session, reserve_bytes=index_bytes)
-        # Each grouped comparison reads one cell and one batch from the complete census.
-        await self.session.execute(text("CREATE INDEX ON code_calibration_raw(geo_cell,npi)"))
-        await self.session.execute(text("CREATE INDEX ON code_calibration_members(npi)"))
+        # The heap is appended in ZIP and NPI batches, so page ranges prune the address reads.
+        await self.session.execute(
+            text(
+                "CREATE INDEX ON code_calibration_raw USING brin(geo_cell,npi) "
+                f"WITH (pages_per_range={RAW_INDEX_PAGES_PER_RANGE})"
+            )
+        )
         await require_budget(self.session)
         await self.session.execute(
             text("ANALYZE code_calibration_raw,code_calibration_members,code_calibration_batches")
@@ -230,17 +241,18 @@ class CodeInputOracle:
 
     async def verify_batch(self, session, cell):
         """Compare the complete grouped batch with independent scalar evidence."""
-        batch = self.verified_batches
+        batch = f"FROM code_calibration_batches WHERE batch={self.verified_batches}"
         await _equal(
             session,
             "SELECT npi,raw_rows FROM plan_pricing_zip_npi",
-            f"SELECT npi,raw_rows FROM code_calibration_batches WHERE batch={batch}",
+            f"SELECT npi,raw_rows {batch}",
         )
-        wanted = f"npi IN (SELECT npi FROM code_calibration_batches WHERE batch={batch})"
+        # Use the bounds to prune pages and the exact batch to handle gaps between NPIs.
+        wanted = f"npi BETWEEN (SELECT min(npi) {batch}) AND (SELECT max(npi) {batch}) AND npi IN (SELECT npi {batch})"
         matched = "EXISTS(SELECT 1 FROM code_calibration_members member WHERE member.npi=raw.npi)"
-        raw = f"SELECT {RAW_FIELDS} FROM code_calibration_raw raw WHERE {wanted} AND geo_cell='{cell}' AND {matched}"
-        await _equal(session, f"SELECT {RAW_FIELDS} FROM plan_pricing_zip_address", raw)
-        assured = f"SELECT npi,geo_cell FROM code_calibration_raw raw WHERE {wanted} AND geo_cell='{cell}' AND {matched} AND oracle_evidence IS NOT NULL"
+        scope = f"FROM code_calibration_raw raw WHERE {wanted} AND geo_cell='{cell}' AND {matched}"
+        await _equal(session, f"SELECT {RAW_FIELDS} FROM plan_pricing_zip_address", f"SELECT {RAW_FIELDS} {scope}")
+        assured = f"SELECT npi,geo_cell {scope} AND oracle_evidence IS NOT NULL"
         await _equal(session, "SELECT npi,geo_cell FROM plan_pricing_zip_assured", assured)
         self.verified_batches += 1
         await require_budget(session, self.schema)
