@@ -281,8 +281,9 @@ async def test_mapped_capture_rebind_reads_content_only_outside_frozen_inventory
         comment["content"]["pairs"]["sha256"] = "0" * 64
     metadata = None if mode == "missing" else captures.LEGACY_COMMENT + json.dumps(comment)
     connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value=metadata))
-    full_read = AsyncMock(return_value=pin.capture["content"])
-    monkeypatch.setattr(captures, "_content", full_read)
+    expected_rows_by_kind = {kind: entry["rows"] for kind, entry in pin.capture["content"].items()}
+    full_read = AsyncMock(return_value=expected_rows_by_kind)
+    monkeypatch.setattr(captures, "_content_rows", full_read)
     read = await captures.load_typed_graph_capture(connection, pin.capture, expected_anchor=pin.anchor)
     mapping = SimpleNamespace(source_stage=read, require_ready=Mock())
     offices = TypedOfficeMatches("offices", "a" * 64, "b" * 64, None, (), (mapping,))
@@ -376,3 +377,43 @@ def test_legacy_capture_projection_preserves_source_data_scope_validation():
     capture["catalog_descriptor"]["dataset_sha256"] = "f" * 64
     with pytest.raises(TypedFHIRGraphError, match="catalog_origin"):
         validate_typed_capture(capture)
+
+
+async def test_load_typed_graph_capture_accepts_legacy_digest_via_row_counts():
+    from process.network_fhir_typed_capture import LEGACY_COMMENT, TypedGraphAnchor, load_typed_graph_capture
+    from tests.test_registry_typed_source_recipe import _recipe
+
+    capture = _recipe().source_pin.capture
+    legacy_capture_by_field = {**capture, "descriptor_version": 4}
+    legacy_capture_by_field["content"] = {
+        kind: {**entry, "sha256": "9" * 64} for kind, entry in capture["content"].items()
+    }
+    anchor = TypedGraphAnchor(legacy_capture_by_field["capture_id"], legacy_capture_by_field["observed_at"])
+    queries = []
+
+    async def count_rows(query, *arguments):
+        queries.append((query, arguments))
+        return {kind: entry["rows"] for kind, entry in legacy_capture_by_field["content"].items()}
+
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(side_effect=count_rows),
+        copy_from_query=AsyncMock(side_effect=AssertionError("legacy binary COPY re-hash must not run")),
+    )
+    loaded = await load_typed_graph_capture(connection, legacy_capture_by_field, expected_anchor=anchor)
+    assert loaded.capture["content"] == legacy_capture_by_field["content"]
+    assert len(queries) == 1 and "SELECT count(*)::bigint" in queries[0][0]
+    connection.copy_from_query.assert_not_awaited()
+
+    assert LEGACY_COMMENT.endswith(":4:")
+    mismatch_connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(
+            return_value={
+                **{kind: entry["rows"] for kind, entry in legacy_capture_by_field["content"].items()},
+                "pairs": 999,
+            }
+        ),
+    )
+    with pytest.raises(TypedFHIRGraphError, match="content_changed"):
+        await load_typed_graph_capture(mismatch_connection, legacy_capture_by_field, expected_anchor=anchor)

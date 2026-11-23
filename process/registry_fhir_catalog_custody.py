@@ -5,19 +5,11 @@ import json
 from dataclasses import dataclass
 from uuid import UUID
 
+from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import TABLES
 from process.registry_fhir_catalog_validation import validate_fhir_catalog_candidate, verify_fhir_catalog_validation
 
 PHYSICAL_TABLES = frozenset(set(TABLES) - {"registry_fhir_catalog_snapshot"})
-# pg_class comes from the read snapshot, which can be older; row_security_active reads the current catalog.
-_UNSUPPORTED_SQL = (
-    "SELECT EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1) "
-    "OR EXISTS(SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND "
-    "(c.relrowsecurity OR c.relforcerowsecurity OR pg_catalog.row_security_active(c.oid) OR c.relispartition OR "
-    "EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) OR "
-    "EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid) OR "
-    "EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)))"
-)
 
 
 @dataclass(frozen=True)
@@ -47,8 +39,25 @@ async def validate_fhir_catalog_snapshot_data(
     """Validate complete candidate data before its logical control record is registered."""
     if not connection.is_in_transaction() or type(copy_target) is not FHIRCatalogTarget:
         raise ValueError("registry_fhir_catalog_transaction_required")
-    if await connection.fetchval("SELECT current_setting('transaction_isolation')") != "read committed":
+    # An outside inheritance relation can change a catalog after its own writers close.
+    candidate_state = await connection.fetchrow(
+        "SELECT current_setting('transaction_isolation') AS isolation, "
+        "(SELECT count(*) = $3 FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = $1 AND c.relname::text = ANY($2::text[]) "
+        "AND c.relkind = 'r' AND NOT c.relispartition AND NOT c.relhassubclass AND NOT c.relhasrules "
+        "AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend d "
+        "WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.refclassid = d.classid "
+        "AND d.objid = c.oid AND d.deptype = 'n')) AS layout_complete",
+        copy_target.schema_name,
+        sorted(PHYSICAL_TABLES),
+        len(PHYSICAL_TABLES),
+    )
+    if candidate_state["isolation"] != "read committed":
         raise ValueError("registry_fhir_catalog_fresh_snapshot_required")
+    if not candidate_state["layout_complete"]:
+        raise ValueError("registry_fhir_catalog_table_layout_invalid")
+    await connection.execute("SET LOCAL row_security = off")
     return await validate_fhir_catalog_candidate(
         connection, copy_target, expected_snapshot, control_schema=control_schema, standing_grant=standing_grant
     )
@@ -58,6 +67,7 @@ async def validate_fhir_catalog_snapshot_record(connection, snapshot):
     """Validate logical generation and content accounting from retained control metadata."""
     if not connection.is_in_transaction():
         raise ValueError("registry_fhir_catalog_transaction_required")
+    storage_identifier(snapshot["schema_name"])
     validation_by_field = snapshot["custody_json"]
     if type(validation_by_field) is str:
         validation_by_field = json.loads(validation_by_field)
@@ -69,6 +79,5 @@ async def validate_fhir_catalog_snapshot_record(connection, snapshot):
         catalog_snapshot_preparation(snapshot)
         validation_by_field = {key: value for key, value in validation_by_field.items() if key != "preparation"}
     verify_fhir_catalog_validation(snapshot, validation_by_field)
-    # A row filter, partition, rule or trigger on a named catalog table would change what a read returns.
-    if await connection.fetchval(_UNSUPPORTED_SQL, snapshot["schema_name"]):
-        raise ValueError("registry_fhir_catalog_custody_invalid")
+    # PostgreSQL refuses a filtered read with this setting. It does not grant RLS bypass.
+    await connection.execute("SET LOCAL row_security = off")

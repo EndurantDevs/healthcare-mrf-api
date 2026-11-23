@@ -62,6 +62,16 @@
       "service",
       "support/ptg2_scanner/src"
     ],
+    "importer_guard_roots": [
+      "api",
+      "db",
+      "process",
+      "service"
+    ],
+    "importer_guard_exclude_globs": [
+      "db/migration_*.py",
+      "db/models/**"
+    ],
     "module_attribute_injection_allowlist": [
       "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphAcquisitionError",
       "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphAcquisitionConfig",

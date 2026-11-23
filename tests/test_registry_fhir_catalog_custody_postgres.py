@@ -756,16 +756,55 @@ async def test_manual_uuid_relationship_is_validated(metadata_custody):
 
 
 @pytest.mark.asyncio
-async def test_row_filter_enabled_after_reader_snapshot_refuses(metadata_custody):
+async def test_snapshot_read_refuses_a_current_row_filter_without_catalog_probes(metadata_custody):
     fixture = metadata_custody
     selected = await freeze_metadata(fixture)
-    async with fixture.reader.transaction(isolation="repeatable_read", readonly=True):
-        await fixture.reader.fetchval("SELECT 1")  # fixes the snapshot before the policy change
-        await fixture.connection.execute(
-            f'ALTER TABLE "{fixture.target.schema_name}".registry_fhir_catalog_network ENABLE ROW LEVEL SECURITY'
-        )
-        with pytest.raises(ValueError, match="custody_invalid"):
+    with pytest.raises(asyncpg.InsufficientPrivilegeError, match="row-level security"):
+        async with fixture.reader.transaction(isolation="repeatable_read", readonly=True):
+            await fixture.reader.fetchval("SELECT 1")
+            await fixture.connection.execute(
+                f'ALTER TABLE "{fixture.target.schema_name}".registry_fhir_catalog_network ENABLE ROW LEVEL SECURITY'
+            )
             await validate_fhir_catalog_snapshot_record(fixture.reader, selected)
+            await fixture.reader.fetchval(
+                f'SELECT count(*) FROM "{fixture.target.schema_name}".registry_fhir_catalog_network'
+            )
+
+
+@pytest.mark.asyncio
+async def test_catalog_validation_refuses_inheritance_from_writable_schema(metadata_custody):
+    fixture = metadata_custody
+    external = await create_metadata_target(fixture)
+    await fixture.loader.execute(
+        f'CREATE TABLE "{external.schema_name}".extra_networks () '
+        f'INHERITS ("{fixture.target.schema_name}".registry_fhir_catalog_network)'
+    )
+    with pytest.raises(ValueError, match="registry_fhir_catalog_table_layout_invalid"):
+        await freeze_metadata(fixture)
+
+
+@pytest.mark.asyncio
+async def test_catalog_validation_refuses_dependency_on_writable_parent(metadata_custody):
+    fixture = metadata_custody
+    external = await create_metadata_target(fixture)
+    await fixture.loader.execute(f'CREATE TABLE "{external.schema_name}".external_parent ()')
+    await fixture.loader.execute(
+        f'ALTER TABLE "{fixture.target.schema_name}".registry_fhir_catalog_network '
+        f'INHERIT "{external.schema_name}".external_parent'
+    )
+    with pytest.raises(ValueError, match="registry_fhir_catalog_table_layout_invalid"):
+        await freeze_metadata(fixture)
+
+
+@pytest.mark.asyncio
+async def test_catalog_validation_refuses_rewrite_rule(metadata_custody):
+    fixture = metadata_custody
+    await fixture.loader.execute(
+        f'CREATE RULE skip_network AS ON INSERT TO "{fixture.target.schema_name}".registry_fhir_catalog_network '
+        "DO INSTEAD NOTHING"
+    )
+    with pytest.raises(ValueError, match="registry_fhir_catalog_table_layout_invalid"):
+        await freeze_metadata(fixture)
 
 
 @pytest.mark.asyncio

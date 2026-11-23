@@ -234,23 +234,54 @@ async def test_carry_forward_cannot_target_its_sealed_source_schema(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_carry_forward_oversized_first_row_rolls_back_without_advancing_cursor(monkeypatch):
+async def test_carry_forward_uses_set_based_inserts_and_rolls_back(monkeypatch):
     connection = _connection()
     verify = AsyncMock()
     monkeypatch.setattr(store, "validate_fhir_catalog_snapshot_record", verify)
-    page_by_field = {"seen": 1, "first_bytes": 128, "copied": 0}
-    connection.fetchrow.return_value = page_by_field
+    table_names = sorted(store.PHYSICAL_TABLES)
+    executed_statements = []
+
+    async def execute_copy(statement, *parameters):
+        executed_statements.append((statement, parameters))
+        if statement.startswith("INSERT INTO"):
+            return "INSERT 0 4"
+        return "OK"
+
+    connection.execute = AsyncMock(side_effect=execute_copy)
+    connection.fetchrow = AsyncMock(return_value={table: "[4, 512]" for table in table_names})
     previous_by_field = {"schema_name": "previous_catalog"}
-    with pytest.raises(ValueError, match="registry_fhir_catalog_store_row_too_large"):
+    accounting = await store.copy_fhir_catalog_snapshot(
+        connection,
+        previous_by_field,
+        _candidate(),
+        "a" * 64,
+        loader_role="catalog_loader",
+        control_schema="catalog_control",
+    )
+    verify.assert_awaited_once_with(connection, previous_by_field)
+    inserts = [stmt for stmt, _ in executed_statements if stmt.startswith("INSERT INTO")]
+    assert len(inserts) == len(table_names)
+    assert all(
+        "SELECT " in stmt and "ON CONFLICT" in stmt and "LIMIT " not in stmt and "running_bytes" not in stmt
+        for stmt in inserts
+    )
+    assert accounting == {
+        "input_rows": 4 * len(table_names),
+        "affected_rows": 4 * len(table_names),
+        "batches": len(table_names),
+        "payload_bytes": 512 * len(table_names),
+    }
+    assert connection.events == ["begin", "commit"]
+
+    failing_connection = _connection()
+    failing_connection.execute = AsyncMock(side_effect=[None, RuntimeError("synthetic failure")])
+    with pytest.raises(RuntimeError, match="synthetic failure"):
         await store.copy_fhir_catalog_snapshot(
-            connection,
+            failing_connection,
             previous_by_field,
             _candidate(),
             "a" * 64,
             loader_role="catalog_loader",
             control_schema="catalog_control",
-            max_bytes=128,
         )
-    verify.assert_awaited_once_with(connection, previous_by_field)
-    assert connection.events == ["begin", "rollback"]
-    assert connection.fetchrow.await_count == 1
+    assert failing_connection.events == ["begin", "rollback"]

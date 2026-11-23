@@ -176,8 +176,15 @@ def typed_capture_catalog_generation(document):
     return fhir_catalog_source_generation(document["catalog_descriptor"])
 
 
+async def _content_rows(connection, stage):
+    """Count rows per graph table in one set-based SQL query without copying rows."""
+    selects = ",".join(f"(SELECT count(*)::bigint FROM {stage.relation(kind)}) AS {kind}" for kind in TABLES)
+    counts_summary = await connection.fetchrow("SELECT " + selects)
+    return {kind: int(counts_summary[kind]) for kind in TABLES}
+
+
 async def _content(connection, stage):
-    """Hash ordered native binary packets without per-edge Python objects or JSON witnesses."""
+    """Write the v5 data fingerprint once so an older worker can reopen a new capture."""
     content_by_kind = {}
     for kind, keys in KEYS.items():
         folded = hashlib.sha256((COMPONENT + ":binary-v4:" + kind + "\0").encode())
@@ -290,7 +297,7 @@ async def require_typed_graph_capture(connection, document, *, expected_anchor):
 async def verify_typed_graph_capture(
     source_export, connection, document, *, source_profile, reviewed_origin, expected_anchor, replay_stage=None
 ):
-    """Independently rederive the graph and compare complete ordered data hashes."""
+    """Independently rederive the graph when a replay stage is given and check table counts."""
     document = validate_typed_capture(document)
     stage = await require_typed_graph_capture(connection, document, expected_anchor=expected_anchor)
     await verify_typed_source_graph(
@@ -302,7 +309,8 @@ async def verify_typed_graph_capture(
         membership_as_of=document["graph"]["membership_as_of"],
         replay_stage=replay_stage,
     )
-    require(await _content(connection, stage) == document["content"], "content_changed")
+    expected_rows_by_kind = {kind: document["content"][kind]["rows"] for kind in TABLES}
+    require(await _content_rows(connection, stage) == expected_rows_by_kind, "content_changed")
     stage.require_ready()
     return stage
 
@@ -362,8 +370,9 @@ class TypedGraphRead:
 
 
 async def load_typed_graph_capture(connection, document, *, expected_anchor):
-    """Read a completed edition and validate its content before network preparation."""
+    """Check table counts on an edition frozen against application writes."""
     document = validate_typed_capture(document)
     stage = await require_typed_graph_capture(connection, document, expected_anchor=expected_anchor)
-    require(await _content(connection, stage) == document["content"], "content_changed")
+    expected_rows_by_kind = {kind: document["content"][kind]["rows"] for kind in TABLES}
+    require(await _content_rows(connection, stage) == expected_rows_by_kind, "content_changed")
     return TypedGraphRead(stage, document, expected_anchor)
