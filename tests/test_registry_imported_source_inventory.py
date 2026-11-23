@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from asyncpg import UndefinedTableError
 
 from process import registry_fhir_catalog_sync as catalog_sync
 from process import registry_imported_catalog_preparation as catalog_preparation
@@ -512,6 +513,33 @@ async def test_published_catalog_families_key_complete_observations_by_dataset_a
     assert "network_serving_control" in connection.fetchval.call_args.args[0]
     connection.fetchval.return_value = None
     assert await inventory._serving_catalog_observations(connection, "registry") == ()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_family_cache_is_optional_when_retention_removes_the_table():
+    transactions = []
+
+    @asynccontextmanager
+    async def savepoint():
+        try:
+            yield
+        except UndefinedTableError:
+            transactions.append("rolled back")
+            raise
+
+    descriptor = observed_descriptor(dataset="checkpoint-edition")
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value="checkpoint_catalog"),
+        fetch=AsyncMock(return_value=[{"descriptor": json.dumps(descriptor)}]),
+        transaction=savepoint,
+    )
+    assert await inventory._checkpoint_catalog_observations(connection, "registry") == (descriptor,)
+    selection = connection.fetchval.call_args.args[0]
+    assert "published_at IS NULL" in selection and "accounting_json ? 'registry_fhir_catalog_source'" in selection
+
+    connection.fetch.side_effect = UndefinedTableError("test checkpoint was removed")
+    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ()
+    assert transactions == ["rolled back"]
 
 
 @pytest.mark.asyncio
