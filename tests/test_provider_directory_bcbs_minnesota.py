@@ -136,6 +136,55 @@ async def test_minnesota_count_lookahead_preserves_census_and_retry_fences(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("window_concurrency", "expected_peak"), [(3, 3), (8, 4)])
+async def test_minnesota_count_lookahead_uses_bounded_batches(
+    carrier_source, monkeypatch, window_concurrency, expected_peak
+):
+    config = last_updated_partition_config()
+    state = last_updated_partition_state(census=directory.LastUpdatedCompletenessCensus(ranged_root_pre=80))
+    state.context = replace(state.context, canonical_api_base=BASE)
+    state.start_url = BASE + "/Practitioner"
+    state.plan.observe_count("root", directory.CountObservation.exact(80))
+    for count in (40, 20):
+        for window in state.plan.pending_count_windows():
+            state.plan.observe_count(window.window_id, directory.CountObservation.exact(count))
+    expected_urls = {
+        directory._last_updated_partition_count_url(state, config, window)
+        for window in state.plan.pending_count_windows()
+    }
+    active_urls = set()
+    observed_concurrency_levels = []
+    requested_urls = []
+
+    async def fetch(_source, url, **_kwargs):
+        requested_urls.append(url)
+        active_urls.add(url)
+        observed_concurrency_levels.append(len(active_urls))
+        await asyncio.sleep(0)
+        active_urls.remove(url)
+        return directory.LastUpdatedCountFetch(directory.CountObservation.exact(10))
+
+    slots = asyncio.BoundedSemaphore(window_concurrency)
+    monkeypatch.setattr(directory.time_partition, "partition_window_slots", lambda *_args: slots)
+    monkeypatch.setattr(directory, "_fetch_last_updated_partition_count", fetch)
+    monkeypatch.setattr(directory, "_save_last_updated_partition_plan", AsyncMock())
+    outcome = await directory._observe_partition_counts(
+        carrier_source,
+        "Practitioner",
+        ProviderDirectoryPractitioner,
+        config,
+        state,
+        last_updated_partition_fetch_options(window_concurrency=window_concurrency),
+    )
+    assert outcome is None
+    assert max(observed_concurrency_levels) == expected_peak
+    assert len(requested_urls) == len(expected_urls) == 8
+    assert set(requested_urls) == expected_urls
+    assert state.plan.status is directory.PlanStatus.ACQUIRING
+    assert sum(window.count for window in state.plan.leaf_windows()) == 80
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "count_changed", "wrong_id", "wrong_stamp", "throttled"])
 async def test_timed_out_practitioner_verifies_small_retained_window(carrier_source, monkeypatch, outcome):
     start = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
