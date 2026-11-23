@@ -368,7 +368,7 @@ def test_shared_assurance_preserves_ordinary_query_bytes():
 
 @pytest.mark.asyncio
 async def test_group_enumeration_charges_complete_raw_count_before_pending_membership(monkeypatch):
-    monkeypatch.setattr(build, "CODE_PROVIDER_READ_BATCH_SIZE", 2)
+    monkeypatch.setattr(scoped, "ZIP_PROVIDER_READ_BATCH_SIZE", 2)
     session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(side_effect=[7, 12]))
     assert await scoped._stage_address_batch(session, "48104", 10, 7) == (7, 12)
     query, params = session.execute.await_args_list[1].args

@@ -5,13 +5,13 @@ import hashlib
 
 from sqlalchemy import text
 
+from api import plan_pricing_code_zip_build as zip_build
 from api.plan_pricing_projection_contract import table
 from process import reference_family_archive as native
 
 MAX_CALIBRATION_BYTES = 256 * 1024 * 1024
 MAX_ENCODED_BYTES = 384 * 1024 * 1024
 MAX_FRAME_BYTES = 40000
-NPI_BATCH = 100
 RAW_INDEX_PAGES_PER_RANGE = 16
 RAW_FIELDS = "npi,geo_cell,location_key,type,address_key,premise_key,address_source_mask,geo_assurance_version,geo_evidence_source_id"
 
@@ -139,8 +139,8 @@ class CodeInputOracle:
                 FROM {table("entity_address_unified")} addr
                 WHERE addr.type IN ('practice','primary','secondary','site') AND addr.npi>0
                 AND {zip5}=:cell AND addr.npi>:position
-                GROUP BY addr.npi ORDER BY addr.npi LIMIT {NPI_BATCH}"""),
-                    {"cell": cell, "position": position},
+                GROUP BY addr.npi ORDER BY addr.npi LIMIT :batch_size"""),
+                    {"cell": cell, "position": position, "batch_size": zip_build.ZIP_PROVIDER_READ_BATCH_SIZE},
                 )
             ).all()
             if not group_rows:

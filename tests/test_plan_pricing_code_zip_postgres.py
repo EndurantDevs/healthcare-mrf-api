@@ -495,7 +495,7 @@ async def _assert_pending_npi_statistics(session, pending_npis):
 async def test_zip_native_batches_preserve_raw_multisets_and_exact_pages(monkeypatch, batch_size):
     """Grouped pages preserve the scalar multiset and globally deduplicated code work."""
     _limits(monkeypatch)
-    monkeypatch.setattr(build, "CODE_PROVIDER_READ_BATCH_SIZE", batch_size)
+    monkeypatch.setattr(scoped, "ZIP_PROVIDER_READ_BATCH_SIZE", batch_size)
     async with original._database(monkeypatch) as db:
         oid = await original._source_database(db)
         unscoped_identity = original._fixture(monkeypatch, db, oid)
@@ -557,7 +557,7 @@ async def test_zip_native_batches_preserve_raw_multisets_and_exact_pages(monkeyp
 @pytest.mark.parametrize("failure", ["raw_address", "factor", "member_cell", "cancelled"])
 async def test_zip_native_late_batch_refusal_precedes_output_and_rolls_back(monkeypatch, failure):
     _limits(monkeypatch)
-    monkeypatch.setattr(build, "CODE_PROVIDER_READ_BATCH_SIZE", 1)
+    monkeypatch.setattr(scoped, "ZIP_PROVIDER_READ_BATCH_SIZE", 1)
     async with original._database(monkeypatch) as db:
         oid = await original._source_database(db)
         identity = original._fixture(monkeypatch, db, oid)
