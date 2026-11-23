@@ -497,7 +497,7 @@ async def test_source_count_and_input_tamper_refuse(metadata_custody):
 
 
 @pytest.mark.asyncio
-async def test_set_validation_counts_resources_by_type_and_id(metadata_custody):
+async def test_set_validation_counts_resources_by_type_and_id(metadata_custody, monkeypatch):
     fixture = metadata_custody
     snapshot = await seed_observations(fixture, 1)
     namespace = f'"{fixture.target.schema_name}"'
@@ -514,6 +514,7 @@ async def test_set_validation_counts_resources_by_type_and_id(metadata_custody):
         f"FROM {observation} WHERE ordinal=0"
     )
     await fixture.connection.execute(f"UPDATE {source} SET source_rows=2,observation_rows=3")
+    monkeypatch.setattr(validation, "_OBSERVATION_PAGE_ROWS", 1)
     arguments = (fixture.connection, namespace, snapshot["metadata_generation"], snapshot, fixture.control_schema)
     await validation._validate_sets(*arguments)
     for assignment in ("source_rows=1,observation_rows=3", "source_rows=2,observation_rows=2"):
@@ -620,6 +621,54 @@ async def seed_source_projection(fixture):
             table, schema_name=fixture.target.schema_name, columns=columns, records=batch_rows
         )
     return snapshot_by_field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_binding_counts_distinct_matching_sources(metadata_custody, ambiguous):
+    from process.registry_fhir_catalog_validation import _validate_sets
+
+    fixture = metadata_custody
+    snapshot = await seed_source_projection(fixture)
+    namespace = '"' + fixture.target.schema_name + '"'
+    source_table = f"{namespace}.registry_fhir_catalog_source"
+    original = snapshot["source_vector_json"][0]["source_generation"]
+    native_descriptor = "jsonb_build_object('contract','registry-native-network-source-v1')"
+    await fixture.connection.execute(
+        f"UPDATE {source_table} SET descriptor_json=jsonb_set(descriptor_json,"
+        "'{coordinates,producer_id}','\"registry-native-network-source-v1\"'::jsonb)"
+    )
+    matched = original
+    if ambiguous:
+        matched = "f" * 64
+        await fixture.connection.execute(
+            f"INSERT INTO {source_table} (source_generation,source_id,descriptor_json,profile,source_rows,"
+            "observation_rows,accepted_at) "
+            "SELECT $1,'other-source',jsonb_set(descriptor_json,'{coordinates,source_id}',"
+            f"'\"other-source\"'::jsonb) || {native_descriptor},profile,0,0,accepted_at "
+            f"FROM {source_table} WHERE source_generation=$2",
+            matched,
+            original,
+        )
+        snapshot["source_vector_json"].append(
+            {"source_generation": matched, "source_id": "other-source", "status": "current"}
+        )
+    else:
+        await fixture.connection.execute(
+            f"UPDATE {source_table} SET descriptor_json=descriptor_json || {native_descriptor}"
+        )
+    await fixture.connection.execute(
+        f"UPDATE {namespace}.registry_fhir_catalog_binding SET document_json="
+        "jsonb_set(document_json || jsonb_build_object('producer_id','registry-native-network-source-v1'),"
+        "'{source_scope,source_generation}',to_jsonb($1::text))",
+        matched,
+    )
+    args = fixture.connection, namespace, snapshot["metadata_generation"], snapshot, fixture.control_schema
+    if ambiguous:
+        with pytest.raises(ValueError, match="set_validation_failed"):
+            await _validate_sets(*args)
+    else:
+        await _validate_sets(*args)
 
 
 @pytest.mark.asyncio

@@ -72,6 +72,33 @@ async def freeze_network_import_preparation(freeze_preparation, handoff, prepara
     return receipt
 
 
+def _pin_catalog_inventory(factory):
+    """Reuse the first complete Source inventory for this run's catalog preparation."""
+    pages_by_profile = {}
+
+    @asynccontextmanager
+    async def export(*, source_profile):
+        """Open the normal Source export and reuse its completed inventory pages."""
+        async with factory(source_profile=source_profile) as source:
+            key = source_profile.schema_name, source_profile.catalog_schema
+
+            async def inventory():
+                """Retain pages only after the Source inventory reaches its end."""
+                if key in pages_by_profile:
+                    for page in pages_by_profile[key]:
+                        yield page
+                    return
+                pages = []
+                async for page in source["inventory"]():
+                    pages.append(page)
+                    yield page
+                pages_by_profile[key] = tuple(pages)
+
+            yield {**source, "inventory": inventory}
+
+    return export
+
+
 @asynccontextmanager
 async def native_network_import_runtime(worker_config, cleanup):
     """Open genuine factories once and keep their lifetime inside the admitted run."""
@@ -96,7 +123,7 @@ async def native_network_import_runtime(worker_config, cleanup):
         or not all(callable(capability) for capability in capabilities.values())
     ):
         raise ValueError("registry_imported_freeze_capability_invalid")
-    factory = capabilities["catalog_export"]
+    factory = _pin_catalog_inventory(capabilities["catalog_export"])
     catalog = parse_fhir_catalog_sync_config(os.environ.get(CATALOG_CONFIG_ENV), source_export=factory)
     if catalog.source_endpoint_ids is not None or catalog.consumer.control_schema != settings.control_schema:
         raise ValueError("registry_imported_catalog_configuration_invalid")

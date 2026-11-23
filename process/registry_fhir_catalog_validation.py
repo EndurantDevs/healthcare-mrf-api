@@ -35,6 +35,7 @@ INPUT_FIELDS = (
 )
 PAGE_ROWS = 1000
 PAGE_BYTES = 34 * 1024 * 1024
+_OBSERVATION_PAGE_ROWS = 50_000
 _TABLES = (
     "registry_fhir_catalog_binding",
     "registry_fhir_catalog_network",
@@ -226,50 +227,43 @@ def _source_document(row):
         row[field] = timestamp.astimezone(timezone.utc).isoformat()
 
 
-# Group resource keys separately so the observation primary key can supply the order.
-_SET_SQL = """WITH observation_counts AS (
- SELECT source_generation,sum(observations)::bigint AS observations,count(*) AS resources
- FROM (
-   SELECT source_generation,resource_type,resource_id,count(*) AS observations
-   FROM {namespace}.registry_fhir_catalog_observation
-   GROUP BY source_generation,resource_type,resource_id
- ) resources GROUP BY source_generation
-), vector AS (
+_SET_SQL = """WITH vector AS (
  SELECT * FROM jsonb_to_recordset($3::jsonb) AS selected(source_generation text,source_id text,status text)
-), matched_sources AS (
- SELECT b.metadata_generation,b.binding_id,s.source_generation
- FROM {namespace}.registry_fhir_catalog_binding b
- JOIN {namespace}.registry_fhir_catalog_source s ON s.source_generation=left(b.document_json->>'evidence_id',64)
- WHERE b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key')
- UNION
- SELECT b.metadata_generation,b.binding_id,s.source_generation
- FROM {namespace}.registry_fhir_catalog_binding b
- JOIN {namespace}.registry_fhir_catalog_source s
-   ON s.source_generation=b.document_json->'source_scope'->>'source_generation'
- WHERE (s.descriptor_json->>'contract'='registry-native-network-source-v1'
-     AND b.document_json->>'producer_id'='registry-native-network-source-v1')
-    OR (b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' AND s.profile='published_normalized')
- UNION
- SELECT b.metadata_generation,b.binding_id,s.source_generation
- FROM {namespace}.registry_fhir_catalog_binding b
- JOIN {namespace}.registry_fhir_catalog_source s
-   ON s.descriptor_json->>'capture_sha256'=b.document_json->'source_scope'->>'capture_sha256'
- WHERE b.document_json->'source_scope' ? 'insurance_plan_id'
-   AND s.profile='retained_normalized'
-   AND NOT EXISTS(SELECT FROM unnest(ARRAY['source_system','source_id','dataset_schema','dataset_id','producer_id','edition_id']) field
-       WHERE b.document_json->>field IS DISTINCT FROM s.descriptor_json->'coordinates'->>field)
-), source_bindings AS (
- SELECT b.*,s.source_generation AS matched_generation,s.accepted_at,v.status AS source_status,
+), source_bindings AS NOT MATERIALIZED (
+ SELECT b.*,m.matched_generation,s.accepted_at,v.status AS source_status,
    s.descriptor_json->'coordinates' AS source_coordinates,
    s.descriptor_json->>'profile' AS source_profile,s.descriptor_json->'complete' AS source_complete,
    coalesce(s.descriptor_json->>'contract'='registry-native-network-source-v1',false) AS is_native,
    b.document_json->'source_scope' ? 'insurance_plan_id' AS is_product,
-   coalesce(b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1',false) AS is_tier,
-   count(s.source_generation) OVER(PARTITION BY b.binding_id) AS source_matches
+   coalesce(b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1',false) AS is_tier,m.source_matches
  FROM {namespace}.registry_fhir_catalog_binding b
- LEFT JOIN matched_sources m USING(metadata_generation,binding_id)
- LEFT JOIN {namespace}.registry_fhir_catalog_source s ON s.source_generation=m.source_generation
- LEFT JOIN vector v ON v.source_generation=m.source_generation
+ CROSS JOIN LATERAL (
+   SELECT min(source_generation) AS matched_generation,count(*) AS source_matches
+   FROM (
+     SELECT s.source_generation FROM {namespace}.registry_fhir_catalog_source s
+     WHERE s.source_generation=left(b.document_json->>'evidence_id',64)
+       AND b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key')
+     UNION
+     SELECT s.source_generation FROM {namespace}.registry_fhir_catalog_source s
+     WHERE s.source_generation=b.document_json->'source_scope'->>'source_generation'
+       AND ((s.descriptor_json->>'contract'='registry-native-network-source-v1'
+         AND b.document_json->>'producer_id'='registry-native-network-source-v1')
+         OR (b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' AND s.profile='published_normalized'))
+     UNION
+     SELECT s.source_generation FROM {namespace}.registry_fhir_catalog_source s
+     WHERE b.document_json->'source_scope' ? 'insurance_plan_id'
+       AND s.profile='retained_normalized'
+       AND s.descriptor_json->>'capture_sha256'=b.document_json->'source_scope'->>'capture_sha256'
+       AND NOT EXISTS(SELECT FROM unnest(ARRAY['source_system','source_id','dataset_schema','dataset_id','producer_id','edition_id']) field
+           WHERE b.document_json->>field IS DISTINCT FROM s.descriptor_json->'coordinates'->>field)
+   ) matches
+ ) m
+ LEFT JOIN {namespace}.registry_fhir_catalog_source s ON s.source_generation=m.matched_generation
+ LEFT JOIN vector v ON v.source_generation=m.matched_generation
+), relationship_bindings AS MATERIALIZED (
+ SELECT metadata_generation,network_id,binding_id,source_id,matched_generation,is_native,is_product,is_tier,
+   document_json->>'source_key' AS source_key,document_json->'source_scope'->>'insurance_plan_id' AS insurance_plan_id
+ FROM source_bindings
 )
 SELECT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_network n
  LEFT JOIN {control}.network_registry_identity i USING(network_id)
@@ -277,7 +271,7 @@ SELECT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_network n
  WHERE i.network_id IS NULL OR n.metadata_generation<>$1
    OR n.archived IS DISTINCT FROM coalesce((a.record_json->>'archived')::boolean,false))
 OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
- LEFT JOIN source_bindings b USING(metadata_generation,network_id,binding_id,source_id)
+ LEFT JOIN relationship_bindings b USING(metadata_generation,network_id,binding_id,source_id)
  WHERE NOT coalesce((SELECT true FROM {namespace}.registry_fhir_catalog_network n
    WHERE n.metadata_generation=r.metadata_generation AND n.network_id=r.network_id LIMIT 1),false)
    OR r.metadata_generation<>$1
@@ -288,9 +282,9 @@ OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
        AND a.record_json->'archived'='false'::jsonb AND a.record_json->'network_ids' @> jsonb_build_array(r.network_id)))
    OR (r.source_id<>'registry-manual' AND NOT b.is_tier AND NOT b.is_native AND NOT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_observation o
      WHERE o.source_generation=r.source_generation AND o.observation_kind='edge'
-       AND ((NOT b.is_product AND o.document_json->>'network_resource_id'=b.document_json->>'source_key')
+       AND ((NOT b.is_product AND o.document_json->>'network_resource_id'=b.source_key)
          OR (b.is_product AND o.resource_type='InsurancePlan'
-           AND o.resource_id=b.document_json->'source_scope'->>'insurance_plan_id'
+           AND o.resource_id=b.insurance_plan_id
            AND o.document_json->>'scope_path' ~ '^/normalized_aggregate/(0|[1-9][0-9]*)$'))
        AND coalesce(o.document_json->>'plan_resource_id','') = coalesce(r.document_json->'plan'->>'resource_id','')
        AND o.document_json->>'plan_resource_id' IS NOT DISTINCT FROM r.document_json->'plan'->>'resource_id'
@@ -311,8 +305,13 @@ OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
        AND a.record_json->>'group_kind'=r.document_json->'group'->>'group_kind')))
 OR EXISTS(SELECT FROM source_bindings b
  LEFT JOIN {namespace}.registry_fhir_catalog_network n USING(metadata_generation,network_id)
- LEFT JOIN {namespace}.registry_fhir_catalog_observation o ON o.source_generation=b.matched_generation
-   AND o.resource_type='Organization' AND o.resource_id=b.document_json->>'source_key' AND o.observation_kind='organization'
+ LEFT JOIN LATERAL (
+   SELECT o.document_json FROM {namespace}.registry_fhir_catalog_observation o
+   WHERE NOT b.is_product AND NOT b.is_tier AND NOT b.is_native AND o.source_generation=b.matched_generation
+     AND o.resource_type='Organization' AND o.resource_id=b.document_json->>'source_key' AND o.observation_kind='organization'
+   -- Keep this lookup keyed to the binding rather than joining all organization observations.
+   OFFSET 0
+ ) o ON true
  LEFT JOIN {control}.registry_approved_record product ON b.is_product
    AND product.approved_revision=$2 AND product.record_kind='network_binding' AND product.record_key=b.binding_id::text
  WHERE n.network_id IS NULL OR b.metadata_generation<>$1 OR b.matched_generation IS NULL
@@ -339,15 +338,64 @@ OR EXISTS(SELECT FROM source_bindings b
    OR (b.document_json->>'accepted_at')::timestamptz IS DISTINCT FROM b.accepted_at
    OR EXISTS(SELECT FROM unnest(ARRAY['source_system','source_id','dataset_schema','dataset_id','producer_id','edition_id']) field
      WHERE b.document_json->>field IS DISTINCT FROM b.source_coordinates->>field))
-OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_observation o
- LEFT JOIN {namespace}.registry_fhir_catalog_source s USING(source_generation) WHERE s.source_generation IS NULL)
 OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_source s
- LEFT JOIN observation_counts counts USING(source_generation) LEFT JOIN vector v USING(source_generation)
- WHERE s.observation_rows<>coalesce(counts.observations,0) OR s.source_rows<coalesce(counts.resources,0)
-   OR s.source_id IS DISTINCT FROM v.source_id OR v.source_generation IS NULL
+ LEFT JOIN vector v USING(source_generation)
+ WHERE s.source_id IS DISTINCT FROM v.source_id OR v.source_generation IS NULL
    OR (v.status='current' AND s.descriptor_json->'complete'<>'true'::jsonb))
 OR EXISTS(SELECT FROM vector v LEFT JOIN {namespace}.registry_fhir_catalog_source s USING(source_generation)
- WHERE s.source_generation IS NULL) AS invalid"""
+ WHERE s.source_generation IS NULL) AS invalid,
+ (SELECT coalesce(jsonb_object_agg(source_generation,jsonb_build_array(observation_rows,source_rows)),'{{}}'::jsonb)
+  FROM {namespace}.registry_fhir_catalog_source) AS observation_totals"""
+
+
+_OBSERVATION_COUNTS_SQL = """WITH page AS MATERIALIZED (
+ SELECT source_generation,resource_type,resource_id,observation_kind,ordinal
+ FROM {namespace}.registry_fhir_catalog_observation
+ {after_key}
+ ORDER BY source_generation,resource_type,resource_id,observation_kind,ordinal LIMIT $1
+), counts AS (
+ SELECT source_generation,sum(observations)::bigint AS observations,count(*) AS resources
+ FROM (
+   SELECT source_generation,resource_type,resource_id,count(*) AS observations
+   FROM page GROUP BY source_generation,resource_type,resource_id
+ ) resources GROUP BY source_generation
+)
+SELECT jsonb_object_agg(source_generation,jsonb_build_array(observations,resources)) AS counts,
+ sum(observations) AS page_rows,
+ (SELECT ARRAY[source_generation,resource_type,resource_id] FROM page
+  ORDER BY source_generation,resource_type,resource_id,observation_kind,ordinal LIMIT 1) AS first_resource,
+ (SELECT jsonb_build_array(source_generation,resource_type,resource_id,observation_kind,ordinal) FROM page
+  ORDER BY source_generation DESC,resource_type DESC,resource_id DESC,observation_kind DESC,ordinal DESC LIMIT 1) AS last_key
+FROM counts"""
+
+
+async def _validate_observation_counts(connection, namespace, expected_by_source):
+    """Compare exact row and resource totals with bounded primary-key pages."""
+    counts_by_source = {source_generation: [0, 0] for source_generation in expected_by_source}
+    first_query = _OBSERVATION_COUNTS_SQL.format(namespace=namespace, after_key="")
+    next_query = _OBSERVATION_COUNTS_SQL.format(
+        namespace=namespace,
+        after_key="WHERE (source_generation,resource_type,resource_id,observation_kind,ordinal)>($2,$3,$4,$5,$6)",
+    )
+    page = await connection.fetchrow(first_query, _OBSERVATION_PAGE_ROWS)
+    key_parts = ()
+    while page["last_key"] is not None:
+        first_resource = page["first_resource"]
+        continued_source = first_resource[0] if tuple(first_resource) == key_parts[:3] else None
+        for source_generation, (observations, resources) in json.loads(page["counts"]).items():
+            if source_generation not in counts_by_source:
+                _invalid("set_validation_failed")
+            totals = counts_by_source[source_generation]
+            totals[0] += observations
+            totals[1] += resources - (source_generation == continued_source)
+        if page["page_rows"] < _OBSERVATION_PAGE_ROWS:
+            break
+        key_parts = tuple(json.loads(page["last_key"]))
+        page = await connection.fetchrow(next_query, _OBSERVATION_PAGE_ROWS, *key_parts)
+    for source_generation, (observation_rows, source_rows) in expected_by_source.items():
+        observations, resources = counts_by_source[source_generation]
+        if observations != observation_rows or resources > source_rows:
+            _invalid("set_validation_failed")
 
 
 # Every approved retained product projects at least its binding row (keyed by the approved record key);
@@ -362,17 +410,18 @@ _PRODUCTS_SQL = """SELECT EXISTS(SELECT FROM {control}.registry_approved_record 
 
 async def _validate_sets(connection, namespace, generation, inputs, control_schema):
     control = storage_identifier(control_schema)
-    invalid = await connection.fetchval(
+    result = await connection.fetchrow(
         _SET_SQL.format(namespace=namespace, control=control),
         generation,
         inputs["metadata_approved_revision"],
         canonical_json(inputs["source_vector_json"]),
         inputs["mapping_sha256"],
     )
-    if invalid or await connection.fetchval(
+    if result["invalid"] or await connection.fetchval(
         _PRODUCTS_SQL.format(namespace=namespace, control=control), generation, inputs["metadata_approved_revision"]
     ):
         _invalid("set_validation_failed")
+    await _validate_observation_counts(connection, namespace, json.loads(result["observation_totals"]))
 
 
 def _content_digest(tables):
