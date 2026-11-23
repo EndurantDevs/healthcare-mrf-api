@@ -463,11 +463,11 @@ def finder_binding(monkeypatch):
     monkeypatch.setenv(
         source_http_proxy.POLICY_ENV, json.dumps({"version": 1, "revision": "policy", "sources": [rule_by_field]})
     )
-    routes = [{"id": f"route-{i:02}", "url": f"https://user:example@proxy-{i:02}.example.test"} for i in range(50)]
+    routes = [{"id": f"route-{i}", "url": f"https://user:example@proxy-{i}.example.test"} for i in range(3)]
     routes.extend(
         [
-            {"id": "route-50", "url": routes[-1]["url"]},
-            {"id": "route-51", "url": "http://user:example@insecure.example.test"},
+            {"id": "route-3", "url": routes[-1]["url"]},
+            {"id": "route-4", "url": "http://user:example@insecure.example.test"},
         ]
     )
     monkeypatch.setenv(source_http_proxy.POOL_ENV, json.dumps({"version": 1, "revision": "pool", "proxies": routes}))
@@ -516,22 +516,22 @@ async def test_random_routes_reuse_prior_capture(tmp_path, monkeypatch, finder_b
             "test",
             searches,
             plan_id="second",
-            concurrency=8,
-            requests_per_second=4,
+            concurrency=2,
+            requests_per_second=5,
             random_proxy_routes=True,
         ),
         AsyncMock(),
         AsyncMock(),
     )
-    assert (summary["pages_reused"], summary["transport"]["origin_requests"], choose.call_count) == (1, 3, 11)
+    assert (summary["pages_reused"], summary["transport"]["origin_requests"], choose.call_count) == (1, 3, 5)
     assert [postal for _, postal, _ in starts] == ["00000", "00001", "00002", "00003"]
-    assert starts[1][2] == "https://proxy-49.example.test"
-    assert starts[2][2] == "https://proxy-48.example.test"
+    assert starts[1][2] == "https://proxy-2.example.test"
+    assert starts[2][2] == "https://proxy-1.example.test"
     first_candidates = choose.call_args_list[-3].args[0]
     second_candidates = choose.call_args_list[-2].args[0]
-    assert len(first_candidates) == 51 and "route-51" not in first_candidates
-    assert not {"route-49", "route-50"} & set(second_candidates)
-    assert all(second[0] - first[0] >= 0.25 for first, second in zip(starts[1:], starts[2:]))
+    assert set(first_candidates) == {"route-0", "route-1", "route-2", "route-3"}
+    assert set(second_candidates) == {"route-0", "route-1"}
+    assert all(second[0] - first[0] >= 0.2 for first, second in zip(starts[1:], starts[2:]))
 
 
 @pytest.mark.asyncio
