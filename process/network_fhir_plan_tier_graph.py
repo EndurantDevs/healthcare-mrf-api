@@ -87,7 +87,7 @@ class _PlanProjection:
         """Validate distinct role selectors against original plan evidence before adding references."""
         await self._plans(page)
         selections_by_resource, pending_by_selector = {}, {}
-        for source_row in source_rows:
+        for source_row in page:
             if source_row["resource_type"] not in {"PractitionerRole", "OrganizationAffiliation"}:
                 continue
             role_payload = _payload(source_row["payload_json"])

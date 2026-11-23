@@ -12,6 +12,7 @@ import pytest
 from process import network_fhir_typed_source as typed
 from process.network_fhir_retained_capture_contract import registry_location_id
 from process.network_fhir_typed_contract import CELL_COLUMNS, PAIR_COLUMNS, TypedFHIRGraphError, validate_graph_document
+from process.network_fhir_typed_sql import PAIR_ROLE_PAGE_SIZE
 from tests import generic_source_successor_postgres_support as source
 from tests.source_witness_capture_postgres_support import source_witness_case
 from tests.test_verified_office_source_witnesses_v2_postgres import _resource
@@ -19,6 +20,7 @@ from tests.test_verified_office_source_witnesses_v2_postgres import _resource
 pytestmark = pytest.mark.asyncio
 _ORIGINAL_ROWS = source._edition_rows
 _AS_OF = "2026-10-01"
+_BOUNDARY_ROLES = PAIR_ROLE_PAGE_SIZE + 2
 
 
 def _arguments(case):
@@ -125,6 +127,14 @@ def _strict_rows(edition, dataset):
             "network_refs": [source.BASE + "/Organization/network-one"],
             "location_refs": [source.BASE + "/Location/office-one"],
         },
+        "mixed-locations": {
+            "location_refs": [
+                "Location/office-one",
+                source.BASE + "/Location/office-one",
+                "Location/Office-one",
+                "Location/office-one/_history/1",
+            ],
+        },
         "foreign-network": {"network_refs": ["https://foreign.example.test/fhir/Organization/network-one"]},
         "foreign-location": {"location_refs": ["https://foreign.example.test/fhir/Location/office-one"]},
         "missing-parent": {"practitioner_ref": "Practitioner/missing", "organization_ref": "Organization/provider-org"},
@@ -161,13 +171,14 @@ async def test_strict_subject_reference_and_acceptance_boundaries(monkeypatch):
         )
         assert [tuple(row) for row in actual] == [
             ("absolute", "1234567893", 1),
+            ("mixed-locations", "1234567893", 2),
             ("participant", "1000000004", 1),
             ("role-office", "1234567893", 1),
         ]
         assert stage.document["counts"]["provider_only_roles"] == 1
 
 
-def _role_page_boundary_rows(edition, dataset):
+def _role_page_boundary_rows(edition, dataset, *, role_count=_BOUNDARY_ROLES):
     resource_rows = _ORIGINAL_ROWS(edition, dataset) + _affiliation_fixture_rows(dataset)
     resource_rows.extend(
         _resource("Organization", f"unused-{index:04d}", {"active": False}, dataset) for index in range(1000)
@@ -187,7 +198,7 @@ def _role_page_boundary_rows(edition, dataset):
                 },
                 dataset,
             )
-            for index in range(130)
+            for index in range(role_count)
         )
     return resource_rows
 
@@ -243,12 +254,16 @@ async def test_role_pages_preserve_type_boundaries_and_reference_multiplicity(mo
             + " WHERE resource_id LIKE 'range-%' GROUP BY resource_type ORDER BY resource_type"
         )
         assert [tuple(reference_count) for reference_count in reference_counts] == [
-            ("OrganizationAffiliation", 130, 2, 2, 3, 3),
-            ("PractitionerRole", 130, 1, 1, 6, 6),
+            ("OrganizationAffiliation", _BOUNDARY_ROLES, 2, 2, 3, 3),
+            ("PractitionerRole", _BOUNDARY_ROLES, 1, 1, 6, 6),
         ]
         expected_rows = [("OrganizationAffiliation", "participant", "1000000004", 1)]
-        expected_rows.extend(("OrganizationAffiliation", f"range-{index:04d}", "1000000004", 6) for index in range(130))
-        expected_rows.extend(("PractitionerRole", f"range-{index:04d}", "1234567893", 6) for index in range(130))
+        expected_rows.extend(
+            ("OrganizationAffiliation", f"range-{index:04d}", "1000000004", 6) for index in range(_BOUNDARY_ROLES)
+        )
+        expected_rows.extend(
+            ("PractitionerRole", f"range-{index:04d}", "1234567893", 6) for index in range(_BOUNDARY_ROLES)
+        )
         expected_rows.append(("PractitionerRole", "role-office", "1234567893", 1))
         assert [tuple(pair) for pair in pair_rows] == expected_rows
     assert checked_plans == [True]
@@ -397,14 +412,10 @@ async def test_native_13542_unique_and_repeated_edges_remain_streamed(monkeypatc
         while pending:
             node = pending.pop()
             pending.extend(node.get("Plans", ()))
-            if (
-                node.get("Alias", "").split("_", 1)[0] in {"p", "net", "loc", "l"}
-                and node["Node Type"].endswith("Scan")
-                and "Index Cond" in node
-            ):
+            if node.get("Relation Name") == stage.names["cells"] and node["Alias"] != stage.names["cells"]:
                 keyed.append(node)
-        assert {node["Alias"].split("_", 1)[0] for node in keyed} == {"p", "net", "loc", "l"}, json.dumps(plan)
-        assert all("resource_id" in node["Index Cond"] for node in keyed)
+        assert {node["Alias"].split("_", 1)[0] for node in keyed} == {"p", "net", "l"}, json.dumps(plan)
+        assert all("resource_id" in node.get("Index Cond", "") for node in keyed)
         # Independent declared truth: every integer network/location product, plus two existing offices.
         assert await case.writer.fetchval(
             "SELECT NOT EXISTS((SELECT 'network-'||n::text,'fanout-'||l::text FROM generate_series(0,5) n CROSS JOIN generate_series(0,2256) l EXCEPT ALL SELECT network_source_key,location_resource_id FROM "
@@ -661,7 +672,7 @@ async def test_typed_approved_catalog_and_native_office_mapping(monkeypatch):
 
 
 def _provider_page_boundary_rows(edition, dataset, include_affiliations):
-    resource_rows = _role_page_boundary_rows(edition, dataset)
+    resource_rows = _role_page_boundary_rows(edition, dataset, role_count=130)
     for kind, subject, field in (
         ("OrganizationAffiliation", "Organization/provider-org", "participating_organization_ref"),
         ("PractitionerRole", "Practitioner/provider-one", "practitioner_ref"),

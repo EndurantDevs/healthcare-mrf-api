@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Plan-tier graph versioning preserves the old graph and exact semantic identities."""
 
+import json
 from copy import deepcopy
 from dataclasses import asdict, replace
 from types import SimpleNamespace
@@ -70,7 +71,10 @@ def test_raw_semantic_refs_reject_malformed_typed_key(key):
 
 
 @pytest.mark.asyncio
-async def test_repeated_roles_validate_and_read_plan_metadata_once_per_distinct_tier(monkeypatch):
+@pytest.mark.parametrize("use_serialized_payload", [False, True])
+async def test_repeated_roles_validate_and_read_plan_metadata_once_per_distinct_tier(
+    monkeypatch, use_serialized_payload
+):
     from process import network_fhir_plan_tier_graph as graph
 
     tier = tier_document()
@@ -100,8 +104,9 @@ async def test_repeated_roles_validate_and_read_plan_metadata_once_per_distinct_
         source_row_by_field = {
             "resource_type": "PractitionerRole",
             "resource_id": "role-" + str(index),
-            "payload_json": role_payload_by_field,
+            "payload_json": json.dumps(role_payload_by_field) if use_serialized_payload else role_payload_by_field,
         }
-        prepared_rows = await projection.prepare((source_row_by_field,), (source_row_by_field,))
+        wire_row_by_field = {**source_row_by_field, "payload_json": json.dumps(role_payload_by_field)}
+        prepared_rows = await projection.prepare((source_row_by_field,), (wire_row_by_field,))
         assert prepared_rows[0]["plan_network_refs"] == []
     assert connection.fetch.await_count == validator.call_count == 1

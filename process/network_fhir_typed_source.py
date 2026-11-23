@@ -38,6 +38,7 @@ from process.network_fhir_typed_sql import (
     CHECKER_DDL,
     CHECKER_PAIR_SQL,
     PAIR_DDL,
+    PAIR_ROLE_PAGE_SIZE,
     PAIR_SQL,
     PLAN_TIER_CHECKER_PAIR_SQL,
     PLAN_TIER_PAIR_SQL,
@@ -460,19 +461,17 @@ async def _pairs(connection, stage, origin, as_of, *, checker=False, plan_tiers=
     for name in ("cells", "addresses", "checks"):
         if "{" + name + "}" in query:
             query = query.replace("{" + name + "}", stage.relation(name))
+    boundary = (
+        "SELECT max(resource_id) FROM (SELECT resource_id FROM "
+        + stage.relation("cells")
+        + f" WHERE resource_type=$1 AND resource_id>$2 ORDER BY resource_id LIMIT {PAIR_ROLE_PAGE_SIZE}) page"
+    )
+    insert = "INSERT INTO " + stage.relation("pairs") + " " + query
     for resource_type in ("OrganizationAffiliation", "PractitionerRole"):
-        after = (resource_type, "")
-        while rows := await connection.fetch(
-            "SELECT resource_type,resource_id FROM "
-            + stage.relation("cells")
-            + " WHERE resource_type=$1 AND resource_id>$2 ORDER BY resource_id LIMIT 128",
-            *after,
-        ):
-            last_keys = tuple(rows[-1])
-            await connection.execute(
-                "INSERT INTO " + stage.relation("pairs") + " " + query, *arguments, *after, *last_keys
-            )
-            after = last_keys
+        after = ""
+        while (last_id := await connection.fetchval(boundary, resource_type, after)) is not None:
+            await connection.execute(insert, *arguments, resource_type, after, resource_type, last_id)
+            after = last_id
 
 
 async def _same_rows(connection, left, right, columns, keys):
