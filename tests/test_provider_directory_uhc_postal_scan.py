@@ -21,6 +21,7 @@ from db.models import (
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
 )
+from process import provider_directory_postal_checkpoint as postal_checkpoint
 from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
 from process import provider_directory_uhc_scan as uhc_scan
@@ -92,6 +93,30 @@ def test_uhc_full_zip4_cap_is_exhausted():
     assert importer._uhc_adaptive_partition_child_urls(SOURCE, "PractitionerRole", leaf_url, _bundle(10000)) == []
     assert importer._is_uhc_partition_cap_exhausted(SOURCE, leaf_url, _bundle(10000))
     assert importer._is_uhc_role_zip_cap_hit(SOURCE, "PractitionerRole", leaf_url, _bundle(10000))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent", (None, "failed-run"))
+async def test_named_role_retry_reuses_proved_numeric_splits(monkeypatch, parent):
+    context = SimpleNamespace(retry_of_run_id=parent)
+    leaves = {"7102", "71030", "88000-1234"}
+    monkeypatch.setattr(postal_checkpoint, "isolated_context", lambda *_: context)
+    monkeypatch.setattr(postal_checkpoint, "completed_partitions", AsyncMock(return_value=(leaves, 7, 64)))
+    starts = [_role_url(prefix) for prefix in ("710", "88000", "9", "Q")]
+
+    queue, state = await importer._prepare_partition_fetch(
+        SOURCE, "PractitionerRole", ProviderDirectoryPractitionerRole, starts, "run"
+    )
+
+    urls = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert state.resumed_partition_pages == 7 and state.resumed_partition_rows == 64
+    assert state.completed_partition_identities == leaves
+    if parent:
+        expect = [f"7103{digit}" for digit in range(1, 10)] + ["88000"]
+        expect += ["7100", "7101", "7104", "7105", "7106", "7107", "7108", "7109", "9", "Q"]
+        assert urls == [_role_url(prefix) for prefix in expect]
+    else:
+        assert urls == starts
 
 
 def test_uhc_affiliation_uses_postal_partitions():
