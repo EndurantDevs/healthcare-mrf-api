@@ -207,6 +207,25 @@ def test_source_index_rejects_wrong_json_field_types_from_coverage(tmp_path):
         assert sum(index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0])).values()) == 0
 
 
+def test_source_index_and_witness_decode_service_code_arrays_encoded_as_text(tmp_path):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    price = payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0]
+    price["service_code"] = json.dumps(["22", "01", "22"])
+    source_path = _write_source_fixture(
+        tmp_path / "source.json",
+        references_before=True,
+        gzip_encoded=False,
+        source_document=payload,
+    )
+
+    assert audit.canonical_price_payload(price)["service_code"] == ["01", "22"]
+    with _open_source_index(tmp_path, source_path) as index:
+        assert not index.metrics.get("invalid_field_types")
+        expected = index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
+        assert sum(expected.values()) == 1
+        assert json.loads(next(iter(expected)))["service_code"] == ["01", "22"]
+
+
 @pytest.mark.parametrize(
     ("field_name", "malformed_value"),
     [
@@ -218,8 +237,12 @@ def test_source_index_rejects_wrong_json_field_types_from_coverage(tmp_path):
         ("negotiated_rate", [123]),
         ("service_code", {}),
         ("service_code", [[]]),
+        ("service_code", '["11",22]'),
+        ("service_code", '["11"'),
+        ("service_code", "11"),
         ("billing_code_modifier", {"value": "TC"}),
         ("billing_code_modifier", [["TC"]]),
+        ("billing_code_modifier", '["TC"]'),
     ],
 )
 def test_source_index_rejects_malformed_price_container_shapes(

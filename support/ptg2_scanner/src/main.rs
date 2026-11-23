@@ -60,10 +60,11 @@ use ptg2_scanner::manifest::{
 use ptg2_scanner::manifest::{price_set_global_id_from_atom_ids, procedure_global_id};
 use ptg2_scanner::normalize::{
     canonical_modifier_list, canonical_text_list, compare_canonical_decimal_text,
-    normalize_catalog_code, normalize_code, normalize_code_system, normalize_string,
-    normalize_tin_type, normalize_tin_value, strict_integer_text, strict_money_number,
-    strict_money_number_from_reader, strict_npi_integer, strict_npi_list, strict_npi_partition,
-    strict_npi_partition_allow_empty_tin_only, strict_string_array_from_reader, StrictNpiList,
+    deserialize_service_codes, normalize_catalog_code, normalize_code, normalize_code_system,
+    normalize_string, normalize_tin_type, normalize_tin_value, service_codes_from_reader,
+    strict_integer_text, strict_money_number, strict_money_number_from_reader, strict_npi_integer,
+    strict_npi_list, strict_npi_partition, strict_npi_partition_allow_empty_tin_only,
+    strict_string_array_from_reader, StrictNpiList,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::{
@@ -929,7 +930,7 @@ struct PriceLiteWire {
     negotiated_rate: serde_json::Number,
     #[serde(default)]
     expiration_date: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_service_codes")]
     service_code: Vec<String>,
     #[serde(default)]
     billing_class: Option<String>,
@@ -11410,10 +11411,7 @@ fn read_price_lite_struson<R: Read>(
                     strict_nullable_string_from_reader(json_reader, "expiration_date")?;
             }
             4 => {
-                service_code = canonical_text_list(
-                    strict_string_array_from_reader(json_reader, "service_code")?,
-                    false,
-                );
+                service_code = canonical_text_list(service_codes_from_reader(json_reader)?, false);
             }
             5 => {
                 billing_class = strict_nullable_string_from_reader(json_reader, "billing_class")?;

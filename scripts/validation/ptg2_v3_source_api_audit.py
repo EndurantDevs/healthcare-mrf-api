@@ -225,14 +225,17 @@ CANONICALIZATION = {
     ),
     "decimal": "finite base-10 value; expand exponent; remove leading/trailing insignificant zeroes; -0 becomes 0",
     "date": "strict ISO calendar date YYYY-MM-DD, emitted with date.isoformat()",
-    "service_code": "scalar-or-list; POS canonicalization; sorted unique list",
+    "service_code": "decode JSON-string arrays; POS canonicalization; sorted unique list",
     "billing_code_modifier": ("scalar-or-list; split payer-packed comma values; uppercase; sorted unique list"),
     "arrangement": "trim and uppercase; null remains null",
     "setting": "trim only; null remains null; exact case-sensitive comparison",
     "multiplicity": "count every source negotiated-price occurrence after provider membership union",
     "occurrence_identity": "canonical price tuple plus exact original raw-container SHA-256",
     "source_types": "TiC identities and strings retain their JSON schema types; negotiated_rate is numeric",
-    "price_container_types": "recognized scalar fields reject objects/arrays; list fields require one flat string array",
+    "price_container_types": (
+        "recognized scalar fields reject objects/arrays; list fields require flat string arrays; "
+        "source service_code may encode its array as text"
+    ),
     "api_types": "identities and pagination integers are JSON integers; text and list fields are not coerced",
     "source_keys": "source_artifact_key is the required nonnegative dense ordinal; source_key is an optional logical string",
     "audit_sample_digest": "SHA-256 over the V2 domain, occurrence ID, and big-endian IIIQQQQ persisted coordinates in occurrence-ID order",
@@ -2105,14 +2108,27 @@ def canonical_modifier_list(values: Any) -> list[str]:
     return canonical_list(split_values, uppercase=True)
 
 
+def _decode_service_codes(encoded: str) -> list[str]:
+    try:
+        values = json.loads(encoded)
+    except (ValueError, RecursionError) as error:
+        raise ValueError("service_code text must encode an array of strings") from error
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError("service_code text must encode an array of strings")
+    return values
+
+
 def canonical_price_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Return the canonical serving comparison fields for one source price."""
 
+    service_codes = raw.get("service_code")
+    if isinstance(service_codes, str) and service_codes.lstrip().startswith("["):
+        service_codes = _decode_service_codes(service_codes)
     return {
         "negotiated_type": canonical_scalar(raw.get("negotiated_type")),
         "negotiated_rate": canonical_decimal(raw.get("negotiated_rate")),
         "expiration_date": canonical_date(raw.get("expiration_date")),
-        "service_code": canonical_list(raw.get("service_code"), code_system="POS"),
+        "service_code": canonical_list(service_codes, code_system="POS"),
         "billing_class": canonical_scalar(raw.get("billing_class")),
         "setting": canonical_scalar(raw.get("setting")),
         "billing_code_modifier": canonical_modifier_list(raw.get("billing_code_modifier")),
@@ -3545,6 +3561,9 @@ class SourceIndex:
         raw_value: Any,
     ) -> None:
         assert state.price_fields is not None
+        if prefix == f"{NEGOTIATED_PRICE_PREFIX}.service_code" and event == "string":
+            self._capture_encoded_service_codes(state, raw_value)
+            return
         for field_name in ("service_code", "billing_code_modifier"):
             field_prefix = f"{NEGOTIATED_PRICE_PREFIX}.{field_name}"
             if prefix == field_prefix:
@@ -3559,6 +3578,17 @@ class SourceIndex:
                 else:
                     self._append_price_list_value(state.price_fields, field_name, raw_value)
                 return
+
+    def _capture_encoded_service_codes(self, state: InNetworkState, raw_value: str) -> None:
+        assert state.price_fields is not None
+        try:
+            codes = _decode_service_codes(raw_value)
+        except ValueError:
+            self.metrics["invalid_field_types"] += 1
+            state.has_valid_price_types = False
+            return
+        for code in codes:
+            self._append_price_list_value(state.price_fields, "service_code", code)
 
     def _finish_negotiated_price(self, spec: SourceSpec, state: InNetworkState) -> None:
         assert state.price_fields is not None
