@@ -1697,24 +1697,10 @@ def _assert_review_job_isolation(monkeypatch, request, launch):
     pod = job["spec"]["template"]["spec"]
     container = pod["containers"][0]
     assert container["envFrom"] == [{"configMapRef": {"name": "public-config"}}]
-    assert pod["volumes"] == [
-        {
-            "name": "retained",
-            "persistentVolumeClaim": {"claimName": "retained-cache", "readOnly": True},
-        }
-    ]
-    assert container["volumeMounts"] == [
-        {
-            "name": "retained",
-            "mountPath": "/work/retained-artifacts/delta-dental-directory",
-            "subPath": "retained-artifacts/delta-dental-directory",
-            "readOnly": True,
-        }
-    ]
+    _assert_review_mounts(pod, container)
     env_by_name = {entry["name"]: entry for entry in container["env"]}
     assert env_by_name["REVIEW_KEY"]["valueFrom"]["secretKeyRef"] == {"name": launch.secret_name, "key": "review-key"}
     assert env_by_name["SQLITE_TMPDIR"]["value"] == "/tmp"
-    assert env_by_name["HLTHPRT_IMPORT_STATUS_EVENT_URL"]["value"] == ""
     assert not env_by_name.keys() & {
         source.PROXY_POOL_ENV,
         source.PROXY_BINDING_ENV,
@@ -1724,8 +1710,16 @@ def _assert_review_job_isolation(monkeypatch, request, launch):
         "SHARED_KEY",
         "UNSCOPED_KEY",
     }
-    assert source.is_fhir_source_job_matching(job, launch, request)
-    for changed in ("broad_secret", "cache_source", "cache_mount", "cache_scope", "review_id"):
+    _assert_review_callback_readback(job, launch, request, env_by_name["HLTHPRT_IMPORT_STATUS_EVENT_URL"])
+    for changed in (
+        "broad_secret",
+        "cache_source",
+        "cache_mount",
+        "cache_scope",
+        "review_id",
+        "scratch_limit",
+        "mount_order",
+    ):
         mismatched_job = deepcopy(job)
         mismatched_pod = mismatched_job["spec"]["template"]["spec"]
         mismatched_container = mismatched_pod["containers"][0]
@@ -1733,11 +1727,49 @@ def _assert_review_job_isolation(monkeypatch, request, launch):
             case "broad_secret":
                 mismatched_container["envFrom"].append({"secretRef": {"name": "broad-secret"}})
             case "cache_source":
-                mismatched_pod["volumes"][0]["persistentVolumeClaim"]["readOnly"] = False
+                mismatched_pod["volumes"][1]["persistentVolumeClaim"]["readOnly"] = False
             case "cache_mount":
-                mismatched_container["volumeMounts"][0]["readOnly"] = False
+                mismatched_container["volumeMounts"][1]["readOnly"] = False
             case "cache_scope":
-                del mismatched_container["volumeMounts"][0]["subPath"]
+                del mismatched_container["volumeMounts"][1]["subPath"]
+            case "scratch_limit":
+                mismatched_pod["volumes"][0]["emptyDir"]["sizeLimit"] = "16Gi"
+            case "mount_order":
+                mismatched_container["volumeMounts"].reverse()
             case "review_id":
                 mismatched_job["metadata"]["annotations"]["healthporta.com/source-observed-review-id"] = "e" * 32
         assert not source.is_fhir_source_job_matching(mismatched_job, launch, request)
+
+
+def _assert_review_callback_readback(job, launch, request, callback_by_field):
+    """Accept Kubernetes' name-only encoding without accepting callback or secret drift."""
+    assert callback_by_field["value"] == ""
+    assert source.is_fhir_source_job_matching(job, launch, request)
+    del callback_by_field["value"]
+    assert source.is_fhir_source_job_matching(job, launch, request)
+    callback_by_field["value"] = "https://example.test"
+    assert not source.is_fhir_source_job_matching(job, launch, request)
+    del callback_by_field["value"]
+    callback_by_field["valueFrom"] = {"secretKeyRef": {"name": "synthetic-callback", "key": "url"}}
+    assert not source.is_fhir_source_job_matching(job, launch, request)
+    del callback_by_field["valueFrom"]
+
+
+def _assert_review_mounts(pod, container):
+    """Bind writable worker scratch before the narrow read-only capture mount."""
+    assert pod["volumes"] == [
+        {"name": "delta-worker-scratch", "emptyDir": {"sizeLimit": "8Gi"}},
+        {
+            "name": "retained",
+            "persistentVolumeClaim": {"claimName": "retained-cache", "readOnly": True},
+        },
+    ]
+    assert container["volumeMounts"] == [
+        {"name": "delta-worker-scratch", "mountPath": "/work"},
+        {
+            "name": "retained",
+            "mountPath": "/work/retained-artifacts/delta-dental-directory",
+            "subPath": "retained-artifacts/delta-dental-directory",
+            "readOnly": True,
+        },
+    ]
