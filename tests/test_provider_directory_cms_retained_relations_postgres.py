@@ -10,6 +10,12 @@ from process import provider_directory_cms_desired_fence as dependencies
 from process.provider_directory_generic_source_policy import source_copy_session
 from tests import cms_npd_admission_postgres_support as support
 from tests.cms_npd_admission_postgres_support import cms_artifact_root, fhir
+from tests.provider_directory_completion_control_read_support import (
+    retained_completion_control_database as retained_completion_control_database,
+)
+from tests.provider_directory_completion_control_read_support import (
+    test_retained_completion_reads_control_parent_outside_source_role as test_retained_completion_reads_control_parent_outside_source_role,
+)
 from tests.test_cms_npd_intake_postgres import _admit
 
 
