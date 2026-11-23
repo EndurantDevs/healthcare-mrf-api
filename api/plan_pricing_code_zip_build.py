@@ -7,6 +7,8 @@ from api.plan_pricing_projection_contract import table
 from process import reference_family_archive as native
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
+ZIP_PROVIDER_READ_BATCH_SIZE = 1000
+
 # Independent actual-work units; synthetic parity does not qualify these limits.
 MAX_ZIP_RAW_ADDRESS_WORK_ROWS: int | None = None
 MAX_ZIP_ADDRESS_WORK_ROWS: int | None = None
@@ -60,7 +62,6 @@ async def _create_zip_stages(session):
 async def _stage_address_batch(session, cell, position, remaining):
     """Enumerate whole NPI groups and charge every raw row, including nonmatches."""
     from api import ptg2_serving as serving
-    from api.plan_pricing_code_build import CODE_PROVIDER_READ_BATCH_SIZE
 
     zip5 = serving._ptg2_address_zip5_sql("addr", unified=True)
     await session.execute(
@@ -73,7 +74,7 @@ async def _stage_address_batch(session, cell, position, remaining):
          WHERE addr.type IN ('practice','primary','secondary','site') AND addr.npi>0
            AND {zip5}=:cell AND addr.npi>:after_npi
          GROUP BY addr.npi ORDER BY addr.npi LIMIT :probe_limit"""),
-        {"cell": cell, "after_npi": position, "probe_limit": min(CODE_PROVIDER_READ_BATCH_SIZE, remaining + 1)},
+        {"cell": cell, "after_npi": position, "probe_limit": min(ZIP_PROVIDER_READ_BATCH_SIZE, remaining + 1)},
     )
     count = int(await session.scalar(text("SELECT coalesce(sum(raw_rows),0) FROM plan_pricing_zip_npi")))
     if count > remaining:
