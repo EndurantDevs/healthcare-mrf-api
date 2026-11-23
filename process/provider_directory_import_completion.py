@@ -1,7 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Finalize retained REST input without converting an unfinished traversal to EOF."""
 
+import asyncio
 from dataclasses import replace
+
+from sqlalchemy import text
 
 from process.import_completion_policy import (
     completion_receipt,
@@ -104,14 +107,7 @@ def finalized_import_summary(directory, candidate, resource_completion=None):
     )
 
 
-async def _settled_attempt_metrics(directory, candidate, parent_id):
-    async with directory.profile_scope_copy.source_read_transaction(directory):
-        previous_row = await directory.db.first(
-            "SELECT status,finished_at,params,metrics FROM "
-            + directory._qt(directory._schema(), directory.ImportRun.__tablename__)
-            + " WHERE run_id=:run_id AND importer='provider-directory-fhir'",
-            run_id=parent_id,
-        )
+def _settled_attempt(directory, candidate, previous_row, run_id):
     previous = directory._pagination_checkpoint_row_mapping(previous_row)
     metrics_by_key = directory._json_object(previous.get("metrics"))
     audit = metrics_by_key.get("audit")
@@ -119,17 +115,75 @@ async def _settled_attempt_metrics(directory, candidate, parent_id):
         metrics_by_key = {**metrics_by_key, **audit}
     params = directory._json_object(previous.get("params"))
     _require(
-        previous.get("finished_at") is not None
+        previous.get("run_id") == run_id
+        and previous.get("finished_at") is not None
         and previous.get("status") in {"failed", "canceled", "cancelled", "succeeded"}
         and params.get("source_ids") == list(candidate.source_ids)
-        and params.get("provider_directory_pagination_root_run_id", parent_id) == candidate.acquisition_root_run_id
+        and params.get("provider_directory_pagination_root_run_id", run_id) == candidate.acquisition_root_run_id
+        and params.get("allow_retained_pagination_reset", False) is False
         and (
             previous.get("status") != "succeeded"
             or metrics_by_key.get("source_publication", {}).get("state") == "incomplete"
         ),
         "previous_attempt_not_settled",
     )
-    return previous["status"], metrics_by_key
+    endpoint_scope = params.get("provider_directory_endpoint_scope")
+    if endpoint_scope is not None:
+        _require(
+            type(endpoint_scope) is str
+            and directory._canonical_base(endpoint_scope) == candidate.checkpoint_context.canonical_api_base,
+            "completion_scope_changed",
+        )
+    return previous, params, metrics_by_key
+
+
+def _failed_completion_parent(previous, params, metrics, request):
+    """Follow only an admitted completion attempt that cannot enter acquisition."""
+    historical = validate_completion_request(params["import_completion"])
+    parent_id = previous.get("retry_of_run_id")
+    rows = metrics.get("resource_rows")
+    _require(
+        previous["status"] == "failed"
+        and params.get("allow_retained_pagination_reset") is False
+        and type(rows) is dict
+        and rows.keys() <= request["retained_counts"].keys()
+        and all(type(count) is int and count == 0 for count in rows.values())
+        and metrics.get("resource_fetch_stats") == {}
+        and parent_id == historical["retry_of_run_id"]
+        and params.get("retry_of_run_id") == parent_id
+        and parent_id != previous["run_id"]
+        and {key: value for key, value in historical.items() if key != "retry_of_run_id"}
+        == {key: value for key, value in request.items() if key != "retry_of_run_id"},
+        "completion_ancestor_changed",
+    )
+    return parent_id
+
+
+async def _settled_attempt_metrics(directory, candidate, parent_id, *, request):
+    """Read control evidence independently of the restricted candidate actor."""
+    _require(
+        parent_id == request["retry_of_run_id"]
+        and directory.db._reader_binding() is None
+        and directory.db._transaction_binding() is None,
+        "control_reader_bound",
+    )
+    observed_ids = []
+    async with asyncio.timeout(10), directory.db.transaction() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        for _ in range(64):
+            _require(parent_id not in observed_ids, "completion_ancestor_cycle")
+            previous_row = await directory.db.first(
+                "SELECT run_id,retry_of_run_id,status,finished_at,params,metrics FROM "
+                + directory._qt(directory._schema(), directory.ImportRun.__tablename__)
+                + " WHERE run_id=:run_id AND engine='healthcare-mrf-api' AND importer='provider-directory-fhir'",
+                run_id=parent_id,
+            )
+            previous, params, metrics_by_key = _settled_attempt(directory, candidate, previous_row, parent_id)
+            observed_ids.append(parent_id)
+            if "import_completion" not in params:
+                return previous["status"], metrics_by_key, observed_ids
+            parent_id = _failed_completion_parent(previous, params, metrics_by_key, request)
+    raise CompletionNotAccepted("provider_directory_import_completion_ancestor_limit")
 
 
 def _checkpoint_diagnostic(directory, resume):
@@ -204,10 +258,15 @@ async def retained_completion(directory, candidate, request, *, retry_of_run_id)
         and candidate.source_release is None,
         "scope_changed",
     )
-    previous_status, metrics_by_key = await _settled_attempt_metrics(directory, candidate, retry_of_run_id)
+    previous_status, metrics_by_key, evidence_run_ids = await _settled_attempt_metrics(
+        directory, candidate, retry_of_run_id, request=request
+    )
     diagnostic_by_resource, retry_evidence_by_resource = await _retained_diagnostics(
         directory, candidate, request, previous_status, metrics_by_key
     )
+    if len(evidence_run_ids) > 1:
+        for resource in retry_evidence_by_resource:
+            diagnostic_by_resource[resource]["retry_evidence_run_ids"] = list(evidence_run_ids)
     evidence_by_field = {
         "request": request,
         "retry_evidence": retry_evidence_by_resource,
