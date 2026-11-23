@@ -23,6 +23,7 @@ from process.custom_import.derived_query import DerivedQueryField, parse_derived
 CONTRACT_VERSION = "custom-import/v1"
 MAX_DEFINITION_BYTES = 1024 * 1024
 ROOTED_CHILD_TEXT_STORAGE_PROFILE = "rooted_child_text_v1"
+ROOT_BOOLEAN_TRUE_STORAGE_PROFILE = "root_boolean_true_v1"
 MAX_DEFINITION_DEPTH = 32
 MAX_DEFINITION_NODES = 10_000
 MAX_HOT_FIELDS = 20
@@ -469,7 +470,10 @@ def _parse_definition_contents(definition: Mapping[str, Any]) -> CustomImportDef
     selection_profiles = _parse_profiles(definition.get("selection_profiles", []), query, (*root_fields, *child_fields))
     _validate_entity_selection(query, selection_profiles, root_logical_key, entity_field)
     storage_profile = definition.get("storage_profile")
-    if "storage_profile" in definition and storage_profile != ROOTED_CHILD_TEXT_STORAGE_PROFILE:
+    if "storage_profile" in definition and storage_profile not in (
+        ROOTED_CHILD_TEXT_STORAGE_PROFILE,
+        ROOT_BOOLEAN_TRUE_STORAGE_PROFILE,
+    ):
         raise DefinitionError("definition.storage_profile is unsupported")
     schema_by_scope = {"root": root_schema, "children": schema.get("children", [])}
     return CustomImportDefinition(

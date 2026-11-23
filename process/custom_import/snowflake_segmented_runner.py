@@ -276,6 +276,22 @@ async def run_segmented_snowflake_candidate(
     if isinstance(request.lease_token, (bytearray, memoryview)):
         request = replace(request, lease_token=bytes(request.lease_token))
     captured = await _capture_for_build(session_factory, connector, request, policy)
+    return await build_segmented_capture(
+        session_factory, request, captured, policy, writer_transports=writer_transports
+    )
+
+
+async def build_segmented_capture(
+    session_factory,
+    request,
+    captured,
+    policy,
+    *,
+    writer_transports=None,
+    retained_base=None,
+):
+    """Build a bound capture. Replays require the original base and explicit activation."""
+
     counts = SourceOutcomeCounts(0, 0)
     if captured.status not in {"capture_sealed", "capture_bound"}:
         return _result(captured.status, captured, counts)
@@ -283,6 +299,11 @@ async def run_segmented_snowflake_candidate(
     try:
         with failure_phase(FailurePhase.BEGIN_BUILD):
             build_request = await _build_request(session_factory, request, captured, policy, **handoff)
+            if (
+                retained_base is not None
+                and (build_request.expected_base_generation_id, build_request.expected_pointer_version) != retained_base
+            ):
+                raise CandidateRunnerError("retained replay base has changed")
         staged_source = await stage_segmented_source(session_factory, build_request, **handoff)
         with failure_phase(FailurePhase.COUNTS):
             failure_identifiers(build_id=staged_source.build_id)
@@ -311,6 +332,8 @@ async def run_segmented_snowflake_candidate(
         return _result(status, captured, counts)
     if output.no_change is not None:
         return _result("no_change", captured, counts, output, output.no_change)
+    if retained_base is not None:
+        return _result("sealed_unpublished", captured, counts, output)
     with failure_phase(FailurePhase.ACTIVATE):
         publication = await _activate(session_factory, build_request, output)
     return _result("sealed_unpublished" if publication is None else "activated", captured, counts, output, publication)

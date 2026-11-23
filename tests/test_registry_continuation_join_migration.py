@@ -29,7 +29,7 @@ COMPANY_JOIN = "20261025020000_company_affiliation_join"
 CATALOG_HEAD = "20261028010000_registry_fhir_catalog"
 REFRESH_HEAD = "20261028020000_registry_membership_refresh"
 INVENTORY_HEAD = "20261029010000_registry_source_inventory"
-LIFECYCLE_HEAD = "20261121050000_custom_import_rooted_text"
+LIFECYCLE_HEAD = "20261123182000_custom_import_root_boolean_index"
 PTG_MEMBERSHIP = "20261021110000_ptg_membership_import_idempotency"
 
 

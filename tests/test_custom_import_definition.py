@@ -101,14 +101,15 @@ def test_json_and_yaml_have_one_canonical_definition_and_digest():
     ]
 
 
-def test_storage_profile_changes_only_the_definition_identity(definition):
+@pytest.mark.parametrize("storage_profile", ("rooted_child_text_v1", "root_boolean_true_v1"))
+def test_storage_profile_changes_only_the_definition_identity(definition, storage_profile):
     raw = _raw_definition()
     raw["revision"]["definition"] += 1
-    raw["storage_profile"] = "rooted_child_text_v1"
+    raw["storage_profile"] = storage_profile
     next_definition = CustomImportDefinition.from_mapping(raw, previous=definition)
 
     assert definition.storage_profile is None and "storage_profile" not in json.loads(definition.canonical)
-    assert next_definition.storage_profile == "rooted_child_text_v1"
+    assert next_definition.storage_profile == storage_profile
     assert next_definition.digest != definition.digest
     assert next_definition.schema_revision == definition.schema_revision
     assert next_definition.schema_digest == definition.schema_digest

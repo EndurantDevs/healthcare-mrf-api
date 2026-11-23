@@ -66,6 +66,7 @@ _NAMED_GENERATION_REVISIONS = (
     "20261119090000_cms_npd_typed_release",
     "20261119230000_clinical_code_catalog_page_index",
     "20261121050000_custom_import_rooted_text",
+    "20261123182000_custom_import_root_boolean_index",
 )
 
 
@@ -138,7 +139,7 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    assert script.get_heads() == ["20261121050000_custom_import_rooted_text"]
+    assert script.get_heads() == ["20261123182000_custom_import_root_boolean_index"]
     assert (
         script.get_revision("20261119090000_cms_npd_typed_release").down_revision
         == "20261116090000_profile_capacity_logical_names"
