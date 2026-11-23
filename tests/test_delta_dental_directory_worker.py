@@ -122,8 +122,8 @@ def test_protected_manifest_scope(tmp_path, monkeypatch):
         "searches": [{"selector": "Delta Dental Patient Direct", "zip_code": "00000", "radius_miles": 30}],
     }
     path.write_text(json.dumps(manifest_by_field))
-    capture_id, searches, concurrency, rate, budget = worker._authorized_plan()
-    assert (concurrency, rate, budget) == (1, None, 100_000)
+    capture_id, searches, concurrency, rate, budget, random_proxy_routes = worker._authorized_plan()
+    assert (concurrency, rate, budget, random_proxy_routes) == (1, None, 100_000, False)
     assert len(capture_id) == 64
     assert len(searches) == 1
     assert searches[0].selector == "Delta Dental Patient Direct"
@@ -161,7 +161,7 @@ async def test_hold_blocks_new_editions(tmp_path, monkeypatch):
     monkeypatch.setattr(transport, "open_finder_http", unexpected_egress)
     monkeypatch.setattr(worker, "_artifact_root", lambda: tmp_path)
     search = worker.FinderSearch("Delta Dental Premier", "01234", 30)
-    monkeypatch.setattr(worker, "_authorized_plan", lambda: ("new-edition", (search,), 1, None, 100_000))
+    monkeypatch.setattr(worker, "_authorized_plan", lambda: ("new-edition", (search,), 8, 4, 100_000, True))
 
     async def prepare(*_args, **_options):
         return None
@@ -203,6 +203,11 @@ def test_inventory_retains_zip_zeros():
     }
     supplementary = worker._searches_from_plan({**plan_by_field, "selector_scope": "named-and-all"})
     assert {search.selector for search in supplementary} - {search.selector for search in named} == {"All networks"}
+    combined = worker._searches_from_plan({**plan_by_field, "selector_scope": "all-only"})
+    assert {(search.zip_code, search.selector) for search in combined} == {
+        ("01234", "All networks"),
+        ("04321", "All networks"),
+    }
 
 
 def test_catalog_requires_scoped_route(monkeypatch):
@@ -421,6 +426,7 @@ def test_observation_disables_the_inherited_status_event_route(delta_launch):
         {"requests_per_second": True},
         {"requests_per_second": "2"},
         {"requests_per_second": None},
+        {"random_proxy_routes": "true"},
     ],
 )
 def test_protected_manifest_validates_acquisition_settings(tmp_path, monkeypatch, settings):
@@ -432,8 +438,10 @@ def test_protected_manifest_validates_acquisition_settings(tmp_path, monkeypatch
         "zip_inventory": ["01234"],
         "radius_miles": 30,
     }
-    path.write_text(json.dumps({**manifest_by_field, "concurrency": 8, "requests_per_second": 2}))
-    assert worker._authorized_plan()[2:] == (8, 2, 100_000)
+    path.write_text(
+        json.dumps({**manifest_by_field, "concurrency": 8, "requests_per_second": 4, "random_proxy_routes": True})
+    )
+    assert worker._authorized_plan()[2:] == (8, 4, 100_000, True)
     path.write_text(json.dumps({**manifest_by_field, **settings}))
     with pytest.raises(ValueError, match="authorized_manifest_invalid"):
         worker._authorized_plan()
@@ -458,15 +466,21 @@ def test_origin_budget_is_explicit_and_bounds_the_plan(configured, rate, count, 
         assert worker._origin_request_budget(configured, rate, count) == expected
 
 
-@pytest.mark.parametrize("changed", ["concurrency", "rate", "budget"])
-def test_retry_refuses_acquisition_settings_drift(tmp_path, changed):
+@pytest.mark.parametrize(
+    "changed_settings",
+    [(7, 2.0, 200_000, False), (8, 4.0, 200_000, False), (8, 2.0, 199_999, False), (8, 2.0, 200_000, True)],
+)
+def test_retry_refuses_acquisition_settings_drift(tmp_path, changed_settings):
     retry_by_field = {"retry_of_run_id": "first", "provider_directory_pagination_root_run_id": "first"}
-    original_by_field = {"concurrency": 8, "rate": 2.0, "budget": 200_000}
-    worker._bind_observation_edition(tmp_path, "first", "example-edition", {}, **original_by_field)
-    worker._bind_observation_edition(tmp_path, "retry", "example-edition", retry_by_field, **original_by_field)
-    changed_by_field = {**original_by_field, changed: original_by_field[changed] - 1}
+    request_settings = (8, 2.0, 200_000, False)
+    worker._bind_observation_edition(tmp_path, "first", "example-edition", {}, request_settings=request_settings)
+    worker._bind_observation_edition(
+        tmp_path, "retry", "example-edition", retry_by_field, request_settings=request_settings
+    )
     with pytest.raises(ValueError, match="run_edition_changed"):
-        worker._bind_observation_edition(tmp_path, "retry", "example-edition", retry_by_field, **changed_by_field)
+        worker._bind_observation_edition(
+            tmp_path, "retry", "example-edition", retry_by_field, request_settings=changed_settings
+        )
 
 
 def test_destination_hold_keeps_the_latest_finite_boundary(tmp_path):

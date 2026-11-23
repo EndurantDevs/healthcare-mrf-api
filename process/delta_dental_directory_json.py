@@ -4,7 +4,7 @@
 import json
 import re
 
-from process.delta_dental_directory_capture import RESULT_CAP, FinderCard, FinderPage
+from process.delta_dental_directory_capture import ALL_NETWORKS_SELECTOR, RESULT_CAP, FinderCard, FinderPage
 from process.provider_directory_projection_fhir_values import is_valid_npi
 
 SOURCE_ID = "delta-dental-national-finder"
@@ -16,7 +16,7 @@ SELECTOR_VALUES = {
     "Delta Dental Medicare Advantage": "MedicareAdvantage",
     "DeltaCare USA": "Deltacare",
     "Delta Dental Patient Direct": "PatientDirect",
-    "All networks": "NationalNetworks",
+    ALL_NETWORKS_SELECTOR: "NationalNetworks",
 }
 _DEFAULT_FILTERS = {
     "sortType": 0,

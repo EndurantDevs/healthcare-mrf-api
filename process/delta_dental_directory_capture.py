@@ -26,12 +26,14 @@ NETWORK_LABELS = frozenset(
 )
 COMPOSITE_SELECTOR = "Delta Dental PPO Plus Premier"
 COMPOSITE_NETWORKS = frozenset({"Delta Dental PPO", "Delta Dental Premier"})
-FINDER_SELECTORS = NETWORK_LABELS | {COMPOSITE_SELECTOR, "All networks"}
+ALL_NETWORKS_SELECTOR = "All networks"
+FINDER_SELECTORS = NETWORK_LABELS | {COMPOSITE_SELECTOR, ALL_NETWORKS_SELECTOR}
 FINDER_RADII = frozenset({0.5, 1, 5, 10, 15, 20, 30, 50, 100})
 PAGE_SIZE = 50
 RESULT_CAP = 100
 MAX_PAGE_BYTES = 8 * 1024 * 1024
 DEFAULT_REQUEST_BUDGET = 100_000
+_COMBINED_PROBE_WINDOWS = 12
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,7 @@ class FinderCapturePlan:
     concurrency: int = 1
     requests_per_second: float | None = None
     max_origin_requests: int = DEFAULT_REQUEST_BUDGET
+    random_proxy_routes: bool = False
 
 
 class FinderPaginationUnresolved(ValueError):
@@ -370,7 +373,20 @@ async def _capture_parallel(unique_searches, concurrency, capture_window):
 
 
 async def _capture_windows(unique_searches, concurrency, capture_window):
-    """Keep the legacy serial order unless parallel capture is explicitly selected."""
+    """Confirm the combined selector before scheduling its larger inventory."""
+    if len(unique_searches) > _COMBINED_PROBE_WINDOWS and all(
+        search.selector == ALL_NETWORKS_SELECTOR for search in unique_searches
+    ):
+        observed_networks = set()
+        for visited, search in enumerate(unique_searches[:_COMBINED_PROBE_WINDOWS], start=1):
+            window = await capture_window(search)
+            observed_networks.update(_observed_office_networks(window))
+            yield window
+            if len(observed_networks) > 1:
+                unique_searches = unique_searches[visited:]
+                break
+        else:
+            raise ValueError("delta_dental_finder_combined_memberships_unverified")
     if concurrency == 1:
         for search in unique_searches:
             yield await capture_window(search)
@@ -378,6 +394,17 @@ async def _capture_windows(unique_searches, concurrency, capture_window):
     async with aclosing(_capture_parallel(unique_searches, concurrency, capture_window)) as windows:
         async for window in windows:
             yield window
+
+
+def _observed_office_networks(window):
+    """Recognize explicit positive assignments on a publishable provider-office row."""
+    return {
+        network
+        for page in window.pages
+        for card in page.cards
+        if card.practitioner_npi and card.provider_office_id and card.office_id
+        for network in card.office_memberships
+    }
 
 
 async def iter_finder_windows(

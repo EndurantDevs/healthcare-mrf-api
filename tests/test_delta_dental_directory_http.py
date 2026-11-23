@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from process import delta_dental_directory_http as transport
-from process.delta_dental_directory_capture import FinderCapturePlan, FinderSearch
+from process.delta_dental_directory_capture import DEFAULT_REQUEST_BUDGET, FinderCapturePlan, FinderSearch
 from process.delta_dental_directory_json import SOURCE_ENDPOINT, finder_payload, parse_finder_json_page
 from process.delta_dental_directory_observations import export_retained_capture
 from process.delta_dental_directory_worker import _run_http_capture
@@ -157,6 +157,23 @@ async def test_rejected_and_empty_windows_remain_incomplete(tmp_path, scoped_tra
     assert summary["office_observations"] == 0
 
 
+@pytest.mark.asyncio
+async def test_all_networks_uses_one_request_and_keeps_office_memberships(tmp_path, scoped_transport):
+    dispatch = scoped_transport
+    body_by_field = json.loads(_response(100, PPO.selector))
+    body_by_field["providerResults"][0]["products"].append({"productType": PATIENT_DIRECT.selector})
+    dispatch.response = lambda _: _Response(200, json.dumps(body_by_field).encode())
+    search = FinderSearch("All networks", "00000", 30)
+    summary = await _run_http_capture(
+        dispatch.binding, FinderCapturePlan(tmp_path, "test", "test", (search,)), AsyncMock(), dispatch.pause
+    )
+    [(_, options)] = dispatch.requests
+    assert options["json"]["productType"] == "NationalNetworks"
+    assert summary["membership_observations"] == {PPO.selector: 100, PATIENT_DIRECT.selector: 1}
+    assert summary["gaps"] == {"result_cap_reached": 1}
+    assert summary["directory_complete"] is False
+
+
 def test_office_products_never_expand_unknown_or_composite_labels():
     raw = json.loads(_response(1, "Delta Dental PPO Plus Premier"))
     row = raw["providerResults"][0]
@@ -168,6 +185,31 @@ def test_office_products_never_expand_unknown_or_composite_labels():
     assert not card.memberships
     assert card.practitioner_npi is None
     assert page.gaps == {"provider_npi_unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_network_zip", [None, "00005"])
+async def test_combined_probe_uses_distinct_observed_networks(tmp_path, scoped_transport, second_network_zip):
+    dispatch = scoped_transport
+
+    def answer(payload):
+        label = PATIENT_DIRECT.selector if payload["address"] == second_network_zip else PPO.selector
+        body_by_field = json.loads(_response(1, label))
+        office_by_field = body_by_field["providerResults"][0]
+        office_by_field["providerServiceOfficeId"] = int(payload["address"]) + 1
+        office_by_field["serviceOffice"]["serviceOfficeNumber"] = int(payload["address"]) + 1
+        return _Response(200, json.dumps(body_by_field).encode())
+
+    dispatch.response = answer
+    searches = tuple(FinderSearch("All networks", f"{index:05}", 30) for index in range(14))
+    plan = FinderCapturePlan(tmp_path, "test", "test", searches)
+    if second_network_zip is not None:
+        summary = await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+        assert summary["search_windows"] == len(dispatch.requests) == len(searches)
+    else:
+        with pytest.raises(ValueError, match="combined_memberships_unverified"):
+            await _run_http_capture(dispatch.binding, plan, AsyncMock(), dispatch.pause)
+        assert len(dispatch.requests) == 12
 
 
 @pytest.mark.asyncio
@@ -310,15 +352,19 @@ async def test_unusable_response_stops_after_the_one_attempt(
 
 
 @pytest.mark.asyncio
-async def test_preflight_refuses_exhausted_budget_route_drift_and_cancellation(scoped_transport, monkeypatch):
+async def test_preflight_refuses_exhausted_budget_route_drift_and_cancellation(tmp_path, scoped_transport, monkeypatch):
     from process.control_cancel import ImportCancelledError
     from process.delta_dental_directory_capture import FinderPaginationUnresolved
 
     dispatch = scoped_transport
     cancel_check = AsyncMock()
-    counts_by_action = {"origin_requests": transport.DEFAULT_REQUEST_BUDGET}
+    counts_by_action = {"origin_requests": DEFAULT_REQUEST_BUDGET}
     async with transport.open_finder_http(
-        dispatch.binding, cancel_check=cancel_check, pause=dispatch.pause, stats=counts_by_action
+        dispatch.binding,
+        FinderCapturePlan(tmp_path, "test", "test", (PPO,)),
+        cancel_check=cancel_check,
+        pause=dispatch.pause,
+        stats=counts_by_action,
     ) as fetch_page:
         with pytest.raises(FinderPaginationUnresolved, match="legacy_window"):
             await fetch_page(PPO, 2, None)
@@ -407,6 +453,85 @@ async def test_eight_sticky_workers_share_one_pacer_and_exact_cache(tmp_path, sc
     replay = await _run_http_capture(dispatch.binding, warm, AsyncMock(), dispatch.pause)
     assert len(dispatch.requests) == replay["pages_reused"] == 9
     assert replay["transport"]["origin_requests"] == 0
+
+
+@pytest.fixture
+def finder_binding(monkeypatch):
+    from process.ext import source_http_proxy
+
+    rule_by_field = {"source_id": "finder", "use_proxy": True, "endpoint_scope": SOURCE_ENDPOINT}
+    monkeypatch.setenv(
+        source_http_proxy.POLICY_ENV, json.dumps({"version": 1, "revision": "policy", "sources": [rule_by_field]})
+    )
+    routes = [{"id": f"route-{i:02}", "url": f"https://user:example@proxy-{i:02}.example.test"} for i in range(50)]
+    routes.extend(
+        [
+            {"id": "route-50", "url": routes[-1]["url"]},
+            {"id": "route-51", "url": "http://user:example@insecure.example.test"},
+        ]
+    )
+    monkeypatch.setenv(source_http_proxy.POOL_ENV, json.dumps({"version": 1, "revision": "pool", "proxies": routes}))
+    return source_http_proxy.SourceProxyConfig.from_environment().bind("finder", SOURCE_ENDPOINT)
+
+
+@pytest.mark.asyncio
+async def test_random_routes_reuse_prior_capture(tmp_path, monkeypatch, finder_binding):
+    import asyncio
+
+    from process.ext import source_http_proxy
+
+    choose = Mock(side_effect=lambda eligible: eligible[-1])
+    monkeypatch.setattr(source_http_proxy, "choice", choose)
+    starts = []
+    second_active = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    @asynccontextmanager
+    async def post(_url, **options):
+        postal = options["json"]["address"]
+        starts.append((loop.time(), postal, options["proxy"]))
+        if postal == "00002":
+            second_active.set()
+        if postal == "00001":
+            await asyncio.wait_for(second_active.wait(), timeout=3)
+        yield _Response(200, _response(1, PPO.selector))
+
+    @asynccontextmanager
+    async def client(**_options):
+        yield SimpleNamespace(post=post)
+
+    monkeypatch.setattr(transport.aiohttp, "ClientSession", client)
+    searches = _synthetic_searches(4)
+    await _run_http_capture(
+        finder_binding,
+        FinderCapturePlan(tmp_path, "test", "test", searches[:1], plan_id="first"),
+        AsyncMock(),
+        AsyncMock(),
+    )
+    summary = await _run_http_capture(
+        finder_binding,
+        FinderCapturePlan(
+            tmp_path,
+            "test",
+            "test",
+            searches,
+            plan_id="second",
+            concurrency=8,
+            requests_per_second=4,
+            random_proxy_routes=True,
+        ),
+        AsyncMock(),
+        AsyncMock(),
+    )
+    assert (summary["pages_reused"], summary["transport"]["origin_requests"], choose.call_count) == (1, 3, 11)
+    assert [postal for _, postal, _ in starts] == ["00000", "00001", "00002", "00003"]
+    assert starts[1][2] == "https://proxy-49.example.test"
+    assert starts[2][2] == "https://proxy-48.example.test"
+    first_candidates = choose.call_args_list[-3].args[0]
+    second_candidates = choose.call_args_list[-2].args[0]
+    assert len(first_candidates) == 51 and "route-51" not in first_candidates
+    assert not {"route-49", "route-50"} & set(second_candidates)
+    assert all(second[0] - first[0] >= 0.25 for first, second in zip(starts[1:], starts[2:]))
 
 
 @pytest.mark.asyncio

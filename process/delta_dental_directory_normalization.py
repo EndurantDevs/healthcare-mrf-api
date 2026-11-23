@@ -16,6 +16,7 @@ _PLAN_NET = "http://hl7.org/fhir/us/davinci-pdex-plan-net/StructureDefinition/"
 _SOURCE = f"urn:{SOURCE_ID}:"
 _MAX_PLAN_BYTES = 32 * 1024 * 1024
 _MAX_WINDOWS = 200_000
+_MAX_CUMULATIVE_WINDOWS = 250_000
 MAX_CUMULATIVE_LINEAGES = 16
 _COUNT_FIELDS = (
     "observed_windows",
@@ -90,7 +91,7 @@ def _load_cumulative_plans(connection, lineages, edition, digest):
         digest.update(len(definition).to_bytes(8, "big"))
         digest.update(definition)
     planned_windows = connection.execute("SELECT count(*) FROM windows").fetchone()[0]
-    if not 0 < planned_windows <= _MAX_WINDOWS:
+    if not 0 < planned_windows <= _MAX_CUMULATIVE_WINDOWS:
         raise ValueError("delta_retained_edition_or_plan_invalid")
     return planned_windows
 
