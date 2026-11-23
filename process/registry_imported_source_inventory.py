@@ -372,10 +372,6 @@ async def native_imported_source_reader():
         yield connection
 
 
-def _json(value):
-    return json.loads(value) if type(value) is str else value
-
-
 def _bounded(rows):
     if len(rows) > MAX_DEFINITIONS:
         raise ValueError("registry_imported_inventory_definition_bounds")
@@ -426,97 +422,6 @@ async def _aca_inputs(connection, schema):
     ]
 
 
-async def _ptg_inputs(connection, schema):
-    """Observe complete negotiated scopes and exclude allowed-amount-only data."""
-    namespace = storage_identifier(schema)
-    heads = await _ptg_heads(connection, namespace)
-    plans_by_source = await _ptg_plans_by_source(connection, namespace)
-    return [
-        document
-        for source_row in heads
-        if (document := _ptg_source_document(source_row, schema, plans_by_source)) is not None
-    ]
-
-
-async def _ptg_heads(connection, namespace):
-    heads = await connection.fetch(
-        "SELECT current.source_key,current.snapshot_id,binding.snapshot_key,snapshot.import_run_id,"
-        "snapshot.manifest->'serving_index' AS serving_index,snapshot.manifest->'allowed_amount_index' AS allowed_amount_index "
-        f"FROM {namespace}.ptg2_current_source_snapshot current JOIN {namespace}.ptg2_snapshot snapshot "
-        "ON snapshot.snapshot_id=current.snapshot_id "
-        f"LEFT JOIN {namespace}.ptg2_v3_snapshot_binding binding ON binding.snapshot_id=current.snapshot_id "
-        "WHERE snapshot.status='published' AND snapshot.validated_at IS NOT NULL AND snapshot.published_at IS NOT NULL "
-        f'ORDER BY current.source_key COLLATE "C" LIMIT {MAX_SOURCES + 1}'
-    )
-    if len(heads) > MAX_SOURCES or len({source_row["source_key"] for source_row in heads}) != len(heads):
-        raise ValueError("registry_imported_inventory_ptg_head_bounds")
-    return heads
-
-
-async def _ptg_plans_by_source(connection, namespace):
-    plans = _bounded(
-        await connection.fetch(
-            "SELECT source.source_key,source.snapshot_id,source.plan_id,source.plan_market_type "
-            f"FROM {namespace}.ptg2_current_plan_source source JOIN {namespace}.ptg2_current_source_snapshot current "
-            "ON (current.source_key,current.snapshot_id)=(source.source_key,source.snapshot_id) "
-            'ORDER BY source.source_key COLLATE "C",source.plan_id COLLATE "C",source.plan_market_type COLLATE "C" '
-            f"LIMIT {MAX_DEFINITIONS + 1}"
-        )
-    )
-    plans_by_source = {}
-    for source_row in plans:
-        plans_by_source.setdefault((source_row["source_key"], source_row["snapshot_id"]), []).append(
-            {name: source_row[name] for name in ("plan_id", "plan_market_type")}
-        )
-    return plans_by_source
-
-
-def _ptg_source_document(source_row, schema, plans_by_source):
-    serving_by_field = _json(source_row["serving_index"])
-    allowed_by_field = _json(source_row["allowed_amount_index"])
-    if not serving_by_field:
-        if type(allowed_by_field) is dict and allowed_by_field.get("data_domain") == "allowed_amounts":
-            return None
-        raise ValueError("registry_imported_inventory_ptg_graph_unavailable")
-    graph_by_field = serving_by_field.get("provider_graph")
-    if (
-        type(graph_by_field) is not dict
-        or any(
-            type(graph_by_field.get(name)) is not int or graph_by_field[name] <= 0
-            for name in ("npi_count", "owner_count", "provider_group_count")
-        )
-        or source_row["snapshot_key"] is None
-    ):
-        raise ValueError("registry_imported_inventory_ptg_graph_unavailable")
-    source_id = source_row["source_key"]
-    return {
-        "contract": NATIVE_CONTRACT,
-        "source_system": "ptg",
-        "source_id": source_id,
-        "schema_name": schema,
-        "edition_id": source_row["snapshot_id"],
-        "policy": NATIVE_POLICY,
-        "graph": {
-            "snapshot_key": source_row["snapshot_key"],
-            "import_run_id": source_row["import_run_id"],
-            "source_set": serving_by_field.get("source_set"),
-            "npi_scope_table": "ptg2_v4_npi_scope"
-            if serving_by_field.get("serving_binary", {}).get("provider_graph_v4")
-            else "ptg2_v3_npi_scope",
-            "provider_graph": {
-                name: graph_by_field[name] for name in ("npi_count", "owner_count", "provider_group_count")
-            },
-        },
-        "definitions": [
-            {
-                "source_key": source_id,
-                "network_names": serving_by_field.get("network_names") or [],
-                "plans": plans_by_source.get((source_id, source_row["snapshot_id"]), []),
-            }
-        ],
-    }
-
-
 async def observe_imported_source_inventory(
     connection, *, config, catalog_export, effective_date=None, previous_fhir=()
 ):
@@ -538,7 +443,6 @@ async def observe_imported_source_inventory(
         descriptor["endpoint_id"] for descriptor in (*descriptors, *carried)
     }
     native = await _aca_inputs(connection, config.aca_source_schema)
-    native.extend(await _ptg_inputs(connection, config.ptg_source_schema))
     keys = [source_disposition["source_id"] for source_disposition in native] + [
         source_disposition["coordinates"]["source_id"] for source_disposition in descriptors
     ]

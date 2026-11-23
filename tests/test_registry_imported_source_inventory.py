@@ -292,15 +292,15 @@ async def test_catalog_retains_one_copy_of_the_latest_complete_edition_if_unavai
 
 
 @pytest.mark.asyncio
-async def test_inventory_reads_native_heads_and_excludes_allowed_amounts(inventory_case):
+async def test_ordinary_inventory_never_discovers_ptg_provider_sets(inventory_case):
     case = inventory_case
     result = await observe(case)
     assert result.fhir_descriptors == (case.descriptor,)
-    assert {source["source_system"] for source in result.native_sources} == {"aca", "ptg"}
-    assert len(result.native_sources) == 2
+    assert [source["source_system"] for source in result.native_sources] == ["aca"]
     generation, sources, descriptors = await refresh.imported_catalog_inputs(object(), "registry", inventory=result)
     assert generation == result.token and descriptors == [case.descriptor]
-    assert len(sources) == 3 and {source["capture_generation"] for source in sources} == {result.token}
+    assert len(sources) == 2 and {source["capture_generation"] for source in sources} == {result.token}
+    assert all("ptg2_" not in call.args[0] for call in case.connection.fetch.call_args_list)
     assert all("network_serving_control" not in call.args[0] for call in case.connection.fetch.call_args_list)
 
 
@@ -308,9 +308,9 @@ async def test_inventory_reads_native_heads_and_excludes_allowed_amounts(invento
 async def test_source_token_tracks_named_data_and_policy(inventory_case, monkeypatch):
     case = inventory_case
     before = await observe(case)
-    case.descriptor["tables"]["resource"] = {"schema": "edition_resources", "name": "resources"}
-    assert (await observe(case)).token != before.token
     case.ptg["edition_id"] = "snapshot-two"
+    assert (await observe(case)).token == before.token
+    case.descriptor["tables"]["resource"] = {"schema": "edition_resources", "name": "resources"}
     assert (await observe(case)).token != before.token
     monkeypatch.setattr(inventory, "graph_policy", lambda source_id: {"office_policy": "next-policy"})
     assert (await observe(case)).token != before.token
@@ -355,7 +355,7 @@ async def test_native_catalog_preparation_refuses_reuse_after_source_discovery_c
     case = inventory_case
     before = await observe(case)
     previous_by_field_by_field = {"accounting_json": catalog_preparation.imported_catalog_accounting(before)}
-    case.ptg["edition_id"] = "successor-snapshot"
+    case.connection.fetchrow.return_value["import_id"] = "successor-edition"
     current = await observe(case)
     assert current.token != before.token
     monkeypatch.setattr(

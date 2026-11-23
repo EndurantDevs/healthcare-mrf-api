@@ -589,7 +589,10 @@ class _SourceResolver:
                     if type(recipe.source_pin) not in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
                     and not (
                         type(recipe.source_pin) is PinnedNativeProviderMembershipSource
-                        and recipe.source_pin.source_id in native_current_ids
+                        and (
+                            recipe.source_pin.source_id in native_current_ids
+                            or recipe.binding_coordinates.source_system == "ptg"
+                        )
                     )
                 )
                 + retained_unavailable_fhir_recipes(retained, inventory)

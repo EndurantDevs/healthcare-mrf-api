@@ -12,6 +12,9 @@ import pytest
 from process import registry_network_import as importer
 from process.registry_membership_refresh_contract import membership_refresh_command_sha256
 from tests.test_registry_imported_membership_refresh import imported_command
+from tests.test_registry_native_provider_reuse import native_recipe
+from tests.test_registry_ptg_office_membership_recipe import _recipe as manual_ptg_recipe
+from tests.test_registry_typed_source_recipe import _recipe as typed_recipe
 
 
 def observation():
@@ -107,13 +110,15 @@ def test_normal_core_parameters_are_empty_and_legacy_exact_selector_stays_valid(
 async def test_imported_refresh_preserves_unavailable_predecessor_recipes(
     monkeypatch, has_replacement, caller_snapshot
 ):
+    """Retain reviewed PTG and unavailable FHIR during ordinary replacement."""
     from process import registry_imported_source_inventory as inventory_module
     from process import registry_membership_refresh_runtime as runtime
     from process import registry_source_recipe_store as recipe_store
-    from tests.test_registry_typed_source_recipe import _recipe
 
-    previous = _recipe()
-    native = SimpleNamespace(source_pin=object())
+    previous = typed_recipe()
+    aca = native_recipe(1)
+    implicit_ptg = native_recipe(2, source_system="ptg")
+    reviewed_ptg = manual_ptg_recipe()
     prepared = object()
     inventory = SimpleNamespace(
         fhir_descriptors=(previous.source_pin.catalog_descriptor,) if has_replacement else (),
@@ -138,7 +143,7 @@ async def test_imported_refresh_preserves_unavailable_predecessor_recipes(
 
     async def retained_recipes(connection, manifest, *, control_schema):
         assert connection.is_in_transaction()
-        return native, previous
+        return aca, implicit_ptg, reviewed_ptg, previous
 
     monkeypatch.setattr(recipe_store, "resolve_retained_registry_source_recipes", retained_recipes)
 
@@ -157,7 +162,7 @@ async def test_imported_refresh_preserves_unavailable_predecessor_recipes(
     monkeypatch.setattr(resolver, "_composition", lambda pin, recipes, manifest, source_runtime: recipes)
     connection = SimpleNamespace(is_in_transaction=lambda: state.has_snapshot, transaction=transaction)
     async with resolver._pin_imported_sources(connection, envelope_by_field, object()) as recipes:
-        assert recipes == (native,) + (() if has_replacement else (previous,)) + (prepared,)
+        assert recipes == (aca, reviewed_ptg) + (() if has_replacement else (previous,)) + (prepared,)
         assert state.has_snapshot == caller_snapshot
     require_inputs.assert_awaited_once_with(connection, envelope_by_field["command"], "registry", inventory=inventory)
 

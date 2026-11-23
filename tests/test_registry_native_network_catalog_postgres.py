@@ -144,6 +144,45 @@ async def _stage_native_descriptor(fixture, candidate, selected, descriptor):
 
 
 @pytest.mark.asyncio
+async def test_ordinary_replacement_retires_only_automatic_ptg(storage_database, monkeypatch):
+    """Remove a synthetic PTG source from a replacement catalog while keeping ACA and the old catalog."""
+    from process import registry_imported_catalog_preparation as preparation
+
+    fixture = storage_database
+    await native_control(fixture)
+    predecessor, candidate = await target(fixture), await target(fixture)
+    selected = snapshot(standing_grant())
+    aca = native_catalog_descriptor(native_aca_source())
+    ptg = native_catalog_descriptor(native_ptg_source())
+    _native_snapshot_vector(selected, [aca, ptg])
+    previous_by_field = {**selected, "schema_name": predecessor.schema_name}
+    async with fixture.connection.transaction():
+        for catalog in (predecessor, candidate):
+            for descriptor in (aca, ptg):
+                await _stage_native_descriptor(fixture, catalog, selected, descriptor)
+        monkeypatch.setattr(preparation, "current_catalog_inventory", object)
+        assert await preparation.replaced_native_generations(fixture.connection, previous_by_field, ()) == (
+            digest(ptg),
+        )
+        _native_snapshot_vector(selected, [aca])
+        await preparation.retire_replaced_catalog_sources(
+            fixture.connection, candidate, selected, previous_by_field, fixture.control
+        )
+        assert (
+            await fixture.connection.fetchval(
+                f'SELECT display_name FROM "{candidate.schema_name}".registry_fhir_catalog_network'
+            )
+            == "Example insurer 2027 Preferred"
+        )
+        assert (
+            await fixture.connection.fetchval(
+                f'SELECT count(*) FROM "{predecessor.schema_name}".registry_fhir_catalog_network'
+            )
+            == 2
+        )
+
+
+@pytest.mark.asyncio
 async def test_native_replacement_retires_obsolete_rows_and_keeps_other_sources(storage_database):
     """Retire one accepted native replacement while keeping other Sources and the published predecessor."""
     from process.registry_imported_catalog_preparation import retire_replaced_catalog_sources
