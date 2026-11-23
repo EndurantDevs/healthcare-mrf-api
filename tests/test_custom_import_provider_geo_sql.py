@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from sanic.exceptions import InvalidUsage
 from sanic.request.parameters import RequestParameters
-from sqlalchemy import Integer, literal, select, text
+from sqlalchemy import Boolean, Integer, String, column, literal, select, text, values
 from sqlalchemy.exc import DBAPIError
 
 from api import provider_geo_sql as geo_sql
@@ -148,7 +148,7 @@ def test_required_linked_geo_preserves_projected_entity_filter_when_composing_me
         assert "a.npi IN (SELECT npi FROM plan_member_npis)" in bounding
 
 
-@pytest.mark.parametrize("direction", (None, "asc", "desc"))
+@pytest.mark.parametrize("direction", ("asc", "desc"))
 def test_imported_geo_filter_uses_one_correlated_membership_predicate(direction):
     statements = _statements(direction=direction, require_match=True)
     count_sql = str(statements.count)
@@ -161,7 +161,16 @@ def test_imported_geo_filter_uses_one_correlated_membership_predicate(direction)
     native_eligibility = page_sql.split("custom_import_provider_relation AS", 1)[0]
     assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" not in native_eligibility
     assert "LIMIT" not in native_eligibility
-    assert ("LEFT JOIN custom_import_provider_relation AS imported" in page_sql) is (direction is not None)
+    assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
+
+
+def test_imported_geo_without_order_keeps_membership_as_a_subplan():
+    statements = _statements(direction=None, require_match=True)
+    membership = (
+        "(native_eligible_geo.npi_code::text IN (SELECT entity_value FROM custom_import_provider_relation)) IS TRUE"
+    )
+    assert str(statements.count).count(membership) == 1
+    assert str(statements.page).count(membership) == 1
 
 
 def test_geo_score_scope_uses_every_native_provider():
@@ -975,12 +984,23 @@ async def test_postgres_imported_geo_without_order_preserves_empty_total_and_hyd
             pytest.skip("PostGIS is unavailable for the native geo execution proof")
         await _seed_geo_tables(session, address_table_sql=address_table_sql)
         context = _context(direction=None, require_match=True)
+        badge_rows = (
+            values(column("entity_value", String), column("selected", Boolean))
+            .data([("1000000002", True), ("1000000002", True), ("1000000003", False), (None, True)])
+            .alias("badge_rows")
+        )
+        membership = select(badge_rows.c.entity_value).where(badge_rows.c.selected.is_(True))
+        context = replace(
+            context,
+            prepared=replace(context.prepared, statement=membership),
+            compiled=compile_npi_entity_relation(membership),
+        )
         query = _imported_geo_query(address_table_sql=address_table_sql)
         statements = geo_sql.build_imported_geo_statements(context, query)
-        rows = (await session.execute(statements.page, statements.parameters)).all()
-        assert len(rows) == 1 and rows[0]._mapping["npi_code"] == 1000000002
-        assert rows[0]._mapping["first_line"] == "1 primary Example Street"
-        assert rows[0]._mapping["_geo_total"] == 1
+        matching_offices = (await session.execute(statements.page, statements.parameters)).all()
+        assert len(matching_offices) == 1 and matching_offices[0]._mapping["npi_code"] == 1000000002
+        assert matching_offices[0]._mapping["first_line"] == "1 primary Example Street"
+        assert matching_offices[0]._mapping["_geo_total"] == 1
         exhausted = geo_sql.build_imported_geo_statements(
             context, replace(query, cursor_anchor=("1000000002", _SECOND_ADDRESS_KEY))
         )

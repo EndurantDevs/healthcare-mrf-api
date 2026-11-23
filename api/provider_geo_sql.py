@@ -366,6 +366,12 @@ def _taxonomy_filter_where(nearby: NearbySqlQuery, *, on_search: bool = False) -
 def _membership_clause(import_context: ProviderImportQuery) -> str:
     if not import_context.require_match:
         return ""
+    if not import_context.prepared.normalized_order_terms:
+        # Keep membership as a hashable subplan when spatial cardinality is underestimated.
+        return (
+            f"\n       AND ({_NATIVE_GEO_RELATION}.npi_code::text IN ("
+            f"SELECT entity_value FROM {_IMPORT_RELATION})) IS TRUE"
+        )
     return (
         f"\n       AND EXISTS (SELECT 1 FROM {_IMPORT_RELATION} AS imported "
         f"WHERE imported.entity_value = {_NATIVE_GEO_RELATION}.npi_code::text)"
