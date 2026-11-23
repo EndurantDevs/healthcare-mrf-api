@@ -1873,7 +1873,17 @@ def _worker_job_pvc_volumes(launch=None) -> list[dict[str, Any]]:
         claim_by_field["readOnly"] = True
         mount_by_field = _delta_review_cache_mount(mount_path)
     volume_name = os.getenv("HLTHPRT_WORKER_JOB_PVC_VOLUME_NAME", "import-workdir").strip() or "import-workdir"
+    runtime_volumes = []
+    if is_reviewed_delta:
+        scratch_name = "delta-worker-scratch"
+        runtime_volumes.append(
+            {
+                "volume": {"name": scratch_name, "emptyDir": {"sizeLimit": "8Gi"}},
+                "volumeMount": {"name": scratch_name, "mountPath": "/work"},
+            }
+        )
     return [
+        *runtime_volumes,
         {
             "volume": {
                 "name": volume_name,
@@ -1883,7 +1893,7 @@ def _worker_job_pvc_volumes(launch=None) -> list[dict[str, Any]]:
                 "name": volume_name,
                 **mount_by_field,
             },
-        }
+        },
     ]
 
 

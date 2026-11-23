@@ -1477,8 +1477,8 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
 
 
 def _is_source_job_env_matching(observed, expected, launch):
-    """Normalize the API's omitted empty callback value only on Delta observations."""
-    if not is_delta_observation_launch(launch) or type(observed) is not list:
+    """Normalize the API's omitted empty callback value only on isolated Delta workers."""
+    if not uses_isolated_delta_environment(launch) or type(observed) is not list:
         return observed == expected
     callback_by_field = {"name": "HLTHPRT_IMPORT_STATUS_EVENT_URL"}
     return [{**entry, "value": ""} if entry == callback_by_field else entry for entry in observed] == expected
