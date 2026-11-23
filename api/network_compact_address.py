@@ -37,7 +37,7 @@ def compact_address_read_relations(layout):
     return tuple(relations)
 
 
-def _membership_arms(layout, *, selected, location_lookup=False):
+def _membership_arms(layout, *, selected, location_lookup=False, prefetched_slices=False):
     arms = []
     for index, artifact in enumerate(layout.artifacts):
         ref_map = _relation(layout.ref_map)
@@ -46,12 +46,18 @@ def _membership_arms(layout, *, selected, location_lookup=False):
         artifact_filter = f"ref.artifact_candidate_id=CAST(:_compact_artifact_{index} AS uuid)"
         if selected and location_lookup:
             # Probe the location index once with all selected slices in its bucket.
+            bucket = "(get_byte(sha256(convert_to(office.location_key,'UTF8')),0)&63)"
+            if prefetched_slices:
+                subscript = f"({bucket}+1)"
+                slices = (
+                    f"CAST((SELECT slice_ids[{subscript}:{subscript}][:] "
+                    f"FROM selected_slice_buckets_{index}) AS uuid[])"
+                )
+            else:
+                slices = f"""ARRAY(SELECT ref.slice_id FROM ONLY {ref_map} ref
+                    WHERE {artifact_filter} {selector} AND ref.office_bucket={bucket})"""
             arms.append(f"""SELECT edge.location_key FROM ONLY {edge} edge
-                WHERE edge.location_key=office.location_key AND edge.slice_id=ANY(ARRAY(
-                    SELECT ref.slice_id FROM ONLY {ref_map} ref
-                    WHERE {artifact_filter} {selector}
-                    AND ref.office_bucket=(get_byte(sha256(convert_to(office.location_key,'UTF8')),0)&63)
-                ))""")
+                WHERE edge.location_key=office.location_key AND edge.slice_id=ANY({slices})""")
             continue
         projected = "edge.location_key" if selected else "ref.network_id"
         office = "" if selected else "AND edge.location_key=office.location_key"
@@ -124,7 +130,30 @@ def compact_selected_offices(layout, network_ids):
     return keys, offices
 
 
-def _address_query(layout, network_ids, visible_membership_sql, location_lookup, columns=None):
+def compact_bounded_offices(layout, network_ids):
+    """Prepare the bucket lookup once outside the correlated provider-page scan."""
+    offices = _address_query(layout, network_ids, None, True, prefetched_slices=True)
+    ref_map = _relation(layout.ref_map)
+    buckets = ",\n".join(
+        f"""selected_slice_buckets_{index} AS MATERIALIZED (
+    SELECT array_agg(per_bucket.slice_ids ORDER BY buckets.bucket) AS slice_ids
+      FROM generate_series(0,63) AS buckets(bucket)
+      CROSS JOIN LATERAL (
+          SELECT array_agg(ref.slice_id) AS slice_ids
+            FROM unnest(CAST(:_canonical_network_ids AS integer[])) AS requested(network_id)
+            LEFT JOIN ONLY {ref_map} ref
+              ON ref.artifact_candidate_id=CAST(:_compact_artifact_{index} AS uuid)
+             AND ref.office_bucket=buckets.bucket AND ref.network_id=requested.network_id
+      ) AS per_bucket
+)"""
+        for index in range(len(layout.artifacts))
+    )
+    return buckets, f"({offices})"
+
+
+def _address_query(
+    layout, network_ids, visible_membership_sql, location_lookup, columns=None, *, prefetched_slices=False
+):
     _validate_address_selection(layout, network_ids, visible_membership_sql, location_lookup)
     requested_columns = _projection_column_names(columns)
     hidden_columns = (
@@ -149,7 +178,9 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup,
     )
     query = f"SELECT {output_columns} FROM ({base}) office"
     if network_ids is not None:
-        selected = _membership_arms(layout, selected=True, location_lookup=location_lookup)
+        selected = _membership_arms(
+            layout, selected=True, location_lookup=location_lookup, prefetched_slices=prefetched_slices
+        )
         # Avoid a national office scan when the selected memberships are empty.
         membership_prefix = f"EXISTS ({selected}) AND " if not location_lookup else ""
         scoped = query + (

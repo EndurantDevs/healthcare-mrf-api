@@ -52,8 +52,11 @@ async def test_selected_office_page(monkeypatch, size, extra, staged, computed, 
     assert ordinary in hydration and "selected_office_keys" not in hydration
     assert ("ORDER BY npi + 0" in selection) == computed
     assert ("taxonomy_prefix AS MATERIALIZED" in selection) == bounded
+    assert ("selected_slice_buckets_0 AS MATERIALIZED" in selection) == bounded
+    assert "selected_slice_buckets" not in hydration and "selected_slice_buckets" not in count
     if bounded:
         assert "bucket_members OFFSET 0" in selection
+        assert "FROM selected_slice_buckets_0" in selection
         assert "COUNT(*) FROM prefix_matches" in selection and "COUNT(*) FROM taxonomy_prefix" in selection
         budget = "GREATEST(2048, LEAST(64, (CAST(:limit AS bigint) + CAST(:start AS bigint))) * 128)"
         assert f"LIMIT {budget}" in selection and f"< {budget}" in selection

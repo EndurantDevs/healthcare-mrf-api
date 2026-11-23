@@ -344,12 +344,14 @@ def _provider_page_access(scope, filters, address_source, taxonomy_source, *, pl
     )
     if any(filters.get(key) for key in other_filters):
         return computed, None, ProviderPageSource(address_source)
-    from api.network_compact_address import compact_selected_offices
+    from api.network_compact_address import compact_bounded_offices, compact_selected_offices
 
     keys, offices = compact_selected_offices(scope.manifest.compact_layout, scope.network_ids)
-    bounded_source = (
-        scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True) if is_bounded_page else None
-    )
+    bounded_source = None
+    if is_bounded_page:
+        buckets, bounded_source = compact_bounded_offices(scope.manifest.compact_layout, scope.network_ids)
+        if buckets:
+            keys = f"{buckets},\n{keys}"
     return computed, keys, ProviderPageSource(f"{offices} as c {taxonomy_source}", bounded_source)
 
 

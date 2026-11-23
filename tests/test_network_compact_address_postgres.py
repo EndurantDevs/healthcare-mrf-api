@@ -24,6 +24,7 @@ from api.network_compact_address import (
     compact_address_read_relations,
     compact_address_relation_sql,
     compact_address_selectable,
+    compact_bounded_offices,
     compact_selected_offices,
 )
 from api.network_read_execution import qualified_relation_sql
@@ -154,6 +155,7 @@ async def test_three_network_taxonomy_pages_use_exact_office_eligibility(compact
     network_ids = (7, 42, 99)
     keys, offices = compact_selected_offices(layout, network_ids)
     bounded = compact_address_relation_sql(layout, network_ids=network_ids, location_lookup=True)
+    buckets, prefetched = compact_bounded_offices(layout, network_ids)
     provider_npi = "COALESCE(c.npi, c.inferred_npi)"
     taxonomy = taxonomy_codes_subquery("code = ANY(:codes)")
     primary_match = provider_taxonomy_lateral_join(provider_npi_sql=provider_npi, primary_only=True)
@@ -161,11 +163,14 @@ async def test_three_network_taxonomy_pages_use_exact_office_eligibility(compact
     eligibility_clauses = ["c.taxonomy_array && q.int_codes", "c.type = 'practice'"]
     params = compact_address_parameters(layout) | {"_canonical_network_ids": list(network_ids), "codes": ["TESTCODE"]}
 
-    def page(bounded_source):
+    def page(bounded_source, ctes):
         npis = provider_page_npis_sql(
             ProviderPageSource(staged_source, bounded_source), provider_npi, eligibility_clauses, None
         ).replace("mrf.", "pg_temp.")
-        return text(f"WITH {keys}, page AS ({npis} ORDER BY npi LIMIT :limit OFFSET :start) SELECT npi FROM page")
+        return text(f"WITH {ctes}, page AS ({npis} ORDER BY npi LIMIT :limit OFFSET :start) SELECT npi FROM page")
+
+    prefetched_page = page(prefetched, f"{buckets}, {keys}")
+    pages = page(None, keys), page(bounded, keys), prefetched_page
 
     async with db.engine.begin() as connection:
         await connection.execute(text("CREATE TEMP TABLE nucc_taxonomy (code varchar, int_code integer)"))
@@ -191,10 +196,10 @@ async def test_three_network_taxonomy_pages_use_exact_office_eligibility(compact
         )
         for offset, expected in [(0, [1111111111]), (1, [2222222222]), (2, [])]:
             request = params | {"start": offset, "limit": 1}
-            for lookup_relation in (None, bounded):
-                page_rows = await connection.execute(page(lookup_relation), request)
+            for statement in pages:
+                page_rows = await connection.execute(statement, request)
                 assert page_rows.scalars().all() == expected
-        await _assert_sparse_taxonomy_pages(connection, page(bounded), params)
+        await _assert_sparse_taxonomy_pages(connection, prefetched_page, params)
 
 
 @pytest.mark.asyncio
