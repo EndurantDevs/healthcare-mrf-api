@@ -95,7 +95,7 @@ def test_legacy_complete_sets_keep_original_codec(count):
         else {},
     }
     inputs = _inputs(recipes)
-    execution._require_prepared_recipes(candidate_by_field, inputs, inputs)
+    execution._require_candidate_recipes(candidate_by_field, execution._prepared_recipe_commitment(inputs, inputs))
 
 
 @pytest.mark.parametrize("count", [0, 1, 101, 1000])
@@ -111,7 +111,7 @@ def test_final_complete_equality_never_hydrates(monkeypatch, count):
     for name in ("read_source_inventory_page", "verify_source_inventory", "load_source_inventory"):
         monkeypatch.setattr(inventory_store, name, forbidden)
     monkeypatch.setattr(recipe_store, "verify_registry_source_recipes", forbidden)
-    execution._require_prepared_recipes(candidate_by_field, original, final)
+    execution._require_candidate_recipes(candidate_by_field, execution._prepared_recipe_commitment(original, final))
     assert set(candidate_by_field) == {"source_recipes_json", "source_generations"}
 
 
@@ -139,20 +139,19 @@ def test_registered_set_must_equal_replacement(storage, mismatch):
         }
     inputs = _inputs(expected)
     with pytest.raises(RegistryApprovalConflict, match="candidate_recipes_changed"):
-        execution._require_prepared_recipes(candidate_by_field, inputs, inputs)
+        execution._require_candidate_recipes(candidate_by_field, execution._prepared_recipe_commitment(inputs, inputs))
 
 
 def test_final_fence_preserves_source_and_address_guards():
     recipes = _recipe_set(101)
     original = _inputs(recipes)
-    candidate_by_field = _registered(recipes)
     for final in (
         _inputs(recipes[:-1]),
         _inputs((_recipe(999), *recipes[:-1])),
         replace(original, base_source=replace(_ADDRESS, generation_id="b" * 64)),
     ):
         with pytest.raises(RegistryApprovalConflict, match="sources_changed"):
-            execution._require_prepared_recipes(candidate_by_field, original, final)
+            execution._prepared_recipe_commitment(original, final)
 
 
 @asynccontextmanager

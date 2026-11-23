@@ -14,11 +14,11 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from process import registry_membership_refresh_execution as refresh
+from process import registry_membership_refresh_sources as sources
 from process import registry_publication_execution as publication
 from process.network_address_projection import PinnedAddressSource
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import RegistryCompositionAddressSources
-from process.registry_membership_refresh_execution import _require_prepared_recipes
 from process.registry_membership_refresh_queue import RegistryMembershipRefreshAddressProfile
 from process.registry_publication_consumer import _lease_authority
 from tests.test_registry_source_recipe_store_postgres import _candidate, _cms_epoch_recipe
@@ -44,14 +44,14 @@ def source_inputs(index=0):
 
 def test_final_source_fence_compares_whole_recipe_documents():
     original = source_inputs()
-    _require_prepared_recipes(_candidate((recipe_for(),)), original, original)
+    expected = refresh._prepared_recipe_commitment(original, original)
+    refresh._require_candidate_recipes(_candidate((recipe_for(),)), expected)
     with pytest.raises(RegistryApprovalConflict, match="candidate_recipes_changed"):
-        _require_prepared_recipes(_candidate((recipe_for(1),)), original, original)
+        refresh._require_candidate_recipes(_candidate((recipe_for(1),)), expected)
     with pytest.raises(RegistryApprovalConflict, match="sources_changed"):
-        _require_prepared_recipes(_candidate((recipe_for(),)), original, source_inputs(1))
+        refresh._prepared_recipe_commitment(original, source_inputs(1))
     with pytest.raises(RegistryApprovalConflict, match="sources_changed"):
-        _require_prepared_recipes(
-            _candidate((recipe_for(),)),
+        refresh._prepared_recipe_commitment(
             original,
             replace(original, base_source=replace(original.base_source, generation_id="b" * 64)),
         )
@@ -182,14 +182,22 @@ async def test_refresh_refuses_nested_execution_transaction_before_touching_requ
 @pytest.mark.asyncio
 async def test_changed_locked_request_stops_before_candidate_locks_or_final_grant(monkeypatch):
     events = []
+    original = source_inputs()
+    commitment = sources._recipe_commitment
+
+    def compare(recipes):
+        events.append("recipe_commitment")
+        return commitment(recipes)
 
     @asynccontextmanager
     async def locked(*_arguments):
+        events.append("locked")
         try:
             yield {"request_sha256": "b" * 64}
         finally:
             events.append("released")
 
+    monkeypatch.setattr(sources, "_recipe_commitment", compare)
     monkeypatch.setattr(refresh, "_locked_request_transaction", locked)
     controls = AsyncMock()
     monkeypatch.setattr(refresh, "_lock_publication_controls", controls)
@@ -198,12 +206,12 @@ async def test_changed_locked_request_stops_before_candidate_locks_or_final_gran
         await refresh._finish_refresh(
             object(),
             (UUID(int=1), UUID(int=2), {"request_sha256": "a" * 64}),
-            ({"command": {}}, None, None),
+            ({"command": {}}, original, original),
             None,
             SimpleNamespace(control_schema="registry"),
             final_authority,
         )
-    assert events == ["released"]
+    assert events == ["recipe_commitment", "recipe_commitment", "locked", "released"]
     controls.assert_not_awaited()
     final_authority.assert_not_awaited()
 
