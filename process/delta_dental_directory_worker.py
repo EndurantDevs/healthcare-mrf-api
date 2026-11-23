@@ -17,6 +17,7 @@ from time import monotonic, time
 
 from process.control_cancel import raise_if_cancelled
 from process.delta_dental_directory_capture import (
+    ALL_NETWORKS_SELECTOR,
     COMPOSITE_SELECTOR,
     DEFAULT_REQUEST_BUDGET,
     FINDER_SELECTORS,
@@ -128,7 +129,7 @@ def _searches_from_plan(plan):
     plan_by_field = {
         key: setting
         for key, setting in plan.items()
-        if key not in {"concurrency", "requests_per_second", "max_origin_requests"}
+        if key not in {"concurrency", "requests_per_second", "max_origin_requests", "random_proxy_routes"}
     }
     identities = {"authorization_scope", "data_edition"}
     if (
@@ -147,6 +148,7 @@ def _searches_from_plan(plan):
             "primitive": NETWORK_LABELS,
             "named": NETWORK_LABELS | {COMPOSITE_SELECTOR},
             "named-and-all": FINDER_SELECTORS,
+            "all-only": {ALL_NETWORKS_SELECTOR},
         }.get(plan_by_field.get("selector_scope", "primitive"))
         if selectors is None:
             raise ValueError("delta_dental_finder_selector_scope_invalid")
@@ -178,7 +180,10 @@ def _acquisition_settings(manifest_by_field, search_count):
             raise ValueError
         rate = float(rate)
     budget = _origin_request_budget(manifest_by_field, rate, search_count)
-    return concurrency, rate, budget
+    random_proxy_routes = manifest_by_field.get("random_proxy_routes", False)
+    if type(random_proxy_routes) is not bool:
+        raise ValueError
+    return concurrency, rate, budget, random_proxy_routes
 
 
 def _authorized_plan():
@@ -198,11 +203,11 @@ def _authorized_plan():
         if not all(type(item) is str and 0 < len(item) <= 128 and item == item.strip() for item in (scope, edition)):
             raise ValueError
         searches = tuple(dict.fromkeys(_searches_from_plan(manifest_by_field)))
-        concurrency, rate, budget = _acquisition_settings(manifest_by_field, len(searches))
+        concurrency, rate, budget, random_proxy_routes = _acquisition_settings(manifest_by_field, len(searches))
         fingerprint = hashlib.sha256(json.dumps([scope, edition]).encode()).hexdigest()
     except (TypeError, ValueError, KeyError, OverflowError, RecursionError) as exc:
         raise ValueError("delta_dental_finder_authorized_manifest_invalid") from exc
-    return fingerprint, searches, concurrency, rate, budget
+    return fingerprint, searches, concurrency, rate, budget, random_proxy_routes
 
 
 def _artifact_root():
@@ -217,7 +222,7 @@ def _artifact_root():
 
 
 def _bind_observation_edition(
-    root, run_id, capture_id, task, searches=(), *, concurrency=1, rate=None, budget=DEFAULT_REQUEST_BUDGET
+    root, run_id, capture_id, task, searches=(), *, request_settings=(1, None, DEFAULT_REQUEST_BUDGET, False)
 ):
     """Refuse authorization or search-plan drift within a retry lineage."""
     is_retry = bool(task.get("retry_of_run_id"))
@@ -231,8 +236,11 @@ def _bind_observation_edition(
     serialized_searches = [asdict(search) for search in dict.fromkeys(searches)]
     plan_hash = hashlib.sha256(json.dumps(serialized_searches, sort_keys=True).encode()).hexdigest()
     edition_binding = f"{capture_id}:{plan_hash}"
+    concurrency, rate, budget, random_proxy_routes = request_settings
     if concurrency != 1 or rate is not None or budget != DEFAULT_REQUEST_BUDGET:
         edition_binding += f":{concurrency}:{rate}:{budget}"
+    if random_proxy_routes:
+        edition_binding += ":random-proxy-routes"
     with PTG2ArtifactStore(root).named_lock("delta-dental-directory", "authorized-edition"):
         if marker.is_file():
             if marker.read_text(encoding="utf-8") != edition_binding:
@@ -492,11 +500,10 @@ async def _run_http_capture(binding, plan, cancel_check, pause, *, report=None):
                             await resources.enter_async_context(
                                 open_finder_http(
                                     binding,
+                                    plan,
                                     pause=pause,
                                     cancel_check=admission.check_egress,
                                     stats=counts_by_transport_action,
-                                    concurrency=plan.concurrency,
-                                    max_origin_requests=plan.max_origin_requests,
                                     before_start=admission.admit,
                                     on_hold=admission.record_hold,
                                 )
@@ -526,9 +533,14 @@ def _require_run_id(ctx, task):
 
 def _make_capture_plan(root, run_id, task, authorized):
     """Bind the protected search subset and settings to its exact run lineage."""
-    capture_id, searches, concurrency, rate, budget = authorized
+    capture_id, searches, concurrency, rate, budget, random_proxy_routes = authorized
     lineage = _bind_observation_edition(
-        root, run_id, capture_id, task, searches, concurrency=concurrency, rate=rate, budget=budget
+        root,
+        run_id,
+        capture_id,
+        task,
+        searches,
+        request_settings=(concurrency, rate, budget, random_proxy_routes),
     )
     resume = bool(task.get("retry_of_run_id"))
     return FinderCapturePlan(
@@ -542,6 +554,7 @@ def _make_capture_plan(root, run_id, task, authorized):
         concurrency=concurrency,
         requests_per_second=rate,
         max_origin_requests=budget,
+        random_proxy_routes=random_proxy_routes,
     )
 
 

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from process import delta_dental_directory_normalization as normalization
 from process.delta_dental_directory_capture import _create_capture_tables
 from process.delta_dental_directory_json import SOURCE_ID, _office_card
 from process.delta_dental_directory_normalization import _structured_address, normalized_delta_capture
@@ -188,7 +189,9 @@ def test_source_capture_rejects_unsupported_or_mixed_input(tmp_path, invalid_kin
         pytest.fail("Invalid capture reached normalized output")
 
 
-def test_cumulative_lineages_keep_positive_roles_and_deduplicate_windows(tmp_path):
+def test_cumulative_lineages_keep_positive_roles_and_deduplicate_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(normalization, "_MAX_WINDOWS", 3)
+    monkeypatch.setattr(normalization, "_MAX_CUMULATIVE_WINDOWS", 4)
     database = _capture(tmp_path)
     with sqlite3.connect(database) as connection:
         connection.execute(

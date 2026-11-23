@@ -7,6 +7,7 @@ import re
 import ssl
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from random import choice
 from threading import RLock
 from types import MappingProxyType
 from urllib.parse import unquote
@@ -58,6 +59,16 @@ class _ProxyRoute:
 class SourceProxySelection:
     proxy_id: str
     request_options: dict = field(repr=False)
+
+
+def _https_candidate_ids(routes_by_id, exclude_ids):
+    """Keep HTTPS routes whose connection is absent from the active exclusions."""
+    active_connections = {(routes_by_id[proxy_id].url, routes_by_id[proxy_id].auth) for proxy_id in exclude_ids}
+    return {
+        route.proxy_id
+        for route in routes_by_id.values()
+        if route.url.startswith("https://") and (route.url, route.auth) not in active_connections
+    }
 
 
 def _require(condition, error):
@@ -253,7 +264,21 @@ class SourceProxyConfig:
         boundary = self._cooldowns_by_route[key]
         return boundary is not None and boundary <= now
 
-    def _select(self, bound, url, cursor_key, exclude_ids):
+    def _sticky_proxy_id(self, key, eligible_ids):
+        """Reuse the cursor route when available and advance the selection cursor otherwise."""
+        proxy_id = self._assignments_by_cursor.get(key)
+        if proxy_id in eligible_ids:
+            return proxy_id
+        for offset in range(len(self._routes)):
+            index = (self._next_index + offset) % len(self._routes)
+            proxy_id = self._routes[index].proxy_id
+            if proxy_id in eligible_ids:
+                self._next_index = (index + 1) % len(self._routes)
+                self._assignments_by_cursor[key] = proxy_id
+                return proxy_id
+        raise SourceProxyUnavailable(None)
+
+    def _select(self, bound, url, cursor_key, exclude_ids, *, random_https=False):
         origin, path = _target_scope(url)
         rule = bound._rule
         _require(
@@ -261,42 +286,42 @@ class SourceProxyConfig:
             and (rule.base_path == "/" or path == rule.base_path or path.startswith(rule.base_path + "/")),
             "source_proxy_target_invalid",
         )
-        _require(
-            type(cursor_key) is str
-            and bool(cursor_key)
-            and len(cursor_key) <= 512
-            and not any(char in cursor_key for char in "?#")
-            and "://" not in cursor_key
-            and not any(ord(char) < 32 or ord(char) == 127 for char in cursor_key),
-            "source_proxy_cursor_invalid",
-        )
+        if not random_https:
+            _require(
+                type(cursor_key) is str
+                and bool(cursor_key)
+                and len(cursor_key) <= 512
+                and not any(char in cursor_key for char in "?#")
+                and "://" not in cursor_key
+                and not any(ord(char) < 32 or ord(char) == 127 for char in cursor_key),
+                "source_proxy_cursor_invalid",
+            )
         _require(type(exclude_ids) in {set, frozenset}, "source_proxy_exclusions_invalid")
         with self._lock:
             routes_by_id = {route.proxy_id: route for route in self._routes}
             _require(exclude_ids <= routes_by_id.keys(), "source_proxy_exclusions_invalid")
+            candidate_ids = _https_candidate_ids(routes_by_id, exclude_ids) if random_https else routes_by_id.keys()
             now = _utcnow()
             eligible_ids = {
                 proxy_id
-                for proxy_id in routes_by_id
+                for proxy_id in candidate_ids
                 if proxy_id not in exclude_ids and self._is_available(origin, proxy_id, now)
             }
             if not eligible_ids:
                 boundaries = [
                     boundary
                     for (destination, proxy_id), boundary in self._cooldowns_by_route.items()
-                    if destination == origin and proxy_id not in exclude_ids and boundary is not None and boundary > now
+                    if destination == origin
+                    and proxy_id in candidate_ids
+                    and proxy_id not in exclude_ids
+                    and boundary is not None
+                    and boundary > now
                 ]
                 raise SourceProxyUnavailable(_iso(min(boundaries)) if boundaries else None)
-            key = bound._source_id, cursor_key
-            proxy_id = self._assignments_by_cursor.get(key)
-            if proxy_id not in eligible_ids:
-                for offset in range(len(self._routes)):
-                    index = (self._next_index + offset) % len(self._routes)
-                    if self._routes[index].proxy_id in eligible_ids:
-                        proxy_id = self._routes[index].proxy_id
-                        self._next_index = (index + 1) % len(self._routes)
-                        self._assignments_by_cursor[key] = proxy_id
-                        break
+            if random_https:
+                proxy_id = choice(sorted(eligible_ids))
+            else:
+                proxy_id = self._sticky_proxy_id((bound._source_id, cursor_key), eligible_ids)
             route = routes_by_id[proxy_id]
             return SourceProxySelection(proxy_id, {"proxy": route.url, "proxy_auth": route.auth, "ssl": self._ssl})
 
@@ -336,6 +361,10 @@ class BoundSourceProxy:
     def select(self, url, cursor_key, exclude_ids=frozenset()):
         """Select a scoped route for one logical cursor without rewriting its URL."""
         return self._config._select(self, url, cursor_key, exclude_ids)
+
+    def select_random_https(self, url, exclude_ids=frozenset()):
+        """Select an eligible HTTPS connection for a request with no cursor affinity."""
+        return self._config._select(self, url, None, exclude_ids, random_https=True)
 
     def defer(self, proxy_id, retry_not_before):
         """Extend an origin-specific cooldown; None requires manual intervention."""
