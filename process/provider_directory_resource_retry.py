@@ -313,9 +313,14 @@ async def fetch(directory, runner, resource, source_record_by_field, *, report_s
         await wait(directory, runner, boundary[0])
 
 
+def cursor_source(source_record, resource):
+    """Keep a logical cursor on its route even when the next page uses an opaque path."""
+    return {**source_record, "_source_proxy_resource_cursor": resource}
+
+
 async def import_one(directory, runner, resource, report_start, resource_semaphore):
     """Fetch one task-local source view and merge its guarded outcome once."""
-    source_by_field = dict(runner.source_record)
+    source_by_field = cursor_source(runner.source_record, resource)
     result = await fetch(
         directory, runner, resource, source_by_field, report_start=report_start, resource_semaphore=resource_semaphore
     )

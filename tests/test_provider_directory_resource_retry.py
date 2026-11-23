@@ -217,6 +217,7 @@ async def test_due_partial_reports_recheck_throttle_after_queued_writer(monkeypa
 
 @pytest.mark.asyncio
 async def test_retry_progress_and_completion_do_not_wait_for_blocked_sibling(monkeypatch):
+    """A waiting cursor releases its slot and keeps its identity when it resumes."""
     runner = _scan(("Organization", "Location", "HealthcareService"))
     waiting = asyncio.Event()
     resume = asyncio.Event()
@@ -236,7 +237,8 @@ async def test_retry_progress_and_completion_do_not_wait_for_blocked_sibling(mon
         waiting.set()
         await resume.wait()
 
-    async def fetch(resource, _source, **_options):
+    async def fetch(resource, source, **_options):
+        assert source["_source_proxy_resource_cursor"] == resource
         calls[resource] += 1
         if resource == "Location":
             sibling_started.set()

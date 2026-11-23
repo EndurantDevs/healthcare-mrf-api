@@ -253,7 +253,7 @@ class SourceProxyConfig:
         boundary = self._cooldowns_by_route[key]
         return boundary is not None and boundary <= now
 
-    def _select(self, bound, url, cursor_key, exclude_ids):
+    def _select(self, bound, url, cursor_key, exclude_ids, pinned_slot):
         origin, path = _target_scope(url)
         rule = bound._rule
         _require(
@@ -275,6 +275,13 @@ class SourceProxyConfig:
             routes_by_id = {route.proxy_id: route for route in self._routes}
             _require(exclude_ids <= routes_by_id.keys(), "source_proxy_exclusions_invalid")
             now = _utcnow()
+            if pinned_slot is not None:
+                _require(type(pinned_slot) is int and pinned_slot >= 0, "source_proxy_cursor_invalid")
+                _require(not exclude_ids, "source_proxy_exclusions_invalid")
+                proxy_id = sorted(routes_by_id)[pinned_slot % len(routes_by_id)]
+                if not self._is_available(origin, proxy_id, now):
+                    raise SourceProxyUnavailable(_iso(self._cooldowns_by_route[origin, proxy_id]))
+                return self._selection(routes_by_id[proxy_id])
             eligible_ids = {
                 proxy_id
                 for proxy_id in routes_by_id
@@ -297,8 +304,10 @@ class SourceProxyConfig:
                         self._next_index = (index + 1) % len(self._routes)
                         self._assignments_by_cursor[key] = proxy_id
                         break
-            route = routes_by_id[proxy_id]
-            return SourceProxySelection(proxy_id, {"proxy": route.url, "proxy_auth": route.auth, "ssl": self._ssl})
+            return self._selection(routes_by_id[proxy_id])
+
+    def _selection(self, route):
+        return SourceProxySelection(route.proxy_id, {"proxy": route.url, "proxy_auth": route.auth, "ssl": self._ssl})
 
     def _defer(self, origin, proxy_id, boundary):
         _require(
@@ -333,9 +342,9 @@ class BoundSourceProxy:
         """Return this binding's frozen nonsecret pool revision."""
         return self._config._pool_revision
 
-    def select(self, url, cursor_key, exclude_ids=frozenset()):
+    def select(self, url, cursor_key, exclude_ids=frozenset(), *, pinned_slot=None):
         """Select a scoped route for one logical cursor without rewriting its URL."""
-        return self._config._select(self, url, cursor_key, exclude_ids)
+        return self._config._select(self, url, cursor_key, exclude_ids, pinned_slot)
 
     def defer(self, proxy_id, retry_not_before):
         """Extend an origin-specific cooldown; None requires manual intervention."""
