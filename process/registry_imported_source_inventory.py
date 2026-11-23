@@ -130,6 +130,7 @@ class ImportedSourceInventory:
     """Canonical bounded data; decoding returns fresh objects instead of mutable shared pins."""
 
     document_json: str
+    checkpoint_date: str | None = field(default=None, compare=False)
 
     @property
     def document(self):
@@ -146,7 +147,9 @@ class ImportedSourceInventory:
         if effective_date == self.effective_date:
             return self
         document_by_field = {**self.document, "effective_date": effective_date}
-        return ImportedSourceInventory(json.dumps(document_by_field, sort_keys=True, separators=(",", ":")))
+        return ImportedSourceInventory(
+            json.dumps(document_by_field, sort_keys=True, separators=(",", ":")), checkpoint_date=self.checkpoint_date
+        )
 
     @property
     def token(self):
@@ -227,6 +230,12 @@ def current_imported_effective_date(fallback=None):
     return fallback if fallback is not None else datetime.now(timezone.utc).date().isoformat()
 
 
+def current_imported_checkpoint_date():
+    """Return the prior catalog date available for looking up completed graphs."""
+    runtime = _RUNTIME.get()
+    return runtime.observed[0].checkpoint_date if runtime is not None and runtime.observed else None
+
+
 @contextmanager
 def imported_source_inventory_runtime(runtime):
     """Keep native observation configuration task-local and reset it on every exit."""
@@ -260,9 +269,10 @@ async def _observe_current_inventory(runtime):
             connection, runtime.config.aca_source_schema, ("plan_npi_raw", "plan", "plan_networktier", "issuer")
         )
         prior = checkpoint = ()
+        checkpoint_date = None
         if runtime.control_schema is not None:
             prior = await _serving_catalog_observations(connection, runtime.control_schema)
-            checkpoint = await _checkpoint_catalog_observations(connection, runtime.control_schema)
+            checkpoint, checkpoint_date = await _checkpoint_catalog_observations(connection, runtime.control_schema)
         with known_fhir_catalog_families(catalog_observation_families(checkpoint + prior)):
             observed = await observe_imported_source_inventory(
                 connection,
@@ -279,7 +289,7 @@ async def _observe_current_inventory(runtime):
         document["native_sources"] = await enrich_aca_company_sources(
             connection, document["native_sources"], control_schema=runtime.control_schema
         )
-        return ImportedSourceInventory(json.dumps(document, sort_keys=True, separators=(",", ":")))
+        return ImportedSourceInventory(json.dumps(document, sort_keys=True, separators=(",", ":")), checkpoint_date)
 
 
 async def _serving_catalog_observations(connection, control_schema):
@@ -294,22 +304,26 @@ async def _serving_catalog_observations(connection, control_schema):
 
 
 async def _checkpoint_catalog_observations(connection, control_schema):
-    """Reuse family facts from a validated, unpublished catalog."""
+    """Reuse family facts and recover a graph lookup date from the current serving predecessor."""
     control = storage_identifier(control_schema)
-    schema = await connection.fetchval(
-        f"SELECT schema_name FROM {control}.registry_fhir_catalog_snapshot "
-        "WHERE published_at IS NULL AND accounting_json ? 'imported_source_inventory' "
-        "AND accounting_json ? 'registry_fhir_catalog_source' "
-        "ORDER BY as_of DESC, metadata_approved_revision DESC, metadata_generation DESC LIMIT 1"
+    checkpoint = await connection.fetchrow(
+        "SELECT c.schema_name, CASE WHEN s.id=1 THEN c.as_of END AS checkpoint_date "
+        f"FROM {control}.registry_fhir_catalog_snapshot c LEFT JOIN {control}.network_serving_control s "
+        "ON s.id=1 AND s.generation_id IS NOT DISTINCT FROM c.network_generation "
+        "WHERE c.published_at IS NULL AND c.accounting_json ? 'imported_source_inventory' "
+        "AND c.accounting_json ? 'registry_fhir_catalog_source' "
+        "ORDER BY c.as_of DESC, c.metadata_approved_revision DESC, c.metadata_generation DESC LIMIT 1"
     )
-    if schema is None:
-        return ()
+    if checkpoint is None:
+        return (), None
     try:
         # Preserve the inventory snapshot when retention removes the optional catalog.
         async with connection.transaction():
-            return await _catalog_observations(connection, schema)
+            observations = await _catalog_observations(connection, checkpoint["schema_name"])
+            as_of = checkpoint["checkpoint_date"]
+            return observations, as_of.isoformat() if as_of is not None else None
     except UndefinedTableError, InvalidSchemaNameError, InsufficientPrivilegeError:
-        return ()
+        return (), None
 
 
 async def _catalog_observations(connection, schema):

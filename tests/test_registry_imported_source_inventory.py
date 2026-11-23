@@ -534,18 +534,24 @@ async def test_checkpoint_family_cache_is_optional_when_retention_removes_the_ta
             raise
 
     descriptor = observed_descriptor(dataset="checkpoint-edition")
+    checkpoint_by_field = {"schema_name": "checkpoint_catalog", "checkpoint_date": date(2026, 11, 17)}
     connection = SimpleNamespace(
-        fetchval=AsyncMock(return_value="checkpoint_catalog"),
+        fetchrow=AsyncMock(return_value=checkpoint_by_field),
         fetch=AsyncMock(return_value=[{"descriptor": json.dumps(descriptor)}]),
         transaction=savepoint,
     )
-    assert await inventory._checkpoint_catalog_observations(connection, "registry") == (descriptor,)
-    selection = connection.fetchval.call_args.args[0]
+    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((descriptor,), "2026-11-17")
+    selection = connection.fetchrow.call_args.args[0]
     assert "published_at IS NULL" in selection and "accounting_json ? 'registry_fhir_catalog_source'" in selection
+    assert "s.generation_id IS NOT DISTINCT FROM c.network_generation" in selection
+    checkpoint_by_field["checkpoint_date"] = None
+    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((descriptor,), None)
 
     connection.fetch.side_effect = UndefinedTableError("test checkpoint was removed")
-    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ()
+    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((), None)
     assert transactions == ["rolled back"]
+    connection.fetchrow.return_value = None
+    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((), None)
 
 
 @pytest.mark.asyncio

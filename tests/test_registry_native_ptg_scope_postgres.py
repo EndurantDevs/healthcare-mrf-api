@@ -88,7 +88,7 @@ async def test_same_count_different_raw_inputs_refuses_shared_scope(storage_data
 
 
 @pytest.mark.asyncio
-async def test_scope_version_and_invalid_provider_are_rejected(storage_database):
+async def test_scope_requires_correct_layout_and_preserves_raw_providers(storage_database):
     fixture = storage_database
     descriptor, namespace = await source_scope(fixture, "v4")
     wrong = deepcopy(descriptor)
@@ -99,5 +99,7 @@ async def test_scope_version_and_invalid_provider_are_rejected(storage_database)
         await fixture.connection.execute(
             f"UPDATE {namespace}.ptg2_v4_npi_scope SET npi=3333333333 WHERE npi=1234567893"
         )
-        with pytest.raises(ValueError, match="identifier_invalid"):
-            await providers.require_ptg_complete_provider_scope(fixture.connection, descriptor)
+        await providers.require_ptg_complete_provider_scope(fixture.connection, descriptor)
+        query, parameters = providers.native_provider_query(descriptor)
+        rows = await fixture.connection.fetch(query, *parameters)
+        assert [row["npi"] for row in rows] == [1999999984, 3333333333]
