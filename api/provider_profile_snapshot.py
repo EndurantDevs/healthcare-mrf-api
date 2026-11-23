@@ -205,7 +205,18 @@ def provider_directory_snapshot_read(handler):
             or provider.current_network_address_scope() is not None
         )
         async with provider_directory_read_snapshot(provider.db, request_session, reuse=should_reuse) as read_session:
-            return await handler(request, *args, session=read_session, **kwargs)
+            info = getattr(read_session, "info", None)
+            if (
+                info is None
+                or (should_reuse and info.get("api_reader_verified") is not True)
+                or "provider_profile_named_editions" in info
+            ):
+                return await handler(request, *args, session=read_session, **kwargs)
+            info["provider_profile_named_editions"] = {}
+            try:
+                return await handler(request, *args, session=read_session, **kwargs)
+            finally:
+                info.pop("provider_profile_named_editions", None)
 
     return snapshot_read
 

@@ -9,6 +9,7 @@ from sanic.exceptions import InvalidUsage
 
 from api import provider_batch
 from api.endpoint import npi as npi_module
+from process import provider_directory_named_edition
 from process.custom_import.read_contracts import CustomImportReadUnavailableError
 from tests.npi_location_hydration_support import unified_location_mapping
 
@@ -181,6 +182,27 @@ async def test_native_batch_endpoint_reuses_extended_shared_path_only_when_reque
     assert reply.status == 200 and shared.await_count == 1 and original.await_count == 0
     assert shared.await_args.kwargs["native_args"].get("q") == "Synthetic"
     assert json.loads(reply.body)["meta"]["view"] == "summary"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_batch_reuses_directory_editions_only_within_each_reader_request(monkeypatch):
+    monkeypatch.setattr("db.connection.has_reader_session", lambda _database: True)
+    monkeypatch.setattr("process.provider_directory_projection_stage._copy_driver", AsyncMock())
+    resolve = AsyncMock(side_effect=[("first-edition",), ("second-edition",)])
+    monkeypatch.setattr(provider_directory_named_edition, "named_current_editions", resolve)
+
+    async def build(params, *, session):
+        first = await npi_module._named_directory_editions(session, "mrf")
+        assert await npi_module._named_directory_editions(session, "mrf") == first
+        return {"items": [], "requested": 1, "found": 0, "not_found": 1}
+
+    monkeypatch.setattr(npi_module, "_build_npi_batch_payload", build)
+    session = SimpleNamespace(info={"api_reader_verified": True})
+    request = SimpleNamespace(args={}, json={"npis": [9000000000]}, ctx=SimpleNamespace(sa_session=session))
+    for count in (1, 2):
+        reply = await npi_module.get_npi_batch(request)
+        assert reply.status == 200 and resolve.await_count == count
+        assert session.info == {"api_reader_verified": True}
 
 
 @pytest.mark.asyncio
