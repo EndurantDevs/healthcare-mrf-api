@@ -66031,7 +66031,7 @@ async def _import_resources(
                 return written
 
             retry_result = await _fetch_resource_rows(
-                partition_source,
+                rest_retry.cursor_source(partition_source, "PractitionerRole"),
                 "PractitionerRole",
                 per_resource_limit=per_resource_limit,
                 page_limit=page_limit,

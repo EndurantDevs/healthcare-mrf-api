@@ -233,6 +233,19 @@ def test_new_cursor_skips_a_blocked_initial_route(monkeypatch):
     assert bound.select(SCOPE + "/Practitioner", "Practitioner").proxy_id == "route-b"
 
 
+def test_pinned_cursor_cannot_exclude_its_assignment(monkeypatch):
+    bound = _bound(monkeypatch)
+    assigned = bound.select(SCOPE, "logical-resource", pinned_slot=0)
+    with pytest.raises(proxy.SourceProxyError, match="source_proxy_exclusions_invalid"):
+        bound.select(SCOPE, "logical-resource", {assigned.proxy_id}, pinned_slot=0)
+
+
+@pytest.mark.parametrize("slot", [-1, True, "1"])
+def test_pinned_slot_must_be_a_nonnegative_integer(monkeypatch, slot):
+    with pytest.raises(proxy.SourceProxyError, match="source_proxy_cursor_invalid"):
+        _bound(monkeypatch).select(SCOPE, "logical-resource", pinned_slot=slot)
+
+
 def test_bind_and_selection_are_atomic_across_callers(monkeypatch):
     config = _configured(monkeypatch)
     with ThreadPoolExecutor(max_workers=8) as executor:

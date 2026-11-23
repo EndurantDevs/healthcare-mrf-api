@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 from copy import deepcopy
+from functools import partial
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from process.ext.source_http_proxy import POLICY_ENV, SourceProxyConfig, SourceProxyError, SourceProxyUnavailable
@@ -226,8 +227,20 @@ class SourceProxyRun:
             return 403, payload, None, last_result[3]
         return last_result or (None, None, "source_proxy_unavailable", 0)
 
+    def _cursor_selector(self, binding, source_record, url, base):
+        """Assign independent resource scans to stable slots in the frozen pool."""
+        relative_path = urlsplit(url).path[len(urlsplit(base).path.rstrip("/")) :].lstrip("/")
+        is_pinned = base == self.directory.MOLINA_PROVIDER_DIRECTORY_BASE
+        cursor_key = source_record.get("_source_proxy_resource_cursor") if is_pinned else PARTITION_CURSOR_KEY.get()
+        cursor_key = cursor_key or relative_path.split("/", 1)[0] or "metadata"
+        slot = None
+        if is_pinned:
+            resources = self.directory.DEFAULT_RESOURCES
+            slot = resources.index(cursor_key) if cursor_key in resources else len(resources)
+        return partial(binding.select, url, cursor_key, pinned_slot=slot), is_pinned
+
     async def fetch(self, source_record, url, *, timeout):
-        """Retry an unchanged cursor only through explicitly eligible frozen routes."""
+        """Fetch through the cursor's assigned route and preserve vendor deferrals."""
         directory = self.directory
         source_id = source_record["source_id"]
         binding = self.bindings[source_id]
@@ -235,11 +248,10 @@ class SourceProxyRun:
         if session is None or session.closed:
             raise SourceProxyError("source_proxy_async_session_required")
         base = self._identity(source_record)[1]
-        relative_path = urlsplit(url).path[len(urlsplit(base).path.rstrip("/")) :].lstrip("/")
-        cursor_key = PARTITION_CURSOR_KEY.get() or relative_path.split("/", 1)[0] or "metadata"
+        select, is_pinned = self._cursor_selector(binding, source_record, url, base)
         last_result = self._last_quota.get(source_id)
         try:
-            binding.select(url, cursor_key)
+            select()
         except SourceProxyUnavailable as unavailable:
             return self._unavailable(binding, unavailable, last_result)
         options = await self._origin_options(source_record, url)
@@ -248,15 +260,15 @@ class SourceProxyRun:
         total_elapsed_ms = 0
         while True:
             try:
-                selection = binding.select(url, cursor_key, exclude_ids=attempted_proxy_ids)
+                selection = select(exclude_ids=attempted_proxy_ids)
             except SourceProxyUnavailable as unavailable:
                 try:
-                    binding.select(url, cursor_key)
+                    select()
                 except SourceProxyUnavailable as pool_unavailable:
                     unavailable = pool_unavailable
                 else:
                     unavailable = SourceProxyUnavailable(datetime.datetime.now(datetime.UTC).isoformat())
-                return self._unavailable(binding, unavailable, last_result)
+                return self._unavailable(binding, unavailable, self._last_quota.get(source_id, last_result))
             attempted_proxy_ids.add(selection.proxy_id)
             fetch_result = await directory._fetch_json_with_source_session(
                 session,
@@ -271,9 +283,6 @@ class SourceProxyRun:
             total_elapsed_ms += fetch_result[3]
             fetch_result = directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms)
             is_quota = directory._is_molina_quota_response(source_record, fetch_result[0], fetch_result[1])
-            if not is_quota and fetch_result[2] != "ClientProxyConnectionError":
-                return fetch_result
-            last_result = fetch_result
             if is_quota:
                 binding.defer(
                     selection.proxy_id,
@@ -281,4 +290,8 @@ class SourceProxyRun:
                 )
                 self._audit["cooldowns"] = binding.cooldown_snapshot()
                 self._last_quota[source_id] = directory._source_fetch_result_with_elapsed(fetch_result, 0)
+                return fetch_result
+            if is_pinned or fetch_result[2] != "ClientProxyConnectionError":
+                return fetch_result
+            last_result = fetch_result
             await directory._pace_source_request(source_record)
