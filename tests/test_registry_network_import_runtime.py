@@ -25,6 +25,38 @@ async def test_failed_publication_keeps_completed_source_captures_for_other_requ
     connection.execute.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_catalog_discovery_reuses_first_inventory_until_next_import():
+    from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
+
+    profile = FHIRCatalogSourceReadProfile("source")
+    visible_pages = [("first edition",)]
+    reads = []
+
+    @asynccontextmanager
+    async def factory(*, source_profile):
+        assert source_profile == profile
+
+        async def inventory():
+            reads.append(source_profile)
+            for page in visible_pages:
+                yield page
+
+        yield {"inventory": inventory}
+
+    async def read(factory):
+        async with factory(source_profile=profile) as export:
+            return [page async for page in export["inventory"]()]
+
+    first_run = bootstrap._pin_catalog_inventory(factory)
+    initial_pages = await read(first_run)
+    visible_pages.append(("later edition",))
+
+    assert await read(first_run) == initial_pages
+    assert await read(bootstrap._pin_catalog_inventory(factory)) == visible_pages
+    assert reads == [profile, profile]
+
+
 @pytest.fixture
 def configured_source_runtime(monkeypatch):
     from process import registry_fhir_catalog_worker as catalog_worker
