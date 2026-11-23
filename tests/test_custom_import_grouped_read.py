@@ -818,15 +818,13 @@ async def test_unicode_detail_and_page_keep_their_wire_bounds(monkeypatch, child
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("children_per_group", "status"), [(80, 200), (160, 503)])
+@pytest.mark.parametrize(("children_per_group", "status"), [(160, 200), (300, 503)])
 async def test_grouped_detail_enforces_final_utf8_envelope(monkeypatch, children_per_group, status):
+    """Apply the grouped cap to final UTF-8 bytes and roll back an oversized reply."""
     session = provider_fixture._Session()
     http_fixture._install_keyring(monkeypatch, session)
-    child_projections = tuple(
-        SimpleNamespace(
-            collection="rates", fields=(read_core.ReadFieldValue("service_code", "string", "value", "界" * 300),)
-        )
-        for _ in range(children_per_group)
+    child = SimpleNamespace(
+        collection="rates", fields=(read_core.ReadFieldValue("service_code", "string", "value", "界" * 300),)
     )
     families = tuple(
         (
@@ -836,7 +834,7 @@ async def test_grouped_detail_enforces_final_utf8_envelope(monkeypatch, children
                     read_core.ReadFieldValue("period", "integer", "value", 2024),
                     read_core.ReadFieldValue("segment", "string", "value", group),
                 ),
-                children=child_projections,
+                children=(child,) * children_per_group,
             ),
         )
         for group in ("segment_a", "segment_b")
@@ -860,7 +858,8 @@ async def test_grouped_detail_enforces_final_utf8_envelope(monkeypatch, children
     )
     encoded = orjson.dumps(transport._detail_payload(detail, transport._TransportTarget(**http_fixture._TARGET)))
     assert children_per_group * 2 <= read_core.MAX_DETAIL_CHILDREN
-    assert (len(encoded) <= transport._MAX_RESPONSE_BYTES) is (status == 200)
+    assert len(encoded) > transport._MAX_RESPONSE_BYTES
+    assert (len(encoded) <= transport.MAX_GROUPED_DETAIL_RESPONSE_BYTES) is (status == 200)
 
     reply = await transport.serve_custom_import_detail(request, http_fixture.cold_caller())
 

@@ -75,6 +75,7 @@ from process.custom_import.read_contracts import (
     MAX_FILTER_TERMS,
     MAX_FULL_FAMILY_PAGE_SIZE,
     MAX_GROUPED_CHILD_PREDICATE_TERMS,
+    MAX_GROUPED_DETAIL_RESPONSE_BYTES,
     MAX_GROUPED_PREDICATE_TERMS,
     MAX_NPI_PAGE_SIZE,
     MAX_ORDER_TERMS,
@@ -455,11 +456,15 @@ class CustomImportReadService:
         cursor_ttl_seconds: int = 300,
         statement_timeout_ms: int = DEFAULT_READ_TIMEOUT_MS,
         now: Callable[[], int] | None = None,
+        grouped_detail_batch: bool = False,
     ) -> None:
         if type(cursor_ttl_seconds) is not int or not 1 <= cursor_ttl_seconds <= MAX_CURSOR_TTL_SECONDS:
             raise CustomImportReadRequestError("cursor_ttl_seconds is outside the read-core limit")
         if type(statement_timeout_ms) is not int or not 1 <= statement_timeout_ms <= MAX_READ_TIMEOUT_MS:
             raise CustomImportReadRequestError("statement_timeout_ms is outside the read-core limit")
+        if type(grouped_detail_batch) is not bool:
+            raise CustomImportReadRequestError("grouped detail batch mode is invalid")
+        self._grouped_detail_batch = grouped_detail_batch
         self._authorizer = authorizer
         self._cache = cache
         self._cursor_codec = None if cursor_secret is None else ReadCursorCodec(cursor_secret)
@@ -651,7 +656,11 @@ class CustomImportReadService:
         """
 
         authorization_scope = self._authorize(authorization, pinned_target)
-        if type(query) is not NpiEntityRelationQuery or type(full_family) is not bool:
+        if (
+            type(query) is not NpiEntityRelationQuery
+            or type(full_family) is not bool
+            or (self._grouped_detail_batch and (not full_family or query.grouped_entity_selection is None))
+        ):
             raise CustomImportReadRequestError("provider relation query is invalid")
         _validate_npi_entity_relation_request(
             query.filters,
@@ -682,7 +691,8 @@ class CustomImportReadService:
             if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
                 from process.custom_import.grouped_read import hydrate_page
 
-                return await hydrate_page(session, context, query, prepared, entity_values, authorization_scope)
+                limit = MAX_GROUPED_DETAIL_RESPONSE_BYTES if self._grouped_detail_batch else None
+                return await hydrate_page(session, context, query, prepared, entity_values, authorization_scope, limit)
             return await self._hydrate_single_family_page(
                 session, context, query, prepared, entity_values, authorization_scope, full_family=full_family
             )
@@ -2537,7 +2547,7 @@ async def _hydrate_root_detail(
 
 
 async def _hydrate_complete_family_entities(
-    session, context, selected_rows, entity_values, scope_digest, *, is_page=False
+    session, context, selected_rows, entity_values, scope_digest, *, is_page=False, family_response_bytes=None
 ):
     """Preflight every entity and bound projections retained for ASCII-wire pages.
 
@@ -2575,7 +2585,7 @@ async def _hydrate_complete_family_entities(
             families = tuple(next(hydrated) for _ in entity_rows)
             if is_page and (
                 len(_canonical_bytes({"families": [full_family_payload(family) for family in families]}))
-                > MAX_FAMILY_RESPONSE_BYTES
+                > (family_response_bytes or MAX_FAMILY_RESPONSE_BYTES)
             ):
                 raise CustomImportReadUnavailableError("selected family response exceeds its bound")
             for (index, _), family in zip(entity_rows, families, strict=True):

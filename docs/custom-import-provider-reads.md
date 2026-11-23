@@ -185,7 +185,9 @@ by `(returned row count + 1) * 256 KiB`: one allowance per row plus one for the
 native envelope. Repeated geo addresses hydrate their shared provider once but
 each serialized occurrence counts toward the page bound. Neither children nor
 rows are truncated; exact totals, native ordering, and pagination are unchanged.
-Legacy/query-projection pages and detail responses keep the 256 KiB bound.
+Legacy and query-projection pages keep the 256 KiB bound. The signed single
+detail route allows 512 KiB for an authorized grouped full family and 256 KiB
+for ordinary detail. The child and public response limits are unchanged.
 
 ## Exact native-page hydration
 
@@ -218,10 +220,12 @@ The response contains `target` and ordered `items`, each with the requested
 `npi` and nullable `custom_import`. Every requested identity appears exactly
 once, including absent families. Ordinary imports use the detail shape
 `target`, `root_fields`, and complete `children`, without `context_fields`.
-Grouped imports use the existing full-family set shape. Each family retains
-the 256 KiB limit; the batch envelope is bounded by `(requested identities + 1)
-* 256 KiB`. Reads use one bounded read-only snapshot and fail closed without
-partial results when authorization, hydration, finality, or a limit fails.
+Grouped imports use the existing full-family set shape. Each ordinary family
+allows 256 KiB and each authorized grouped full-family set allows 512 KiB.
+The batch envelope allows one additional family-sized allowance for its
+metadata, with an overall maximum of `51 * 256 KiB`. Reads use one bounded
+read-only snapshot and fail closed without partial results when authorization,
+hydration, finality, or a limit fails.
 
 ## Filtered native batches
 

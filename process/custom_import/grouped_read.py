@@ -421,7 +421,7 @@ def _family_sets(context, plan, selected_rows, projections, scope, *, projection
     }
 
 
-async def hydrate_page(session, context, query, prepared, entity_values, scope):
+async def hydrate_page(session, context, query, prepared, entity_values, scope, family_response_bytes=None):
     """Hydrate both selected groups after deduplicated matching and paging."""
 
     entity_model = context.model(CustomImportEntityBinding)
@@ -442,7 +442,9 @@ async def hydrate_page(session, context, query, prepared, entity_values, scope):
     selected_rows = await _selected_family_rows(session, context, plan, eligible)
     _validated_family_keys(context, selected_rows)
     if plan.projection == "full_family":
-        projections = await _hydrate_complete_families(session, context, selected_rows, scope, is_page=True)
+        projections = await _hydrate_complete_families(
+            session, context, selected_rows, scope, is_page=True, family_response_bytes=family_response_bytes
+        )
     else:
         projections = await core._hydrate_search_page_items(
             session, context, tuple(core._winner_row(selected_row[:3], False) for selected_row in selected_rows)
@@ -451,7 +453,9 @@ async def hydrate_page(session, context, query, prepared, entity_values, scope):
     return _family_sets(context, plan, selected_rows, projections, scope, projection=plan.projection)
 
 
-async def _hydrate_complete_families(session, context, selected_rows, scope, *, is_page=False):
+async def _hydrate_complete_families(
+    session, context, selected_rows, scope, *, is_page=False, family_response_bytes=None
+):
     """Keep the grouped row cap and use the shared bounded family hydration."""
 
     entity_values = tuple(selected_row[-3] for selected_row in selected_rows)
@@ -464,6 +468,7 @@ async def _hydrate_complete_families(session, context, selected_rows, scope, *, 
         entity_values,
         core._scope_digest(scope),
         is_page=is_page,
+        family_response_bytes=family_response_bytes,
     )
 
 
