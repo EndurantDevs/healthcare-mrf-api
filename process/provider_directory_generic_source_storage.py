@@ -1545,15 +1545,11 @@ def _require_registered_transition_scope(checkpoints, bulk_checkpoints, source_i
 
 
 async def _verify_transition_checkpoints(
-    connection,
-    policy,
-    identity_by_field,
-    expected_counts,
-    run_evidence,
-    source_ids,
+    connection, policy, identity_by_field, expected_counts, run_evidence, candidate
 ):
     """Reject mixed checkpoint families before comparing their retained input census."""
     run_status = run_evidence["status"]
+    source_ids = candidate["identity"]["metadata"]["source_ids"]
     root_run_id = identity_by_field["acquisition_root_run_id"]
     dataset_id = identity_by_field["dataset_id"]
     checkpoint_rows = await connection.fetch(
@@ -1601,8 +1597,11 @@ async def _verify_transition_checkpoints(
         checkpoint_rows, identity_by_field, expected_counts, source_ids, run_evidence
     )
     if transitions is None:
-        _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status)
-        return [], []
+        from process.provider_directory_completion_successor import require_rest
+
+        return await require_rest(
+            connection, candidate, identity_by_field, checkpoint_rows, expected_counts, run_evidence
+        )
     return transitions
 
 
@@ -1737,15 +1736,18 @@ async def _verify_interrupted_postal_checkpoints(
     )
 
 
-def _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status):
+def _require_rest_transition_checkpoints(
+    checkpoint_rows, identity_by_field, expected_counts, run_status, *, owner_run_id=None
+):
     """Retain each ordinary scan's existing cursor, owner and exact row census."""
     _require(run_status == "failed", "transition_run_changed")
+    owner_run_id = identity_by_field["failed_run_id"] if owner_run_id is None else owner_run_id
     _require(
         len(checkpoint_rows) == len(expected_counts)
         and {checkpoint_record["resource_type"] for checkpoint_record in checkpoint_rows} == set(expected_counts)
         and all(
             _is_resumable_transition_checkpoint(checkpoint_record)
-            and checkpoint_record["owner_run_id"] == identity_by_field["failed_run_id"]
+            and checkpoint_record["owner_run_id"] == owner_run_id
             and checkpoint_record["acquisition_root_run_id"] == identity_by_field["acquisition_root_run_id"]
             and checkpoint_record["dataset_id"] == identity_by_field["dataset_id"]
             and checkpoint_record["rows_processed"] == expected_counts[checkpoint_record["resource_type"]]
@@ -1775,7 +1777,7 @@ async def _verify_transition_inputs(
         identity_by_field,
         expected_counts,
         run_evidence,
-        candidate_by_field["identity"]["metadata"]["source_ids"],
+        candidate_by_field,
     )
     dataset_id = identity_by_field["dataset_id"]
     resource_relation = storage_relation(policy.schema, candidate_by_field["tables"]["resource_input"]["name"])
