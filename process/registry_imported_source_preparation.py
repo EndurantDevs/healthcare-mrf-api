@@ -74,11 +74,22 @@ async def _prepare_recipe(connection, runtime, descriptor, observed_at):
     profile = _source_profile(runtime, descriptor)
     # Source owns a one-slot pool: release metadata before the capture reopens its resource stream.
     origin = await _reviewed_origin(runtime, profile, descriptor)
-    from process.registry_imported_source_inventory import current_imported_effective_date
+    from process.registry_imported_source_inventory import (
+        current_imported_checkpoint_date,
+        current_imported_effective_date,
+    )
 
     effective_date = current_imported_effective_date(observed_at[:10])
     membership_as_of = origin.semantic_projection_as_of or effective_date
     recovered = await completed_capture(connection, descriptor, membership_as_of)
+    checkpoint_date = current_imported_checkpoint_date()
+    if (
+        recovered is None
+        and origin.semantic_projection_as_of is None
+        and checkpoint_date
+        and checkpoint_date < effective_date
+    ):
+        recovered = await completed_capture(connection, descriptor, checkpoint_date)
     if recovered is not None:
         return recovered, False
     identity = imported_source_capture_id(descriptor, membership_as_of)

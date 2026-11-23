@@ -11,6 +11,7 @@ from uuid import UUID, uuid4, uuid5
 from db.plan_release_storage import storage_identifier
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_source_witness_contract import digest
+from process.provider_directory_profile import valid_npi_sql
 from process.registry_imported_catalog_bindings import published_fhir_catalog_bindings_sql
 from process.registry_native_network_catalog import native_network_definitions, validate_native_catalog_descriptor
 
@@ -229,12 +230,6 @@ async def require_ptg_complete_provider_scope(source_connection, descriptor):
     table = "ptg2_v4_npi_scope" if selected["generation"] == "shared_blocks_v4" else "ptg2_v3_npi_scope"
     if document["graph"].get("npi_scope_table", "ptg2_v3_npi_scope") != table:
         raise ValueError("registry_native_provider_scope_changed")
-    invalid = await source_connection.fetchval(
-        f"SELECT EXISTS(SELECT FROM {namespace}.{table} WHERE snapshot_key=$1 AND npi::text !~ '^[12][0-9]{{9}}$')",
-        document["graph"]["snapshot_key"],
-    )
-    if invalid is not False:
-        raise ValueError("registry_native_provider_identifier_invalid")
 
 
 async def prepare_native_provider_recipe(writer, descriptor, *, owner_role, runtime_roles):
@@ -463,7 +458,7 @@ async def rebuild_native_provider_stage(
             + name
             + " SELECT DISTINCT selected.network_id,'npi',fact.npi::text,encode(sha256(convert_to(jsonb_build_array($11::text,"
             "fact.source_key,'npi',fact.npi::text,selected.network_id)::text,'UTF8')),'hex') "
-            "FROM " + capture + " fact JOIN selected USING(source_key)",
+            f"FROM {capture} fact JOIN selected USING(source_key) WHERE {valid_npi_sql('fact.npi')}",
             *arguments,
             pin.generation_id,
         )
