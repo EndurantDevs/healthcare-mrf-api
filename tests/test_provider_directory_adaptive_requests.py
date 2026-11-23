@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process.provider_directory_fhir_response import request_concurrency_snapshot
 from tests.test_process_provider_directory_fhir_unit import (
     _checkpoint_complete_fetch_result,
     _patch_parallel_resource_flow,
@@ -59,6 +60,115 @@ class BlockedRequests:
 def start_fetch(source_record, index, base=BASE):
     """Start a real shared response-gate call on one synthetic resource path."""
     return asyncio.create_task(importer._fetch_source_json_once(source_record, f"{base}/{index}", timeout=1))
+
+
+@pytest.mark.parametrize(("base", "allowance"), [(BASE, 1), (importer.UHC_PROVIDER_DIRECTORY_BASE, 4)])
+async def test_concurrent_load_failures_share_one_reduction_only_for_optum(monkeypatch, base, allowance):
+    """An old wave cannot successively halve Optum's allowance while its cursors drain."""
+    network = BlockedRequests(12)
+    for index in range(8):
+        network.results[index] = (503, {}, None, 0)
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
+    shared_source = source(base)
+    assert request_concurrency_snapshot(shared_source) is None
+    async with importer._source_http_session_scope(force=True, request_concurrency=8):
+        tasks = [start_fetch(dict(shared_source), index, base) for index in range(12)]
+        try:
+            await network.wait(range(8))
+            for index in range(8):
+                network.release[index].set()
+                assert await tasks[index] == network.results[index]
+            await network.wait(range(8, 8 + allowance))
+            assert sum(event.is_set() for event in network.started[8:]) == allowance
+            snapshot = request_concurrency_snapshot(shared_source)
+            if base == BASE:
+                assert snapshot is None
+            else:
+                assert snapshot["limit"] == snapshot["active"] == allowance
+                assert snapshot["reductions"] == 1
+                assert snapshot["recoveries"] == snapshot["waiters"] == 0
+                network.results[8] = (None, {}, "request timed out", 0)
+                network.release[8].set()
+                assert await tasks[8] == network.results[8]
+                assert request_concurrency_snapshot(shared_source)["limit"] == 2
+        finally:
+            await finish(tasks)
+
+
+async def test_optum_recovers_only_after_healthy_time_at_capacity_and_pending_demand(monkeypatch, source_request_clock):
+    """Require both sustained utilization and healthy finishes in the current allowance."""
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    shared_source = source(base)
+    network = BlockedRequests(44)
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
+    async with importer._source_http_session_scope(force=True, request_concurrency=2):
+        tasks = [start_fetch(dict(shared_source), index, base) for index in range(44)]
+
+        async def complete(index, seconds=0.0, result=SUCCESS):
+            source_request_clock.now += seconds
+            network.results[index] = result
+            network.release[index].set()
+            assert await tasks[index] == result
+            return request_concurrency_snapshot(shared_source)["limit"]
+
+        async def complete_next(seconds=0.0, result=SUCCESS):
+            (index,) = await network.admissions(1)
+            return await complete(index, seconds, result)
+
+        try:
+            assert await network.admissions(2) == [0, 1]
+            assert request_concurrency_snapshot(shared_source) == {
+                "capacity": 2,
+                "limit": 2,
+                "active": 2,
+                "waiters": 42,
+                "started": 2,
+                "completed": 0,
+                "request_time_ms": 0,
+                "reductions": 0,
+                "recoveries": 0,
+            }
+            assert await complete(0, 1.0, (429, {}, None, 0)) == 1
+            assert await complete(1, 40.0) == 1
+            for _ in range(8):
+                assert await complete_next(1.0) == 1
+            assert await complete_next(40.0, (200, {"resourceType": "OperationOutcome"}, None, 0)) == 1
+            assert await complete_next(31.0) == 1
+            for _ in range(6):
+                assert await complete_next() == 1
+            assert await complete_next() == 2
+            for _ in range(12):
+                assert await complete_next(5.0) == 2
+        finally:
+            await finish(tasks)
+    snapshot = request_concurrency_snapshot(shared_source)
+    assert snapshot["limit"] == snapshot["capacity"] == 2
+    assert snapshot["active"] == snapshot["waiters"] == 0
+    assert snapshot["started"] == snapshot["completed"]
+    assert snapshot["reductions"] == snapshot["recoveries"] == 1
+    assert snapshot["request_time_ms"] >= 121_000
+
+
+async def test_idle_time_and_uncontended_requests_cannot_raise_optum_allowance(monkeypatch, source_request_clock):
+    """Slow individual requests do not by themselves establish demand for another slot."""
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    shared_source = source(base)
+    network = BlockedRequests(12)
+    network.results[0] = (504, {}, None, 0)
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
+    async with importer._source_http_session_scope(force=True, request_concurrency=2):
+        for index in range(12):
+            task = start_fetch(shared_source, index, base)
+            try:
+                await network.wait([index])
+                source_request_clock.now += 40
+                network.release[index].set()
+                assert await task == network.results.get(index, SUCCESS)
+                source_request_clock.now += 60
+            finally:
+                await finish([task])
+    snapshot = request_concurrency_snapshot(shared_source)
+    assert snapshot["limit"] == 1 and snapshot["recoveries"] == 0
 
 
 async def test_eight_inflight_requests_drain_before_reduced_allowance_admits_a_sibling(monkeypatch):
@@ -153,22 +263,23 @@ async def test_repeated_throttles_keep_at_least_one_request_slot(monkeypatch):
             await finish(tasks)
 
 
-async def test_cancelled_waiter_and_active_request_return_their_allowances(monkeypatch):
+@pytest.mark.parametrize("base", [BASE, importer.UHC_PROVIDER_DIRECTORY_BASE])
+async def test_cancelled_waiter_and_active_request_return_their_allowances(monkeypatch, base):
     """Both cancellation positions must permit a subsequent request to finish."""
     network = BlockedRequests(3)
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
-    shared_source = source()
+    shared_source = source(base)
     async with importer._source_http_session_scope(force=True, request_concurrency=1):
-        tasks = [asyncio.create_task(importer._fetch_source_json_once(shared_source, f"{BASE}/0", timeout=1))]
+        tasks = [start_fetch(shared_source, 0, base)]
         try:
             await network.wait([0])
-            tasks.append(asyncio.create_task(importer._fetch_source_json_once(shared_source, f"{BASE}/1", timeout=1)))
+            tasks.append(start_fetch(shared_source, 1, base))
             await asyncio.sleep(0)
             tasks[1].cancel()
             tasks[0].cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             assert all(task.cancelled() for task in tasks)
-            tasks.append(asyncio.create_task(importer._fetch_source_json_once(shared_source, f"{BASE}/2", timeout=1)))
+            tasks.append(start_fetch(shared_source, 2, base))
             await network.wait([2])
             network.release[2].set()
             assert await tasks[2] == SUCCESS
@@ -232,7 +343,8 @@ async def test_distinct_origin_allowances_still_share_the_total_transport_budget
             await finish(tasks)
 
 
-async def test_already_reserved_requests_recheck_reduced_allowance_after_pacing(monkeypatch):
+@pytest.mark.parametrize("base", [BASE, importer.UHC_PROVIDER_DIRECTORY_BASE])
+async def test_already_reserved_requests_recheck_reduced_allowance_after_pacing(monkeypatch, base):
     """Reservations waiting in pacing must not all send after a sibling halves the limit."""
     network = BlockedRequests(8)
     network.results[0] = (429, {}, None, 0)
@@ -245,12 +357,12 @@ async def test_already_reserved_requests_recheck_reduced_allowance_after_pacing(
 
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
     monkeypatch.setattr(importer, "_pace_source_request", pace)
-    shared_source = source()
+    shared_source = source(base)
     async with importer._source_http_session_scope(force=True, request_concurrency=8):
-        tasks = [start_fetch(shared_source, 0)]
+        tasks = [start_fetch(shared_source, 0, base)]
         try:
             assert await network.admissions(1) == [0]
-            tasks.extend(start_fetch({**shared_source, "_queued_index": index}, index) for index in range(1, 8))
+            tasks.extend(start_fetch({**shared_source, "_queued_index": index}, index, base) for index in range(1, 8))
             await asyncio.wait_for(asyncio.gather(*(paced.get() for _ in range(7))), 2)
             network.release[0].set()
             await tasks[0]
@@ -291,18 +403,19 @@ async def test_already_reserved_requests_recheck_reduced_allowance_after_total_b
 
 
 @pytest.mark.parametrize("status", [429, 503, 504])
-async def test_limited_response_delays_sibling_by_retry_after(monkeypatch, source_request_clock, status):
+@pytest.mark.parametrize("base", [BASE, importer.UHC_PROVIDER_DIRECTORY_BASE])
+async def test_limited_response_delays_sibling_by_retry_after(monkeypatch, source_request_clock, status, base):
     """All concurrency-limiting HTTP statuses preserve the server's cooldown deadline."""
     network = BlockedRequests(2)
     network.results[0] = (status, {importer.SOURCE_RETRY_AFTER_FIELD: "2"}, None, 0)
     for release in network.release:
         release.set()
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
-    shared_source = source()
+    shared_source = source(base)
     async with importer._source_http_session_scope(force=True, request_concurrency=4):
-        await importer._fetch_source_json_once(shared_source, f"{BASE}/0", timeout=1)
+        await importer._fetch_source_json_once(shared_source, f"{base}/0", timeout=1)
         assert source_request_clock.now == 10.0
-        assert await importer._fetch_source_json_once(dict(shared_source), f"{BASE}/1", timeout=1) == SUCCESS
+        assert await importer._fetch_source_json_once(dict(shared_source), f"{base}/1", timeout=1) == SUCCESS
     assert source_request_clock.now == 12.0
     assert source_request_clock.delays == [2.0]
 

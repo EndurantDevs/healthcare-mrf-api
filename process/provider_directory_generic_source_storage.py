@@ -1120,10 +1120,7 @@ async def _verify_transition_run(
     if is_highmark_companion_source:
         failure_field += ",metrics::jsonb#>'{audit,pagination_resume_required}' AS pending_resources"
     if expected_failure_error == _POSTAL_START_ERROR:
-        failure_field += (
-            ",error::jsonb->>'message' AS postal_error_message,"
-            "params::jsonb->>'provider_directory_endpoint_scope' AS postal_endpoint_scope"
-        )
+        failure_field += ",error::jsonb->>'message' AS postal_error_message"
     run_rows = await _read_transition_runs(connection, catalog_schema, root_run_id, failure_field)
     run_ids = {run_record["run_id"] for run_record in run_rows}
     _verify_transition_run_rows(run_rows, run_ids, root_run_id, failed_run_id, source_ids)
@@ -1148,6 +1145,7 @@ async def _verify_transition_run(
         "status": run_rows[0]["status"],
         "is_empty_vsp_failure": is_empty_vsp_failure,
         "is_postal_start_failure": is_postal_start_failure,
+        "is_interrupted_postal_scan": _is_interrupted_postal_scan(directory, run_rows, ancestor_run_ids),
         "pending_highmark_resources": _transition_highmark_pending_resources(run_rows[0])
         if is_highmark_companion_source
         else (),
@@ -1172,7 +1170,10 @@ async def _read_transition_runs(connection, catalog_schema, root_run_id, failure
     return await connection.fetch(
         "SELECT run_id,status,finished_at,retry_of_run_id,created_at,"
         "params::jsonb->>'provider_directory_pagination_root_run_id' AS root_run_id,"
-        "params::jsonb->'source_ids' AS source_ids"
+        "params::jsonb->'source_ids' AS source_ids,"
+        "params::jsonb->>'provider_directory_endpoint_scope' AS postal_endpoint_scope,"
+        "params::jsonb->'allow_retained_pagination_reset' IS NOT DISTINCT FROM 'false'::jsonb AS postal_reset_disabled,"
+        "error::jsonb->>'code' AS postal_error_code"
         + failure_field
         + " FROM "
         + storage_relation(catalog_schema, "import_run")
@@ -1190,6 +1191,27 @@ def _is_postal_start_failure(run, expected_failure_error):
     if run["postal_endpoint_scope"] != directory.UHC_PROVIDER_DIRECTORY_BASE:
         return False
     _require(run["postal_error_message"] == expected_failure_error, "transition_run_changed")
+    return True
+
+
+def _is_interrupted_postal_scan(directory, runs, ancestor_ids):
+    """Recognize only an interrupted, unbranched postal acquisition with resets disabled."""
+    leaf = runs[0]
+    endpoint = directory.UHC_PROVIDER_DIRECTORY_BASE
+    if leaf.get("postal_endpoint_scope") != endpoint or leaf.get("postal_error_code") != "import_interrupted":
+        return False
+    _require(
+        leaf["status"] == "failed"
+        and len(runs) == len(ancestor_ids)
+        and all(
+            run["status"] == "failed"
+            and run["finished_at"] is not None
+            and run.get("postal_endpoint_scope") == endpoint
+            and run.get("postal_reset_disabled") is True
+            for run in runs
+        ),
+        "transition_run_changed",
+    )
     return True
 
 
@@ -1557,6 +1579,12 @@ async def _verify_transition_checkpoints(
         _require(not bulk_checkpoints, "transition_checkpoint_changed")
         _require_postal_start_checkpoint(checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids)
         return [], []
+    if run_evidence.get("is_interrupted_postal_scan"):
+        _require(not bulk_checkpoints, "transition_checkpoint_changed")
+        await _verify_interrupted_postal_checkpoints(
+            connection, policy, checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids
+        )
+        return [], []
     if run_evidence.get("is_empty_vsp_failure"):
         _require(not (checkpoint_rows or bulk_checkpoints), "transition_checkpoint_changed")
         return [], []
@@ -1596,6 +1624,115 @@ def _require_postal_start_checkpoint(checkpoints, identity_by_field, expected_co
         "transition_checkpoint_changed",
     )
     _require_rest_transition_checkpoints(checkpoints, identity_by_field, {"InsurancePlan": plans}, run_status)
+
+
+def _valid_postal_transition_leaf(directory, source_record, resource_type, identity):
+    """Check the exact identity encoding of one completed source partition."""
+    if not isinstance(identity, str) or not identity or len(identity) > 128:
+        return False
+    if resource_type == "PractitionerRole":
+        prefix = identity
+    else:
+        query = urllib.parse.parse_qsl(identity, keep_blank_values=True)
+        if (
+            len(query) != 1
+            or directory._uhc_partition_identity(
+                source_record, resource_type, f"{directory.UHC_PROVIDER_DIRECTORY_BASE}/{resource_type}?{identity}"
+            )
+            != identity
+        ):
+            return False
+        prefix = query[0][1]
+    if resource_type in directory.uhc_scan.POSTAL_SEARCH_PARAMS:
+        return re.fullmatch(r"[A-Z]|[0-9]{1,5}|[0-9]{5}-[0-9]{1,4}", prefix) is not None
+    return (
+        bool(prefix)
+        and prefix[0] in directory.UHC_NAME_ROOT_ALPHABET
+        and all(character in directory.UHC_TEXT_SEARCH_ALPHABET for character in prefix[1:])
+    )
+
+
+def _verify_postal_cursors(directory, checkpoints, identity, expected_counts, run_status, source_ids):
+    """Keep the completed plan cursor and validate any other ordinary markers."""
+    endpoint = directory.UHC_PROVIDER_DIRECTORY_BASE
+    ordinary_types = {checkpoint["resource_type"] for checkpoint in checkpoints}
+    _require(
+        len(source_ids) == 1
+        and set(expected_counts) == set(directory.UHC_SUPPORTED_RESOURCES)
+        and "InsurancePlan" in ordinary_types
+        and expected_counts["InsurancePlan"] > 0
+        and all(
+            checkpoint["canonical_api_base"] == endpoint
+            and _json(checkpoint["source_ids"]) == source_ids
+            and type(checkpoint["source_scope_hash"]) is str
+            and re.fullmatch(r"[0-9a-f]{64}", checkpoint["source_scope_hash"])
+            and (
+                checkpoint["resource_type"] != "InsurancePlan"
+                or (checkpoint["state"] == "complete" and checkpoint["next_url"] is None)
+            )
+            for checkpoint in checkpoints
+        ),
+        "transition_checkpoint_changed",
+    )
+    _require_rest_transition_checkpoints(
+        checkpoints,
+        identity,
+        {resource: count for resource, count in expected_counts.items() if resource in ordinary_types},
+        run_status,
+    )
+    return ordinary_types
+
+
+def _covered_postal_counts(directory, leaves, identity, source_record, expected_counts):
+    """Check the exact source, resource and partition identity for every finished leaf."""
+    resource_by_kind = {
+        kind: resource
+        for resource in expected_counts
+        if (kind := directory._uhc_partition_checkpoint_type(source_record, resource))
+    }
+    counts_by_resource = {}
+    for leaf in leaves:
+        resource = resource_by_kind.get(leaf["checkpoint_type"])
+        _require(
+            leaf["dataset_id"] == identity["dataset_id"]
+            and leaf["acquisition_root_run_id"] == identity["acquisition_root_run_id"]
+            and resource is not None
+            and _valid_postal_transition_leaf(directory, source_record, resource, leaf["partition_identity"])
+            and leaf["pages_fetched"] > 0
+            and leaf["rows_fetched"] >= 0,
+            "transition_checkpoint_changed",
+        )
+        counts_by_resource[resource] = counts_by_resource.get(resource, 0) + leaf["rows_fetched"]
+    return counts_by_resource
+
+
+async def _verify_interrupted_postal_checkpoints(
+    connection, policy, checkpoints, identity, expected_counts, run_status, source_ids
+):
+    """Preserve complete ordinary cursors and verify finished leaves against raw intake."""
+    from process.provider_directory_postal_checkpoint import ROOT as POSTAL_CHECKPOINT
+
+    directory = import_module("process.provider_directory_fhir")
+    ordinary_types = _verify_postal_cursors(directory, checkpoints, identity, expected_counts, run_status, source_ids)
+    source_by_field = {"canonical_api_base": directory.UHC_PROVIDER_DIRECTORY_BASE, "source_id": source_ids[0]}
+    leaves = await connection.fetch(
+        "SELECT dataset_id,acquisition_root_run_id,checkpoint_type,partition_identity,pages_fetched,rows_fetched "
+        "FROM "
+        + storage_relation(policy.schema, POSTAL_CHECKPOINT)
+        + " WHERE dataset_id=$1 OR acquisition_root_run_id=$2 FOR SHARE NOWAIT",
+        identity["dataset_id"],
+        identity["acquisition_root_run_id"],
+    )
+    counts_by_resource = _covered_postal_counts(directory, leaves, identity, source_by_field, expected_counts)
+    _require(
+        bool(leaves)
+        and all(counts_by_resource.get(resource, 0) <= count for resource, count in expected_counts.items())
+        and all(
+            count == 0 or resource in ordinary_types or resource in counts_by_resource
+            for resource, count in expected_counts.items()
+        ),
+        "transition_checkpoint_changed",
+    )
 
 
 def _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status):

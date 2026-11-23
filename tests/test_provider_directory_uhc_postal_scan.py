@@ -791,6 +791,34 @@ def _practitioner_fetch(fail_id=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("batch_ids", [("prac-1", "prac-2"), ("prac-1",), ("unexpected",)])
+async def test_uhc_reference_reader_accepts_only_matching_batch_results(monkeypatch, batch_ids):
+    calls = []
+
+    async def fetch(_source, url, *, timeout):
+        if ids := _query(url).get("_id"):
+            calls.append(ids)
+            bundle = _bundle(len(batch_ids))
+            bundle["entry"] = [{"resource": {"resourceType": "Practitioner", "id": row_id}} for row_id in batch_ids]
+            return 200, bundle, None, 1
+        row_id = url.rsplit("/", 1)[-1]
+        calls.append(row_id)
+        return 200, {"resourceType": "Practitioner", "id": row_id}, None, 1
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch)
+    persist = AsyncMock(side_effect=lambda _model, rows: len(rows))
+    reader = uhc_scan._ReferenceReader(importer, SOURCE, persist, timeout=3, run_id=None, use_batches=True)
+    keys = [("Practitioner", "prac-1"), ("Practitioner", "prac-2")]
+
+    assert await reader.read(keys) == []
+
+    accepted = set(batch_ids) if "unexpected" not in batch_ids else set()
+    assert calls == ["prac-1,prac-2", *(row_id for _, row_id in keys if row_id not in accepted)]
+    persisted = persist.await_args.args[1]
+    assert {row["resource_id"] for row in persisted} == {row_id for _, row_id in keys}
+
+
+@pytest.mark.asyncio
 async def test_uhc_reference_reader_persists_in_reading_task(monkeypatch):
     """Threshold and final flushes run in the task that owns the transaction binding, never in a worker."""
     from db import connection as db_connection

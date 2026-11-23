@@ -197,28 +197,33 @@ def _retained_resource_cursor(input_rows):
     return cursor
 
 
+def _transition_row_reader(rows_by_query, input_rows):
+    async def fetch(sql, *args):
+        placeholders = {int(value) for value in re.findall(r"\$(\d+)", sql)}
+        assert placeholders == set(range(1, len(args) + 1))
+        if "provider_directory_postal_partition_checkpoint" in sql:
+            assert args == (DATASET, ROOT) and "FOR SHARE NOWAIT" in sql
+        return deepcopy(next((rows for relation, rows in rows_by_query.items() if relation in sql), input_rows))
+
+    return fetch
+
+
 @pytest.fixture
 def case(monkeypatch):
     """Expose a transaction-shaped fake and native proof seams."""
     policy = GenericSourcePolicy("source_schema", "source_owner", "source_publisher", ("source_reader",))
     header, old_storage_by_field, new_storage_by_field = _candidate_storage_evidence()
     run_rows, checkpoint_rows, input_rows = _completed_input_evidence()
-    bulk_checkpoints, bulk_outputs = [], []
+    bulk_checkpoints, bulk_outputs, postal_leaves = [], [], []
     writes = []
     allowed_tables = {table["name"] for table in header["candidate_storage_json"]["tables"].values()}
-
-    async def fetch(sql, *args):
-        placeholders = {int(value) for value in re.findall(r"\$(\d+)", sql)}
-        assert placeholders == set(range(1, len(args) + 1))
-        if 'FROM "catalog_schema"."import_run"' in sql:
-            return deepcopy(run_rows)
-        if "provider_directory_pagination_checkpoint" in sql:
-            return deepcopy(checkpoint_rows)
-        if "provider_directory_bulk_acquisition_checkpoint" in sql:
-            return deepcopy(bulk_checkpoints)
-        if "provider_directory_bulk_output_checkpoint" in sql:
-            return deepcopy(bulk_outputs)
-        return deepcopy(input_rows)
+    rows_by_query = {
+        'FROM "catalog_schema"."import_run"': run_rows,
+        "provider_directory_pagination_checkpoint": checkpoint_rows,
+        "provider_directory_bulk_acquisition_checkpoint": bulk_checkpoints,
+        "provider_directory_bulk_output_checkpoint": bulk_outputs,
+        "provider_directory_postal_partition_checkpoint": postal_leaves,
+    }
 
     async def execute(sql, *args):
         if sql.startswith("SELECT 1 FROM "):
@@ -235,7 +240,7 @@ def case(monkeypatch):
         fetchval=AsyncMock(
             side_effect=lambda sql, *args: "serializable" if sql == "SHOW transaction_isolation" else True
         ),
-        fetch=AsyncMock(side_effect=fetch),
+        fetch=AsyncMock(side_effect=_transition_row_reader(rows_by_query, input_rows)),
         execute=AsyncMock(side_effect=execute),
         cursor=_retained_resource_cursor(input_rows),
     )
@@ -252,6 +257,7 @@ def case(monkeypatch):
         checkpoints=checkpoint_rows,
         bulk_checkpoints=bulk_checkpoints,
         bulk_outputs=bulk_outputs,
+        postal_leaves=postal_leaves,
         input_rows=input_rows,
         writes=writes,
         native=native,
@@ -337,6 +343,93 @@ async def test_postal_start_failure_retains_the_completed_plan_cursor(case, monk
     assert transition["rows"] == 3 and transition["lineage_run_ids"] == [ROOT]
     assert case.checkpoints == checkpoint_before
     provision.assert_awaited_once_with(case.connection, case.policy)
+
+
+def _attach_interrupted_postal_scan(case):
+    """Attach completed postal leaves and exact raw intake to a stopped candidate."""
+    directory = importlib.import_module("process.provider_directory_fhir")
+    resources = sorted(directory.UHC_SUPPORTED_RESOURCES)
+    source_ids = ["synthetic-postal-source"]
+    endpoint = directory.UHC_PROVIDER_DIRECTORY_BASE
+    metadata = case.header["candidate_storage_json"]["identity"]["metadata"]
+    metadata.update(source_ids=source_ids, selected_resources=resources, expected_resources=resources)
+    case.header["publication_metadata_json"] = deepcopy(metadata)
+    for run in case.runs:
+        run.update(source_ids=source_ids, postal_endpoint_scope=endpoint, postal_reset_disabled=True)
+    case.runs[0]["postal_error_code"] = "import_interrupted"
+    case.checkpoints[0].update(
+        resource_type="InsurancePlan", source_ids=source_ids, source_scope_hash="a" * 64, canonical_api_base=endpoint
+    )
+    case.checkpoints.append({**case.checkpoints[0], "resource_type": "Organization", "rows_processed": 1})
+    case.input_rows[0]["resource_type"] = "InsurancePlan"
+    case.input_rows.extend(
+        dict(dataset_id=DATASET, resource_type=resource, total=count, active=count)
+        for resource, count in (("Organization", 1), ("PractitionerRole", 3))
+    )
+    source_by_field = {"canonical_api_base": endpoint, "source_id": source_ids[0]}
+    case.postal_leaves.append(
+        dict(
+            dataset_id=DATASET,
+            acquisition_root_run_id=ROOT,
+            checkpoint_type=directory._uhc_partition_checkpoint_type(source_by_field, "PractitionerRole"),
+            partition_identity="12345-67",
+            pages_fetched=1,
+            rows_fetched=2,
+        )
+    )
+    return dict.fromkeys(resources, 0) | {"InsurancePlan": 3, "Organization": 1, "PractitionerRole": 3}
+
+
+@pytest.mark.asyncio
+async def test_interrupted_postal_scan_preserves_complete_cursors_leaves_and_uncovered_raw_rows(case):
+    counts = _attach_interrupted_postal_scan(case)
+    before = deepcopy((case.checkpoints, case.postal_leaves, case.input_rows, case.runs))
+
+    transition = await _transition(case, counts)
+
+    assert transition["rows"] == 7 and transition["lineage_run_ids"] == [ROOT, FAILED]
+    assert (await _transition(case, counts, manifest_replay=True))["already_applied"] is True
+    assert (case.checkpoints, case.postal_leaves, case.input_rows, case.runs) == before
+    assert all(sql.startswith('UPDATE "source_schema"."provider_directory_endpoint_dataset"') for sql, _ in case.writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("dataset_id", "other"),
+        ("acquisition_root_run_id", "run_" + "d" * 32),
+        ("checkpoint_type", "PractitionerRolePostalPrefix:unissued"),
+        ("partition_identity", "123-6"),
+        ("pages_fetched", 0),
+        ("rows_fetched", 4),
+    ],
+)
+async def test_interrupted_postal_transition_refuses_drifted_leaf_before_write(case, field, value):
+    counts = _attach_interrupted_postal_scan(case)
+    case.postal_leaves[0][field] = value
+
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await _transition(case, counts)
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["branch", "active", "reset", "endpoint"])
+async def test_interrupted_postal_transition_requires_the_exact_stopped_unreset_lineage(case, drift):
+    counts = _attach_interrupted_postal_scan(case)
+    if drift == "branch":
+        case.runs.insert(1, {**case.runs[0], "run_id": "run_" + "d" * 32})
+    elif drift == "active":
+        case.runs[1]["status"] = "running"
+    elif drift == "reset":
+        case.runs[1]["postal_reset_disabled"] = False
+    else:
+        case.runs[1]["postal_endpoint_scope"] = "https://elsewhere.test/fhir"
+
+    with pytest.raises(GenericCandidateError, match="transition_run_changed"):
+        await _transition(case, counts)
+    assert case.writes == []
 
 
 @pytest.mark.asyncio
