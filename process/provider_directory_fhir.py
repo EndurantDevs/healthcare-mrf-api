@@ -55603,27 +55603,9 @@ def _has_parallel_resource_transport(
     *,
     minimum_resources: int = 2,
 ) -> bool:
-    """Require one reviewed, nonpartitioned start URL for every wave member."""
-    fetchable_count = 0
-    for resource_type in resource_types:
-        try:
-            request_url = _resource_start_url(source_record, resource_type, page_count=page_count)
-            if request_url is None:
-                return False
-            partition_start_urls = _partitioned_resource_start_urls(source_record, resource_type, page_count=page_count)
-        except ValueError as exc:
-            if str(exc) != "untrusted_anthem_start_url":
-                raise
-            return False
-        if partition_start_urls != [request_url]:
-            return False
-        if (
-            _rest_page_prefetch_session(source_record, request_url) is None
-            and source_selection.credentialed_rest_session(sys.modules[__name__], source_record, request_url) is None
-        ):
-            return False
-        fetchable_count += 1
-    return fetchable_count >= minimum_resources
+    return bulk_parallel.has_parallel_rest_transport(
+        sys.modules[__name__], source_record, resource_types, page_count, minimum_resources=minimum_resources
+    )
 
 
 def _has_bound_resource_scan_checkpoint(
@@ -65241,7 +65223,7 @@ class ResourceGroupScanRunner:
             timeout=self.options.timeout,
             run_id=self.options.run_id,
             row_batch_handler=(partial(self.persist_batch, resource_type) if self.is_streaming else None),
-            row_batch_size=self.options.stream_batch_size,
+            row_batch_size=uhc_scan.resource_batch_size(sys.modules[__name__], self, source_record_by_field),
             retain_rows=not self.is_streaming,
             cancel_ctx=self.options.cancel_ctx,
             cancel_task=self.options.cancel_task,
@@ -65404,9 +65386,13 @@ class ResourceGroupScanRunner:
         self,
         resource_type: str,
         resource_semaphore: asyncio.Semaphore,
+        role_done: asyncio.Event | None,
     ) -> ResourceFetchResult | None:
         """Release the resource slot while its retained cursor waits to retry."""
-        return await self.import_one(resource_type, report_start=False, resource_semaphore=resource_semaphore)
+        result = await self.import_one(resource_type, report_start=False, resource_semaphore=resource_semaphore)
+        if role_done is not None:
+            await uhc_scan.hydrate_after_scan(sys.modules[__name__], self, resource_type, role_done)
+        return result
 
     async def wave(
         self,
@@ -65415,9 +65401,14 @@ class ResourceGroupScanRunner:
     ) -> list[ResourceFetchResult | None]:
         """Run a fail-fast wave and always cancel and join every sibling."""
         resource_semaphore = bulk_parallel.resource_slots(self.source_record, concurrency)
+        role_done = (
+            asyncio.Event()
+            if "PractitionerRole" in resource_types and _is_uhc_role_postal_partition_enabled(self.source_record)
+            else None
+        )
         resource_tasks = [
             asyncio.create_task(
-                self._run_bounded(resource_type, resource_semaphore),
+                self._run_bounded(resource_type, resource_semaphore, role_done),
                 name="provider-directory-resource-scan",
             )
             for resource_type in resource_types
@@ -65460,6 +65451,8 @@ class ResourceGroupScanRunner:
     ) -> ResourceFetchResult | None:
         """Run independent cursors and retain any zero-role result for retry."""
         self.source_record.setdefault("_provider_directory_request_pacing_state", {})
+        if uhc_scan.is_source(sys.modules[__name__], self.source_record):
+            self.active_group_by_key[self.group_key]["_request_state_source"] = self.source_record
         ordered_resource_types = tuple(
             _source_resource_fetch_order(
                 self.source_record,
@@ -65667,8 +65660,12 @@ async def _import_resources(
             group_detail_by_field = {
                 key: value
                 for key, value in detail.items()
-                if key not in {"started_monotonic", "resource_started_monotonic"}
+                if key not in {"started_monotonic", "resource_started_monotonic", "_request_state_source"}
             }
+            if (request_source := detail.get("_request_state_source")) is not None and (
+                requests := fhir_response.request_concurrency_snapshot(request_source)
+            ) is not None:
+                group_detail_by_field["http_requests"] = requests
             group_detail_by_field["elapsed_seconds"] = int(now - detail["started_monotonic"])
             if detail.get("resource_started_monotonic") is not None:
                 group_detail_by_field["resource_elapsed_seconds"] = int(now - detail["resource_started_monotonic"])

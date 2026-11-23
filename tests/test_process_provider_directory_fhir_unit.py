@@ -26865,6 +26865,60 @@ async def test_resource_scan_overlaps_all_eight_and_retries_empty_role_after_wav
 
 
 @pytest.mark.asyncio
+async def test_proxied_uhc_postal_families_start_together_with_bounded_batches(monkeypatch):
+    resources = list(importer.UHC_SUPPORTED_RESOURCES)
+    started_resource_types = set()
+    wave_started = asyncio.Event()
+    hydrated_resource_types = set()
+    links_hydrated = asyncio.Event()
+
+    async def fetch(source_record, resource_type, **options):
+        assert options["row_batch_size"] == 100 // len(resources)
+        started_resource_types.add(resource_type)
+        if started_resource_types == set(resources):
+            wave_started.set()
+        await wave_started.wait()
+        if resource_type == "PractitionerRole":
+            await links_hydrated.wait()
+        model = importer.RESOURCE_MODELS_BY_TYPE[resource_type]
+        written = await options["row_batch_handler"](
+            model, [{"source_id": source_record["source_id"], "resource_id": resource_type.lower()}]
+        )
+        return _checkpoint_complete_fetch_result(model, written)
+
+    async def hydrate(_directory, source, resource_type, persist, role_done, **_options):
+        assert not role_done.is_set()
+        model = importer.RESOURCE_MODELS_BY_TYPE[resource_type]
+        written = await persist(model, [{"source_id": source["source_id"], "resource_id": "linked"}])
+        hydrated_resource_types.add(resource_type)
+        if hydrated_resource_types == set(importer.uhc_scan.ROLE_LINK_FIELDS):
+            links_hydrated.set()
+        return written
+
+    source_record = _patch_parallel_resource_flow(monkeypatch, fetch)
+    source_record["canonical_api_base"] = source_record["api_base"] = importer.UHC_PROVIDER_DIRECTORY_BASE
+    source_record["_pagination_checkpoint_context"] = dataclasses.replace(
+        source_record["_pagination_checkpoint_context"], canonical_api_base=source_record["api_base"]
+    )
+    _patch_resource_scan_storage(monkeypatch, True)
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_UHC_ROLE_POSTAL_PARTITIONS", "1")
+    monkeypatch.setattr(
+        importer.source_proxy, "current_run", lambda: SimpleNamespace(descriptors={}, enabled=lambda _source: True)
+    )
+    monkeypatch.setattr(source_adapters, "resource_scan_estimates", AsyncMock(return_value={}))
+    reference_closure = AsyncMock()
+    monkeypatch.setattr(importer.uhc_scan, "close_references", reference_closure)
+    monkeypatch.setattr(importer.uhc_scan, "hydrate_saved_role_links", hydrate)
+
+    counts = await asyncio.wait_for(_run_parallel_resource_import(source_record, resources=resources, concurrency=8), 5)
+
+    assert started_resource_types == set(resources)
+    assert counts == {resource: 2 if resource in hydrated_resource_types else 1 for resource in resources}
+    assert hydrated_resource_types == set(importer.uhc_scan.ROLE_LINK_FIELDS)
+    reference_closure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("isolated", (False, True))
 async def test_resource_scan_failure_cancels_and_joins_sibling(monkeypatch, isolated):
     """Propagate a source failure only after the other cursor is joined."""

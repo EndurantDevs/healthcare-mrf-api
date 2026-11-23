@@ -60,6 +60,135 @@ class AdaptiveRequestSlots:
         """Retain a lower allowance until this import's transport closes."""
         self.limit = max(1, self.limit // 2)
 
+    def _log_limit_change(self, directory, previous):
+        if previous != self.limit:
+            directory.LOGGER.info(
+                "Provider Directory request concurrency %s: previous=%s effective=%s",
+                "reduced" if self.limit < previous else "recovered",
+                previous,
+                self.limit,
+            )
+
+    async def send(self, directory, send, _pacing_state):
+        """Apply the endpoint's existing reduction after an admitted send."""
+        response = await send()
+        if _response_limits_concurrency(response):
+            previous = self.limit
+            self.reduce()
+            self._log_limit_change(directory, previous)
+        return response
+
+
+class _OptumRequestSlots(AdaptiveRequestSlots):
+    """Recover only after healthy sends have saturated the reduced allowance."""
+
+    MAX_SATURATION_GAP_SECONDS = 1.0
+    MIN_SATURATED_SECONDS = 30.0
+    MIN_HEALTHY_RESPONSES = 8
+
+    def __init__(self, capacity):
+        super().__init__(capacity)
+        self.capacity = capacity
+        self.waiters = self.started = self.completed = 0
+        self.request_seconds = 0.0
+        self.reductions = self.recoveries = 0
+        self._reset_health()
+
+    def _reset_health(self):
+        self.healthy_responses = 0
+        self.saturated_seconds = 0.0
+        self.saturated_since = None
+        self.last_saturated_at = None
+
+    async def __aenter__(self):
+        self.waiters += 1
+        try:
+            return await super().__aenter__()
+        finally:
+            self.waiters -= 1
+
+    async def send(self, directory, send, pacing_state):
+        """Record actual sends after pacing, token checks and both slot budgets."""
+        if self.started == self.completed and not self.waiters:
+            self._reset_health()
+        epoch = self.reductions + self.recoveries
+        started_at = directory.time.monotonic()
+        self.started += 1
+        if self.started - self.completed == self.limit:
+            if (
+                self.last_saturated_at is not None
+                and started_at - self.last_saturated_at > self.MAX_SATURATION_GAP_SECONDS
+            ):
+                self._reset_health()
+            self.saturated_since = started_at
+        response = None
+        try:
+            response = await send()
+            return response
+        finally:
+            now = directory.time.monotonic()
+            self.completed += 1
+            self.request_seconds += now - started_at
+            if self.saturated_since is not None:
+                self.saturated_seconds += now - self.saturated_since
+                self.saturated_since = None
+                self.last_saturated_at = now
+            previous = self.limit
+            self._adjust(epoch, response, now, pacing_state)
+            self._log_limit_change(directory, previous)
+
+    def _adjust(self, epoch, response, now, pacing_state):
+        is_current_epoch = epoch == self.reductions + self.recoveries
+        if response is not None and _response_limits_concurrency(response):
+            self._reset_health()
+            if is_current_epoch and self.limit > 1:
+                self.reduce()
+                self.reductions += 1
+            return
+        fhir_payload = response[1] if response is not None else None
+        resource_type = fhir_payload.get("resourceType") if isinstance(fhir_payload, dict) else None
+        if (
+            not isinstance(resource_type, str)
+            or not resource_type
+            or resource_type == "OperationOutcome"
+            or response[0] != 200
+            or response[2] is not None
+            or now < pacing_state.get("retry_after_monotonic", 0.0)
+        ):
+            self._reset_health()
+            return
+        if not is_current_epoch or self.limit == self.capacity:
+            return
+        self.healthy_responses += 1
+        if (
+            self.waiters
+            and self.last_saturated_at == now
+            and self.healthy_responses >= max(self.MIN_HEALTHY_RESPONSES, self.limit)
+            and self.saturated_seconds >= self.MIN_SATURATED_SECONDS
+        ):
+            self.limit += 1
+            self.recoveries += 1
+            self._reset_health()
+
+
+def request_concurrency_snapshot(source_record: Mapping[str, Any]) -> dict[str, int] | None:
+    """Return numeric Optum transport totals shared by resource views and progress callbacks."""
+    pacing_state = source_record.get("_provider_directory_request_pacing_state") or {}
+    slots = pacing_state.get("optum_request_slots")
+    if slots is None or not slots.started:
+        return None
+    return {
+        "capacity": slots.capacity,
+        "limit": slots.limit,
+        "active": slots.started - slots.completed,
+        "waiters": slots.waiters,
+        "started": slots.started,
+        "completed": slots.completed,
+        "request_time_ms": round(slots.request_seconds * 1000),
+        "reductions": slots.reductions,
+        "recoveries": slots.recoveries,
+    }
+
 
 def _response_limits_concurrency(response):
     """Reduce load for throttling, unavailable upstreams and transport timeouts."""
@@ -245,8 +374,15 @@ async def _fetch_admitted_source_response(directory, source_record, url, *, send
         if slot_map is None:
             slot_map, slot_key = pacing_state, "request_slots"
         if slot_key not in slot_map:
-            slot_map[slot_key] = AdaptiveRequestSlots(max(1, capacity))
+            slots_type = AdaptiveRequestSlots
+            if directory.uhc_scan.is_source(directory, source_record) and directory._is_url_within_api_base(
+                url, directory.UHC_PROVIDER_DIRECTORY_BASE
+            ):
+                slots_type = _OptumRequestSlots
+            slot_map[slot_key] = slots_type(max(1, capacity))
         request_slots = slot_map[slot_key]
+        if isinstance(request_slots, _OptumRequestSlots):
+            pacing_state["optum_request_slots"] = request_slots
     while True:
         async with request_slots, total_slots:
             try:
@@ -257,16 +393,10 @@ async def _fetch_admitted_source_response(directory, source_record, url, *, send
                 continue
             if ready is not None and not ready():
                 return None
-            response = await send()
-            if isinstance(request_slots, AdaptiveRequestSlots) and _response_limits_concurrency(response):
-                previous_limit = request_slots.limit
-                request_slots.reduce()
-                if request_slots.limit != previous_limit:
-                    directory.LOGGER.info(
-                        "Provider Directory request concurrency reduced: previous=%s effective=%s",
-                        previous_limit,
-                        request_slots.limit,
-                    )
+            if isinstance(request_slots, AdaptiveRequestSlots):
+                response = await request_slots.send(directory, send, pacing_state)
+            else:
+                response = await send()
             if response[0] in {429, 503, 504} and pacing_state is not None:
                 delay = directory._source_retry_after_seconds(
                     response[1],

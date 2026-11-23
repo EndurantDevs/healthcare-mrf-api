@@ -5,6 +5,8 @@ import asyncio
 import re
 import urllib.parse
 from contextlib import aclosing
+from functools import partial
+from itertools import batched
 
 from process import provider_directory_source_proxy as source_proxy
 
@@ -18,6 +20,8 @@ BARE_ZIP_ERROR = "uhc_bare_zip_postal_codes_unverified"
 REFERENCE_CLOSURE_ERROR = "uhc_reference_closure_incomplete"
 REFERENCE_SOURCE_TYPES = ("InsurancePlan", "PractitionerRole", "OrganizationAffiliation")
 REFERENCE_TARGET_TYPES = ("Practitioner", "Organization", "Location")
+REFERENCE_BATCH_SIZE = {"Practitioner": 15, "Location": 10}
+ROLE_LINK_FIELDS = {"Practitioner": "practitioner_ref", "Organization": "organization_ref", "Location": "location_refs"}
 RETRY_ROUNDS = 2
 RETRY_DELAY_SECONDS = 2.0
 REFERENCE_FLUSH_ROWS = 500
@@ -57,6 +61,18 @@ def request_concurrency(directory, source_records):
     if source_records and all(is_source(directory, source_record) for source_record in source_records):
         return min(100, directory._partition_fetch_concurrency())
     return 1
+
+
+def resource_batch_size(directory, runner, source_record):
+    """Share the row-buffer budget across postal families in the wave."""
+    size = runner.options.stream_batch_size
+    if (
+        runner.is_streaming
+        and runner.effective_concurrency > 1
+        and directory._is_uhc_role_postal_partition_enabled(source_record)
+    ):
+        return max(1, size // runner.effective_concurrency)
+    return size
 
 
 def enter_proxy_cursor(directory, source_record, resource_type, request_url):
@@ -181,10 +197,19 @@ async def _read_by_id(directory, source_record, resource_key, timeout, run_id):
         return "missing", None
     if status_code != 200 or fetch_error or not isinstance(payload, dict):
         return "failed", None
+    parsed = _parse_reference(directory, source_record, resource_key, payload, url, "rest_read", run_id)
+    return ("fetched", parsed) if parsed is not None else ("failed", None)
+
+
+def _parse_reference(directory, source_record, resource_key, payload, fetch_url, mode, run_id):
+    resource_type, resource_id = resource_key
+    url = f"{directory.UHC_PROVIDER_DIRECTORY_BASE}/{resource_type}/{urllib.parse.quote(resource_id, safe='')}"
+    if payload.get("resourceType") != resource_type or payload.get("id") != resource_id:
+        return None
     acquisition = directory.FHIRAcquisitionContext(
         self_url=url,
-        fetch_url=url,
-        fetch_mode="rest_read",
+        fetch_url=fetch_url,
+        fetch_mode=mode,
         semantic_projection_as_of=directory._source_semantic_projection_as_of(source_record),
     )
     parsed = directory.parse_fhir_resource(
@@ -195,16 +220,48 @@ async def _read_by_id(directory, source_record, resource_key, timeout, run_id):
         or directory.RESOURCE_TYPES_BY_MODEL.get(parsed[0]) != resource_type
         or parsed[1].get("resource_id") != resource_id
     ):
-        return "failed", None
-    return "fetched", parsed
+        return None
+    return parsed
+
+
+async def _read_id_batch(directory, source_record, resource_keys, timeout, run_id):
+    resource_type = resource_keys[0][0]
+    expected_ids = {resource_id for _, resource_id in resource_keys}
+    if not all(re.fullmatch(r"[A-Za-z0-9.-]{1,64}", resource_id) for resource_id in expected_ids):
+        return {}
+    url = directory._url_with_query_params(
+        f"{directory.UHC_PROVIDER_DIRECTORY_BASE}/{resource_type}",
+        {"_id": ",".join(resource_id for _, resource_id in resource_keys), "_count": len(resource_keys)},
+    )
+    status, bundle, error, _elapsed = await directory._fetch_source_json(
+        source_record, url, timeout=directory._source_resource_timeout(source_record, resource_type, timeout)
+    )
+    if directory._is_transient_source_fetch_failure(status, error):
+        return None
+    if status != 200 or error or not directory._is_bundle_payload(bundle) or directory._next_link(bundle):
+        return {}
+    parsed_by_key = {}
+    for entry in directory._bundle_entries(bundle):
+        payload = entry.get("resource")
+        resource_id = payload.get("id") if isinstance(payload, dict) else None
+        key = (resource_type, resource_id)
+        if not isinstance(resource_id, str) or resource_id not in expected_ids or key in parsed_by_key:
+            return {}
+        parsed = _parse_reference(directory, source_record, key, payload, url, "rest_bundle", run_id)
+        if parsed is None:
+            return {}
+        parsed_by_key[key] = parsed
+    return parsed_by_key
 
 
 class _ReferenceReader:
     """Read missing references concurrently and persist them in bounded batches."""
 
-    def __init__(self, directory, source_record, persist, *, timeout, run_id):
+    def __init__(self, directory, source_record, persist, *, timeout, run_id, use_batches=False, concurrency=None):
         self.directory, self.source_record, self.persist = directory, source_record, persist
         self.timeout, self.run_id = timeout, run_id
+        self.use_batches = use_batches
+        self.concurrency = concurrency or directory._partition_fetch_concurrency()
         self.counts_by_type = {
             resource_type: {"fetched": 0, "missing": 0, "failed": 0} for resource_type in REFERENCE_TARGET_TYPES
         }
@@ -222,20 +279,33 @@ class _ReferenceReader:
     async def _worker(self, worker_index, key_queue, failed_keys, parsed_rows):
         """Fetch and parse only; writes stay in the task that owns the transaction binding."""
         while not key_queue.empty():
-            resource_key = key_queue.get_nowait()
-            cursor_token = source_proxy.PARTITION_CURSOR_KEY.set(f"{resource_key[0]}:read:{worker_index}")
+            resource_keys = key_queue.get_nowait()
+            cursor_token = source_proxy.PARTITION_CURSOR_KEY.set(f"{resource_keys[0][0]}:read:{worker_index}")
             try:
-                outcome, parsed = await _read_by_id(
-                    self.directory, self.source_record, resource_key, self.timeout, self.run_id
-                )
+                if len(resource_keys) > 1:
+                    staged_by_key = await _read_id_batch(
+                        self.directory, self.source_record, resource_keys, self.timeout, self.run_id
+                    )
+                else:
+                    staged_by_key = {}
+                if staged_by_key is None:
+                    failed_keys.extend(resource_keys)
+                    continue
+                for resource_key in resource_keys:
+                    if (parsed := staged_by_key.get(resource_key)) is None:
+                        outcome, parsed = await _read_by_id(
+                            self.directory, self.source_record, resource_key, self.timeout, self.run_id
+                        )
+                    else:
+                        outcome = "fetched"
+                    if outcome == "failed":
+                        failed_keys.append(resource_key)
+                        continue
+                    self.counts_by_type[resource_key[0]][outcome] += 1
+                    if parsed:
+                        await parsed_rows.put(parsed)
             finally:
                 source_proxy.PARTITION_CURSOR_KEY.reset(cursor_token)
-            if outcome == "failed":
-                failed_keys.append(resource_key)
-                continue
-            self.counts_by_type[resource_key[0]][outcome] += 1
-            if parsed:
-                await parsed_rows.put(parsed)
         await parsed_rows.put(None)
 
     async def _persist_parsed(self, parsed_rows, worker_count):
@@ -253,9 +323,14 @@ class _ReferenceReader:
             if retry_round:
                 await asyncio.sleep(RETRY_DELAY_SECONDS * retry_round)
             key_queue, failed_keys = asyncio.Queue(), []
-            for resource_key in resource_keys:
-                key_queue.put_nowait(resource_key)
-            worker_count = min(self.directory._partition_fetch_concurrency(), max(1, len(resource_keys)))
+            keys_by_type = {}
+            for key in resource_keys:
+                keys_by_type.setdefault(key[0], []).append(key)
+            for resource_type, keys in keys_by_type.items():
+                batch_size = REFERENCE_BATCH_SIZE.get(resource_type, 1) if self.use_batches and not retry_round else 1
+                for offset in range(0, len(keys), batch_size):
+                    key_queue.put_nowait(keys[offset : offset + batch_size])
+            worker_count = min(self.concurrency, max(1, key_queue.qsize()))
             parsed_rows = asyncio.Queue(maxsize=2 * worker_count)
             try:
                 # A failing worker cancels this task's persist loop; a failing persist cancels the workers.
@@ -284,6 +359,48 @@ def _scans_complete(directory, diagnostics_by_type):
     )
 
 
+async def hydrate_saved_role_links(directory, source_record, resource_type, persist, role_done, *, timeout, run_id):
+    """Fill gaps after one target scan settles, while the role scan still runs."""
+    from process.provider_directory_generic_source_adapters import missing_saved_role_links
+
+    concurrency = max(1, directory._partition_fetch_concurrency() // 8)
+    keys = await missing_saved_role_links(
+        directory, source_record["_endpoint_dataset_id"], resource_type, ROLE_LINK_FIELDS[resource_type]
+    )
+    reader = _ReferenceReader(
+        directory, source_record, persist, timeout=timeout, run_id=run_id, use_batches=True, concurrency=concurrency
+    )
+    for chunk in batched(keys, 2 * concurrency * REFERENCE_BATCH_SIZE.get(resource_type, 1)):
+        if role_done.is_set():
+            break
+        await reader.read(chunk)
+    return reader.written_by_type[resource_type]
+
+
+async def hydrate_after_scan(directory, runner, resource_type, role_done):
+    """Keep a completed target's extra reads off the role scan's critical path."""
+    if resource_type == "PractitionerRole":
+        role_done.set()
+        return
+    if resource_type not in ROLE_LINK_FIELDS or role_done.is_set():
+        return
+    diagnostic = runner.diagnostic_by_resource.get(resource_type)
+    if not diagnostic or not _scans_complete(directory, {resource_type: diagnostic}):
+        return
+    written = await hydrate_saved_role_links(
+        directory,
+        runner.source_record,
+        resource_type,
+        partial(runner.persist_batch, resource_type),
+        role_done,
+        timeout=runner.options.timeout,
+        run_id=runner.options.run_id,
+    )
+    if written:
+        runner.count_by_resource[resource_type] = runner.count_by_resource.get(resource_type, 0) + written
+        diagnostic["prefetched_role_links"] = written
+
+
 async def close_references(directory, source_record, persist, diagnostics_by_type, count_by_type, *, timeout, run_id):
     """Read by id every referenced Practitioner, Organization and Location the scans did not return."""
     if (
@@ -295,7 +412,15 @@ async def close_references(directory, source_record, persist, diagnostics_by_typ
     target_types = [resource_type for resource_type in REFERENCE_TARGET_TYPES if resource_type in diagnostics_by_type]
     stored_dataset_id = directory._clean_text(source_record.get("_endpoint_dataset_id"))
     dataset_id = stored_dataset_id if directory.is_source_storage_required() else None
-    reader = _ReferenceReader(directory, source_record, persist, timeout=timeout, run_id=run_id)
+    proxy_run = source_proxy.current_run()
+    reader = _ReferenceReader(
+        directory,
+        source_record,
+        persist,
+        timeout=timeout,
+        run_id=run_id,
+        use_batches=bool(dataset_id and proxy_run and proxy_run.enabled(source_record)),
+    )
     if dataset_id:
         await reader.read(await _missing_references(directory, dataset_id, set(diagnostics_by_type)))
     for resource_type in target_types:

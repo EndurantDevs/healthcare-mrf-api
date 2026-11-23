@@ -465,6 +465,59 @@ async def source_organization_reference_ids(directory, dataset_id, api_base, lim
     )
 
 
+async def missing_saved_role_links(directory, dataset_id, target_type, role_field):
+    """Read one committed role-reference projection while role acquisition can keep writing."""
+    from process.provider_directory_generic_source_policy import bound_publisher
+
+    _require(
+        role_field in directory.LINKED_REFERENCE_FIELDS["PractitionerRole"].get(target_type, ()), "link_scope_changed"
+    )
+    async with source_transaction(directory.db):
+        candidate = await resolve_existing_source_candidate(directory.db, directory, dataset_id)
+        _require({"PractitionerRole", target_type} <= set(candidate.selected_resources), "family_scope_changed")
+        publisher = bound_publisher()
+        connection, policy = publisher.connection, publisher.policy
+        binding = await _locked(connection, policy, candidate.identity, lock="KEY SHARE")
+        table = storage_relation(policy.schema, binding["tables"]["resource_input"]["name"])
+        resets = binding["resets"]
+        acquired = connection.cursor(
+            f"SELECT DISTINCT resource_id FROM {table} WHERE dataset_id=$1 AND resource_type=$2 "
+            "AND batch_ordinal>$3 AND batch_ordinal<=$4",
+            dataset_id,
+            target_type,
+            max(resets.get("*", 0), resets.get(target_type, 0)),
+            binding["ordinal"],
+            prefetch=4096,
+        )
+        acquired_ids = {acquired_row["resource_id"] async for acquired_row in acquired}
+        references = connection.cursor(
+            f"""
+            SELECT DISTINCT item.value #>> '{{}}' AS reference FROM {table} r
+            CROSS JOIN LATERAL (SELECT (r.payload_json->($2::text))::jsonb AS field) projected
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE jsonb_typeof(projected.field)
+                    WHEN 'array' THEN projected.field
+                    WHEN 'string' THEN jsonb_build_array(projected.field)
+                    ELSE '[]'::jsonb
+                END
+            ) item(value)
+            WHERE r.dataset_id=$1 AND r.resource_type='PractitionerRole'
+              AND r.batch_ordinal>$3 AND r.batch_ordinal<=$4 AND jsonb_typeof(item.value)='string'
+            """,
+            dataset_id,
+            role_field,
+            max(resets.get("*", 0), resets.get("PractitionerRole", 0)),
+            binding["ordinal"],
+            prefetch=4096,
+        )
+        return {
+            key
+            async for reference_row in references
+            if (key := directory._reference_resource_key(reference_row["reference"], target_type))
+            and key[1] not in acquired_ids
+        }
+
+
 def _family_callbacks(directory, candidate):
     prepare_content, merge_content = _resource_callbacks(directory, candidate)
 

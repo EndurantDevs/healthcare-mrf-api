@@ -492,6 +492,42 @@ def has_parallel_transport(directory, source_record, resource_types):
     )
 
 
+def has_parallel_rest_transport(directory, source_record, resource_types, page_count, *, minimum_resources):
+    """Require independent, request-bounded paths for each REST wave member."""
+    proxy_run = directory.source_proxy.current_run()
+    if (
+        directory._is_uhc_role_postal_partition_enabled(source_record)
+        and directory.is_source_storage_required()
+        and directory._SOURCE_HTTP_SESSION.get() is not None
+        and proxy_run is not None
+        and proxy_run.enabled(source_record)
+        and set(resource_types) <= set(directory.UHC_SUPPORTED_RESOURCES)
+    ):
+        return len(resource_types) >= minimum_resources
+    fetchable_count = 0
+    for resource_type in resource_types:
+        try:
+            request_url = directory._resource_start_url(source_record, resource_type, page_count=page_count)
+            if request_url is None:
+                return False
+            partition_start_urls = directory._partitioned_resource_start_urls(
+                source_record, resource_type, page_count=page_count
+            )
+        except ValueError as exc:
+            if str(exc) != "untrusted_anthem_start_url":
+                raise
+            return False
+        if partition_start_urls != [request_url]:
+            return False
+        if (
+            directory._rest_page_prefetch_session(source_record, request_url) is None
+            and directory.source_selection.credentialed_rest_session(directory, source_record, request_url) is None
+        ):
+            return False
+        fetchable_count += 1
+    return fetchable_count >= minimum_resources
+
+
 def effective_resource_concurrency(directory, source_record, options):
     """Keep the existing durable-scan contract and reserve ordinary guard capacity."""
     requested = min(
