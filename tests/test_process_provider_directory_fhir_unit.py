@@ -17651,11 +17651,6 @@ def test_partitioned_resource_start_urls_partitions_uhc_provider_directory_searc
         "Organization",
         page_count=100,
     )
-    location_urls = importer._partitioned_resource_start_urls(
-        {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
-        "Location",
-        page_count=100,
-    )
     role_urls = importer._partitioned_resource_start_urls(
         {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
         "PractitionerRole",
@@ -17672,9 +17667,6 @@ def test_partitioned_resource_start_urls_partitions_uhc_provider_directory_searc
     assert organization_urls[26].endswith("_count=100&name=0")
     assert organization_urls[-1].endswith("_count=100&name=9")
     assert len(organization_urls) == len(importer.UHC_NAME_ROOT_ALPHABET)
-    assert location_urls[0] == "https://flex.optum.com/fhirpublic/R4/Location?_count=100&address-postalcode=0"
-    assert location_urls[-1].endswith("_count=100&address-postalcode=Z")
-    assert len(location_urls) == len(importer.UHC_POSTAL_ROOT_ALPHABET)
     assert role_urls[0] == (
         "https://flex.optum.com/fhirpublic/R4/PractitionerRole?_count=100&location.address-postalcode=0"
     )
@@ -17718,6 +17710,7 @@ async def test_uhc_partition_scan_uses_deadline_instead_of_global_page_cap(monke
         )
 
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", "1")
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[("77030",), ("77031",)]))
     monkeypatch.setattr(
         importer,
         "_fetch_partitioned_resource_rows",
@@ -17979,6 +17972,16 @@ def test_uhc_location_partition_identity_uses_postal_prefix():
             "https://flex.optum.com/fhirpublic/R4/Location?address-state=CA&address-city=S",
             {"state": "CA", "city": "Oakland"},
             "uhc_location_address_city_predicate_rejected",
+        ),
+        (
+            "https://flex.optum.com/fhirpublic/R4/Location?address-postalcode=11372",
+            {"postalCode": "11373-1234"},
+            "uhc_location_address_postal_predicate_rejected",
+        ),
+        (
+            "https://flex.optum.com/fhirpublic/R4/Location?address-postalcode=11372",
+            {"postalCode": "11372-1234"},
+            None,
         ),
     ),
 )
@@ -26866,14 +26869,18 @@ async def test_resource_scan_overlaps_all_eight_and_retries_empty_role_after_wav
 
 @pytest.mark.asyncio
 async def test_proxied_uhc_postal_families_start_together_with_bounded_batches(monkeypatch):
+    """Seed linked Locations ahead of ZIP searches while roles keep scanning."""
     resources = list(importer.UHC_SUPPORTED_RESOURCES)
     started_resource_types = set()
     wave_started = asyncio.Event()
-    hydrated_resource_types = set()
+    hydrated_batches = set()
+    expected_batches = {(resource, None) for resource in importer.uhc_scan.ROLE_LINK_FIELDS} | {("Location", 1)}
     links_hydrated = asyncio.Event()
 
     async def fetch(source_record, resource_type, **options):
         assert options["row_batch_size"] == 100 // len(resources)
+        if resource_type == "Location":
+            assert ("Location", 1) in hydrated_batches
         started_resource_types.add(resource_type)
         if started_resource_types == set(resources):
             wave_started.set()
@@ -26886,12 +26893,12 @@ async def test_proxied_uhc_postal_families_start_together_with_bounded_batches(m
         )
         return _checkpoint_complete_fetch_result(model, written)
 
-    async def hydrate(_directory, source, resource_type, persist, role_done, **_options):
+    async def hydrate(_directory, source, resource_type, persist, role_done, *, max_batches=None, **_options):
         assert not role_done.is_set()
         model = importer.RESOURCE_MODELS_BY_TYPE[resource_type]
-        written = await persist(model, [{"source_id": source["source_id"], "resource_id": "linked"}])
-        hydrated_resource_types.add(resource_type)
-        if hydrated_resource_types == set(importer.uhc_scan.ROLE_LINK_FIELDS):
+        written = await persist(model, [{"source_id": source["source_id"], "resource_id": f"linked-{max_batches}"}])
+        hydrated_batches.add((resource_type, max_batches))
+        if hydrated_batches == expected_batches:
             links_hydrated.set()
         return written
 
@@ -26913,8 +26920,8 @@ async def test_proxied_uhc_postal_families_start_together_with_bounded_batches(m
     counts = await asyncio.wait_for(_run_parallel_resource_import(source_record, resources=resources, concurrency=8), 5)
 
     assert started_resource_types == set(resources)
-    assert counts == {resource: 2 if resource in hydrated_resource_types else 1 for resource in resources}
-    assert hydrated_resource_types == set(importer.uhc_scan.ROLE_LINK_FIELDS)
+    assert hydrated_batches == expected_batches
+    assert counts == {resource: 1 + sum(kind == resource for kind, _ in expected_batches) for resource in resources}
     reference_closure.assert_awaited_once()
 
 

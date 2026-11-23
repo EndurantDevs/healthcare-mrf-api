@@ -124,9 +124,21 @@ async def prepare_fetch(
             resource_type,
             request_url,
         )
-        if partition_identity not in state.completed_partition_identities:
+        if not _partition_already_covered(resource_type, partition_identity, state.completed_partition_identities):
             start_url_queue.put_nowait(request_url)
     return start_url_queue, state
+
+
+def _partition_already_covered(resource_type, identity, completed):
+    if identity in completed:
+        return True
+    if resource_type != "Location" or not identity:
+        return False
+    field, _, zip_code = identity.partition("=")
+    if field != "address-postalcode" or len(zip_code) != 5 or not zip_code.isascii() or not zip_code.isdigit():
+        return False
+    # Older Location runs can have completed a whole prefix before switching to five-digit starts.
+    return any(f"{field}={zip_code[:digits]}" in completed for digits in range(1, 5))
 
 
 async def record_partition(

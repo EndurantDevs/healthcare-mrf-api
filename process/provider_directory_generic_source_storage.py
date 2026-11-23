@@ -1709,7 +1709,7 @@ def _covered_postal_counts(directory, leaves, identity, source_record, expected_
 async def _verify_interrupted_postal_checkpoints(
     connection, policy, checkpoints, identity, expected_counts, run_status, source_ids
 ):
-    """Preserve complete ordinary cursors and verify finished leaves against raw intake."""
+    """Preserve finished leaves while allowing partitioned raw intake ahead of its first leaf."""
     from process.provider_directory_postal_checkpoint import ROOT as POSTAL_CHECKPOINT
 
     directory = import_module("process.provider_directory_fhir")
@@ -1728,7 +1728,9 @@ async def _verify_interrupted_postal_checkpoints(
         bool(leaves)
         and all(counts_by_resource.get(resource, 0) <= count for resource, count in expected_counts.items())
         and all(
-            count == 0 or resource in ordinary_types or resource in counts_by_resource
+            count == 0
+            or resource in ordinary_types
+            or directory._uhc_partition_checkpoint_type(source_by_field, resource) is not None
             for resource, count in expected_counts.items()
         ),
         "transition_checkpoint_changed",
