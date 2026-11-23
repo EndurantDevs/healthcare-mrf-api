@@ -9,6 +9,7 @@ import io
 import logging
 import urllib.parse
 import zlib
+from collections import deque
 from contextlib import asynccontextmanager, nullcontext
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -80,8 +81,10 @@ class AdaptiveRequestSlots:
 
 
 class _OptumRequestSlots(AdaptiveRequestSlots):
-    """Recover only after healthy sends have saturated the reduced allowance."""
+    """Back off for rate limits or clustered transport failures."""
 
+    RESPONSE_WINDOW_SIZE = 32
+    TRANSIENT_FAILURE_LIMIT = 3
     MAX_SATURATION_GAP_SECONDS = 1.0
     MIN_SATURATED_SECONDS = 30.0
     MIN_HEALTHY_RESPONSES = 8
@@ -92,10 +95,11 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
         self.waiters = self.started = self.completed = 0
         self.request_seconds = 0.0
         self.reductions = self.recoveries = 0
+        self.throttled_responses = self.transient_failures = 0
+        self.recent_outcomes = deque(maxlen=self.RESPONSE_WINDOW_SIZE)
         self._reset_health()
 
     def _reset_health(self):
-        self.healthy_responses = 0
         self.saturated_seconds = 0.0
         self.saturated_since = None
         self.last_saturated_at = None
@@ -112,6 +116,7 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
         if self.started == self.completed and not self.waiters:
             self._reset_health()
         epoch = self.reductions + self.recoveries
+        send_limit = self.limit
         started_at = directory.time.monotonic()
         self.started += 1
         if self.started - self.completed == self.limit:
@@ -134,41 +139,53 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
                 self.saturated_since = None
                 self.last_saturated_at = now
             previous = self.limit
-            self._adjust(epoch, response, now, pacing_state)
+            self._adjust(epoch, send_limit, response, now, pacing_state)
             self._log_limit_change(directory, previous)
 
-    def _adjust(self, epoch, response, now, pacing_state):
+    def _adjust(self, epoch, send_limit, response, now, pacing_state):
+        if response is None:
+            self._reset_health()
+            return
         is_current_epoch = epoch == self.reductions + self.recoveries
-        if response is not None and _response_limits_concurrency(response):
+        if response[0] == 429:
+            self.throttled_responses += 1
+            # A late throttle still applies if recovery has restored its original allowance.
+            if is_current_epoch or send_limit <= self.limit:
+                self._back_off()
+            return
+        outcome = _optum_request_outcome(response)
+        self.transient_failures += outcome == "transient"
+        if not is_current_epoch:
+            return
+        self.recent_outcomes.append(outcome)
+        if outcome == "transient" and self.recent_outcomes.count("transient") >= self.TRANSIENT_FAILURE_LIMIT:
+            self._back_off()
+        elif now < pacing_state.get("retry_after_monotonic", 0.0):
             self._reset_health()
-            if is_current_epoch and self.limit > 1:
-                self.reduce()
-                self.reductions += 1
-            return
-        fhir_payload = response[1] if response is not None else None
-        resource_type = fhir_payload.get("resourceType") if isinstance(fhir_payload, dict) else None
+        elif outcome == "healthy":
+            self._try_recover(now)
+
+    def _try_recover(self, now):
+        successes = self.recent_outcomes.count("healthy")
         if (
-            not isinstance(resource_type, str)
-            or not resource_type
-            or resource_type == "OperationOutcome"
-            or response[0] != 200
-            or response[2] is not None
-            or now < pacing_state.get("retry_after_monotonic", 0.0)
-        ):
-            self._reset_health()
-            return
-        if not is_current_epoch or self.limit == self.capacity:
-            return
-        self.healthy_responses += 1
-        if (
-            self.waiters
+            self.limit < self.capacity
+            and self.waiters
             and self.last_saturated_at == now
-            and self.healthy_responses >= max(self.MIN_HEALTHY_RESPONSES, self.limit)
+            and successes >= self.MIN_HEALTHY_RESPONSES
+            and successes * 5 >= len(self.recent_outcomes) * 4
             and self.saturated_seconds >= self.MIN_SATURATED_SECONDS
         ):
-            self.limit += 1
+            self.limit = min(self.capacity, self.limit + max(2, self.limit // 5))
             self.recoveries += 1
+            self.recent_outcomes.clear()
             self._reset_health()
+
+    def _back_off(self):
+        self.recent_outcomes.clear()
+        self._reset_health()
+        if self.limit > 1:
+            self.reduce()
+            self.reductions += 1
 
 
 def request_concurrency_snapshot(source_record: Mapping[str, Any]) -> dict[str, int] | None:
@@ -187,6 +204,8 @@ def request_concurrency_snapshot(source_record: Mapping[str, Any]) -> dict[str, 
         "request_time_ms": round(slots.request_seconds * 1000),
         "reductions": slots.reductions,
         "recoveries": slots.recoveries,
+        "throttled_responses": slots.throttled_responses,
+        "transient_failures": slots.transient_failures,
     }
 
 
@@ -194,6 +213,31 @@ def _response_limits_concurrency(response):
     """Reduce load for throttling, unavailable upstreams and transport timeouts."""
     status, _payload, error, _elapsed = response
     return status in {429, 503, 504} or bool(error and any(word in error.lower() for word in ("timeout", "timed out")))
+
+
+def _optum_request_outcome(response):
+    status, payload, error, _elapsed = response
+    if (
+        status == 502
+        or _response_limits_concurrency(response)
+        or error
+        in {
+            "ClientConnectionResetError",
+            "ClientOSError",
+            "ConnectionResetError",
+            "ServerDisconnectedError",
+        }
+    ):
+        return "transient"
+    resource_type = payload.get("resourceType") if isinstance(payload, dict) else None
+    if (
+        status == 200
+        and error is None
+        and isinstance(resource_type, str)
+        and resource_type not in {"", "OperationOutcome"}
+    ):
+        return "healthy"
+    return "other"
 
 
 def strict_search_next_link(
