@@ -87,7 +87,12 @@ def test_projected_entity_type_filters_count_and_both_page_paths():
         assert "a.taxonomy_array &&" in sql and "a.primary_taxonomy_codes &&" in sql
     assert nearby.extra_clause == filter_clause
     named = replace(nearby, ilike_clause="\n AND d.provider_last_name ILIKE :q")
-    assert "JOIN mrf.npi AS d" in build_native_nearby_count_sql(named)
+    named_count = build_native_nearby_count_sql(named)
+    assert "WITH matched_npis AS MATERIALIZED" in named_count
+    assert "a.npi IN (SELECT npi FROM matched_npis)" in named_count
+    assert "d.provider_last_name ILIKE :q" in named_count and "JOIN mrf.npi AS d" not in named_count
+    needs_live_provider = build_native_nearby_count_sql(replace(named, search_has_entity_type_code=False))
+    assert "JOIN mrf.npi AS d" in needs_live_provider and "matched_npis" not in needs_live_provider
 
 
 def test_primary_taxonomy_reads_the_projection_column_not_npi_taxonomy():
