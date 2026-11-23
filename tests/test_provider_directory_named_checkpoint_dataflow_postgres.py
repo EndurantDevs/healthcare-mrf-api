@@ -183,6 +183,84 @@ async def test_named_copy_and_checkpoint_commit_or_roll_back_together(native_boo
         await engine.dispose()
 
 
+def _named_network_intake_fixture(database, factory):
+    """Wire the network importer to a real factory and a bounded upstream seam."""
+    from process import provider_directory_network_first_intake as intake
+
+    checkpoint = SimpleNamespace(dataset_id="synthetic", acquisition_root_run_id="root")
+    traversal = intake.traversal
+    source_by_field = {
+        "source_id": traversal.SOURCE_ID,
+        "api_base": traversal.API_BASE,
+        "canonical_api_base": traversal.API_BASE,
+        "metadata_json": {traversal.METADATA_KEY: traversal.LEGACY_CONFIG},
+        "_endpoint_dataset_id": checkpoint.dataset_id,
+        "_pagination_checkpoint_context": checkpoint,
+        "_resource_hash_contract": True,
+    }
+
+    async def initialize_checkpoint(context, resource_type, url):
+        assert context is checkpoint and resource_type in intake.RESOURCE_TYPES
+        assert url.startswith(traversal.API_BASE)
+        assert source.current_source_storage_binding() == factory.storage_binding
+
+    directory = SimpleNamespace(
+        db=database,
+        _source_metadata=lambda row: row["metadata_json"],
+        _has_bound_resource_scan_checkpoint=lambda row, context: row is source_by_field and context is checkpoint,
+        _SOURCE_HTTP_SESSION=SimpleNamespace(get=lambda: None),
+        _validated_resource_scan_concurrency=int,
+        _source_resource_scan_concurrency=lambda _row: 8,
+        _load_or_initialize_pagination_checkpoint=AsyncMock(side_effect=initialize_checkpoint),
+    )
+    return directory, source_by_field
+
+
+@pytest.mark.asyncio
+async def test_network_intake_starts_from_named_transaction_factory(native_bootstrap, monkeypatch):
+    """Commit the native frontier before making the first directory request."""
+    from process import provider_directory_network_first_intake as intake
+
+    await _prepare_named_atomicity_storage(native_bootstrap)
+    monkeypatch.setenv("HLTHPRT_DB_DATABASE", native_bootstrap.url.database)
+    monkeypatch.delenv("HLTHPRT_DB_DATABASE_OVERRIDE", raising=False)
+    database = Database()
+    engine = create_async_engine(native_bootstrap.url)
+    roles = native_bootstrap.roles
+    policy = source.GenericSourcePolicy("source_schema", roles["owner"], roles["publisher"], (roles["reader"],))
+    factory = _native_factory(engine, policy)
+    directory, source_by_field = _named_network_intake_fixture(database, factory)
+
+    async def first_page(*_args, **_kwargs):
+        assert database._transaction_binding() is None
+        with pytest.raises(ValueError, match="isolated_transaction_required"):
+            source.current_source_storage_binding()
+        raise RuntimeError("stop at first directory request")
+
+    upstream = AsyncMock(side_effect=first_page)
+    monkeypatch.setattr(intake.traversal, "step", upstream)
+    try:
+        async with source.bind_generic_source_transaction_factory(factory):
+            assert database._transaction_binding() is None
+            with pytest.raises(RuntimeError, match="stop at first directory request"):
+                await intake.import_group(
+                    directory,
+                    source_by_field,
+                    intake.IntakeOptions("root", 3, 100, 10, 8),
+                    persist=AsyncMock(),
+                    progress_callback=AsyncMock(),
+                    cancel_check=AsyncMock(),
+                )
+        upstream.assert_awaited_once()
+        assert directory._load_or_initialize_pagination_checkpoint.await_count == len(intake.RESOURCE_TYPES)
+        graph = intake.GraphStore(directory, source_by_field)
+        assert (
+            await native_bootstrap.connection.fetchval(f"SELECT count(*) FROM source_schema.{graph.prefix}_work") == 2
+        )
+    finally:
+        await engine.dispose()
+
+
 def _catalog_projection(database, state, stage, payload):
     async def read(*_args, **_kwargs):
         assert not state.cancelled or state.first_response_finished

@@ -11,6 +11,7 @@ import asyncpg
 import pytest
 
 from process import provider_directory_network_first_store as storage
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 pytestmark = pytest.mark.asyncio
 
@@ -28,7 +29,9 @@ async def graph(monkeypatch):
     schema = "network_graph_" + uuid4().hex[:16]
     await connection.execute(f'CREATE SCHEMA "{schema}"')
     policy = SimpleNamespace(schema=schema, runtime_roles=(), control_runtime_roles=())
-    publisher = SimpleNamespace(connection=connection, policy=policy)
+    publisher = SimpleNamespace(
+        connection=connection, policy=policy, storage_binding=NamedFHIRSourceStorage("synthetic_catalog", schema)
+    )
 
     @asynccontextmanager
     async def transaction(_database):
@@ -181,15 +184,11 @@ async def _install_normal_group(graph, monkeypatch):
     from unittest.mock import AsyncMock
 
     from process import provider_directory_network_first_intake as intake
-    from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
     from tests.test_process_provider_directory_fhir_unit import (
         _patch_parallel_resource_flow,
         importer,
     )
 
-    monkeypatch.setattr(
-        intake, "current_source_storage_binding", lambda: NamedFHIRSourceStorage("synthetic_catalog", graph.schema)
-    )
     original_checkpoint_signature = inspect.signature(importer._save_pagination_checkpoint)
     source_record = _patch_parallel_resource_flow(monkeypatch, AsyncMock(side_effect=AssertionError("ordinary fetch")))
     source_record.update(graph.store.source)

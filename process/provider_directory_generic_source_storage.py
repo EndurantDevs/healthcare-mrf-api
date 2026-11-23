@@ -1042,6 +1042,29 @@ def _transition_candidate_document(stored_document, old_storage, new_storage):
     return raw, candidate_by_field
 
 
+def _is_unstarted_named_binding(binding):
+    """Recognize a named loading candidate before any input batch or conversion."""
+    return (
+        binding["contract"] == NAMED_ISOLATED_CONTRACT
+        and binding["ordinal"] == 0
+        and binding["resets"] in ({}, {"*": 0})
+        and binding["relationship_sha256"] is None
+        and "payload_conversion" not in binding
+    )
+
+
+def _is_unstarted_named_root(header, binding, identity, expected_counts, manifest_replay):
+    """Identify only the original failed named root or its issued replay."""
+    return (
+        (header["status"] == "failed" or manifest_replay and header["status"] == "acquiring")
+        and header["import_run_id"] == identity["failed_run_id"] == identity["acquisition_root_run_id"]
+        and _is_unstarted_named_binding(binding)
+        and not any(expected_counts.values())
+        and header.get("resource_count") == 0
+        and named_source_resources(binding["identity"]["metadata"].get("source_ids")) is None
+    )
+
+
 async def _locked_transition_candidate(
     connection, policy, identity_by_field, old_storage, new_storage, expected_counts, *, manifest_replay=False
 ):
@@ -1056,12 +1079,16 @@ async def _locked_transition_candidate(
     is_empty_vsp_failure = _is_empty_vsp_checkpoint_failure(
         header, raw_candidate, identity_by_field, expected_counts, new_storage, manifest_replay=manifest_replay
     )
+    is_unstarted_named_root = not is_empty_vsp_failure and _is_unstarted_named_root(
+        header, candidate_by_field, identity_by_field, expected_counts, manifest_replay
+    )
     metadata = _json(header["publication_metadata_json"])
-    has_identity_metadata = _transition_metadata_matches(metadata, stored_identity["metadata"], header["status"])
+    metadata_status = "failed" if is_unstarted_named_root else header["status"]
+    has_identity_metadata = _transition_metadata_matches(metadata, stored_identity["metadata"], metadata_status)
     has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
     candidate_storage_by_field = candidate_by_field.get("storage")
     source_ids = stored_identity["metadata"].get("source_ids")
-    if source_ids != [VSP_SOURCE_ID] and named_source_resources(source_ids) is not None:
+    if is_unstarted_named_root or (source_ids != [VSP_SOURCE_ID] and named_source_resources(source_ids) is not None):
         _require_named_source_identity(stored_identity)
     expected_storage_by_field = {key: old_storage[key] for key in ("catalog_schema", "storage_schema")}
     _require(
@@ -1089,6 +1116,7 @@ async def _locked_transition_candidate(
         has_changed_header_owner,
         metadata.get("error"),
         raw_candidate,
+        is_unstarted_named_root,
     )
 
 
@@ -1544,6 +1572,15 @@ def _require_registered_transition_scope(checkpoints, bulk_checkpoints, source_i
     )
 
 
+def _record_unstarted_checkpoint_proof(run_evidence, has_checkpoints):
+    """Use the ordinary verification path whenever there is a saved checkpoint."""
+    if run_evidence.get("is_unstarted_named_root"):
+        run_evidence["is_unstarted_named_root"] = not has_checkpoints
+        if not has_checkpoints:
+            _require(run_evidence["status"] == "failed", "transition_checkpoint_changed")
+            run_evidence["require_empty_checkpoints"] = True
+
+
 async def _verify_transition_checkpoints(
     connection, policy, identity_by_field, expected_counts, run_evidence, candidate
 ):
@@ -1571,6 +1608,7 @@ async def _verify_transition_checkpoints(
         dataset_id,
     )
     _require_registered_transition_scope(checkpoint_rows, bulk_checkpoints, source_ids)
+    _record_unstarted_checkpoint_proof(run_evidence, bool(checkpoint_rows or bulk_checkpoints))
     if run_evidence.get("is_postal_start_failure"):
         _require(not bulk_checkpoints, "transition_checkpoint_changed")
         _require_postal_start_checkpoint(checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids)
@@ -1581,7 +1619,7 @@ async def _verify_transition_checkpoints(
             connection, policy, checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids
         )
         return [], []
-    if run_evidence.get("is_empty_vsp_failure"):
+    if run_evidence.get("require_empty_checkpoints"):
         _require(not (checkpoint_rows or bulk_checkpoints), "transition_checkpoint_changed")
         return [], []
     _require(not (checkpoint_rows and bulk_checkpoints), "transition_checkpoint_changed")
@@ -1805,7 +1843,7 @@ async def _verify_transition_inputs(
             "transition_partition_input_changed",
         )
     await _verify_transition_witness(
-        connection, policy, candidate_by_field, dataset_id, run_evidence.get("is_empty_vsp_failure", False)
+        connection, policy, candidate_by_field, dataset_id, run_evidence.get("require_empty_checkpoints", False)
     )
     return renewals, companion_starts
 
@@ -1872,15 +1910,40 @@ async def has_empty_isolated_vsp_storage(directory, candidate, header):
             binding,
             identity,
             dict.fromkeys(VSP_RESOURCE_TYPES, 0),
-            {"status": header["status"], "is_empty_vsp_failure": True},
+            {"status": header["status"], "require_empty_checkpoints": True},
         )
         return isolated is not None
 
 
-async def _verify_transition_witness(connection, policy, candidate_by_field, dataset_id, is_empty_vsp_failure):
+async def has_empty_named_root_storage(directory, candidate, header):
+    """Check empty rearmed named storage again under the worker's admission lock."""
+    binding = _json(header["candidate_storage_json"])
+    if type(binding) is not dict or binding.get("contract") != NAMED_ISOLATED_CONTRACT:
+        return False
+    identity = candidate_identity(directory, candidate)
+    if named_source_resources(identity["metadata"]["source_ids"]) is not None:
+        return False
+    async with source_owner_transaction(directory.db) as publisher:
+        connection, policy = publisher.connection, publisher.policy
+        _require_candidate_storage(publisher, directory, identity)
+        _validate_binding(binding, identity, phases=("loading",))
+        _require(header["resource_count"] == 0 and _is_unstarted_named_binding(binding), "transition_candidate_changed")
+        await _verify_tables(connection, policy, binding)
+        await _verify_transition_inputs(
+            connection,
+            policy,
+            binding,
+            identity,
+            dict.fromkeys(candidate.selected_resources, 0),
+            {"status": header["status"], "require_empty_checkpoints": True},
+        )
+    return True
+
+
+async def _verify_transition_witness(connection, policy, candidate_by_field, dataset_id, require_empty):
     witness_relation = storage_relation(policy.schema, candidate_by_field["tables"]["witness_input"]["name"])
     check = f"SELECT NOT EXISTS(SELECT FROM {witness_relation} WHERE dataset_id<>$1)"
-    if is_empty_vsp_failure:
+    if require_empty:
         proof_relation = storage_relation(policy.schema, "provider_directory_dataset_proof_shard")
         check = (
             f"SELECT NOT EXISTS(SELECT FROM {witness_relation}) "
@@ -1942,7 +2005,7 @@ async def _verify_stopped_candidate(
     connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
 ):
     """Check the failed acquisition lineage and candidate contents before changing storage."""
-    candidate_by_field, _, is_empty_vsp_failure, has_changed_header_owner, failure_error, _raw_candidate = (
+    candidate_by_field, _, is_empty_vsp_failure, has_changed_header_owner, failure_error, _, is_unstarted_named_root = (
         locked_candidate
     )
     run_evidence_by_field = await _verify_transition_run(
@@ -1954,6 +2017,8 @@ async def _verify_stopped_candidate(
         is_empty_vsp_failure=is_empty_vsp_failure,
         expected_failure_error=failure_error,
     )
+    run_evidence_by_field["is_unstarted_named_root"] = is_unstarted_named_root
+    run_evidence_by_field["require_empty_checkpoints"] = is_empty_vsp_failure
     _require(not is_empty_vsp_failure or run_evidence_by_field["status"] == "failed", "transition_checkpoint_changed")
     transitions = await _verify_transition_inputs(
         connection,
@@ -1989,7 +2054,7 @@ async def transition_isolated_loading_candidate_storage(
         expected_resource_counts,
         manifest_replay=manifest_replay,
     )
-    candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate = locked_candidate
+    candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate, _ = locked_candidate
     run_evidence_by_field, transitions = await _verify_stopped_candidate(
         connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
     )
@@ -2004,7 +2069,13 @@ async def transition_isolated_loading_candidate_storage(
         expected_resource_counts,
         run_evidence_by_field,
     )
-    is_already_applied = candidate_by_field == successor_by_field and raw_candidate == candidate_by_field
+    is_unstarted_named_root = run_evidence_by_field["is_unstarted_named_root"]
+    should_rearm = is_unstarted_named_root or is_empty_vsp_failure and failure_error not in _RETAINED_VSP_CAPTURE_ERRORS
+    is_already_applied = (
+        candidate_by_field == successor_by_field
+        and raw_candidate == candidate_by_field
+        and not (is_unstarted_named_root and previous_status == "failed")
+    )
     await _store_transition_successor(
         connection,
         policy,
@@ -2012,7 +2083,7 @@ async def transition_isolated_loading_candidate_storage(
         successor_by_field,
         raw_candidate,
         previous_status,
-        is_empty_vsp_failure and failure_error not in _RETAINED_VSP_CAPTURE_ERRORS,
+        should_rearm,
     )
     await apply_partition_transitions(connection, policy.schema, transitions)
     return {**receipt_by_field, "already_applied": is_already_applied}
