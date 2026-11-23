@@ -307,6 +307,32 @@ async def _approved_graph_keys(connection, bindings, arguments, *, allow_empty=F
     return approved_keys
 
 
+@dataclass(frozen=True)
+class _PreparedBindingRows:
+    relation: str
+
+
+def _mapping_binding_rows(bindings):
+    if isinstance(bindings, _PreparedBindingRows):
+        return bindings.relation
+    return (
+        "(WITH " + bindings + " SELECT record_json->>'source_key' AS source_key, "
+        "record_json->'source_scope_json'->>'source_generation' AS source_generation, network_id "
+        "FROM approved_network_bindings)"
+    )
+
+
+async def _prepare_mapping_bindings(connection, bindings, arguments):
+    relation = "pg_temp." + _identifier("typed_network_bindings_" + uuid4().hex)
+    await connection.execute(
+        "CREATE TEMP TABLE " + relation + " ON COMMIT DROP AS SELECT * FROM " + _mapping_binding_rows(bindings),
+        *arguments[:-1],
+    )
+    await connection.execute("CREATE INDEX ON " + relation + "(source_key,source_generation)")
+    await connection.execute("ANALYZE " + relation)
+    return _PreparedBindingRows(relation), (arguments[-1],)
+
+
 async def _map_pair_rows(connection, stage, mapping, bindings, arguments):
     # Large approved maps must not be rescanned for every pair in each page.
     # The savepoint restores the caller's planner setting after failure.
@@ -319,10 +345,15 @@ async def _map_pair_rows(connection, stage, mapping, bindings, arguments):
 
 
 async def _map_pair_pages(connection, stage, mapping, bindings, arguments):
+    generation_parameter = "$" + str(len(arguments)) + "::text"
     joins = (
         " FROM "
         + stage.relation("pairs")
-        + " p LEFT JOIN approved_network_bindings b ON b.record_json->>'source_key'=p.network_source_key AND b.record_json->'source_scope_json'->>'source_generation'=$8::text LEFT JOIN LATERAL (SELECT location_key FROM "
+        + " p LEFT JOIN "
+        + _mapping_binding_rows(bindings)
+        + " b ON b.source_key=p.network_source_key AND b.source_generation="
+        + generation_parameter
+        + " LEFT JOIN LATERAL (SELECT location_key FROM "
         + mapping.relation("offices")
         + " o WHERE (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true "
     )
@@ -338,11 +369,9 @@ async def _map_pair_pages(connection, stage, mapping, bindings, arguments):
         0,
     )
     async for low, high in _pair_ranges(connection, stage):
-        scope = " WHERE " + _range("p.", 9)
+        scope = " WHERE " + _range("p.", len(arguments) + 1)
         counts = await connection.fetchrow(
-            "WITH "
-            + bindings
-            + " SELECT count(*) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NOT NULL) mapped_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NOT NULL),0)::bigint mapped_reference_rows,count(*) FILTER(WHERE b.network_id IS NULL) unapproved_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NULL),0)::bigint unapproved_reference_rows,count(*) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NULL) unmatched_office_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NULL),0)::bigint unmatched_office_reference_rows"
+            "SELECT count(*) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NOT NULL) mapped_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NOT NULL),0)::bigint mapped_reference_rows,count(*) FILTER(WHERE b.network_id IS NULL) unapproved_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NULL),0)::bigint unapproved_reference_rows,count(*) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NULL) unmatched_office_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NULL),0)::bigint unmatched_office_reference_rows"
             + joins
             + scope,
             *arguments,
@@ -351,11 +380,13 @@ async def _map_pair_pages(connection, stage, mapping, bindings, arguments):
         )
         for key, count_value in counts.items():
             totals[key] += count_value
-        evidence = "encode(sha256(convert_to(jsonb_build_array('fhir-direct-network-office-v3',$8::text,p.resource_type,p.resource_id,p.network_source_key,p.location_resource_id,p.evidence_basis)::text,'UTF8')),'hex')"
+        evidence = (
+            "encode(sha256(convert_to(jsonb_build_array('fhir-direct-network-office-v3',"
+            + generation_parameter
+            + ",p.resource_type,p.resource_id,p.network_source_key,p.location_resource_id,p.evidence_basis)::text,'UTF8')),'hex')"
+        )
         await connection.execute(
-            "WITH "
-            + bindings
-            + " INSERT INTO "
+            "INSERT INTO "
             + mapping.relation("memberships")
             + " SELECT b.network_id,p.provider_system,p.provider_id,p.location_id,"
             + evidence
@@ -374,8 +405,9 @@ async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
     provider_sql = (
         PLAN_TIER_PROVIDER_ONLY_SQL if stage.document["contract"] == PLAN_TIER_CONTRACT else PROVIDER_ONLY_SQL
     ).replace("{cells}", stage.relation("cells"))
-    # Shift Source query parameters after the closed approved coordinates and generation.
-    provider_sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + 8), provider_sql)
+    # Source parameters follow the mapping generation and any live approval coordinates.
+    generation_parameter = "$" + str(len(arguments)) + "::text"
+    provider_sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + len(arguments)), provider_sql)
     for resource_type in ("OrganizationAffiliation", "PractitionerRole"):
         after = (resource_type, "")
         while resource_rows := await connection.fetch(
@@ -386,13 +418,15 @@ async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
         ):
             last_keys = tuple(resource_rows[-1])
             await connection.execute(
-                "WITH "
-                + bindings
-                + " INSERT INTO "
+                "INSERT INTO "
                 + mapping.relation("provider_only")
-                + " SELECT b.network_id,'npi',p.provider_id,encode(sha256(convert_to(jsonb_build_array('fhir-provider-only-v3',$8::text,p.resource_type,p.resource_id,p.network_source_key)::text,'UTF8')),'hex') FROM ("
+                + " SELECT b.network_id,'npi',p.provider_id,encode(sha256(convert_to(jsonb_build_array('fhir-provider-only-v3',"
+                + generation_parameter
+                + ",p.resource_type,p.resource_id,p.network_source_key)::text,'UTF8')),'hex') FROM ("
                 + provider_sql
-                + ") p JOIN approved_network_bindings b ON b.record_json->>'source_key'=p.network_source_key ON CONFLICT DO NOTHING",
+                + ") p JOIN "
+                + _mapping_binding_rows(bindings)
+                + " b ON b.source_key=p.network_source_key ON CONFLICT DO NOTHING",
                 *arguments,
                 origin.source_uri.rstrip("/"),
                 date.fromisoformat(stage.document["membership_as_of"]),
@@ -497,6 +531,9 @@ async def _prepare_mapping_offices(connection, stage, approval, table_names, con
         allow_empty=approval.catalog_bindings is not None,
         plan_tiers=stage.document["contract"] == PLAN_TIER_CONTRACT,
     )
+    if approval.catalog_bindings is not None and table_names is None:
+        # The ordinary producer owns a writable transaction. Precreated workspaces can run read-only.
+        bindings, arguments = await _prepare_mapping_bindings(connection, bindings, arguments)
     await _office_inputs(connection, stage, mapping, approved_keys)
     return mapping, approval, generation, arguments, bindings
 

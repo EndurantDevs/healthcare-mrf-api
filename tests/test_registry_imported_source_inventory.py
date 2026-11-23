@@ -4,6 +4,7 @@
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import date, timedelta
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -316,11 +317,16 @@ async def test_source_token_tracks_named_data_and_policy(inventory_case, monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reuse", [False, True])
-async def test_native_catalog_preparation_returns_the_exact_input_cohort(inventory_case, monkeypatch, reuse):
+@pytest.mark.parametrize(("reuse", "saved_days"), [(False, 0), (True, 0), (False, 1)])
+async def test_native_catalog_preparation_returns_the_exact_input_cohort(
+    inventory_case, monkeypatch, reuse, saved_days
+):
     case = inventory_case
     observed = await observe(case)
-    accounting = catalog_preparation.imported_catalog_accounting(observed)
+    saved_date = date.fromisoformat(observed.effective_date) - timedelta(days=saved_days)
+    pinned = observed.at_date(saved_date.isoformat())
+    accounting = catalog_preparation.imported_catalog_accounting(pinned)
+    metrics = {"resumed_snapshot_as_of": pinned.effective_date} if saved_days else accounting
     prepared_snapshot_by_field = {
         "accounting_json": accounting,
         "metadata_generation": "e" * 64,
@@ -331,16 +337,16 @@ async def test_native_catalog_preparation_returns_the_exact_input_cohort(invento
     async def prepare(*_arguments, source_export):
         assert source_export is case.factory
         assert catalog_preparation.current_catalog_inventory() is observed
-        return (None if reuse else prepared_snapshot_by_field), previous, accounting
+        return (None if reuse else prepared_snapshot_by_field), previous, metrics
 
     monkeypatch.setattr(catalog_sync, "prepare_fhir_catalog_snapshot", prepare)
-    result = await catalog_preparation.prepare_imported_catalog_snapshot(
+    preparation = await catalog_preparation.prepare_imported_catalog_snapshot(
         case.config, None, None, None, source_export=case.factory, inventory=observed
     )
 
-    assert result.inventory_token == observed.token
-    assert result.snapshot is prepared_snapshot_by_field and result.previous is previous
-    assert result.accounting == accounting
+    assert preparation.inventory_token == pinned.token
+    assert preparation.snapshot is prepared_snapshot_by_field and preparation.previous is previous
+    assert preparation.accounting == metrics
     assert catalog_preparation.current_catalog_inventory() is None
 
 
