@@ -345,7 +345,7 @@ async def test_oracle_reserves_index_space_before_creating_indexes():
     from api import plan_pricing_code_oracle as oracle_module
 
     session = SimpleNamespace(
-        scalar=AsyncMock(side_effect=[2, 8192, oracle_module.MAX_CALIBRATION_BYTES - 65536]),
+        scalar=AsyncMock(side_effect=[2, 73728, oracle_module.MAX_CALIBRATION_BYTES - 65536]),
         execute=AsyncMock(),
     )
     oracle = oracle_module.CodeInputOracle(session, {"scope": {"geo_cells": []}}, [])
