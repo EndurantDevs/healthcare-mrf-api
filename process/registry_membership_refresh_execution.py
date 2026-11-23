@@ -193,6 +193,7 @@ async def _finish_refresh(connection, request_scope, inputs, copy_target, writer
     envelope, original_sources, final_sources = inputs
     command = envelope["command"]
     schema = writer_context.control_schema
+    expected_recipes = _prepared_recipe_commitment(original_sources, final_sources)
     async with _locked_request_transaction(connection, identity, lease, _namespace(schema)) as locked:
         if locked["request_sha256"] != initial_request["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
@@ -205,7 +206,7 @@ async def _finish_refresh(connection, request_scope, inputs, copy_target, writer
             connection, command, current, writer_context.membership_refresh_runtime.address_profile, schema
         )
         candidate = await _candidate_scope(connection, copy_target, command, schema)
-        _require_prepared_recipes(candidate, original_sources, final_sources)
+        _require_candidate_recipes(candidate, expected_recipes)
         manifest = await publish_network_candidate(
             connection, copy_target, control_schema=schema, preparation_roles=writer_context.preparation_roles
         )
@@ -226,8 +227,8 @@ async def _finish_refresh(connection, request_scope, inputs, copy_target, writer
         return receipt_by_field
 
 
-def _require_prepared_recipes(candidate, original_sources, final_sources):
-    """The fenced inputs are a complete replacement; compare commitments, never hash subsets."""
+def _prepared_recipe_commitment(original_sources, final_sources):
+    """Compare the complete fenced inputs before taking the publication locks."""
     from process.registry_membership_refresh_sources import _recipe_commitment
 
     if (
@@ -239,8 +240,12 @@ def _require_prepared_recipes(candidate, original_sources, final_sources):
     expected_count, expected_sha256 = _recipe_commitment(final_sources.introduced_source_recipes)
     if _recipe_commitment(original_sources.introduced_source_recipes) != (expected_count, expected_sha256):
         raise RegistryApprovalConflict("registry_membership_refresh_sources_changed")
+    return expected_count, expected_sha256 if expected_count else None
+
+
+def _require_candidate_recipes(candidate, expected):
     actual = verify_source_recipe_metadata(candidate)
-    if (actual.recipe_count, actual.recipes_sha256) != (expected_count, expected_sha256 if expected_count else None):
+    if (actual.recipe_count, actual.recipes_sha256) != expected:
         raise RegistryApprovalConflict("registry_membership_refresh_candidate_recipes_changed")
 
 
