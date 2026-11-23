@@ -89,6 +89,10 @@ pub fn decode_line(raw: &[u8]) -> Result<Option<Value>, Unsupported> {
     let line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
     // Python replaces invalid bytes instead of failing; that text is never reproduced here.
     let text = std::str::from_utf8(line).map_err(|_| unsupported("invalid_utf8"))?;
+    decode_json(text).map(Some)
+}
+
+pub(super) fn decode_json(text: &str) -> Result<Value, Unsupported> {
     let mut parser = Parser {
         bytes: text.as_bytes(),
         text,
@@ -100,7 +104,7 @@ pub fn decode_line(raw: &[u8]) -> Result<Option<Value>, Unsupported> {
     if parser.position != parser.bytes.len() {
         return Err(unsupported("invalid_json"));
     }
-    Ok(Some(value))
+    Ok(value)
 }
 
 struct Parser<'a> {
