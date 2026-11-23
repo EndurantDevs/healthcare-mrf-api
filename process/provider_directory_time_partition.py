@@ -176,8 +176,8 @@ def partition_window_slots(directory, source_record, request_url):
     return slots[key]
 
 
-async def _fetch_partition_count_pair(directory, source_record, config, state, options, windows, slots):
-    """Read two disjoint windows with the normal HTTP pacing and bounded window permits."""
+async def _fetch_partition_count_batch(directory, source_record, config, state, options, windows, slots):
+    """Read disjoint windows under the shared HTTP pacing and window permits."""
 
     async def fetch(window):
         """Hold one shared permit through the normal count transport."""
@@ -194,7 +194,7 @@ async def _fetch_partition_count_pair(directory, source_record, config, state, o
         if isinstance(observation, BaseException):
             raise observation
     retry_not_before = max((item.retry_not_before for item in observations if item.retry_not_before), default=None)
-    # Commit successful siblings before yielding a retry. Keep the later source retry fence if both failed.
+    # Commit successful siblings before yielding the latest source retry fence.
     return sorted(
         (
             (window, replace(item, retry_not_before=retry_not_before) if item.transient else item)
@@ -209,13 +209,16 @@ async def observe_partition_counts(directory, source_record, resource_type, mode
     slots = None
     if state.context.canonical_api_base == bcbs_minnesota.API_BASE and options.window_concurrency > 1:
         slots = partition_window_slots(directory, source_record, state.start_url)
+    batch_width = min(4, options.window_concurrency)
     while pending := state.plan.pending_count_windows():
         if state.deadline_at is not None and directory._last_updated_partition_monotonic() >= state.deadline_at:
             return await directory._saved_partition_retry_result(
                 model, resource_type, config, state, "deadline_reached", deadline_reached=True
             )
         counts = (
-            await _fetch_partition_count_pair(directory, source_record, config, state, options, pending[:2], slots)
+            await _fetch_partition_count_batch(
+                directory, source_record, config, state, options, pending[:batch_width], slots
+            )
             if slots is not None and len(pending) >= 2
             else (None,)
         )
