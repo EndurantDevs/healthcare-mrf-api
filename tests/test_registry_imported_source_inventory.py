@@ -16,6 +16,7 @@ from process import registry_imported_source_inventory as inventory
 from process import registry_native_network_catalog as native
 from process.registry_fhir_catalog_observation import catalog_observation_descriptor_digest
 from process.registry_fhir_catalog_validation import metadata_generation, snapshot_inputs
+from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
 from tests.test_registry_fhir_catalog_grant import standing_grant
 from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor
 from tests.test_registry_fhir_catalog_validation import snapshot
@@ -189,6 +190,18 @@ def test_latest_complete_edition_wins_across_registrations_without_merging_disti
         "endpoint-other",
         "endpoint-missing-url",
     }
+
+
+def test_practitioner_enrichment_does_not_replace_or_become_a_network_edition():
+    uri = "https://directory.example.test/tenant"
+    network = edition("network", "endpoint-network", uri, 1, 10)
+    enrichment = edition("enrichment", "endpoint-enrichment", uri, 2, 20)
+    enrichment["coordinates"]["source_id"] = UHC_FLEX_PRACTITIONER_SOURCE_ID
+    enrichment["source_aliases"] = [UHC_FLEX_PRACTITIONER_SOURCE_ID]
+
+    assert inventory.select_fhir_editions([network, enrichment], ()) == ([network], [])
+    assert inventory.select_fhir_editions([network], [enrichment]) == ([network], [])
+    assert inventory.select_fhir_editions([enrichment], [network]) == ([], [network])
 
 
 def test_current_feed_retires_typed_predecessor_from_a_different_registration():

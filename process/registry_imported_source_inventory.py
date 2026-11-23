@@ -20,6 +20,7 @@ from process.registry_fhir_catalog_sources import (
     validate_fhir_catalog_source_descriptor,
 )
 from process.registry_imported_source_reuse import graph_policy, source_edition
+from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
 
 INVENTORY_CONTRACT = "registry-imported-source-inventory-v1"
 NATIVE_CONTRACT = "registry-native-network-source-v1"
@@ -50,11 +51,13 @@ def _edition_rank(descriptor):
 
 
 def preferred_fhir_editions(accepted):
-    """Select the latest admitted publication per feed, preferring more rows on a date tie."""
+    """Select the latest admitted network edition per feed, preferring more rows on a date tie."""
+    # The exact-NPI feed enriches practitioners and supplies no network coverage.
     eligible_descriptors = [
         descriptor
         for descriptor in accepted
-        if descriptor["complete"] or is_delta_positive_catalog_descriptor(descriptor)
+        if descriptor["coordinates"]["source_id"] != UHC_FLEX_PRACTITIONER_SOURCE_ID
+        and (descriptor["complete"] or is_delta_positive_catalog_descriptor(descriptor))
     ]
     by_feed = {}
     for descriptor in sorted(eligible_descriptors, key=_edition_rank):
