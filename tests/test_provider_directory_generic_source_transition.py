@@ -383,11 +383,13 @@ def _attach_interrupted_postal_scan(case):
 @pytest.mark.asyncio
 async def test_interrupted_postal_scan_preserves_complete_cursors_leaves_and_uncovered_raw_rows(case):
     counts = _attach_interrupted_postal_scan(case)
+    counts["Practitioner"] = 2
+    case.input_rows.append(dict(dataset_id=DATASET, resource_type="Practitioner", total=2, active=2))
     before = deepcopy((case.checkpoints, case.postal_leaves, case.input_rows, case.runs))
 
     transition = await _transition(case, counts)
 
-    assert transition["rows"] == 7 and transition["lineage_run_ids"] == [ROOT, FAILED]
+    assert transition["rows"] == 9 and transition["lineage_run_ids"] == [ROOT, FAILED]
     assert (await _transition(case, counts, manifest_replay=True))["already_applied"] is True
     assert (case.checkpoints, case.postal_leaves, case.input_rows, case.runs) == before
     assert all(sql.startswith('UPDATE "source_schema"."provider_directory_endpoint_dataset"') for sql, _ in case.writes)

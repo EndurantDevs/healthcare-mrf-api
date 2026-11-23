@@ -6,8 +6,9 @@ import re
 import urllib.parse
 from contextlib import aclosing
 from functools import partial
-from itertools import batched
+from itertools import batched, islice
 
+from db.plan_release_storage import storage_relation
 from process import provider_directory_source_proxy as source_proxy
 
 POSTAL_SEARCH_PARAMS = {
@@ -45,6 +46,48 @@ def postal_child_prefixes(prefix):
     return []
 
 
+async def location_start_urls(directory, source_record, page_count):
+    """Search only five-digit ZIPs from the existing geographic reference inventory."""
+    start_url = directory._resource_start_url(source_record, "Location", page_count=page_count)
+    if not start_url:
+        return []
+    query_by_name = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(start_url).query, keep_blank_values=True))
+    if "address-postalcode" in query_by_name:
+        return [start_url]
+    relation = storage_relation(directory._schema(), "geo_zip_lookup")
+    zip_rows = await directory.db.all(
+        f"SELECT DISTINCT zip_code FROM {relation} WHERE zip_code ~ '^[0-9]{{5}}$' ORDER BY zip_code"
+    )
+    if not zip_rows:
+        raise RuntimeError("provider_directory_uhc_location_zip_inventory_empty")
+    return [directory._url_with_query_item(start_url, "address-postalcode", zip_row[0]) for zip_row in zip_rows]
+
+
+def location_partition_predicate_error(directory, source_record, resource_type, url, bundle):
+    """Fail a Location partition if a returned address falls outside its search."""
+    if resource_type != "Location" or not is_source(directory, source_record):
+        return None
+    query_by_name = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True))
+    state = directory._clean_text(query_by_name.get("address-state"))
+    city = directory._uhc_query_prefix(query_by_name, "address-city") if state else None
+    postal = directory._uhc_query_prefix(query_by_name, "address-postalcode")
+    if not state and not postal:
+        return None
+    for entry in directory._bundle_entries(bundle):
+        resource = entry.get("resource")
+        if not isinstance(resource, dict) or resource.get("resourceType") != "Location":
+            continue
+        address = resource.get("address")
+        address = address if isinstance(address, dict) else {}
+        if state and (directory._clean_text(address.get("state")) or "").casefold() != state.casefold():
+            return "uhc_location_address_state_predicate_rejected"
+        if city and not (directory._clean_text(address.get("city")) or "").casefold().startswith(city.casefold()):
+            return "uhc_location_address_city_predicate_rejected"
+        if postal and not (directory._clean_text(address.get("postalCode")) or "").startswith(postal):
+            return "uhc_location_address_postal_predicate_rejected"
+    return None
+
+
 def unenumerable_residual(directory, source_record, resource_type, start_urls):
     """State what postal partitions cannot reach: rows whose location has no postal code to search by."""
     search_param = POSTAL_SEARCH_PARAMS.get(resource_type)
@@ -52,6 +95,8 @@ def unenumerable_residual(directory, source_record, resource_type, start_urls):
         return None
     if not any(search_param in urllib.parse.parse_qs(urllib.parse.urlsplit(url).query) for url in start_urls):
         return None
+    if resource_type == "Location":
+        return {"unenumerable_residual": "location_outside_known_zip_inventory"}
     # `:missing` is ignored and unfiltered totals clamp at the cap, so this residual cannot be counted or listed.
     return {"unenumerable_residual": "location_without_postal_code"}
 
@@ -359,8 +404,10 @@ def _scans_complete(directory, diagnostics_by_type):
     )
 
 
-async def hydrate_saved_role_links(directory, source_record, resource_type, persist, role_done, *, timeout, run_id):
-    """Fill gaps after one target scan settles, while the role scan still runs."""
+async def hydrate_saved_role_links(
+    directory, source_record, resource_type, persist, role_done, *, timeout, run_id, max_batches=None
+):
+    """Fill missing targets from saved roles while the role scan still runs."""
     from process.provider_directory_generic_source_adapters import missing_saved_role_links
 
     concurrency = max(1, directory._partition_fetch_concurrency() // 8)
@@ -370,11 +417,32 @@ async def hydrate_saved_role_links(directory, source_record, resource_type, pers
     reader = _ReferenceReader(
         directory, source_record, persist, timeout=timeout, run_id=run_id, use_batches=True, concurrency=concurrency
     )
-    for chunk in batched(keys, 2 * concurrency * REFERENCE_BATCH_SIZE.get(resource_type, 1)):
+    batches = batched(keys, 2 * concurrency * REFERENCE_BATCH_SIZE.get(resource_type, 1))
+    for chunk in islice(batches, max_batches):
         if role_done.is_set():
             break
         await reader.read(chunk)
     return reader.written_by_type[resource_type]
+
+
+async def hydrate_before_scan(directory, runner, resource_type, role_done):
+    """Start Location intake with one batch of IDs already known from roles."""
+    if resource_type != "Location" or role_done.is_set() or not directory.is_source_storage_required():
+        return
+    proxy_run = source_proxy.current_run()
+    if not proxy_run or not proxy_run.enabled(runner.source_record):
+        return
+    written = await hydrate_saved_role_links(
+        directory,
+        runner.source_record,
+        resource_type,
+        partial(runner.persist_batch, resource_type),
+        role_done,
+        timeout=runner.options.timeout,
+        run_id=runner.options.run_id,
+        max_batches=1,
+    )
+    runner.count_by_resource[resource_type] += written
 
 
 async def hydrate_after_scan(directory, runner, resource_type, role_done):

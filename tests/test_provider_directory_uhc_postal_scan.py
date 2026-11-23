@@ -94,9 +94,8 @@ def test_uhc_full_zip4_cap_is_exhausted():
     assert importer._is_uhc_role_zip_cap_hit(SOURCE, "PractitionerRole", leaf_url, _bundle(10000))
 
 
-def test_uhc_affiliation_and_location_use_postal_partitions():
+def test_uhc_affiliation_uses_postal_partitions():
     affiliation_urls = importer._partitioned_resource_start_urls(SOURCE, "OrganizationAffiliation", page_count=100)
-    location_urls = importer._partitioned_resource_start_urls(SOURCE, "Location", page_count=100)
     affiliation_children = importer._uhc_adaptive_partition_child_urls(
         SOURCE,
         "OrganizationAffiliation",
@@ -106,10 +105,48 @@ def test_uhc_affiliation_and_location_use_postal_partitions():
 
     assert len(affiliation_urls) == len(importer.UHC_POSTAL_ROOT_ALPHABET)
     assert _query(affiliation_urls[0]) == {"_count": "100", ROLE_PARAM: "0"}
-    assert _query(location_urls[0]) == {"_count": "100", "address-postalcode": "0"}
     assert _query(affiliation_children[0])[ROLE_PARAM] == "82001-0"
     assert importer._uhc_partition_checkpoint_type(SOURCE, "OrganizationAffiliation") is not None
-    assert importer._uhc_partition_identity(SOURCE, "Location", location_urls[0]) == "address-postalcode=0"
+
+
+@pytest.mark.asyncio
+async def test_uhc_location_scan_uses_only_reference_zip_codes(monkeypatch):
+    zip_lookup = AsyncMock(return_value=[("00501",), ("11372",)])
+    partitioned_fetch = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer.db, "all", zip_lookup)
+    monkeypatch.setattr(importer, "_fetch_partitioned_resource_rows", partitioned_fetch)
+
+    await importer._fetch_resource_rows(
+        SOURCE, "Location", per_resource_limit=0, page_limit=0, page_count=100, timeout=3, run_id=None
+    )
+
+    zip_lookup.assert_awaited_once()
+    assert '"geo_zip_lookup"' in zip_lookup.await_args.args[0]
+    assert [_query(url) for url in partitioned_fetch.await_args.args[3]] == [
+        {"_count": "100", "address-postalcode": "00501"},
+        {"_count": "100", "address-postalcode": "11372"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_uhc_location_scan_fails_if_reference_zip_inventory_is_empty(monkeypatch):
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[]))
+
+    with pytest.raises(RuntimeError, match="provider_directory_uhc_location_zip_inventory_empty"):
+        await uhc_scan.location_start_urls(importer, SOURCE, 100)
+
+
+@pytest.mark.asyncio
+async def test_uhc_location_zip_starts_resume_completed_older_prefixes(monkeypatch):
+    monkeypatch.setattr(importer, "_load_partition_checkpoints", AsyncMock(return_value={"address-postalcode=113"}))
+    start_urls = [f"{BASE}/Location?_count=100&address-postalcode={zip_code}" for zip_code in ("11372", "11411")]
+
+    queue, _state = await importer._prepare_partition_fetch(
+        SOURCE, "Location", ProviderDirectoryLocation, start_urls, None
+    )
+
+    assert queue.get_nowait() == start_urls[1]
+    assert queue.empty()
 
 
 def _fake_role_server(location_totals: dict[str, int], fail_once: set[str] | None = None, fail_always=()):
@@ -223,7 +260,10 @@ async def test_uhc_split_children_run_concurrently(monkeypatch):
 async def test_uhc_practitioner_name_cap_is_best_effort_but_postal_cap_fails(monkeypatch):
     async def fetch(_source, url, *, timeout):
         resource_type = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
-        return 200, _bundle(10000, resource_type, "row-1"), None, 1
+        payload = _bundle(10000, resource_type, "row-1")
+        if resource_type == "Location":
+            payload["entry"][0]["resource"]["address"] = {"postalCode": "77030-1234"}
+        return 200, payload, None, 1
 
     async def no_checkpoints(*_args, **_kwargs):
         return set()

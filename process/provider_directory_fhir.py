@@ -3944,29 +3944,9 @@ def _uhc_location_partition_predicate_error(
     url: str,
     bundle_payload: dict[str, Any],
 ) -> str | None:
-    api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    if api_base != UHC_PROVIDER_DIRECTORY_BASE or resource_type != "Location":
-        return None
-    query_by_name = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True))
-    expected_state = _clean_text(query_by_name.get("address-state"))
-    expected_city_prefix = _uhc_query_prefix(query_by_name, "address-city")
-    if not expected_state:
-        return None
-    for entry in _bundle_entries(bundle_payload):
-        resource = entry.get("resource")
-        if not isinstance(resource, dict) or resource.get("resourceType") != "Location":
-            continue
-        address = resource.get("address")
-        if not isinstance(address, dict):
-            return "uhc_location_address_state_predicate_rejected"
-        returned_state = _clean_text(address.get("state"))
-        if not returned_state or returned_state.casefold() != expected_state.casefold():
-            return "uhc_location_address_state_predicate_rejected"
-        if expected_city_prefix:
-            returned_city = _clean_text(address.get("city"))
-            if not returned_city or not returned_city.casefold().startswith(expected_city_prefix.casefold()):
-                return "uhc_location_address_city_predicate_rejected"
-    return None
+    return uhc_scan.location_partition_predicate_error(
+        sys.modules[__name__], source_record, resource_type, url, bundle_payload
+    )
 
 
 def _uhc_exact_partition_entries(
@@ -51517,11 +51497,10 @@ async def _fetch_resource_rows(
             per_resource_limit,
             page_limit,
         )
-        start_urls = _partitioned_resource_start_urls(
-            source_record,
-            resource_type,
-            page_count=page_count,
-        )
+        if resource_type == "Location" and uhc_scan.is_source(sys.modules[__name__], source_record):
+            start_urls = await uhc_scan.location_start_urls(sys.modules[__name__], source_record, page_count)
+        else:
+            start_urls = _partitioned_resource_start_urls(source_record, resource_type, page_count=page_count)
     if not start_urls:
         return None
     checkpoint_context = (
@@ -65389,6 +65368,8 @@ class ResourceGroupScanRunner:
         role_done: asyncio.Event | None,
     ) -> ResourceFetchResult | None:
         """Release the resource slot while its retained cursor waits to retry."""
+        if role_done is not None:
+            await uhc_scan.hydrate_before_scan(sys.modules[__name__], self, resource_type, role_done)
         result = await self.import_one(resource_type, report_start=False, resource_semaphore=resource_semaphore)
         if role_done is not None:
             await uhc_scan.hydrate_after_scan(sys.modules[__name__], self, resource_type, role_done)
