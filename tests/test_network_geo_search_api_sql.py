@@ -222,7 +222,12 @@ def test_imported_search_keeps_eligible_scope_before_score_filter_and_order(monk
         assert sql.index("LIMIT") < sql.index("hydrated_geo AS MATERIALIZED")
         assert relation in remainder
         assert qualified_relation_sql(projection.schema_name, projection.table_name) in sql
-        assert ("WHERE imported.entity_value = native_eligible_geo.npi_code::text" in sql) is required
+        unordered_membership = (
+            "native_eligible_geo.npi_code::text IN (SELECT entity_value FROM custom_import_provider_relation)) IS TRUE"
+        )
+        ranked_membership = "WHERE imported.entity_value = native_eligible_geo.npi_code::text"
+        assert (unordered_membership in sql) is (required and direction is None)
+        assert (ranked_membership in sql) is (required and direction is not None)
         assert ("LEFT JOIN custom_import_provider_relation AS imported" in sql) is (direction is not None)
 
 
