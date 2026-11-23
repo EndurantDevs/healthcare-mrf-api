@@ -167,27 +167,23 @@ _NETWORK_LOOKUP = (
     + _reference_predicate("net", "raw.ref", "'Organization'")
     + " AND net.active IS DISTINCT FROM false OFFSET 0) net ON true"
 )
-_LOCATION_LOOKUP = (
-    "JOIN LATERAL (SELECT loc.resource_id FROM {cells} loc WHERE "
-    + _reference_predicate("loc", "raw.ref", "'Location'")
-    + " AND loc.location_status IS DISTINCT FROM 'inactive' OFFSET 0) loc ON true"
-)
+PAIR_ROLE_PAGE_SIZE = 512
 
 
-def _role_page_sql(first_parameter):
+def _role_page_sql(first_parameter, limit=128):
     """Bound the driving relation before planning the reference joins."""
     return f"""WITH role_page AS MATERIALIZED (
  SELECT * FROM {{cells}}
  WHERE resource_type IN ('PractitionerRole','OrganizationAffiliation')
  AND resource_type=${first_parameter}::text AND resource_type=${first_parameter + 2}::text
  AND resource_id>${first_parameter + 1}::text AND resource_id<=${first_parameter + 3}::text
- ORDER BY resource_id LIMIT 128
+ ORDER BY resource_id LIMIT {limit}
 )
 """
 
 
 PAIR_SQL = (
-    _role_page_sql(3)
+    _role_page_sql(3, PAIR_ROLE_PAGE_SIZE)
     + """SELECT nr.resource_id,'npi'::text,p.npi,l.site_id,a.address_key,a.canonical_identity,
 r.resource_type,r.resource_id,l.resource_id,
 CASE WHEN r.resource_type='OrganizationAffiliation' THEN 'affiliation_network_participant_location'
@@ -199,11 +195,11 @@ JOIN LATERAL (SELECT net.resource_id,count(*)::bigint multiplicity FROM unnest(r
  """
     + _NETWORK_LOOKUP
     + """ GROUP BY net.resource_id) nr ON true
-JOIN LATERAL (SELECT loc.resource_id,count(*)::bigint multiplicity FROM unnest(r.location_refs) raw(ref)
- """
-    + _LOCATION_LOOKUP
-    + """ GROUP BY loc.resource_id) lr ON true
-JOIN LATERAL (SELECT * FROM {cells} l WHERE l.resource_type='Location' AND l.resource_id=lr.resource_id OFFSET 0) l ON true
+JOIN LATERAL (SELECT """
+    + reference_sql("raw.ref")
+    + """ COLLATE "C" AS ref,count(*)::bigint multiplicity FROM unnest(r.location_refs) raw(ref) GROUP BY 1) lr ON true
+JOIN LATERAL (SELECT * FROM {cells} l WHERE l.resource_type='Location' AND l.resource_id=split_part(lr.ref,'/',2)
+ AND lr.ref=l.resource_type||'/'||l.resource_id AND l.location_status IS DISTINCT FROM 'inactive' OFFSET 0) l ON true
 JOIN LATERAL (SELECT * FROM {addresses} a WHERE """
     + _ADDRESS_JOIN
     + """ OFFSET 0) a ON true
@@ -223,7 +219,7 @@ CHECKER_DDL = """resource_type text COLLATE "C" NOT NULL,resource_id text COLLAT
 network_ids text[] NOT NULL,location_ids text[] NOT NULL,eligible boolean NOT NULL,valid_npi boolean NOT NULL,
 PRIMARY KEY(resource_type,resource_id)"""
 CHECKER_PAIR_SQL = (
-    _role_page_sql(1)
+    _role_page_sql(1, PAIR_ROLE_PAGE_SIZE)
     + """SELECT net.resource_id,'npi'::text,p.npi,l.site_id,a.address_key,a.canonical_identity,
 r.resource_type,r.resource_id,l.resource_id,
 CASE WHEN r.resource_type='OrganizationAffiliation' THEN 'affiliation_network_participant_location'
@@ -289,6 +285,6 @@ _CHECKER_PLAN_TIER_NETWORK = """JOIN LATERAL (
 ) net ON true"""
 if CHECKER_PAIR_SQL.count(_CHECKER_NETWORK) != 1 or CHECKER_PAIR_SQL.count("AND nx.eligible") != 1:
     raise ValueError("registry_fhir_typed_network_template_invalid")
-PLAN_TIER_CHECKER_PAIR_SQL = CHECKER_PAIR_SQL.replace(_CHECKER_NETWORK, _CHECKER_PLAN_TIER_NETWORK).replace(
-    "AND nx.eligible", ""
+PLAN_TIER_CHECKER_PAIR_SQL = CHECKER_PAIR_SQL.replace("AND nx.eligible", "").replace(
+    _CHECKER_NETWORK, _CHECKER_PLAN_TIER_NETWORK
 )

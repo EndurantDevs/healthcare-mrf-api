@@ -132,6 +132,28 @@ async def test_canonical_plan_tier_maps_exact_provider_office_and_independent_ch
 
 
 @pytest.mark.asyncio
+async def test_plan_tier_checker_rejects_inactive_organization_network(native_connection):
+    source_rows = plan_tier_rows(1, "dataset-one")
+    for row in source_rows:
+        if row["resource_type"] == "PractitionerRole":
+            row["payload_json"]["network_refs"] = ["Organization/current", "Organization/inactive"]
+    for identity in ("current", "inactive"):
+        source_rows.append(
+            {
+                "resource_type": "Organization",
+                "resource_id": identity,
+                "payload_json": {"active": identity == "current"},
+                "payload_hash": "a" * 64,
+            }
+        )
+    for checker in (False, True):
+        async with typed._workspace(native_connection) as stage:
+            await _project(native_connection, stage, source_rows, checker=checker)
+            keys = await native_connection.fetch("SELECT network_source_key FROM " + stage.relation("pairs"))
+            assert sorted(row["network_source_key"] for row in keys) == [source_key(tier_document()), "current"]
+
+
+@pytest.mark.asyncio
 async def test_provider_only_tier_is_retained_and_legacy_v3_stays_unchanged(native_connection):
     connection = native_connection
     source_rows = plan_tier_rows(1, "dataset-one")
