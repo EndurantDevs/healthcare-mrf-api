@@ -16,6 +16,7 @@ import pytest
 
 from process import provider_directory_generic_source_policy as policy_module
 from process import provider_directory_generic_source_storage as storage
+from process import provider_directory_source_failure_control as failure_control
 from process import provider_directory_source_storage_binding as binding
 from process import provider_directory_timestamp_recovery as timestamp_recovery
 from process.provider_directory_generic_candidate import GenericCandidateError
@@ -1701,6 +1702,110 @@ async def test_bulk_transition_requires_the_complete_unchanged_census(bulk_case,
     with pytest.raises(GenericCandidateError, match=rf"^provider_directory_generic_source_{expected_error}$"):
         await _transition(bulk_case, expected_counts_by_resource)
     assert bulk_case.writes == []
+
+
+@pytest.mark.asyncio
+async def test_unstarted_named_root_rearms_and_replays_the_same_candidate(unstarted_named_root):
+    """Rearm the stopped root while retaining the exact named tables and lineage."""
+    candidate = deepcopy(unstarted_named_root.header["candidate_storage_json"])
+    counts_by_resource = {"Organization": 0}
+    result = await _transition(unstarted_named_root, counts_by_resource, stopped_run_id=ROOT)
+    assert result["rows"] == 0 and result["lineage_run_ids"] == [ROOT]
+    assert result["already_applied"] is False
+    assert unstarted_named_root.header["status"] == "acquiring"
+    assert unstarted_named_root.header["candidate_storage_json"] == candidate
+    replay = await _transition(unstarted_named_root, counts_by_resource, stopped_run_id=ROOT, manifest_replay=True)
+    assert replay == {**result, "already_applied": True}
+
+
+@pytest.fixture
+def unstarted_named_root(case):
+    """Model a named candidate whose first worker stopped before initial paging."""
+    candidate = binding.named_source_document(case.header["candidate_storage_json"])
+    candidate.update(contract=storage.NAMED_ISOLATED_CONTRACT, resets={"*": 0})
+    candidate["identity"]["metadata"]["source_ids"] = ["example-source"]
+    case.header.update(
+        status="failed",
+        import_run_id=ROOT,
+        resource_count=0,
+        candidate_storage_json=candidate,
+        publication_metadata_json={**candidate["identity"]["metadata"], "error": "startup_failed"},
+    )
+    case.runs.pop(0)
+    case.runs[0].update(source_ids=["example-source"], root_run_id=None)
+    case.checkpoints.clear()
+    case.input_rows.clear()
+    return case
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drift", "error"),
+    [
+        ("ordinal", "transition_checkpoint_changed"),
+        ("missing_count", "transition_checkpoint_changed"),
+        ("row", "transition_input_changed"),
+        ("witness", "transition_witness_changed"),
+        ("canceled", "transition_checkpoint_changed"),
+    ],
+)
+async def test_unstarted_named_root_rejects_retained_data_or_unproven_failure(unstarted_named_root, drift, error):
+    """Reject inconsistent empty evidence before making the candidate runnable."""
+    if drift == "ordinal":
+        unstarted_named_root.header["candidate_storage_json"]["ordinal"] = 1
+    elif drift == "missing_count":
+        del unstarted_named_root.header["resource_count"]
+    elif drift == "row":
+        unstarted_named_root.input_rows.append(
+            dict(dataset_id=DATASET, resource_type="Organization", total=1, active=0)
+        )
+    elif drift == "witness":
+        unstarted_named_root.connection.fetchval.side_effect = lambda sql, *_: (
+            "serializable"
+            if sql == "SHOW transaction_isolation"
+            else "provider_directory_dataset_proof_shard" not in sql
+        )
+    else:
+        unstarted_named_root.runs[0]["status"] = "canceled"
+    with pytest.raises(GenericCandidateError, match=error):
+        await _transition(unstarted_named_root, {"Organization": 0}, stopped_run_id=ROOT)
+    assert unstarted_named_root.writes == []
+
+
+@pytest.mark.asyncio
+async def test_rearmed_named_root_is_adopted_only_while_its_storage_stays_empty(unstarted_named_root, monkeypatch):
+    """Check the worker's empty-orphan path against the same retained table group."""
+    case = unstarted_named_root
+    await _transition(case, {"Organization": 0}, stopped_run_id=ROOT)
+    document = case.header["candidate_storage_json"]
+    publisher = SimpleNamespace(
+        connection=case.connection,
+        policy=case.policy,
+        storage_binding=binding.NamedFHIRSourceStorage(**document["storage"]),
+    )
+    monkeypatch.setattr(storage, "source_owner_transaction", lambda _database: nullcontext(publisher))
+    monkeypatch.setattr(policy_module, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(storage, "_require_candidate_storage", lambda *_args: publisher.storage_binding)
+    directory = SimpleNamespace(
+        ENDPOINT_DATASET_ACQUIRING="acquiring",
+        db=object(),
+        _endpoint_dataset_candidate_metadata=lambda _candidate: document["identity"]["metadata"],
+    )
+    candidate = SimpleNamespace(
+        dataset_id=DATASET,
+        endpoint_id=ENDPOINT,
+        acquisition_root_run_id=ROOT,
+        selected_resources=("Organization",),
+        checkpoint_context=SimpleNamespace(
+            acquisition_root_run_id=ROOT, retry_of_run_id=ROOT, require_retained_vsp_capture=False
+        ),
+        repair_empty_orphan=True,
+    )
+    assert await failure_control.orphan_candidate_status(directory, case.header, candidate) == ("acquiring", True)
+    case.checkpoints.append({"resource_type": "Organization"})
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await failure_control.orphan_candidate_status(directory, case.header, candidate)
+    assert len(case.writes) == 1
 
 
 @pytest.mark.asyncio

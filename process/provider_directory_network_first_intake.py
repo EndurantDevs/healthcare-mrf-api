@@ -6,9 +6,7 @@ from dataclasses import dataclass
 
 from process import provider_directory_affiliation_hydration as hydration
 from process import provider_directory_network_traversal as traversal
-from process.provider_directory_generic_source_policy import current_source_storage_binding
 from process.provider_directory_network_first_store import GraphStore, require
-from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 RESOURCE_TYPES = ("Organization", "OrganizationAffiliation")
 CONCURRENCY = 8
@@ -76,8 +74,7 @@ class _GraphIntake:
         self.progress_callback, self.cancel_check = progress_callback, cancel_check
         self.context = source_record.get("_pagination_checkpoint_context")
         require(
-            isinstance(current_source_storage_binding(), NamedFHIRSourceStorage)
-            and directory._has_bound_resource_scan_checkpoint(source_record, self.context)
+            directory._has_bound_resource_scan_checkpoint(source_record, self.context)
             and self.context is not None
             and self.context.dataset_id == source_record.get("_endpoint_dataset_id")
             and self.context.acquisition_root_run_id

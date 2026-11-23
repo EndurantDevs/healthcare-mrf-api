@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session, source_transaction
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 
 def require(condition, code):
@@ -39,6 +40,7 @@ class GraphStore:
         """Open one candidate-owned transaction for rows and their work cursor."""
         async with source_transaction(self.directory.db):
             publisher = bound_publisher()
+            require(isinstance(publisher.storage_binding, NamedFHIRSourceStorage), "prepared_candidate_required")
             self.connection = publisher.connection
             self.schema = publisher.policy.schema
             self.policy = publisher.policy

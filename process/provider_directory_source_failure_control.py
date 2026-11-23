@@ -35,6 +35,11 @@ async def orphan_candidate_status(directory, existing_by_field, candidate):
         return directory.ENDPOINT_DATASET_ACQUIRING, await storage.has_empty_isolated_vsp_storage(
             directory, candidate, existing_by_field
         )
+    run_id = existing_by_field.get("import_run_id")
+    if checkpoint and run_id and run_id == checkpoint.retry_of_run_id == checkpoint.acquisition_root_run_id:
+        return directory.ENDPOINT_DATASET_ACQUIRING, await storage.has_empty_named_root_storage(
+            directory, candidate, existing_by_field
+        )
     return directory.ENDPOINT_DATASET_ACQUIRING, False
 
 
