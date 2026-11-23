@@ -7,6 +7,7 @@ from typing import Any
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_source_policy as source
+from process import provider_directory_uhc_scan as uhc_scan
 from process.provider_directory_fetch_types import PartitionFetchState
 from process.provider_directory_generic_source_storage import _close_grants, _require
 from process.provider_directory_source_checkpoint_control import source_checkpoint_transaction
@@ -118,6 +119,10 @@ async def prepare_fetch(
         ) = await completed_partitions(
             directory.db, directory._schema(), state.postal_checkpoint_context, checkpoint_type
         )
+        if resource_type == "PractitionerRole" and state.postal_checkpoint_context.retry_of_run_id:
+            start_urls = _retained_role_starts(
+                directory, source_record, start_urls, state.completed_partition_identities
+            )
     for request_url in start_urls:
         partition_identity = directory._uhc_partition_identity(
             source_record,
@@ -127,6 +132,36 @@ async def prepare_fetch(
         if not _partition_already_covered(resource_type, partition_identity, state.completed_partition_identities):
             start_url_queue.put_nowait(request_url)
     return start_url_queue, state
+
+
+def _retained_role_starts(directory, source_record, start_urls, completed):
+    """Reuse numeric ancestors established by completed leaves before ZIP+4 descent."""
+    split_prefixes = {
+        leaf[:length]
+        for leaf in completed
+        if 2 <= len(leaf) <= 5 and leaf.isascii() and leaf.isdigit()
+        for length in range(1, len(leaf))
+    }
+    if not split_prefixes:
+        return start_urls
+    search_param = uhc_scan.POSTAL_SEARCH_PARAMS["PractitionerRole"]
+    pending_urls = list(reversed(start_urls))
+    zip_starts, other_starts = [], []
+    while pending_urls:
+        url = pending_urls.pop()
+        prefix = directory._uhc_role_postal_prefix(source_record, "PractitionerRole", url)
+        if prefix in completed:
+            continue
+        if prefix in split_prefixes:
+            pending_urls.extend(
+                directory._url_with_replaced_query_item(url, search_param, child)
+                for child in reversed(uhc_scan.postal_child_prefixes(prefix))
+            )
+        elif prefix and len(prefix) == 5 and prefix.isascii() and prefix.isdigit():
+            zip_starts.append(url)
+        else:
+            other_starts.append(url)
+    return zip_starts + other_starts
 
 
 def _partition_already_covered(resource_type, identity, completed):
