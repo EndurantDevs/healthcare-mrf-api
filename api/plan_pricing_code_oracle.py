@@ -48,8 +48,8 @@ async def _equal(session, left, right):
         raise ValueError("code calibration independent input multiset differs")
 
 
-async def require_budget(session, schema=None):
-    """Measure only this run's temporary/native stage, never alter unrelated resources."""
+async def require_budget(session, schema=None, *, reserve_bytes=0):
+    """Measure this run's temporary/native stage and reserve space for pending writes."""
     size = int(
         await session.scalar(
             text("""SELECT coalesce(sum(pg_total_relation_size(c.oid)),0)
@@ -60,7 +60,7 @@ async def require_budget(session, schema=None):
             {"schema": schema},
         )
     )
-    if size > MAX_CALIBRATION_BYTES:
+    if size + reserve_bytes > MAX_CALIBRATION_BYTES:
         raise ValueError("code calibration candidate byte budget exceeded")
     return size
 
@@ -98,6 +98,18 @@ class CodeInputOracle:
         )
         for cell in self.identity["scope"]["geo_cells"]:
             await self._cell(serving, projection, cell)
+        self.membership_count = int(await self.session.scalar(text("SELECT count(*) FROM code_calibration_members")))
+        block_size = int(await self.session.scalar(text("SELECT current_setting('block_size')::integer")))
+        # Allow 64 bytes per short ZIP/bigint key, plus eight pages for fixed B-tree overhead.
+        index_bytes = 64 * (self.work["raw_address"] + self.membership_count) + 8 * block_size
+        await require_budget(self.session, reserve_bytes=index_bytes)
+        # Each grouped comparison reads one cell and one batch from the complete census.
+        await self.session.execute(text("CREATE INDEX ON code_calibration_raw(geo_cell,npi)"))
+        await self.session.execute(text("CREATE INDEX ON code_calibration_members(npi)"))
+        await require_budget(self.session)
+        await self.session.execute(
+            text("ANALYZE code_calibration_raw,code_calibration_members,code_calibration_batches")
+        )
         await self._finish_counts()
         return {
             "raw_address": max(1, self.work["raw_address"]),
@@ -208,7 +220,6 @@ class CodeInputOracle:
                 text(f"SELECT count(*) FROM code_calibration_raw raw WHERE {matched} AND oracle_evidence IS NOT NULL")
             )
         )
-        self.membership_count = int(await self.session.scalar(text("SELECT count(*) FROM code_calibration_members")))
         self.member_cell_count = int(
             await self.session.scalar(
                 text("""SELECT count(*) FROM

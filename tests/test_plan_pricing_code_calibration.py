@@ -341,6 +341,21 @@ async def test_oracle_refuses_candidate_bytes_before_copying_raw_input():
 
 
 @pytest.mark.asyncio
+async def test_oracle_reserves_index_space_before_creating_indexes():
+    from api import plan_pricing_code_oracle as oracle_module
+
+    session = SimpleNamespace(
+        scalar=AsyncMock(side_effect=[2, 8192, oracle_module.MAX_CALIBRATION_BYTES - 65536]),
+        execute=AsyncMock(),
+    )
+    oracle = oracle_module.CodeInputOracle(session, {"scope": {"geo_cells": []}}, [])
+    with pytest.raises(ValueError, match="candidate byte budget"):
+        await oracle.prepare()
+    assert len(session.execute.await_args_list) == 4
+    assert all(str(call.args[0]).startswith("CREATE TEMP TABLE") for call in session.execute.await_args_list)
+
+
+@pytest.mark.asyncio
 async def test_oracle_membership_budget_preserves_measured_work_without_writing():
     from api import plan_pricing_code_oracle as oracle_module
 
