@@ -17,6 +17,7 @@ from sqlalchemy.exc import DBAPIError
 
 from db.models.custom_import import (
     CustomImportBuildAttempt,
+    CustomImportCapture,
     CustomImportCaptureBundle,
     CustomImportCurrentGeneration,
     CustomImportExecution,
@@ -29,9 +30,14 @@ from db.models.custom_import import (
 from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import snowflake_candidate
 from process.custom_import import snowflake_segmented_runner as runner
-from process.custom_import.definition import CustomImportDefinition, canonical_json
+from process.custom_import.definition import (
+    ROOT_BOOLEAN_TRUE_STORAGE_PROFILE,
+    ROOTED_CHILD_TEXT_STORAGE_PROFILE,
+    CustomImportDefinition,
+    canonical_json,
+)
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
-from process.custom_import.publication import rollback_generation
+from process.custom_import.publication import activate_generation, rollback_generation
 from process.custom_import.read_core import (
     CustomImportReadAuthorizationError,
     CustomImportReadService,
@@ -42,7 +48,14 @@ from process.custom_import.read_core import (
     SearchRequest,
 )
 from process.custom_import.registration_authority import mint_registration_authority, register_with_authority
-from process.custom_import.snowflake_binding import SOURCE_BINDING_V2_CONTRACT, SnowflakeSourceBinding
+from process.custom_import.retained_profile_replay import run_retained_profile_replay
+from process.custom_import.runner_registry import load_current_pointer
+from process.custom_import.runner_types import CandidateRunnerError
+from process.custom_import.snowflake_binding import (
+    SOURCE_BINDING_V2_CONTRACT,
+    RetainedProfileBase,
+    SnowflakeSourceBinding,
+)
 from process.custom_import.snowflake_candidate import SnowflakeBundleCandidateRequest
 from process.custom_import.snowflake_source_binding import (
     load_snowflake_source_binding,
@@ -98,19 +111,19 @@ def _binding(statement, policy):
     )
 
 
-async def _registered_runtime(case, monkeypatch, *, child_text=False, rooted_text=False):
+async def _registered_runtime(case, monkeypatch, *, child_text=False, storage_profile=None, retained_base=None):
     policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16 if child_text else 8, 65_536, 2000, 120, 300))
     connector, bundle, adapter, cursor, connection = _runtime(
         monkeypatch, _ROWS, partition_rows=1, processing_policy=policy
     )
     monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
     definition = _read_definition(bundle.definition) if child_text else bundle.definition
-    if rooted_text:
+    if storage_profile is not None:
         document = json.loads(definition.canonical)
         document["revision"]["definition"] += 1
-        document["storage_profile"] = "rooted_child_text_v1"
+        document["storage_profile"] = storage_profile
         definition = CustomImportDefinition.from_mapping(document, previous=definition)
-    if child_text or rooted_text:
+    if child_text or storage_profile is not None:
         bundle = connector.prepare_request(
             definition,
             bindings=bundle.bindings,
@@ -118,8 +131,10 @@ async def _registered_runtime(case, monkeypatch, *, child_text=False, rooted_tex
             processing_policy=policy,
         )
     binding = _binding(connector.build_statement(bundle), policy)
+    if retained_base is not None:
+        binding = replace(binding, retained_profile_base=retained_base)
     dataset_key = "synthetic_segmented_runner"
-    if rooted_text:
+    if storage_profile is not None:
         registered = await _register_profile(case, monkeypatch, dataset_key, bundle.definition, binding)
     else:
         async with case.sessions() as session, session.begin():
@@ -132,7 +147,7 @@ async def _registered_runtime(case, monkeypatch, *, child_text=False, rooted_tex
         schema_revision_id=registered.schema_revision_id,
         definition=bundle.definition,
         bundle_request=bundle,
-        idempotency_key="synthetic-rooted-text-run" if rooted_text else "synthetic-segmented-run",
+        idempotency_key=f"synthetic-{storage_profile}-run" if storage_profile else "synthetic-segmented-run",
         lease_token=b"synthetic-segmented-owner",
         source_binding_revision_id=registered.source_binding_revision_id,
         source_binding_sha256=registered.source_binding_sha256,
@@ -263,6 +278,7 @@ async def _install_storage_profile_fixture(case):
             "20261114010000_custom_import_snapshot_names",
             "20261114020000_custom_import_snapshot_metadata",
             "20261121050000_custom_import_rooted_text",
+            "20261123182000_custom_import_root_boolean_index",
         ):
             await connection.run_sync(_install_snapshot_revision, case.schema_name, revision)
         await connection.run_sync(CustomImportRegistrationAuthority.__table__.create)
@@ -289,7 +305,9 @@ async def _assert_current_child_text_lookups(case, request, generation_id):
                 assert (detail_id.state, detail_id.value) == ("value", key)
 
 
-async def _assert_candidate_index_and_payload_parity(case, baseline_generation_id, candidate_generation_id):
+async def _assert_candidate_index_and_payload_parity(
+    case, baseline_generation_id, candidate_generation_id, index_name, scalar_table, index_shape
+):
     """Check the index on the new family and compare both logical snapshots."""
 
     async with case.sessions() as session, session.begin():
@@ -305,9 +323,7 @@ async def _assert_candidate_index_and_payload_parity(case, baseline_generation_i
         old = snapshot_schema(family_id_by_generation[baseline_generation_id])
         candidate_family_id = family_id_by_generation[candidate_generation_id]
         new = snapshot_schema(candidate_family_id)
-        assert (
-            await session.scalar(text("SELECT to_regclass(:index)"), {"index": f"{old}.{_ROOTED_TEXT_INDEX}"}) is None
-        )
+        assert await session.scalar(text("SELECT to_regclass(:index)"), {"index": f"{old}.{index_name}"}) is None
         shape = (
             await session.execute(
                 text("""
@@ -318,24 +334,10 @@ async def _assert_candidate_index_and_payload_parity(case, baseline_generation_i
                 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam
                 WHERE i.indexrelid=to_regclass(:index) AND i.indrelid=to_regclass(:heap)
                 """),
-                {"index": f"{new}.{_ROOTED_TEXT_INDEX}", "heap": f"{new}.custom_import_child_scalar"},
+                {"index": f"{new}.{index_name}", "heap": f"{new}.{scalar_table}"},
             )
         ).one()
-        assert shape == (
-            5,
-            7,
-            [
-                "schema_revision_id",
-                "collection_slot",
-                "field_slot",
-                "root_record_id",
-                "string_value",
-                "dataset_id",
-                "child_revision_id",
-            ],
-            "value_state='value'ANDstring_valueISNOTNULL",
-            True,
-        )
+        assert shape == index_shape
         for table in ("custom_import_root_revision", "custom_import_child_revision"):
             query = 'SELECT array_agg(canonical_payload ORDER BY canonical_payload) FROM "{}".{}'
             expected = await session.scalar(text(query.format(old, table)))
@@ -344,8 +346,112 @@ async def _assert_candidate_index_and_payload_parity(case, baseline_generation_i
     return old, candidate_family_id
 
 
-async def test_native_storage_profile_builds_on_candidate_and_preserves_rollback(monkeypatch):
-    """Verify the covering index and child text lookups across activation and rollback."""
+async def _profile_source_base(case, baseline):
+    """Capture the exact current source scope for approval on the successor binding."""
+
+    async with case.sessions() as session:
+        generation = await session.get(CustomImportGeneration, baseline.generation_id)
+        capture = await session.get(CustomImportCaptureBundle, generation.capture_bundle_id)
+        return RetainedProfileBase(
+            baseline.generation_id, baseline.publication.committed_pointer_version, capture.manifest_sha256.hex()
+        )
+
+
+async def _replay_profile(case, original_statement, connector, request, baseline):
+    """Build from the parent capture with the successor's registered binding."""
+
+    async with case.sessions() as session:
+        loaded = await load_snowflake_source_binding(
+            session,
+            definition_revision_id=request.definition_revision_id,
+            source_binding_revision_id=request.source_binding_revision_id,
+        )
+        generation = await session.get(CustomImportGeneration, baseline.generation_id)
+        parent_capture_id = generation.capture_bundle_id
+        base = loaded.binding.retained_profile_base
+    args = (case.sessions, loaded, request, connector.build_statement(request.bundle_request))
+
+    def parent_statement(_binding):
+        return original_statement
+
+    with pytest.raises(CandidateRunnerError, match="retained replay base differs from the approved source binding"):
+        wrong = RetainedProfileBase(base.generation_id, base.pointer_version, "0" * 64)
+        await run_retained_profile_replay(*args, base=wrong, parent_statement=parent_statement)
+    unpublished = await run_retained_profile_replay(*args, base=base, parent_statement=parent_statement)
+    assert unpublished.status == "sealed_unpublished"
+    assert unpublished.publication is None
+    recovered = await run_retained_profile_replay(*args, base=base, parent_statement=parent_statement)
+    assert (recovered.status, recovered.execution_id, recovered.generation_id) == (
+        unpublished.status,
+        unpublished.execution_id,
+        unpublished.generation_id,
+    )
+    async with case.sessions() as session:
+        pointer = await load_current_pointer(session, request.dataset_id)
+        assert (pointer.generation_id, pointer.version) == (base.generation_id, base.pointer_version)
+        generation = await session.get(CustomImportGeneration, unpublished.generation_id)
+        assert generation.capture_bundle_id != parent_capture_id
+        manifest = await session.scalar(
+            select(CustomImportCapture.canonical_manifest)
+            .where(CustomImportCapture.capture_bundle_id == generation.capture_bundle_id)
+            .limit(1)
+        )
+        origin = json.loads(manifest)["retained_replay"]
+        assert origin["parent_capture_bundle_id"] == parent_capture_id
+        assert origin["parent_capture_manifest_sha256"] == base.capture_manifest_sha256
+    return unpublished
+
+
+async def _approve_profile_publication(case, request, baseline, candidate):
+    """Apply the ordinary pointer switch after the unpublished proof."""
+
+    if candidate.publication is not None:
+        return candidate.publication
+    async with case.sessions() as session, session.begin():
+        return await activate_generation(
+            session,
+            dataset_id=request.dataset_id,
+            target_generation_id=candidate.generation_id,
+            expected_generation_id=baseline.generation_id,
+            expected_pointer_version=baseline.publication.committed_pointer_version,
+        )
+
+
+@pytest.mark.parametrize(
+    ("storage_profile", "index_name", "scalar_table", "index_shape"),
+    (
+        (
+            ROOT_BOOLEAN_TRUE_STORAGE_PROFILE,
+            "custom_import_root_scalar_true_idx",
+            "custom_import_root_scalar",
+            (2, 2, ["root_revision_id", "field_slot"], "boolean_value", True),
+        ),
+        (
+            ROOTED_CHILD_TEXT_STORAGE_PROFILE,
+            _ROOTED_TEXT_INDEX,
+            "custom_import_child_scalar",
+            (
+                5,
+                7,
+                [
+                    "schema_revision_id",
+                    "collection_slot",
+                    "field_slot",
+                    "root_record_id",
+                    "string_value",
+                    "dataset_id",
+                    "child_revision_id",
+                ],
+                "value_state='value'ANDstring_valueISNOTNULL",
+                True,
+            ),
+        ),
+    ),
+)
+async def test_native_storage_profile_builds_on_candidate_and_preserves_rollback(
+    monkeypatch, storage_profile, index_name, scalar_table, index_shape
+):
+    """Verify the candidate index and query results across activation and rollback."""
 
     async with _source_case() as case:
         await _install_storage_profile_fixture(case)
@@ -354,24 +460,32 @@ async def test_native_storage_profile_builds_on_candidate_and_preserves_rollback
             case.sessions, connector, original, processing_policy=policy
         )
         assert baseline.status == "activated"
+        original_statement = connector.build_statement(original.bundle_request)
         await _assert_current_child_text_lookups(case, original, baseline.generation_id)
+        retained_base = (
+            await _profile_source_base(case, baseline) if storage_profile == ROOT_BOOLEAN_TRUE_STORAGE_PROFILE else None
+        )
         connector, opted_in, policy, _, _ = await _registered_runtime(
-            case, monkeypatch, child_text=True, rooted_text=True
+            case, monkeypatch, child_text=True, storage_profile=storage_profile, retained_base=retained_base
         )
         assert (opted_in.dataset_id, opted_in.schema_revision_id) == (original.dataset_id, original.schema_revision_id)
         assert opted_in.definition_revision_id != original.definition_revision_id
-        candidate = await runner.run_segmented_snowflake_candidate(
-            case.sessions, connector, opted_in, processing_policy=policy
-        )
-        assert candidate.status == "activated"
-        assert candidate.publication.from_generation_id == baseline.generation_id
+        if storage_profile == ROOT_BOOLEAN_TRUE_STORAGE_PROFILE:
+            candidate = await _replay_profile(case, original_statement, connector, opted_in, baseline)
+        else:
+            candidate = await runner.run_segmented_snowflake_candidate(
+                case.sessions, connector, opted_in, processing_policy=policy
+            )
+            assert candidate.status == "activated"
         assert candidate.seal.effective_output_sha256 != baseline.seal.effective_output_sha256
         assert candidate.seal.child_scalar_count == baseline.seal.child_scalar_count == 6
+        old, candidate_family_id = await _assert_candidate_index_and_payload_parity(
+            case, baseline.generation_id, candidate.generation_id, index_name, scalar_table, index_shape
+        )
+        publication = await _approve_profile_publication(case, original, baseline, candidate)
+        assert publication.from_generation_id == baseline.generation_id
         await _assert_current_child_text_lookups(case, opted_in, candidate.generation_id)
 
-        old, candidate_family_id = await _assert_candidate_index_and_payload_parity(
-            case, baseline.generation_id, candidate.generation_id
-        )
         with pytest.raises(DBAPIError, match="custom_import_snapshot_attempt_lost"):
             async with case.sessions() as session, session.begin():
                 await session.execute(text("SET LOCAL statement_timeout='2000ms'"))
@@ -386,14 +500,11 @@ async def test_native_storage_profile_builds_on_candidate_and_preserves_rollback
                 dataset_id=original.dataset_id,
                 target_generation_id=baseline.generation_id,
                 expected_generation_id=candidate.generation_id,
-                expected_pointer_version=candidate.publication.committed_pointer_version,
+                expected_pointer_version=publication.committed_pointer_version,
             )
             assert rollback.to_generation_id == baseline.generation_id
             assert rollback.event_kind == "rolled_back"
-            assert (
-                await session.scalar(text("SELECT to_regclass(:index)"), {"index": f"{old}.{_ROOTED_TEXT_INDEX}"})
-                is None
-            )
+            assert await session.scalar(text("SELECT to_regclass(:index)"), {"index": f"{old}.{index_name}"}) is None
         await _assert_current_child_text_lookups(case, original, baseline.generation_id)
 
 

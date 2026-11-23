@@ -42,6 +42,7 @@ from process.custom_import.snowflake_preflight_schema import normalize_decimal_c
 __all__ = (
     "SNOWFLAKE_SOURCE_BINDING_CONNECTOR",
     "SOURCE_BINDING_CONTRACT",
+    "RetainedProfileBase",
     "SOURCE_BINDING_CONTRACTS",
     "SOURCE_BINDING_V2_CONTRACT",
     "SnowflakeSourceBinding",
@@ -271,6 +272,28 @@ def _validated_processing_policy(policy: object) -> ProcessingPolicy | None:
 
 
 @dataclass(frozen=True)
+class RetainedProfileBase:
+    """Exact serving generation authorized for a source-free profile rebuild."""
+
+    generation_id: int
+    pointer_version: int
+    capture_manifest_sha256: str
+
+    def __post_init__(self):
+        for identifier in (self.generation_id, self.pointer_version):
+            if type(identifier) is not int or not 0 < identifier < 2**63:
+                raise SnowflakeSourceBindingError("retained profile base identifiers are invalid")
+        _sha256(self.capture_manifest_sha256)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> RetainedProfileBase:
+        """Accept the closed replay scope without implicit conversion."""
+
+        keys = frozenset({"generation_id", "pointer_version", "capture_manifest_sha256"})
+        return cls(**_exact_mapping(value, keys))
+
+
+@dataclass(frozen=True)
 class SnowflakeSourceBinding:
     """One immutable connector configuration without credentials or executable input."""
 
@@ -284,6 +307,7 @@ class SnowflakeSourceBinding:
     snapshot_token_mode: str | None = None
     decimal_conversions: Mapping[str, str] | None = None
     entity_limit: int | None = None
+    retained_profile_base: RetainedProfileBase | None = None
     canonical: str = field(init=False)
     digest: str = field(init=False)
 
@@ -330,6 +354,10 @@ class SnowflakeSourceBinding:
             raise SnowflakeSourceBindingError(
                 "statement query identity requires all snapshot token relations to be null"
             )
+        if self.retained_profile_base is not None and (
+            type(self.retained_profile_base) is not RetainedProfileBase or self.processing_policy is None
+        ):
+            raise SnowflakeSourceBindingError("retained profile replay requires a segmented binding")
         canonical = canonical_json(self._document())
         object.__setattr__(self, "canonical", canonical)
         object.__setattr__(
@@ -373,6 +401,10 @@ class SnowflakeSourceBinding:
             keys = keys | {"entity_limit"}
             if mapping["entity_limit"] is None:
                 raise SnowflakeSourceBindingError("source binding entity limit must not be null")
+        retained_profile_base = None
+        if "retained_profile_base" in mapping:
+            keys = keys | {"retained_profile_base"}
+            retained_profile_base = RetainedProfileBase.from_mapping(mapping["retained_profile_base"])
         document = _exact_mapping(mapping, keys)
         if (
             not isinstance(contract, str)
@@ -398,6 +430,7 @@ class SnowflakeSourceBinding:
             snapshot_token_mode=document.get("snapshot_token_mode"),
             decimal_conversions=document.get("decimal_conversions"),
             entity_limit=document.get("entity_limit"),
+            retained_profile_base=retained_profile_base,
         )
 
     def _document(self) -> dict[str, object]:
@@ -439,6 +472,13 @@ class SnowflakeSourceBinding:
             document_by_field["decimal_conversions"] = dict(self.decimal_conversions)
         if self.entity_limit is not None:
             document_by_field["entity_limit"] = self.entity_limit
+        if self.retained_profile_base is not None:
+            base = self.retained_profile_base
+            document_by_field["retained_profile_base"] = {
+                "generation_id": base.generation_id,
+                "pointer_version": base.pointer_version,
+                "capture_manifest_sha256": base.capture_manifest_sha256,
+            }
         return document_by_field
 
     def bundle_components(
@@ -485,6 +525,10 @@ class SnowflakeSourceBinding:
             raise SnowflakeSourceBindingError("source binding definition is invalid")
         if self.definition_sha256 != definition.digest or self.schema_sha256 != definition.schema_digest:
             raise SnowflakeSourceBindingError("source binding definition identity does not match")
+        if self.retained_profile_base is not None and (
+            definition.refresh_mode != "snapshot" or definition.storage_profile is None
+        ):
+            raise SnowflakeSourceBindingError("retained replay requires a snapshot storage profile")
         binding_by_stream = {stream.stream_id: stream for stream in self.streams}
         if set(binding_by_stream) != {stream.stream_id for stream in definition.source_streams}:
             raise SnowflakeSourceBindingError("source binding stream coverage does not match the definition")

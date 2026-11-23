@@ -253,6 +253,20 @@ original current-pointer compare-and-swap; a conflict retains a sealed but
 unpublished candidate. Identical effective output records `no_change` only while
 the original base and pointer version remain current.
 
+### Rebuild for a storage profile
+
+An approved v2 source binding can set `retained_profile_base` for a new
+storage-profile definition. The object requires `generation_id`,
+`pointer_version`, and `capture_manifest_sha256` from the serving generation
+and its sealed capture. Keep the logical schema, source mapping, and
+processing policy unchanged.
+
+Run the ordinary `execute` command with the new definition and binding.
+The worker verifies the original acquisition, replays its sealed parts,
+and returns `sealed_unpublished` with the replacement generation ID.
+Inspect the candidate before switching the pointer with `activate`.
+The preceding generation remains available for `rollback`.
+
 ### Explicit retained-build continuation
 
 Ordinary `resume` replays retained captures under a new claim; it does not adopt

@@ -11,14 +11,17 @@ import json
 import struct
 import threading
 import weakref
+from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from decimal import Decimal
 from io import BytesIO
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process.custom_import import retained_profile_replay as replay
 from process.custom_import import snowflake_capture as capture
 from process.custom_import.capture import CaptureError, capture_stream
 from process.custom_import.capture_limits import CaptureLimits
@@ -32,6 +35,49 @@ from process.custom_import.snowflake_candidate import SnowflakeBundleCandidateRe
 from process.custom_import.snowflake_python import SnowflakeLandingEOF, SnowflakeLandingPart
 from tests.test_custom_import_snowflake_bundle import _Credentials
 from tests.test_custom_import_snowflake_shared_capture import _runtime, _shared_row
+
+
+@pytest.mark.asyncio
+async def test_retained_capture_deadline_interrupts_a_blocked_part(monkeypatch):
+    """Stop the copy when I/O remains blocked and drain that coroutine."""
+
+    @asynccontextmanager
+    async def session():
+        yield SimpleNamespace(begin=transaction)
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    canceled = asyncio.Event()
+
+    async def blocked_copy(*_arguments):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            canceled.set()
+
+    policy = _policy()
+    request = SimpleNamespace(
+        dataset_id=10,
+        definition_revision_id=11,
+        schema_revision_id=12,
+        lease_token=b"synthetic-replay-token",
+        bundle_request=SimpleNamespace(processing_policy=SimpleNamespace(capture=policy)),
+        source_binding_revision_id=13,
+        source_binding_sha256=b"b" * 32,
+    )
+    origin = SimpleNamespace(source_request_sha256=b"r" * 32, statement_sha256=b"s" * 32, snapshot_token="synthetic")
+    grant = SimpleNamespace(execution_id=14, fence=1)
+    monkeypatch.setattr(replay, "_acquisition_deadline", AsyncMock(return_value=monotonic() + 0.03))
+    monkeypatch.setattr(
+        replay, "begin_pending_parquet_bundle", AsyncMock(return_value=SimpleNamespace(capture_bundle_id=15))
+    )
+    monkeypatch.setattr(replay, "_copy_capture_parts", blocked_copy)
+
+    with pytest.raises(TimeoutError):
+        await replay._retained_capture(session, request, origin, grant, b"i" * 32, {}, None)
+    assert canceled.is_set()
 
 
 def _policy(**changes):

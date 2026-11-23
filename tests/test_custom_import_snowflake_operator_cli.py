@@ -731,6 +731,35 @@ def test_operator_cli_runs_the_retained_revision_command(monkeypatch, capsys):
     assert captured_output.out == '{"execution_id":41,"status":"sealed_unpublished"}\n'
 
 
+@pytest.mark.asyncio
+async def test_hosted_execute_uses_registered_replay_scope(monkeypatch):
+    """Select the replay from its approved binding and leave the source credentials unopened."""
+
+    from process.custom_import.snowflake_binding import RetainedProfileBase
+
+    loaded = _configured_loaded_binding()
+    definition_by_name = json.loads(loaded.definition.canonical)
+    definition_by_name["storage_profile"] = "root_boolean_true_v1"
+    definition = CustomImportDefinition.from_mapping(definition_by_name)
+    base = RetainedProfileBase(24, 3, "4" * 64)
+    binding = replace(loaded.binding, definition_sha256=definition.digest, retained_profile_base=base)
+    assert type(binding).from_json(binding.canonical) == binding
+    loaded = replace(
+        loaded, definition=definition, binding=binding, source_binding_sha256=bytes.fromhex(binding.digest)
+    )
+    run = AsyncMock(return_value=CandidateRunResult(status="sealed_unpublished", execution_id=41))
+    credentials = Mock(side_effect=AssertionError("retained replay opened source credentials"))
+    monkeypatch.setattr(operator_cli, "run_retained_profile_replay", run)
+    monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", credentials)
+
+    database = SimpleNamespace(session_factory=Mock())
+    outcome = await operator_cli._execute_loaded_candidate(database, loaded, "synthetic-replay", None)
+    assert outcome.status == "sealed_unpublished"
+    assert run.await_args.args[:2] == (database.session_factory, loaded)
+    assert run.await_args.kwargs["base"] == base
+    credentials.assert_not_called()
+
+
 def test_resume_cli_dispatches_the_exact_retained_identity(monkeypatch, capsys):
     captured_by_key = {}
 
