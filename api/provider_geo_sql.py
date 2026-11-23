@@ -613,9 +613,22 @@ def build_native_nearby_count_sql(
             if nearby.search_provider_facts
             else "COUNT(DISTINCT (a.npi, a.address_key))"
         )
-        return f"""SELECT {total} AS total_count
+        name_scope = name_filter = ""
+        if (
+            nearby.search_provider_facts
+            and nearby.ilike_clause
+            and not _PROVIDER_COLUMN.search(nearby.search_extra_clause)
+        ):
+            # Let the trigram index select names once before matching projected offices.
+            name_scope = f"""WITH matched_npis AS MATERIALIZED (
+    SELECT d.npi FROM mrf.npi AS d WHERE TRUE{nearby.ilike_clause}
+)
+"""
+            name_filter = "\n   AND a.npi IN (SELECT npi FROM matched_npis)"
+            nearby = replace(nearby, ilike_clause="")
+        return f"""{name_scope}SELECT {total} AS total_count
   FROM {nearby.search_table_sql} AS a{_search_npi_source(nearby)[1]}
- WHERE {_search_geo_predicates(nearby, taxonomy_where)}
+ WHERE {_search_geo_predicates(nearby, taxonomy_where)}{name_filter}
    {bbox_clause};"""
     plan_member_sql, filters = legacy_plan or (None, ())
     extra_clause = nearby.extra_clause if plan_member_sql is None else nearby_extra_clauses(filters, None, 0)[0]

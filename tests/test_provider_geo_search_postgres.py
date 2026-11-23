@@ -33,7 +33,9 @@ CREATE TABLE mrf.entity_address_unified (
     location_key varchar(64) PRIMARY KEY, npi bigint, address_key uuid, lat numeric(11,8), long numeric(11,8),
     state_name varchar, type varchar(32), address_precision varchar(32), taxonomy_array integer[], zip5 varchar(5),
     postal_code varchar(20));
-CREATE TABLE mrf.npi (npi bigint PRIMARY KEY, entity_type_code integer, provider_last_name varchar);
+CREATE TABLE mrf.npi (npi bigint PRIMARY KEY, entity_type_code integer, provider_last_name varchar,
+    provider_first_name varchar, provider_organization_name varchar, provider_other_organization_name varchar,
+    do_business_as_text varchar);
 CREATE TABLE mrf.npi_taxonomy (npi bigint, healthcare_provider_taxonomy_code varchar,
     healthcare_provider_primary_taxonomy_switch varchar);
 CREATE TABLE mrf.nucc_taxonomy (code varchar PRIMARY KEY, int_code integer, classification varchar, display_name varchar);
@@ -45,7 +47,8 @@ GRANT USAGE ON SCHEMA mrf TO {reader};
 GRANT SELECT ON mrf.entity_address_unified TO {reader};
 INSERT INTO mrf.nucc_taxonomy VALUES ('207Q00000X', 1, 'Family Medicine', 'Family'),
     ('208D00000X', 2, 'General Practice', 'General'), ('363L00000X', 3, 'Nurse Practitioner', 'NP');
-INSERT INTO mrf.npi SELECT n, 1, 'Provider ' || n FROM generate_series(1, 40) AS n;
+INSERT INTO mrf.npi (npi, entity_type_code, provider_last_name)
+    SELECT n, 1, 'Provider ' || n FROM generate_series(1, 40) AS n;
 INSERT INTO mrf.npi_taxonomy SELECT n, CASE WHEN n % 2 = 0 THEN '207Q00000X' ELSE '363L00000X' END, 'Y'
     FROM generate_series(1, 40) AS n;
 INSERT INTO mrf.npi_taxonomy SELECT n, '208D00000X', 'N' FROM generate_series(1, 40) AS n;
@@ -128,7 +131,7 @@ def _query(search: ProviderGeoSearch | None, **options) -> NearbySqlQuery:
     return NearbySqlQuery(
         taxonomy_conditions=options.get("taxonomy_conditions", "1=1"),
         extra_clause=options.get("extra_clause", ""),
-        ilike_clause="",
+        ilike_clause=options.get("ilike_clause", ""),
         use_taxonomy_filter="taxonomy_conditions" in options,
         primary_only=options.get("primary_only", False),
         address_table_sql="mrf.entity_address_unified",
@@ -207,6 +210,29 @@ async def test_projection_answers_exactly_like_the_address_table(geo_db):
             projected_answers = await _answers(read, search, parameters_by_name, **options)
             assert projected_answers == live_answers, (parameters_by_name, options)
             assert live_answers[0] > 0 or "General Practice" in str(parameters_by_name)
+
+
+@pytest.mark.asyncio
+async def test_named_projection_count_preserves_distinct_offices_and_empty_results(geo_db):
+    """Count matching projected offices with exact name, radius and identity rules."""
+    from api.endpoint.npi import _name_like_clause
+
+    await geo_db.connection.execute("""
+        INSERT INTO mrf.entity_address_unified (location_key, npi, address_key, lat, long, state_name, type)
+        VALUES ('named-second-office', 8, '00000000-0000-0000-0000-000000000101', 41.88, -87.63, 'IL', 'primary'),
+               ('named-outside-radius', 8, '00000000-0000-0000-0000-000000000102', 42.88, -87.63, 'IL', 'primary')
+    """)
+    await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True)
+    options_by_name = {"ilike_clause": "\n AND " + _name_like_clause("d", "q")}
+    async with geo_db.engine.connect() as connection:
+        read = _ReadConnection(connection)
+        search = await _lookup(read)
+        assert search is not None
+        for term, total in (("%provider 8%", 2), ("%no such name%", 0)):
+            parameters_by_name = {**_CHICAGO, "radius": 25.0, "q": term}
+            expected = await _answers(read, None, parameters_by_name, **options_by_name)
+            assert expected[0] == total and len(expected[1]) == total
+            assert await _answers(read, search, parameters_by_name, **options_by_name) == expected
 
 
 @pytest.mark.asyncio
