@@ -178,14 +178,50 @@ async def test_dashboard_failure_logs_redacted_diagnostics(monkeypatch, capsys):
             raise ValueError("registry_source_connection_unavailable") from None
 
     monkeypatch.setattr(registry_network_import, "run_latest_network_import", fail)
-    with pytest.raises(RuntimeError, match="^registry_membership_refresh_worker_failed$"):
+    with pytest.raises(RuntimeError, match="Preparing network rebuild failed") as failure:
         await worker.control_start({}, {"run_id": "run-a"})
+    assert failure.value.control_error_code == "registry_source_connection_unavailable"
+    assert message not in str(failure.value)
     captured = capsys.readouterr()
     assert message not in captured.err
     diagnostic = json.loads(captured.err)
     assert diagnostic["code"] == "worker_failed"
     assert [cause.get("code") for cause in diagnostic["causes"]] == ["registry_source_connection_unavailable", None]
     assert [cause["class"] for cause in diagnostic["causes"]] == ["ValueError", "TimeoutError"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_id", "error", "source_label", "code"),
+    [
+        ("untrusted/path", KeyError("private_key"), "source 2", "registry_network_rebuild_failed"),
+        (
+            "pdfhir_" + "a" * 24,
+            worker.asyncpg.ConfigurationLimitExceededError("private_key"),
+            "pdfhir_" + "a" * 24,
+            "registry_network_database_failed",
+        ),
+    ],
+)
+async def test_graph_progress_keeps_first_safe_failure_after_status_write_error(
+    monkeypatch, source_id, error, source_label, code
+):
+    from process import registry_network_import_progress as progress
+
+    def offline(**_kwargs):
+        raise OSError("private_key")
+
+    monkeypatch.setattr(progress, "write_live_progress", offline)
+    report = progress.NetworkImportProgress(total=3, committed=1, reused=1)
+    with progress.NETWORK_PROGRESS.set(report):
+        await progress.network_import_stage("FHIR graph capture")
+    report.source_failed(1, {"coordinates": {"source_id": source_id}}, error)
+    report.source_failed(2, {"coordinates": {"source_id": "later"}}, ValueError("registry_publication_request_refused"))
+    failure = report.failure([])
+    assert (failure.progress["done"], failure.progress["total"]) == (2, 3)
+    assert failure.progress["denominator_state"] == "unknown"
+    assert failure.control_error_code == code and source_label in str(failure)
+    assert "private_key" not in str(failure) and "later" not in str(failure)
 
 
 @pytest.mark.asyncio

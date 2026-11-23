@@ -300,8 +300,13 @@ async def test_database_keeps_only_completed_capture_after_later_failure(prepare
     monkeypatch.setattr(preparation, "capture_typed_source_graph", capture)
     case.connection = await asyncpg.connect(dsn.replace("postgresql+asyncpg://", "postgresql://"))
     try:
-        with pytest.raises(type(failure)):
+        from process.registry_network_import_progress import NETWORK_PROGRESS, NetworkImportProgress
+
+        report = NetworkImportProgress()
+        with NETWORK_PROGRESS.set(report), pytest.raises(type(failure)):
             await prepare(case)
+        assert (report.committed, report.reused, report.total) == (1, 0, 2)
+        assert report.fields()["counters"] == {"graphs_committed": 1, "graphs_reused": 0}
         assert len(created_schemas) == 2 and not case.connection.is_in_transaction()
         assert await case.connection.fetchval(
             "SELECT array_agg(nspname) FROM pg_namespace WHERE nspname=ANY($1::text[])", created_schemas

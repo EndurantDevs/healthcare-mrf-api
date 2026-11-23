@@ -141,8 +141,11 @@ async def prepare_network_import_catalog(catalog, runtime, cleanup):
     """Reuse the isolated catalogue builder; publish its pointer only with memberships."""
     from process.registry_imported_catalog_preparation import prepare_imported_catalog_snapshot
     from process.registry_imported_source_inventory import current_imported_source_inventory
+    from process.registry_network_import_progress import network_import_stage
 
+    await network_import_stage("Source inventory")
     inventory = await current_imported_source_inventory()
+    await network_import_stage("Catalog preparation")
     pools = []
     for url, maximum in ((catalog.source_url, 1), (catalog.loader_url, 1), (catalog.sealer_url, 2)):
         pools.append(

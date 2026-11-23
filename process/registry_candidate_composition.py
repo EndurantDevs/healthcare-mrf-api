@@ -1148,7 +1148,7 @@ async def compose_registry_membership_candidate(
         writer_roles,
         control_schema,
     )
-    return await _complete_composition(connection, prepared, source_manifest, control_schema)
+    return await _complete_composition(connection, prepared, address_sources.source_witness_runtime, control_schema)
 
 
 async def _compose_fenced_candidate(
@@ -1185,7 +1185,7 @@ async def _compose_fenced_candidate(
         except BaseException as error:
             await _drop_composition_stages(driver, prepared, error)
             raise
-        return await _complete_composition(driver, prepared, source_manifest, control_schema)
+        return await _complete_composition(driver, prepared, address_sources.source_witness_runtime, control_schema)
 
 
 async def _drop_composition_stages(connection, prepared, original_error):
@@ -1220,7 +1220,7 @@ async def _drop_composition_stages(connection, prepared, original_error):
         raise cleanup_error
 
 
-async def _complete_composition(connection, prepared, source_manifest, control_schema):
+async def _complete_composition(connection, prepared, source_witness_runtime, control_schema):
     (
         copy_target,
         address_source,
@@ -1237,7 +1237,9 @@ async def _complete_composition(connection, prepared, source_manifest, control_s
             from process.registry_typed_source_stage import is_typed_source_stage, rebind_typed_producer_stage
 
             if is_typed_source_stage(source_stage):
-                await rebind_typed_producer_stage(connection, source_stage)
+                await rebind_typed_producer_stage(
+                    connection, source_stage, catalog_bindings=getattr(source_witness_runtime, "catalog_bindings", None)
+                )
             candidate = await _locked_candidate(connection, copy_target, _namespace(control_schema))
             if candidate["state"] not in {
                 "open",

@@ -650,13 +650,17 @@ async def control_start(ctx, task):
     )
     config = parse_registry_publication_worker_config(os.environ.get(CONFIG_ENV))
     await raise_if_cancelled(ctx, task)
+    from process.registry_network_import_progress import NETWORK_PROGRESS, NetworkImportProgress
+
+    progress = NetworkImportProgress() if request_id is None else None
     if request_id is None:
         from process.registry_network_import import run_latest_network_import
 
         operation = run_latest_network_import(config, task["run_id"])
     else:
         operation = run_registry_publication_worker(config, membership_refresh_request_id=request_id)
-    work = asyncio.create_task(operation)
+    with NETWORK_PROGRESS.set(progress):
+        work = asyncio.create_task(operation)
     watcher = asyncio.create_task(_watch_control_cancel(ctx, task))
     try:
         await asyncio.wait((work, watcher), return_when=asyncio.FIRST_COMPLETED)
@@ -666,7 +670,10 @@ async def control_start(ctx, task):
     except asyncio.CancelledError, ImportCancelledError:
         raise
     except Exception as error:
-        _error("worker_failed", causes=_failure_causes(error))
+        causes = _failure_causes(error)
+        _error("worker_failed", causes=causes)
+        if progress is not None:
+            raise progress.failure(causes) from None
         raise RuntimeError("registry_membership_refresh_worker_failed") from None
     finally:
         for owned in (work, watcher):
