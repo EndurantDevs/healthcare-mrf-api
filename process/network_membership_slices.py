@@ -15,7 +15,6 @@ SLICE_CONTRACT_VERSION = 1
 OFFICE_BUCKET_COUNT = 64
 _BATCH_ROWS = 4096
 _METADATA_BATCH_ROWS = 256
-_COPY_BYTE_LIMIT = 16 * 1024 * 1024
 _DIGEST_DOMAIN = b"network-office-slice-v1\0"
 
 
@@ -253,49 +252,20 @@ async def _prepared_slice_refs(connection, copy_target, work_table, previous_tab
     return await _prepare_refs(connection, copy_target, work_table, previous_table)
 
 
-async def _copy_changed_edges(connection, copy_target, work_table):
-    from process.network_bootstrap_sources import NetworkBootstrapSourceError, _copy_native_batch
-
-    ref_table = _identifier(copy_target.schema_name) + ".network_slice_ref"
-    await connection.execute(f"ANALYZE {ref_table}")
-    if not await connection.fetchval(
-        f"SELECT EXISTS(SELECT FROM {ref_table} WHERE artifact_candidate_id=$1)", UUID(copy_target.candidate_id)
-    ):
-        return 0
-    last_network, last_bucket, last_key = 0, -1, ""
-    copied_rows = 0
-    while True:
-        work_page = f"""SELECT network_id,office_bucket,location_key FROM {work_table}
-            WHERE (network_id,office_bucket,location_key COLLATE "C")>($2,$3,$4 COLLATE "C")
-            ORDER BY network_id,office_bucket,location_key COLLATE "C" LIMIT {_BATCH_ROWS}"""
-        changed_page = f"""SELECT f.network_id,f.office_bucket,f.location_key,r.slice_id FROM page f
-            JOIN {ref_table} r USING(network_id,office_bucket) WHERE r.artifact_candidate_id=$1"""
-        arguments = (UUID(copy_target.candidate_id), last_network, last_bucket, last_key)
-        bounds = await connection.fetchrow(
-            f"WITH page AS MATERIALIZED ({work_page}) SELECT "
-            f"(SELECT count(*) FROM ({changed_page}) changed) AS row_count,* FROM page "
-            'ORDER BY network_id DESC,office_bucket DESC,location_key COLLATE "C" DESC LIMIT 1',
-            *arguments,
-        )
-        if bounds is None:
-            return copied_rows
-        if bounds["row_count"]:
-            try:
-                await _copy_native_batch(
-                    connection,
-                    f"WITH page AS MATERIALIZED ({work_page}) SELECT slice_id,location_key "
-                    f"FROM ({changed_page}) changed "
-                    'ORDER BY network_id,office_bucket,location_key COLLATE "C"',
-                    arguments,
-                    copy_target.schema_name,
-                    "network_office_edge",
-                    bounds["row_count"],
-                    byte_limit=_COPY_BYTE_LIMIT,
-                )
-            except NetworkBootstrapSourceError as error:
-                raise NetworkMembershipSliceError(str(error)) from error
-        copied_rows += bounds["row_count"]
-        last_network, last_bucket, last_key = bounds["network_id"], bounds["office_bucket"], bounds["location_key"]
+async def _insert_changed_edges(connection, copy_target, work_table):
+    schema = _identifier(copy_target.schema_name)
+    status = await connection.execute(
+        f"""INSERT INTO {schema}.network_office_edge(slice_id,location_key)
+        SELECT ref.slice_id,edge.location_key FROM {schema}.network_slice_ref ref
+        JOIN LATERAL (
+          SELECT fact.location_key FROM {work_table} fact
+          WHERE (fact.network_id,fact.office_bucket)=(ref.network_id,ref.office_bucket)
+          ORDER BY fact.location_key COLLATE "C" OFFSET 0
+        ) edge ON TRUE
+        WHERE ref.artifact_candidate_id=$1""",
+        UUID(copy_target.candidate_id),
+    )
+    return int(status.removeprefix("INSERT 0 "))
 
 
 async def _office_relation(connection, copy_target, address_source, office_sources):
@@ -384,14 +354,14 @@ async def _prepare_slices(
         total_slices, reused_slices = await _prepared_slice_refs(
             connection, copy_target, work_table, previous_table, is_typed
         )
-        copied_rows = await _copy_changed_edges(connection, copy_target, work_table)
+        copied_rows = await _insert_changed_edges(connection, copy_target, work_table)
         counts = await connection.fetchrow(
             "SELECT COALESCE(sum(row_count) FILTER(WHERE artifact_candidate_id=$1),0)::bigint AS changed_rows,"
             f"COALESCE(sum(row_count),0)::bigint AS distinct_memberships FROM {schema}.network_slice_ref",
             UUID(copy_target.candidate_id),
         )
         if copied_rows != counts["changed_rows"]:
-            raise NetworkMembershipSliceError("Changed edge COPY accounting differs")
+            raise NetworkMembershipSliceError("Changed edge insert accounting differs")
         removed_slices = (
             0
             if previous_table is None

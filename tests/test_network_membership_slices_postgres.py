@@ -452,7 +452,10 @@ async def test_bounded_pages_and_statement_count_is_not_per_slice(slice_db, monk
     assert len(db.connection.cursor_requests) == 1
     assert db.connection.cursor_requests[0][1] == {"prefetch": 7}
     assert max(db.connection.ref_page_rows) <= 11
-    assert len(db.connection.edge_copy_queries) == 21
+    assert not db.connection.edge_copy_queries
+    insert_prefix = f'INSERT INTO "{copy_target.schema_name}".network_office_edge'
+    edge_insert_count = sum(query.query.startswith(insert_prefix) for query in queries)
+    assert edge_insert_count == 1
     assert not any("SELECT convert_to(location_key" in query.query for query in queries)
     print(
         {
@@ -460,9 +463,9 @@ async def test_bounded_pages_and_statement_count_is_not_per_slice(slice_db, monk
             "edge_rows": receipt.copied_edge_rows,
             "digest_statements": len(db.connection.cursor_requests),
             "metadata_copy_pages": len(db.connection.ref_page_rows),
-            "edge_copy_batches": len(db.connection.edge_copy_queries),
+            "edge_insert_statements": edge_insert_count,
             "logged_statements": len(queries),
-            "copy_row_bound": slices._BATCH_ROWS,
+            "digest_prefetch_rows": slices._BATCH_ROWS,
         }
     )
 
@@ -488,21 +491,19 @@ async def test_digest_uses_utf8_byte_lengths_and_c_order(slice_db):
 
 
 @pytest.mark.asyncio
-async def test_copy_failure_can_resume_same_candidate(slice_db, monkeypatch):
-    import process.network_bootstrap_sources as bootstrap
-
+async def test_edge_insert_failure_can_resume_same_candidate(slice_db, monkeypatch):
     db = slice_db
     target = await _candidate(db, [(42, 0), (7, 1)])
-    original_copy = bootstrap._copy_native_batch
+    original_insert = slices._insert_changed_edges
 
-    async def fail_after_copy(*arguments, **kwargs):
-        await original_copy(*arguments, **kwargs)
-        raise bootstrap.NetworkBootstrapSourceError("synthetic copy failure")
+    async def fail_after_insert(*arguments, **kwargs):
+        await original_insert(*arguments, **kwargs)
+        raise NetworkMembershipSliceError("synthetic edge insert failure")
 
     async with db.connection.transaction():
         with monkeypatch.context() as patch:
-            patch.setattr(bootstrap, "_copy_native_batch", fail_after_copy)
-            with pytest.raises(NetworkMembershipSliceError, match="synthetic copy failure"):
+            patch.setattr(slices, "_insert_changed_edges", fail_after_insert)
+            with pytest.raises(NetworkMembershipSliceError, match="synthetic edge insert failure"):
                 await _prepare(db, target)
         for name in ("network_slice_ref", "network_office_edge"):
             assert await db.connection.fetchval("SELECT to_regclass($1)", target.schema_name + "." + name) is None
