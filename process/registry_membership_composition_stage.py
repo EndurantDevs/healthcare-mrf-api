@@ -115,15 +115,13 @@ async def build_registry_source_retention(connection, source_stage, command_stag
     if type(command_stage) is not RegistryMembershipCommandStage or not connection.is_in_transaction():
         raise RegistrySourceRetentionError("registry_composition_command_stage_invalid")
     source = _stage_projection(_source_stage_relation(source_stage), stage=source_stage)
-    from process.registry_typed_source_stage import is_typed_source_stage
-
-    materialization = "NOT MATERIALIZED" if is_typed_source_stage(source_stage) else "MATERIALIZED"
-    counts = await connection.fetchrow(f"""WITH source AS {materialization} ({source}),
-      allowed AS ({_allowed_source("source", command_stage)})
-      SELECT (SELECT count(*) FROM source) AS source_rows,
-        (SELECT count(*) FROM source)-(SELECT count(*) FROM allowed) AS suppressed_source_rows,
+    removals = _relation(command_stage.remove_table)
+    counts = await connection.fetchrow(f"""SELECT count(*) AS source_rows,
+        count(removed.network_id) AS suppressed_source_rows,
         (SELECT count(*) FROM {_relation(command_stage.add_table)}) AS add_rows,
-        (SELECT count(*) FROM {_relation(command_stage.remove_table)}) AS remove_rows""")
+        (SELECT count(*) FROM {removals}) AS remove_rows
+      FROM ({source}) staged
+      LEFT JOIN {removals} removed USING(network_id,provider_system,provider_id,location_id)""")
     if (counts["source_rows"], counts["add_rows"], counts["remove_rows"]) != (
         source_stage.membership_rows,
         command_stage.add_rows,

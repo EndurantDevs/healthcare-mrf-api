@@ -147,26 +147,28 @@ async def retain_registry_source_memberships(connection, copy_target, stage, *, 
         source_relation = f'"{copy_target.schema_name}".{SOURCE_TABLE}'
         try:
             await connection.execute(f"LOCK TABLE {source_relation} IN ACCESS EXCLUSIVE MODE")
-            counts = await connection.fetchrow(
-                f"SELECT (SELECT count(*) FROM {source_relation}) AS source_rows,"
-                f"(SELECT count(*) FROM {stage_relation}) AS stage_rows"
-            )
-            if counts["stage_rows"] != receipt["source_rows"]:
-                raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
-            if counts["source_rows"] == 0:
-                from process.registry_typed_membership_parity import create_order_index, is_typed_candidate
+            if await connection.fetchval(f"SELECT EXISTS(SELECT FROM {source_relation})"):
+                if await connection.fetchval(f"SELECT count(*) FROM {stage_relation}") != receipt["source_rows"]:
+                    raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
+                await verify_registry_source_retention_rows(connection, copy_target, candidate, source_stage=stage)
+            else:
+                from process.registry_typed_membership_parity import ORDER, create_order_index, is_typed_candidate
+                from process.registry_typed_source_stage import is_typed_source_stage
 
-                if is_typed_candidate(candidate):
+                has_typed_memberships = is_typed_candidate(candidate)
+                if has_typed_memberships:
                     await create_order_index(connection, source_relation, "typed_source_membership_order_idx")
                     from process.registry_typed_office_parity import create_source_pair_index
 
                     await create_source_pair_index(connection, source_relation)
-                await connection.execute(
-                    f"INSERT INTO {source_relation} {_stage_projection(stage_relation, stage=stage)}"
-                )
-                if is_typed_candidate(candidate):
+                projection = _stage_projection(stage_relation, stage=stage)
+                if has_typed_memberships and is_typed_source_stage(stage):
+                    projection += f" ORDER BY {ORDER}"
+                inserted = await connection.execute(f"INSERT INTO {source_relation} {projection}")
+                if inserted != f"INSERT 0 {receipt['source_rows']}":
+                    raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
+                if has_typed_memberships:
                     await connection.execute(f"ANALYZE {source_relation}")
-            await verify_registry_source_retention_rows(connection, copy_target, candidate, source_stage=stage)
         except asyncpg.PostgresError as error:
             raise RegistrySourceRetentionError("registry_source_retention_source_invalid") from error
         return receipt
