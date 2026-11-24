@@ -205,8 +205,12 @@ def test_geo_score_scope_uses_every_native_provider():
 
 
 @pytest.mark.parametrize("direction", ("asc", "desc"))
-def test_imported_geo_optional_order_keeps_unmatched_native_providers(direction):
-    page_sql = str(_statements(direction=direction).page)
+@pytest.mark.parametrize("has_native_scope", (False, True))
+def test_imported_geo_optional_order_keeps_unmatched_native_providers(direction, has_native_scope):
+    context = replace(_context(direction=direction), has_native_scope=has_native_scope)
+    page_sql = str(geo_sql.build_imported_geo_statements(context, _imported_geo_query()).page)
+    expected_cte = "AS MATERIALIZED (" if has_native_scope else "AS ("
+    assert f"custom_import_provider_relation {expected_cte}" in page_sql
     assert "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported" not in page_sql
     assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
     assert "WHERE imported.entity_value IS NOT NULL" not in page_sql

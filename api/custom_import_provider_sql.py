@@ -37,6 +37,7 @@ class ProviderImportQuery:
     compiled: CompiledNpiEntityRelation
     require_match: bool
     native_npis: tuple[int, ...] | None = None
+    has_native_scope: bool = False
 
     def __post_init__(self):
         # The normalized grouped plan owns membership for native composition.
