@@ -871,12 +871,14 @@ async def _source_route_lineage(connection, root_run_id):
     from db.plan_release_storage import storage_relation
 
     run_relation = storage_relation(str(ImportRun.__table__.schema), "import_run")
+    # A killed worker can leave its transport audit in the last progress update.
+    transport_audit = "COALESCE(metrics->'audit',metrics)->'source_http_proxy'"
     return await connection.all(
         text(
             "SELECT run_id,importer,status,retry_of_run_id,params,started_at,finished_at,phase_detail,"
             "metrics->'cancel_signal' AS cancel_signal,COALESCE(metrics->'audit',metrics) AS source_audit,"
-            "metrics->'audit'->'source_http_proxy'->'binding' AS source_http_proxy_binding,"
-            "metrics->'audit'->'source_http_proxy'->'cooldowns' AS source_http_proxy_cooldowns FROM "
+            f"{transport_audit}->'binding' AS source_http_proxy_binding,"
+            f"{transport_audit}->'cooldowns' AS source_http_proxy_cooldowns FROM "
             + run_relation
             + " WHERE importer='provider-directory-fhir' AND "
             "(run_id=:root OR params::jsonb->>'provider_directory_pagination_root_run_id'=:root) LIMIT 65"
