@@ -31,6 +31,7 @@ from process.network_bootstrap_sources import (
 from process.network_custom_address_source import (
     NetworkCustomAddressSourceError,
     NetworkCustomAddressUnresolved,
+    _approved_identity,
     prepare_custom_address_source,
     verify_custom_address_source,
 )
@@ -566,12 +567,19 @@ async def test_runtime_role_cannot_write_or_replace(custom_db):
         await fixture.connection.execute("RESET ROLE")
 
 
-async def test_directory_custom_site_is_explicitly_unresolved(custom_db):
+@pytest.mark.parametrize(
+    ("field", "value"), [("provider_system", "provider_directory"), ("provider_system", None), ("provider_id", None)]
+)
+async def test_invalid_custom_pair_is_unresolved(custom_db, field, value):
     fixture = custom_db
     seed = await _seed(fixture)
     await fixture.connection.execute(
-        f"UPDATE \"{fixture.control_schema}\".registry_approved_record SET record_json=jsonb_set(record_json,'{{memberships_json,0,provider_system}}','\"provider_directory\"') WHERE record_kind='membership' AND approved_revision=$1",
+        f"""UPDATE "{fixture.control_schema}".registry_approved_record
+            SET record_json=jsonb_set(record_json,ARRAY['memberships_json','0',$2::text],$3::jsonb)
+            WHERE record_kind='membership' AND approved_revision=$1""",
         seed.revision,
+        field,
+        json.dumps(value),
     )
     arguments = _arguments(fixture, seed.revision)
     with pytest.raises(NetworkCustomAddressUnresolved):
@@ -582,6 +590,43 @@ async def test_directory_custom_site_is_explicitly_unresolved(custom_db):
         )
         is None
     )
+
+
+async def test_retained_bindings_need_one_exact_match(serving_schema):
+    connection, schema, _ = serving_schema
+    control = f'"{schema}"'
+    member_by_field = {
+        "provider_system": "provider_directory",
+        "provider_id": "1000000004",
+        "location_id": str(UUID(int=0xAB)),
+    }
+    members = [
+        member_by_field,
+        {**member_by_field, "provider_system": "npi"},
+        {**member_by_field, "provider_id": "another-provider"},
+        {**member_by_field, "location_id": str(UUID(int=0xCD))},
+    ]
+    last = members[-1]
+    insert = f"""INSERT INTO {control}.registry_approved_record
+        (approved_revision,record_kind,record_key,record_revision,custom_revision,record_json) VALUES(7,$1,$2,1,1,$3)"""
+    await connection.execute(insert, "membership", "head", json.dumps({"archived": False, "memberships_json": members}))
+    bindings = [*members[:-1], {**last, "location_id": last["location_id"].upper()}, {**last, "archived": True}]
+    await connection.executemany(
+        insert,
+        [
+            ("site_binding", str(index), json.dumps({"archived": False, **binding}))
+            for index, binding in enumerate(bindings)
+        ],
+    )
+    with pytest.raises(NetworkCustomAddressUnresolved):
+        await _approved_identity(connection, control, 7, retained=True)
+    active = json.dumps({"archived": False, **last})
+    await connection.execute(insert, "site_binding", "exact", active)
+    summary = await _approved_identity(connection, control, 7, retained=True)
+    assert (summary["pairs"], summary["npi_pairs"], summary["unresolved"]) == (4, 0, 0)
+    await connection.execute(insert, "site_binding", "duplicate", active)
+    with pytest.raises(NetworkCustomAddressUnresolved):
+        await _approved_identity(connection, control, 7, retained=True)
 
 
 async def test_isolation_and_revision_are_explicit(custom_db):

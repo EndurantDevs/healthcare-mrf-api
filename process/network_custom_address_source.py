@@ -114,16 +114,21 @@ _APPROVED_CTE = """WITH approved AS NOT MATERIALIZED (
    AND record_kind IN ('provider','location','membership','site_binding')
 ), pairs AS MATERIALIZED (
  SELECT DISTINCT member.provider_system,member.provider_id,member.location_id
+ -- Keep unrelated or archived payloads safe to evaluate before the membership filter.
  FROM approved head CROSS JOIN LATERAL jsonb_to_recordset(
    CASE WHEN head.record_kind='membership' AND head.record_json->'archived'='false'::jsonb
      THEN head.record_json->'memberships_json' ELSE '[]'::jsonb END)
    AS member(network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text,operation text)
- WHERE coalesce(member.operation,'add')='add'
-), custom AS MATERIALIZED (
- SELECT pair.*,location.record_json AS site,provider.record_json AS provider,
-   encode(sha256(convert_to(jsonb_build_array('network_custom',pair.provider_system,pair.provider_id,pair.location_id)::text,'UTF8')),'hex') AS location_key
- FROM pairs pair JOIN approved location ON location.record_kind='location' AND location.record_key=pair.location_id::text
+ WHERE head.record_kind='membership' AND head.record_json->'archived'='false'::jsonb
+   AND coalesce(member.operation,'add')='add'
+), approved_offices AS NOT MATERIALIZED (
+ SELECT pair.*,location.record_json AS site,provider.record_json AS provider
+ FROM pairs pair LEFT JOIN approved location ON location.record_kind='location' AND location.record_key=pair.location_id::text
  LEFT JOIN approved provider ON provider.record_kind='provider' AND provider.record_key=pair.provider_id
+), custom AS MATERIALIZED (
+ SELECT office.*,
+   encode(sha256(convert_to(jsonb_build_array('network_custom',office.provider_system,office.provider_id,office.location_id)::text,'UTF8')),'hex') AS location_key
+ FROM approved_offices office WHERE site IS NOT NULL
 )
 """
 
@@ -138,22 +143,24 @@ async def _approved_identity(connection, control, revision, *, retained=False):
  SELECT (SELECT encode(sha256(convert_to(coalesce(string_agg(
    record_kind||':'||record_key||':'||record_revision||':'||custom_revision||':'||
      encode(sha256(convert_to(record_json::text,'UTF8')),'hex'),',' ORDER BY record_kind,record_key),''),'UTF8')),'hex')
-   FROM approved) AS fingerprint,count(*)::bigint AS pairs,
-   count(*) FILTER(WHERE custom.provider_system='npi')::bigint AS npi_pairs,
-   count(*) FILTER(WHERE (custom.location_id IS NULL AND source_binding.count<>1)
-     OR (custom.location_id IS NOT NULL AND source_binding.count<>0)
-     OR (custom.location_id IS NOT NULL AND (
-       custom.provider_system NOT IN ('manual','npi') OR coalesce(site->'archived'<>'false'::jsonb,true)
-       OR (custom.provider_system='manual' AND (provider IS NULL OR coalesce(provider->'archived'<>'false'::jsonb,true)))
+   -- The existence probe can use the primary key and skip the fingerprint scan for an empty revision.
+   FROM approved WHERE EXISTS(SELECT FROM approved)) AS fingerprint,count(*)::bigint AS pairs,
+   count(*) FILTER(WHERE office.provider_system='npi' AND office.provider_id IS NOT NULL AND site IS NOT NULL)::bigint AS npi_pairs,
+   count(*) FILTER(WHERE office.provider_system IS NULL OR office.provider_id IS NULL
+     OR (site IS NULL AND source_binding.matches IS DISTINCT FROM 1)
+     OR (site IS NOT NULL AND (
+       source_binding.matches IS NOT NULL OR office.provider_system NOT IN ('manual','npi') OR coalesce(site->'archived'<>'false'::jsonb,true)
+       OR (office.provider_system='manual' AND (provider IS NULL OR coalesce(provider->'archived'<>'false'::jsonb,true)))
        OR coalesce(site->'canonical_address_json'->>'identity_key' NOT LIKE 'v2|%|street',true)
        OR site->'canonical_address_json'->>'address_key' IS NULL)))::bigint AS unresolved
- FROM pairs pair LEFT JOIN custom USING(provider_system,provider_id,location_id)
- LEFT JOIN LATERAL (
-   SELECT count(*) AS count FROM approved binding WHERE binding.record_kind='site_binding'
-     AND binding.record_json->'archived'='false'::jsonb
-     AND (binding.record_json->>'provider_system',binding.record_json->>'provider_id',binding.record_json->>'location_id')
-       =(pair.provider_system,pair.provider_id,pair.location_id::text)
- ) source_binding ON true
+ FROM approved_offices office
+ LEFT JOIN (
+   SELECT record_json->>'provider_system' AS provider_system,record_json->>'provider_id' AS provider_id,
+     record_json->>'location_id' AS location_id,count(*) AS matches
+   FROM approved WHERE record_kind='site_binding' AND record_json->'archived'='false'::jsonb
+   GROUP BY 1,2,3
+ ) source_binding ON (source_binding.provider_system,source_binding.provider_id,source_binding.location_id)
+   =(office.provider_system,office.provider_id,office.location_id::text)
  """,
         revision,
     )
