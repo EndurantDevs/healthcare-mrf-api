@@ -582,6 +582,9 @@ async def _native_projection_inputs(connection, recipes, native_stages, control_
     _require(type(native_stages) is tuple and len(native_stages) == len(recipes_by_identity))
     _require(all(type(native) is NativeProviderStage for native in native_stages))
     _require({native.recipe_sha256 for native in native_stages} == set(recipes_by_identity))
+    for native in native_stages:
+        pin = recipes_by_identity[native.recipe_sha256].source_pin
+        _require(native.capture_sha256 == pin.generation_id and native.catalog_generation == pin.catalog_generation)
     predecessor = native_stages[0].source_manifest
     _require(all(native.source_manifest == predecessor for native in native_stages))
     retained_captures = (
@@ -590,23 +593,42 @@ async def _native_projection_inputs(connection, recipes, native_stages, control_
     return recipes_by_identity, predecessor, retained_captures
 
 
+async def _append_native_batch(connection, destination, native_stages, relation):
+    from process.registry_native_provider_source import native_provider_batch_keys
+
+    _require(all(native.provider_only_table == relation for native in native_stages))
+    native_ids = [bytes.fromhex(native.recipe_sha256) for native in native_stages]
+    keys = native_provider_batch_keys(relation)
+    complete = await connection.fetchval(
+        f"""WITH selected AS MATERIALIZED (SELECT source_slot,recipe_sha256 FROM {keys}
+            WHERE recipe_sha256=ANY($1::bytea[])),
+          scope AS (SELECT count(*)=cardinality($1) AND count(DISTINCT recipe_sha256)=cardinality($1)
+            AND (SELECT count(*)=count(DISTINCT source_slot) FROM {keys}) AS complete FROM selected),
+          copied AS (INSERT INTO {destination}({COLUMNS}) SELECT {COLUMNS} FROM {relation}
+            JOIN selected USING(source_slot) WHERE (SELECT complete FROM scope) ON CONFLICT DO NOTHING)
+          SELECT complete FROM scope""",
+        native_ids,
+    )
+    _require(complete is True)
+
+
 async def _append_native_staged_sources(
     connection, destination, recipes, stage, approved, control_schema, *, verify_source=False
 ):
     native_stages = getattr(stage, "native_provider_stages", ())
     if not native_stages:
         return
-    from process.registry_native_provider_source import rebuild_native_provider_stage
+    from process.registry_native_provider_source import is_native_provider_batch, rebuild_native_provider_stage
 
     recipes_by_identity, predecessor, retained_captures = await _native_projection_inputs(
         connection, recipes, native_stages, control_schema, verify_source
     )
+    relation = native_stages[0].provider_only_table
+    if not verify_source and is_native_provider_batch(relation):
+        await _append_native_batch(connection, destination, native_stages, relation)
+        return
     for native in native_stages:
         recipe = recipes_by_identity[native.recipe_sha256]
-        _require(
-            native.capture_sha256 == recipe.source_pin.generation_id
-            and native.catalog_generation == recipe.source_pin.catalog_generation
-        )
         rebuilt = (
             await rebuild_native_provider_stage(
                 connection,

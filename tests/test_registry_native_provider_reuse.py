@@ -3,7 +3,7 @@
 
 import hashlib
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -212,7 +212,11 @@ async def test_many_sources_load_retained_inventory_once_per_independent_pass(mo
     from process import registry_source_recipe_store
 
     recipes = tuple(native_recipe(ordinal) for ordinal in range(304))
-    connection = SimpleNamespace(fetch=AsyncMock(return_value=recipes), execute=AsyncMock())
+    connection = SimpleNamespace(
+        fetch=AsyncMock(return_value=recipes),
+        execute=AsyncMock(return_value=f"SELECT {len(recipes)}"),
+        transaction=nullcontext,
+    )
     manifest = SimpleNamespace(generation_id=9, manifest_sha256="a" * 64)
 
     async def resolve(driver, source_manifest, *, control_schema):
@@ -222,7 +226,8 @@ async def test_many_sources_load_retained_inventory_once_per_independent_pass(mo
     monkeypatch.setattr(registry_source_recipe_store, "resolve_retained_registry_source_recipes", resolve)
     observed_indexes = []
 
-    async def rebuild(driver, recipe, approved, **options):
+    async def rebuild(driver, recipe, approved, target, scope, **options):
+        relation, _source_slot = target
         retained = options["retained_captures"]
         assert providers._has_retained_native_capture(recipe.source_pin, retained, options["source_manifest"])
         observed_indexes.append(retained)
@@ -232,13 +237,13 @@ async def test_many_sources_load_retained_inventory_once_per_independent_pass(mo
             recipe.source_pin.generation_id,
             recipe.source_pin.catalog_generation,
             "e" * 64,
-            'pg_temp."native_provider_mapped_' + uuid4().hex + '"',
+            relation,
             1,
-            options["catalog_scope"],
+            scope[0],
             manifest,
         )
 
-    monkeypatch.setattr(providers, "rebuild_native_provider_stage", rebuild)
+    monkeypatch.setattr(providers, "_project_native_provider", rebuild)
     approved = ApprovedMembershipSource(1, "c" * 64)
     context = SimpleNamespace(
         source_manifest=manifest, source_witness_runtime=SimpleNamespace(catalog_bindings=object())
@@ -249,6 +254,7 @@ async def test_many_sources_load_retained_inventory_once_per_independent_pass(mo
     )
     assert connection.fetch.await_count == 1
     assert len(observed_indexes) == 304 and len({id(index) for index in observed_indexes}) == 1
+    assert len({native.provider_only_table for native in stage.native_provider_stages}) == 1
     producer_index = observed_indexes[0]
     observed_indexes.clear()
     await projection._append_native_staged_sources(

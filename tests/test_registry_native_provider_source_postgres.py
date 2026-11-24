@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native COPY provider captures and current binding maps never manufacture office evidence."""
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -289,3 +290,62 @@ async def test_native_mapping_survives_phase_commit_and_is_cleaned_exactly(nativ
     assert await case.writer.fetchval(
         "SELECT to_regnamespace($1) IS NOT NULL", case.recipe.source_pin.capture["schema_name"]
     )
+
+
+async def test_shared_native_rows_survive_commit_and_copy_only_the_requested_source(native_provider_case, monkeypatch):
+    from process import network_provider_only_projection as projection
+    from process.registry_source_recipe_composition import RegistrySourceRecipeStage
+
+    case = native_provider_case
+    read_context = SimpleNamespace(
+        source_witness_runtime=SimpleNamespace(catalog_bindings=case.catalog_scope), source_manifest=None
+    )
+    empty_stage = RegistrySourceRecipeStage("unused", 0, 0, "f" * 64)
+    stage_arguments = (case.writer, (case.recipe,), case.approved, empty_stage)
+    stage_options_by_name = dict(read_context=read_context, control_schema=case.fixture.control, verify_source=False)
+    table_count_sql = "SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND relname LIKE 'native_provider_batch_%'"
+    async with case.writer.transaction():
+        before = await case.writer.fetchval(table_count_sql)
+        with monkeypatch.context() as patch:
+            patch.setattr(providers, "network_source_mapped", AsyncMock(side_effect=asyncio.CancelledError))
+            with pytest.raises(asyncio.CancelledError):
+                await providers.append_native_provider_stages(*stage_arguments, **stage_options_by_name)
+        assert await case.writer.fetchval(table_count_sql) == before
+        stage = await providers.append_native_provider_stages(*stage_arguments, **stage_options_by_name)
+        (native,) = stage.native_provider_stages
+        assert native.source_rows == 2
+    async with case.writer.transaction():
+        relation = native.provider_only_table
+        keys = providers.native_provider_batch_keys(relation)
+        assert await case.writer.fetchval(table_count_sql) == before + 2
+        await case.writer.execute(f"INSERT INTO {keys} VALUES (1,decode(repeat('c',64),'hex'))")
+        await case.writer.execute(f"INSERT INTO {relation} SELECT 1,'npi','1999999992',repeat('b',64),1")
+        expected = await case.writer.fetch(
+            f"SELECT {projection.COLUMNS} FROM {relation} WHERE source_slot=0 ORDER BY provider_id",
+        )
+        destination = 'pg_temp."native_selected_' + uuid4().hex + '"'
+        await projection._create_evidence_heap(case.writer, destination, temporary=True)
+        await projection._append_native_staged_sources(
+            case.writer, destination, (case.recipe,), stage, case.approved, case.fixture.control
+        )
+        assert (
+            await case.writer.fetch(f"SELECT {projection.COLUMNS} FROM {destination} ORDER BY provider_id") == expected
+        )
+        assert [fact["provider_id"] for fact in expected] == ["1234567893", "1999999984"]
+        await case.writer.execute(f"TRUNCATE {destination}")
+        for change in (
+            f"UPDATE {keys} SET source_slot=0 WHERE source_slot=1",
+            f"DELETE FROM {keys} WHERE source_slot=0",
+        ):
+            async with case.writer.transaction():
+                await case.writer.execute(change)
+                with pytest.raises(
+                    projection.ProviderOnlyProjectionError, match="network_provider_only_projection_differs"
+                ):
+                    await projection._append_native_staged_sources(
+                        case.writer, destination, (case.recipe,), stage, case.approved, case.fixture.control
+                    )
+                assert await case.writer.fetchval(f"SELECT count(*) FROM {destination}") == 0
+        await providers.drop_native_provider_stages(case.writer, stage)
+        await case.writer.execute(f"DROP TABLE {destination}")
+        assert await case.writer.fetchval(table_count_sql) == before

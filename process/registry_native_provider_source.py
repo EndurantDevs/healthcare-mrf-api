@@ -4,6 +4,7 @@
 import hashlib
 import json
 import re
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from tempfile import TemporaryFile
 from uuid import UUID, uuid4, uuid5
@@ -419,7 +420,46 @@ async def _native_provider_inputs(
     return descriptor
 
 
-async def _map_native_provider_facts(connection, bindings, selected, name, capture, arguments, generation_id):
+def is_native_provider_batch(relation):
+    """Recognize a connection-local provider mapping batch before interpolating its name."""
+    return (
+        type(relation) is str and re.fullmatch(r'pg_temp\."native_provider_batch_[0-9a-f]{32}"', relation) is not None
+    )
+
+
+def native_provider_batch_keys(relation):
+    """Return the producer-owned recipe lookup belonging to this mapped evidence batch."""
+    if not is_native_provider_batch(relation):
+        raise ValueError("registry_native_provider_stage_invalid")
+    return relation[:-1] + '_keys"'
+
+
+async def _record_native_provider_batch_keys(connection, relation, stages):
+    recipe_keys = [bytes.fromhex(native.recipe_sha256) for native in stages]
+    status = await connection.execute(
+        f"CREATE TEMP TABLE {native_provider_batch_keys(relation)} AS "
+        "SELECT (ordinal-1)::integer AS source_slot,recipe_sha256 FROM unnest($1::bytea[]) "
+        "WITH ORDINALITY AS recipe(recipe_sha256,ordinal)",
+        recipe_keys,
+    )
+    if status != f"SELECT {len(recipe_keys)}":
+        raise ValueError("registry_native_provider_stage_invalid")
+
+
+@asynccontextmanager
+async def _native_mapping_table(connection, *, shared=False):
+    """Keep producer evidence on this connection across the approval and copy transactions."""
+    prefix = "native_provider_batch_" if shared else "native_provider_mapped_"
+    relation = "pg_temp." + storage_identifier(prefix + uuid4().hex)
+    scope = ", source_slot integer NOT NULL" if shared else ""
+    async with connection.transaction():
+        await connection.execute(
+            f"CREATE TEMP TABLE {relation}(network_id integer,provider_system text,provider_id text,evidence_id text{scope})"
+        )
+        yield relation
+
+
+async def _map_native_provider_facts(connection, bindings, selected, name, capture, arguments, source_slot):
     """Insert admitted facts and hash their selected networks from the same scoped binding result."""
     result = await connection.fetchrow(
         "WITH "
@@ -429,12 +469,13 @@ async def _map_native_provider_facts(connection, bindings, selected, name, captu
         + ") candidates WHERE NOT (SELECT invalid FROM binding_check)), mapped AS (INSERT INTO "
         + name
         + " SELECT DISTINCT selected.network_id,'npi',fact.npi::text,encode(sha256(convert_to(jsonb_build_array($11::text,"
-        "fact.source_key,'npi',fact.npi::text,selected.network_id)::text,'UTF8')),'hex') "
-        f"FROM {capture} fact JOIN selected USING(source_key) WHERE {valid_npi_sql('fact.npi')}) "
+        "fact.source_key,'npi',fact.npi::text,selected.network_id)::text,'UTF8')),'hex')"
+        + (", $12::integer" if source_slot is not None else "")
+        + f" FROM {capture} fact JOIN selected USING(source_key) WHERE {valid_npi_sql('fact.npi')}) "
         "SELECT invalid,(SELECT encode(sha256(convert_to(coalesce(jsonb_agg(DISTINCT jsonb_build_array(source_key,network_id) "
         "ORDER BY jsonb_build_array(source_key,network_id))::text,'[]'),'UTF8')),'hex') FROM selected) AS mapping FROM binding_check",
         *arguments,
-        generation_id,
+        *((source_slot,) if source_slot is not None else ()),
     )
     require_valid_catalog_bindings(result["invalid"])
     return result["mapping"]
@@ -451,9 +492,28 @@ async def rebuild_native_provider_stage(
     source_manifest=None,
     retained_captures=None,
 ):
-    """Build a fresh mapped relation; rollback removes its temporary heap on every failure."""
+    """Build a standalone mapped table and roll back its allocation on any error."""
+    async with _native_mapping_table(connection) as relation:
+        return await _project_native_provider(
+            connection,
+            recipe,
+            approved,
+            (relation, None),
+            (catalog_scope, control_schema),
+            verify_source=verify_source,
+            source_manifest=source_manifest,
+            retained_captures=retained_captures,
+        )
+
+
+async def _project_native_provider(
+    connection, recipe, approved, mapping_target, scope, *, verify_source, source_manifest, retained_captures
+):
+    """Write one exact source and return its mapping and capture identity."""
     from process.registry_source_recipe_store import canonical_registry_source_recipes
 
+    relation, source_slot = mapping_target
+    catalog_scope, control_schema = scope
     pin = recipe.source_pin
     if type(pin) is not PinnedNativeProviderMembershipSource:
         raise ValueError("registry_native_provider_pin_invalid")
@@ -464,23 +524,25 @@ async def rebuild_native_provider_stage(
         connection, catalog_scope, approved, recipe.binding_coordinates, descriptor, control_schema=control_schema
     )
     keys, checksums, selected = _native_mapping_selection(descriptor)
-    name = "pg_temp." + storage_identifier("native_provider_mapped_" + uuid4().hex)
-    arguments = (approved.approved_revision, *pin.coordinates.sql_parameters, keys, checksums, pin.catalog_generation)
-    async with connection.transaction():
-        await connection.execute(
-            f"CREATE TEMP TABLE {name}(network_id integer,provider_system text,provider_id text,evidence_id text)"
-        )
-        capture = storage_identifier(pin.capture["schema_name"]) + ".provider_fact"
-        mapping = await _map_native_provider_facts(
-            connection, bindings, selected, name, capture, arguments, pin.generation_id
-        )
+    arguments = (
+        approved.approved_revision,
+        *pin.coordinates.sql_parameters,
+        keys,
+        checksums,
+        pin.catalog_generation,
+        pin.generation_id,
+    )
+    capture = storage_identifier(pin.capture["schema_name"]) + ".provider_fact"
     recipe_hash = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
+    mapping = await _map_native_provider_facts(
+        connection, bindings, selected, relation, capture, arguments, source_slot
+    )
     return NativeProviderStage(
         recipe_hash,
         pin.generation_id,
         pin.catalog_generation,
         mapping,
-        name,
+        relation,
         pin.capture["rows"],
         catalog_scope,
         source_manifest,
@@ -501,43 +563,45 @@ async def append_native_provider_stages(
         connection, read_context.source_manifest, control_schema
     )
     mapped_stages = []
-    for recipe in recipes:
-        if type(recipe.source_pin) is PinnedNativeProviderMembershipSource:
+    native_recipes = tuple(
+        recipe for recipe in recipes if type(recipe.source_pin) is PinnedNativeProviderMembershipSource
+    )
+    table = _native_mapping_table(connection, shared=True) if native_recipes else nullcontext(None)
+    async with table as relation:
+        for source_slot, recipe in enumerate(native_recipes):
             mapped_stages.append(
-                await rebuild_native_provider_stage(
+                await _project_native_provider(
                     connection,
                     recipe,
                     approved,
-                    catalog_scope=runtime.catalog_bindings,
-                    control_schema=control_schema,
+                    (relation, source_slot),
+                    (runtime.catalog_bindings, control_schema),
                     verify_source=verify_source,
                     source_manifest=read_context.source_manifest,
                     retained_captures=retained_captures,
                 )
             )
             await network_source_mapped(batch=True)
-    _, recipe_hash = _source_stage_recipes(recipes, True)
-    generations = base.source_generations + tuple(
-        digest([stage.capture_sha256, stage.mapping_sha256]) for stage in mapped_stages
-    )
-    matches = base.office_matches
-    if matches is not None and hasattr(matches, "recipe_sha256"):
-        matches = replace(matches, recipe_sha256=recipe_hash)
-    return replace(
-        base,
-        generation_sha256=_source_stage_generation(
-            recipe_hash, approved, generations, base.membership_rows, base.omitted_rows
-        ),
-        source_generations=generations,
-        office_matches=matches,
-        native_provider_stages=tuple(mapped_stages),
-        office_derivations=base.office_derivations
-        + tuple(
-            native_provider_office_derivation(recipe)
-            for recipe in recipes
-            if type(recipe.source_pin) is PinnedNativeProviderMembershipSource
-        ),
-    )
+        if mapped_stages:
+            await _record_native_provider_batch_keys(connection, relation, mapped_stages)
+        _, recipe_hash = _source_stage_recipes(recipes, True)
+        generations = base.source_generations + tuple(
+            digest([stage.capture_sha256, stage.mapping_sha256]) for stage in mapped_stages
+        )
+        matches = base.office_matches
+        if matches is not None and hasattr(matches, "recipe_sha256"):
+            matches = replace(matches, recipe_sha256=recipe_hash)
+        return replace(
+            base,
+            generation_sha256=_source_stage_generation(
+                recipe_hash, approved, generations, base.membership_rows, base.omitted_rows
+            ),
+            source_generations=generations,
+            office_matches=matches,
+            native_provider_stages=tuple(mapped_stages),
+            office_derivations=base.office_derivations
+            + tuple(native_provider_office_derivation(recipe) for recipe in native_recipes),
+        )
 
 
 async def freeze_native_provider_snapshot(writer, schema, owner_role, runtime_roles):
@@ -551,13 +615,19 @@ async def freeze_native_provider_snapshot(writer, schema, owner_role, runtime_ro
 
 async def drop_native_provider_stages(connection, stage):
     """Remove only this stage's exact connection-local mapped tables after either composition outcome."""
+    relations = set()
     for native in getattr(stage, "native_provider_stages", ()):
         if type(native) is not NativeProviderStage:
             raise ValueError("registry_native_provider_stage_invalid")
         relation = native.provider_only_table
-        if (
+        if not is_native_provider_batch(relation) and (
             type(relation) is not str
             or re.fullmatch(r'pg_temp\."native_provider_mapped_[0-9a-f]{32}"', relation) is None
         ):
             raise ValueError("registry_native_provider_stage_invalid")
-        await connection.execute("DROP TABLE IF EXISTS " + relation)
+        relations.add(relation)
+    for relation in relations:
+        drop_targets = (
+            relation + "," + native_provider_batch_keys(relation) if is_native_provider_batch(relation) else relation
+        )
+        await connection.execute("DROP TABLE IF EXISTS " + drop_targets)
