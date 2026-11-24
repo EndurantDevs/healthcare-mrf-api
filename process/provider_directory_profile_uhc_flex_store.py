@@ -10,13 +10,12 @@ from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
 )
 
-
 _PROFILE_SELECTION_DATASET_SQL = """
 SELECT dataset.endpoint_id, dataset.dataset_id,
        dataset.acquisition_root_run_id, dataset.dataset_hash,
        dataset.status, dataset.is_current, dataset.resource_count,
        dataset.validated_at, dataset.published_at,
-       dataset.superseded_at, dataset.publication_metadata_json,
+       dataset.superseded_at, {publication_metadata_projection},
        CASE WHEN legacy.dataset_id IS NOT NULL
                  THEN {legacy_ready_expression}
             WHEN rooted.dataset_id IS NOT NULL
@@ -75,16 +74,22 @@ def _profile_selection_dataset_sql(
     *,
     exact_readiness: bool = True,
 ) -> str:
-    legacy_header_ref = (
-        f'{schema_ref}."provider_directory_uhc_flex_practitioner_dataset"'
-    )
-    legacy_ready_ref = (
-        f'{schema_ref}."provider_directory_uhc_flex_practitioner_dataset_ready"'
-    )
+    legacy_header_ref = f'{schema_ref}."provider_directory_uhc_flex_practitioner_dataset"'
+    legacy_ready_ref = f'{schema_ref}."provider_directory_uhc_flex_practitioner_dataset_ready"'
     rooted_header_ref = f'{schema_ref}."provider_directory_rooted_graph_dataset"'
     rooted_ready_ref = f'{schema_ref}."provider_directory_rooted_graph_dataset_ready"'
+    publication_metadata_projection = "dataset.publication_metadata_json"
+    if not exact_readiness:
+        # Proposals only need the sealed summary for ordinary sources; dedicated readiness needs the full document.
+        publication_metadata_projection = """CASE
+            WHEN legacy.dataset_id IS NULL AND rooted.dataset_id IS NULL
+                 AND json_typeof(CAST(dataset.publication_metadata_summary_json AS json)->'source_ids') = 'array'
+            THEN CAST(dataset.publication_metadata_summary_json AS json)
+            ELSE CAST(dataset.publication_metadata_json AS json)
+        END AS publication_metadata_json"""
     return _PROFILE_SELECTION_DATASET_SQL.format(
         endpoint_dataset_ref=endpoint_dataset_ref,
+        publication_metadata_projection=publication_metadata_projection,
         legacy_header_ref=legacy_header_ref,
         legacy_ready_expression=(
             f"{legacy_ready_ref}(dataset.dataset_id)"

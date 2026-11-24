@@ -47,9 +47,7 @@ async def _profile_test_database() -> Database:
     database = Database()
     try:
         await database.connect()
-        database_name = str(
-            await database.scalar("SELECT current_database();") or ""
-        )
+        database_name = str(await database.scalar("SELECT current_database();") or "")
     except (OSError, OperationalError) as exc:
         await database.disconnect()
         pytest.skip(f"Postgres is unavailable for Profile proof: {exc}")
@@ -109,7 +107,8 @@ async def _create_selection_source_tables(
             validated_at timestamp,
             published_at timestamp,
             superseded_at timestamp,
-            publication_metadata_json jsonb
+            publication_metadata_json jsonb,
+            publication_metadata_summary_json jsonb
         );
         """
     )
@@ -128,9 +127,7 @@ async def _create_flex_selection_tables(
     for relation_name in UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS:
         if relation_name in dedicated_headers:
             continue
-        await database.status(
-            f"CREATE TABLE {schema}.{relation_name} (id bigint);"
-        )
+        await database.status(f"CREATE TABLE {schema}.{relation_name} (id bigint);")
     await database.status(
         f"""
         CREATE TABLE {schema}.provider_directory_uhc_flex_practitioner_dataset (
@@ -224,9 +221,7 @@ async def _seed_current_selection(database: Database, schema: str) -> None:
             (:legacy_endpoint_id),
             (:graph_endpoint_id);
         """,
-        legacy_endpoint_id=(
-            uhc_flex_practitioner_endpoint_identity().endpoint_id
-        ),
+        legacy_endpoint_id=(uhc_flex_practitioner_endpoint_identity().endpoint_id),
         graph_endpoint_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
     )
     await database.status(
@@ -244,9 +239,7 @@ async def _seed_current_selection(database: Database, schema: str) -> None:
              'Dormant graph generation', NULL);
         """,
         legacy_source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        legacy_endpoint_id=(
-            uhc_flex_practitioner_endpoint_identity().endpoint_id
-        ),
+        legacy_endpoint_id=(uhc_flex_practitioner_endpoint_identity().endpoint_id),
         graph_source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
         graph_endpoint_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
     )
@@ -298,8 +291,7 @@ async def _attest_current(request_map, catalog_map):
 
 async def _set_source_name(database: Database, schema: str, name: str) -> None:
     await database.status(
-        f"UPDATE {schema}.provider_directory_source "
-        "SET org_name = :org_name WHERE source_id = 'pdfhir_test_payer';",
+        f"UPDATE {schema}.provider_directory_source SET org_name = :org_name WHERE source_id = 'pdfhir_test_payer';",
         org_name=name,
     )
 
@@ -316,12 +308,9 @@ async def _assert_old_observation_rejected(first_map, catalog_map) -> None:
 
 
 async def _assert_authority_rows(database: Database, schema: str) -> None:
-    proof_count = await database.scalar(
-        f"SELECT COUNT(*) FROM {schema}.provider_directory_profile_selection_proof;"
-    )
+    proof_count = await database.scalar(f"SELECT COUNT(*) FROM {schema}.provider_directory_profile_selection_proof;")
     observation_count = await database.scalar(
-        f"SELECT COUNT(*) FROM "
-        f"{schema}.provider_directory_profile_selection_observation;"
+        f"SELECT COUNT(*) FROM {schema}.provider_directory_profile_selection_observation;"
     )
     revision = await database.scalar(
         f"SELECT last_revision FROM "

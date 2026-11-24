@@ -31,10 +31,18 @@ async def test_proposal_keeps_exact_request_without_hashing_ordinary_proof(monke
             metadata=json.dumps(metadata),
         )
         full = await snapshot._compute_current_selection(_catalog_map(), node_id="test-node", lock_selection=False)
+        legacy_rows = await snapshot._selection_dataset_rows(exact_readiness=False)
+        assert legacy_rows[0]["publication_metadata_json"] == metadata
+        summary_by_field = {"source_ids": metadata["source_ids"]}
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET publication_metadata_summary_json = CAST(:summary AS jsonb);",
+            summary=json.dumps(summary_by_field),
+        )
         exact_rows = await snapshot._selection_dataset_rows()
         proposal_rows = await snapshot._selection_dataset_rows(exact_readiness=False)
         assert exact_rows[0]["publication_metadata_json"] == metadata
-        assert proposal_rows[0]["publication_metadata_json"] == metadata
+        assert proposal_rows[0]["publication_metadata_json"] == summary_by_field
         original_input = snapshot._profile_input
         input_calls = []
 
@@ -66,8 +74,10 @@ async def test_proposal_preserves_dedicated_and_malformed_metadata(monkeypatch):
         metadata = {"source_ids": ["pdfhir_test_payer"], "proof": {"complete": True}}
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset "
-            "SET publication_metadata_json = CAST(:metadata AS jsonb);",
+            "SET publication_metadata_json = CAST(:metadata AS jsonb), "
+            "publication_metadata_summary_json = CAST(:summary AS jsonb);",
             metadata=json.dumps(metadata),
+            summary=json.dumps({"source_ids": metadata["source_ids"]}),
         )
         await database.status(
             f"INSERT INTO {schema}.provider_directory_rooted_graph_dataset (dataset_id) VALUES ('dataset-1');"
