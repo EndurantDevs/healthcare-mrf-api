@@ -148,17 +148,27 @@ class SyntheticSession(_Session):
 
     def _generation_snapshot_result(self, query_sql, parameters):
         schema = postgresql.dialect().identifier_preparer.quote_schema(CustomImportGeneration.__table__.schema)
-        assert query_sql == (
-            f"SELECT {schema}.resolve_custom_import_generation_snapshot("
+        resolver = (
+            f"{schema}.resolve_custom_import_generation_snapshot("
             "CAST(:generation_id AS bigint), CAST(:dataset_id AS bigint), "
             "CAST(:definition_revision_id AS bigint), CAST(:schema_revision_id AS bigint))"
         )
-        assert parameters == {
+        includes_layout = query_sql.lstrip().startswith("WITH pinned AS MATERIALIZED")
+        if includes_layout:
+            assert query_sql.count(f"(SELECT {resolver} AS family_id)") == 1
+            assert parameters.get("block_family_name") == "custom_import_block_family"
+            parameter_map = {key: value for key, value in parameters.items() if key != "block_family_name"}
+        else:
+            assert query_sql == f"SELECT {resolver}"
+            parameter_map = parameters
+        assert parameter_map == {
             "generation_id": self.target["generation_id"],
             "dataset_id": 11,
             "definition_revision_id": self.target["definition_revision_id"],
             "schema_revision_id": self.target["schema_revision_id"],
         }
+        if includes_layout:
+            return SimpleNamespace(one=lambda: (None, False, None))
         return _result([(None,)])
 
     def _persisted_result_rows(self, statement):

@@ -184,13 +184,15 @@ async def _read_projection_metadata(session, target):
     return rows
 
 
-async def read_projection_tables(session, target, definition, *, snapshot_family_id) -> Mapping[str, Table] | None:
+async def read_projection_tables(
+    session, pinned_target, definition, *, snapshot_family_id, family_block_binding=None, schema_name=None
+) -> Mapping[str, Table] | None:
     """Bind advertised projections once inside an already authorized pinned read transaction."""
 
     if not session.in_transaction():
         raise QueryProjectionUnavailable("projection reads require an active transaction")
     _definition_digest(definition)
-    generation, seal, manifest = await _read_projection_metadata(session, target)
+    generation, seal, manifest = await _read_projection_metadata(session, pinned_target)
     if getattr(seal, "seal_contract", None) != "custom-import-generation-seal/v1":
         raise QueryProjectionUnavailable("projection generation seal contract is invalid")
     evidence = read_seal_projection_evidence(seal)
@@ -199,6 +201,8 @@ async def read_projection_tables(session, target, definition, *, snapshot_family
             _verify_producer(seal, generation, sealed=True)
         except AttributeError:
             raise QueryProjectionUnavailable("projection seal producer is missing") from None
+        if family_block_binding is not None and configured_fields(definition):
+            raise QueryProjectionUnavailable("family block projection completion data is missing")
         return None
     if manifest is None:
         raise QueryProjectionUnavailable("advertised projection manifest is missing")
@@ -207,7 +211,21 @@ async def read_projection_tables(session, target, definition, *, snapshot_family
     ):
         raise QueryProjectionUnavailable("projection pinned snapshot family differs")
     completed_projection_evidence(manifest, generation=generation, definition=definition, seal=seal)
-    return await lock_projection_tables(session, manifest, definition)
+    if family_block_binding is not None:
+        from process.custom_import.family_block_binding import FamilyBlockBinding, check_projection_manifest
+        from process.custom_import.family_block_read_sql import query_projection_views
+
+        if (
+            type(family_block_binding) is not FamilyBlockBinding
+            or family_block_binding.family_id != snapshot_family_id
+            or family_block_binding.layout.definition.digest != definition.digest
+        ):
+            raise QueryProjectionUnavailable("family block projection binding differs")
+        check_projection_manifest(family_block_binding, manifest)
+        return query_projection_views(family_block_binding)
+    if schema_name is None:
+        return await lock_projection_tables(session, manifest, definition)
+    return await lock_projection_tables(session, manifest, definition, schema_name=schema_name)
 
 
 def _encoded_text(value, label, maximum):

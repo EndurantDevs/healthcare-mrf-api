@@ -20,12 +20,12 @@ DEFAULT_ROOTS_ENTITY_INDEX = f"{DEFAULT_ROOTS}_entity_idx"
 
 
 @lru_cache(maxsize=32)
-def default_root_table(family_id):
+def default_root_table(family_id, *, schema_name=None):
     """Name the optional relation inside the selected candidate family."""
 
     table = Table(
         DEFAULT_ROOTS,
-        MetaData(schema=snapshot_schema(family_id)),
+        MetaData(schema=snapshot_schema(family_id) if schema_name is None else schema_name),
         Column("family_revision_id", BigInteger, nullable=False),
         Column("root_record_id", BigInteger, nullable=False),
         Column("root_revision_id", BigInteger, nullable=False),

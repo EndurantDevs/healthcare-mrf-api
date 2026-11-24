@@ -37,6 +37,7 @@ def test_catalog_membership_and_inventory_extend_the_existing_target_head():
         "20261119230000_clinical_code_catalog_page_index",
         "20261121050000_custom_import_rooted_text",
         "20261123182000_custom_import_root_boolean_index",
+        "20261104020000_custom_import_family_blocks",
     )
     assert scripts.get_heads() == [chain[-1]]
     for predecessor, successor in zip(chain, chain[1:]):

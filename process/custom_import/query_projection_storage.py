@@ -65,10 +65,14 @@ def _context_table(metadata, name, field_specs, *, child):
     return Table(name, metadata, *columns)
 
 
-def query_projection_tables(family_id: int, definition):
+def query_projection_tables(family_id: int, definition, *, schema_name=None):
     """Cache only checked static column shapes, never a generation or authority."""
 
-    schema_name = snapshot_schema(family_id)
+    registered_schema = snapshot_schema(family_id)
+    if schema_name is None:
+        schema_name = registered_schema
+    elif type(schema_name) is not str or not schema_name or "\x00" in schema_name:
+        raise ValueError("projection schema name is invalid")
     if not isinstance(definition, CustomImportDefinition):
         raise ValueError("query projection requires a parsed definition")
     enabled_field_ids = {field.field_id for field in configured_fields(definition)}

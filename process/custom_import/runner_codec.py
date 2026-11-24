@@ -516,7 +516,12 @@ def payload_values(
 ) -> Mapping[str, object]:
     """Recover all typed retained values from a canonical record payload."""
 
-    parsed_payload = parse_canonical_payload(canonical_payload, label)
+    return _payload_values_from_document(fields, parse_canonical_payload(canonical_payload, label), label)
+
+
+def _payload_values_from_document(fields, parsed_payload, label):
+    if not isinstance(parsed_payload, Mapping) or parsed_payload.get("contract") != "custom-import-record/v1":
+        raise CandidateRunnerError(f"{label} has an unknown contract")
     encoded_fields = parsed_payload.get("fields")
     if not isinstance(encoded_fields, list) or len(encoded_fields) != len(fields):
         raise CandidateRunnerError(f"{label} fields do not match the definition")
