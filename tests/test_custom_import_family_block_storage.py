@@ -47,13 +47,16 @@ def _storage_buffers(layout, root, child_records, semantic, limits, sparse):
     definition = layout.definition
     encode = encode_retained_family if sparse else encode_family
     with encode(definition, root, {"rates": child_records}, semantic, limits=limits) as encoded:
-        frames, codec_manifest = tuple(encoded.fragments()), encoded.manifest
+        encoded_directory, frames = zip(*encoded.indexed_fragments(), strict=True)
+        assert tuple(encoded.fragments()) == frames
+        codec_manifest = encoded.manifest
     with verify_family(definition, frames, codec_manifest, limits=limits) as verified:
         directory_entries = tuple(
             iter_fragment_directory(
                 verified, layout.collection_slots, (struct.unpack("!QQ", frame[:16])[1] for frame in frames)
             )
         )
+    assert encoded_directory == directory_entries
     members = tuple(iter_revision_memberships(0, [(root.revision_id, 0)], chunk_records=3)) + tuple(
         iter_revision_memberships(
             7,
@@ -122,12 +125,145 @@ def _storage_case(*, count=7, fragment_bytes=37, sparse=False):
     return layout, limits, root, child_records, frames, directory_entries, members, manifest
 
 
+@pytest.mark.parametrize("count,word_space", ((0, 512), (7, 4096), (7, 512)))
+def test_packed_writer_rows_match_full_storage_verification(count, word_space):
+    from process.custom_import.family_block_write import (
+        AllocatedBlockFamily,
+        AllocatedChildCollection,
+        pack_family_rows,
+    )
+
+    layout, limits, root, children, _, _, _, manifest = _storage_case(count=count)
+    limits = replace(limits, memory_bytes=word_space)
+    allocated_records = [
+        replace(child, revision_id=100 + 997 * (count - offset)) for offset, child in enumerate(children)
+    ]
+    family = AllocatedBlockFamily(
+        47,
+        11,
+        13,
+        None,
+        root,
+        {"rates": AllocatedChildCollection(count, iter(allocated_records))},
+    )
+    family_row, fragment_rows, memberships = _packed_roles(pack_family_rows(layout, family, limits=limits))
+    binding_table = layout.tables(11)["family"]
+    metadata_by_name = dict(zip(binding_table.c.keys(), family_row, strict=True))
+    assert metadata_by_name["family_sha256"] == manifest.family_sha256
+    assert metadata_by_name["root_payload_sha256"] == runner_codec.digest_text(
+        "root-payload", runner_codec.record_payload(layout.definition.root_fields, root.values_by_field)
+    )
+    with verify_stored_family(
+        layout.definition,
+        layout.collection_slots,
+        fragment_rows,
+        memberships,
+        layout.manifest(metadata_by_name),
+        limits=limits,
+    ) as verified:
+        assert list(verified.records()) == [root]
+        assert list(verified.records("rates")) == allocated_records
+
+
+@pytest.mark.parametrize("fragment_bytes", (1, 37, 65536))
+def test_source_digest_matches_existing_block_bytes_from_single_use_stream(fragment_bytes):
+    layout, limits, root, children, frames, directory, _, manifest = _storage_case(fragment_bytes=fragment_bytes)
+    with encode_family(layout.definition, root, {"rates": iter(children)}, None, limits=limits) as encoded:
+        assert tuple(encoded.indexed_fragments()) == tuple(zip(directory, frames, strict=True))
+        assert encoded.manifest.family_sha256 == manifest.family_sha256
+
+
+def test_native_copy_batch_limits_include_each_role_header(monkeypatch):
+    from process.custom_import import family_block_write
+
+    monkeypatch.setattr(family_block_write, "MAX_BATCH_ROWS", 3)
+    monkeypatch.setattr(family_block_write, "MAX_BATCH_BYTES", 62)
+    source_rows = [("family", (1,)), ("family", (2,)), ("fragment", (3,)), ("revision_run", (4,))]
+    buffer = family_block_write.BlockCopyBuffer()
+    packets = [batch for role, values in source_rows if (batch := buffer.append(role, values))]
+    assert [*packets, buffer.take()] == [
+        {"family": ((1,), (2,))},
+        {"fragment": ((3,),)},
+        {"revision_run": ((4,),)},
+    ]
+    with pytest.raises(FamilyBlockResourceLimit, match="row exceeds the native byte budget"):
+        buffer.append("fragment", (b"x" * 62,))
+
+
+def _packed_roles(role_rows):
+    role, family_row = next(role_rows)
+    fragments = []
+    memberships = []
+    for name, cells in role_rows:
+        if name == "fragment":
+            fragments.append(((cells[1], cells[2], *cells[4:]), cells[3]))
+        else:
+            assert name == "revision_run"
+            memberships.append(RevisionMembership(*cells[1:]))
+    assert role == "family"
+    return family_row, fragments, memberships
+
+
+def test_packed_writer_checks_source_count_before_exposing_rows():
+    from process.custom_import.family_block_write import (
+        AllocatedBlockFamily,
+        AllocatedChildCollection,
+        pack_family_rows,
+    )
+
+    layout, limits, root, children, _, _, _, manifest = _storage_case(count=1)
+    mismatched = AllocatedChildCollection(2, iter(children))
+    family = AllocatedBlockFamily(47, 11, 13, manifest.family_sha256, root, {"rates": mismatched})
+    with pytest.raises(FamilyBlockUnavailable, match="before the SOURCE count"):
+        next(pack_family_rows(layout, family, limits=limits))
+
+
+def test_packed_writer_rejects_duplicate_ids_before_copy():
+    from process.custom_import.family_block_write import (
+        AllocatedBlockFamily,
+        AllocatedChildCollection,
+        pack_family_rows,
+    )
+
+    layout, limits, root, children, _, _, _, manifest = _storage_case(count=2)
+    children[1] = replace(children[1], revision_id=children[0].revision_id)
+    family = AllocatedBlockFamily(
+        47, 11, 13, manifest.family_sha256, root, {"rates": AllocatedChildCollection(2, children)}
+    )
+    with pytest.raises(FamilyBlockError, match="membership order"):
+        next(pack_family_rows(layout, family, limits=limits))
+
+
+def test_revision_spill_shares_the_family_spool_budget():
+    from process.custom_import.family_block_write import (
+        AllocatedBlockFamily,
+        AllocatedChildCollection,
+        pack_family_rows,
+    )
+
+    layout, limits, root, children, _, _, _, manifest = _storage_case(count=7, fragment_bytes=37)
+    with encode_family(layout.definition, root, {"rates": children}, manifest.family_sha256, limits=limits) as normal:
+        encoding_bytes = normal._file.seek(0, 2)
+    limited = replace(limits, max_spool_bytes=encoding_bytes, max_record_bytes=encoding_bytes)
+    family = AllocatedBlockFamily(
+        47, 11, 13, manifest.family_sha256, root, {"rates": AllocatedChildCollection(7, children)}
+    )
+    with pytest.raises(FamilyBlockResourceLimit, match="family exceeds the caller's spool budget"):
+        next(pack_family_rows(layout, family, limits=limited))
+
+
 @pytest.mark.parametrize("fragment_bytes", (1, 7, 16, 37, 256, 65536))
 @pytest.mark.parametrize("count", (0, 1, 7))
 def test_complete_storage_proof_preserves_ids_ordinals_and_fragment_spans(fragment_bytes, count):
     layout, limits, root, children, frames, directory, members, manifest = _storage_case(
         count=count, fragment_bytes=fragment_bytes
     )
+    observed_records = []
+
+    def observe(collection, record, _parts):
+        """Capture SOURCE audit inputs from the existing verification pass."""
+        observed_records.append((collection, record))
+
     with verify_stored_family(
         layout.definition,
         layout.collection_slots,
@@ -135,10 +271,12 @@ def test_complete_storage_proof_preserves_ids_ordinals_and_fragment_spans(fragme
         members,
         manifest,
         limits=limits,
+        observe=observe,
     ) as verified:
         assert list(verified.records()) == [root]
         assert list(verified.records("rates")) == children
         assert verified.stored_manifest == manifest
+    assert observed_records == [(None, root), *(("rates", child) for child in children)]
     assert sum(row[3] for row in directory) == count + 1
     assert sum(row.record_count for row in members) == count + 1
 

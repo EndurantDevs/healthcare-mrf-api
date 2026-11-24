@@ -37,7 +37,9 @@ def bind_materialization(materialization, evidence):
     return replace(materialization, **hashes_by_name, query_projection_evidence=evidence)
 
 
-async def load_generation_evidence(session, generation, definition=None, *, frozen=True):
+async def load_generation_evidence(
+    session, generation, definition=None, *, frozen=True, family_block_binding=None, compact_family_id=None
+):
     """Accept legacy sealed snapshots; require complete evidence for new capabilities."""
 
     seal = await session.get(CustomImportGenerationSeal, generation.generation_id)
@@ -62,22 +64,45 @@ async def load_generation_evidence(session, generation, definition=None, *, froz
     if manifest is None:
         raise QueryProjectionUnavailable("required query projection manifest is missing")
     evidence = completed_projection_evidence(manifest, generation=generation, definition=definition, seal=seal)
-    await lock_projection_tables(session, manifest, definition, require_complete=frozen)
+    if family_block_binding is not None:
+        from process.custom_import.family_block_binding import check_projection_manifest
+
+        check_projection_manifest(family_block_binding, manifest)
+    elif compact_family_id is not None:
+        from process.custom_import.family_block_binding import check_projection_scope
+
+        check_projection_scope(manifest, compact_family_id, definition)
+    else:
+        await lock_projection_tables(session, manifest, definition, require_complete=frozen)
     return evidence
 
 
-async def bind_generation_materialization(session, generation, materialization, definition=None):
+async def bind_generation_materialization(
+    session, generation, materialization, definition=None, *, family_block_binding=None
+):
     """Share one commitment across compact, exhaustive and legacy verification."""
 
     if session.in_transaction():
-        return bind_materialization(materialization, await load_generation_evidence(session, generation, definition))
+        evidence = await load_generation_evidence(
+            session, generation, definition, family_block_binding=family_block_binding
+        )
+        return bind_materialization(materialization, evidence)
     async with session.begin():
-        return bind_materialization(materialization, await load_generation_evidence(session, generation, definition))
+        evidence = await load_generation_evidence(
+            session, generation, definition, family_block_binding=family_block_binding
+        )
+        return bind_materialization(materialization, evidence)
 
 
-async def validate_sealed_projection(session, generation, seal, definition=None):
-    """Avoid an extra metadata lookup only for an explicitly legacy immutable seal."""
+async def validate_sealed_projection(session, generation, seal, definition=None, *, snapshot=None):
+    """Validate advertised projections under the native generation pin."""
 
     if read_seal_projection_evidence(seal) is None:
         return None
+    if snapshot is None:
+        from process.custom_import.read_identity import verify_generation_storage
+
+        snapshot = await verify_generation_storage(session, generation)
+    if snapshot.family_id is not None and not snapshot.legacy_snapshot:
+        return await load_generation_evidence(session, generation, definition, compact_family_id=snapshot.family_id)
     return await load_generation_evidence(session, generation, definition)

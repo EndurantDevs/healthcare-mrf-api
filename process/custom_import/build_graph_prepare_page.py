@@ -73,7 +73,7 @@ from process.custom_import.runner_graph import stored_root_values
 from process.custom_import.runner_types import CandidateRunnerError
 
 
-def _build_scope(request):
+def _build_scope(request, phase="graph"):
     return and_(
         Build.dataset_id == request.dataset_id,
         Build.definition_revision_id == request.definition_revision_id,
@@ -81,7 +81,7 @@ def _build_scope(request):
         Build.execution_id == request.execution_id,
         Build.producing_fence == request.fence,
         Build.producing_token_sha256 == producer_token_sha256(request),
-        Build.phase == "graph",
+        Build.phase == phase,
         Build.plan_complete_at.is_not(None),
     )
 
@@ -189,17 +189,9 @@ def _retained_selection_joins(statement, plan, base, member):
 def _root_identity_joins(statement, candidate_models, base, retained_root):
     """Load the selected revision and its immutable logical-key record."""
 
-    plan, occurrence, source_root = candidate_models[Plan], candidate_models[Occurrence], candidate_models[Root]
-    statement = statement.outerjoin(
-        source_root,
-        and_(
-            plan.selection_kind == "source",
-            source_root.root_revision_id == occurrence.root_revision_id,
-            source_root.dataset_id == Build.dataset_id,
-            source_root.schema_revision_id == Build.schema_revision_id,
-            source_root.root_record_id == plan.root_record_id,
-        ),
-    ).outerjoin(
+    statement = _source_revision_join(statement, candidate_models)
+    plan = candidate_models[Plan]
+    return statement.outerjoin(
         retained_root,
         and_(
             plan.selection_kind == "retained",
@@ -209,13 +201,38 @@ def _root_identity_joins(statement, candidate_models, base, retained_root):
             retained_root.root_record_id == plan.root_record_id,
         ),
     )
+
+
+def _source_revision_join(statement, candidate_models):
+    plan, occurrence, source_root = candidate_models[Plan], candidate_models[Occurrence], candidate_models[Root]
     return statement.outerjoin(
+        source_root,
+        and_(
+            plan.selection_kind == "source",
+            source_root.root_revision_id == occurrence.root_revision_id,
+            source_root.dataset_id == Build.dataset_id,
+            source_root.schema_revision_id == Build.schema_revision_id,
+            source_root.root_record_id == plan.root_record_id,
+        ),
+    ).outerjoin(
         Record,
         and_(
             Record.root_record_id == plan.root_record_id,
             Record.dataset_id == Build.dataset_id,
             Record.logical_key_sha256 == plan.root_key_sha256,
         ),
+    )
+
+
+def _valid_source_root(candidate_models, source_scope):
+    plan, occurrence, source_root = candidate_models[Plan], candidate_models[Occurrence], candidate_models[Root]
+    return and_(
+        plan.selection_kind == "source",
+        occurrence.occurrence_id.is_not(None),
+        source_root.root_revision_id.is_not(None),
+        source_root.definition_revision_id == Build.definition_revision_id,
+        source_root.source_ordinal == occurrence.source_ordinal,
+        source_scope,
     )
 
 
@@ -246,19 +263,12 @@ def _started_family_joins(statement, plan, base, current):
 def _pending_scope(request, candidate_models, base, current, retained_root, source_scope):
     """Reject missing selected joins and mismatched retry identity."""
 
-    plan, occurrence, source_root = candidate_models[Plan], candidate_models[Occurrence], candidate_models[Root]
+    plan, source_root = candidate_models[Plan], candidate_models[Root]
     return and_(
         _build_scope(request),
         Record.root_record_id.is_not(None),
         or_(
-            and_(
-                plan.selection_kind == "source",
-                occurrence.occurrence_id.is_not(None),
-                source_root.root_revision_id.is_not(None),
-                source_root.definition_revision_id == Build.definition_revision_id,
-                source_root.source_ordinal == occurrence.source_ordinal,
-                source_scope,
-            ),
+            _valid_source_root(candidate_models, source_scope),
             and_(
                 plan.selection_kind == "retained",
                 retained_root.root_revision_id.is_not(None),
@@ -359,7 +369,7 @@ def _collapse_identical_children(statement, definition, registry, occurrence):
     return statement
 
 
-def _children_statement(request, registry, build_id, root_ids, candidate_models):
+def _children_statement(request, registry, build_id, root_ids, candidate_models, *, phase="graph"):
     """One keyset stream, ordered exactly as the existing family digest codec."""
 
     plan, occurrence, child = candidate_models[Plan], candidate_models[Occurrence], candidate_models[Child]
@@ -379,14 +389,14 @@ def _children_statement(request, registry, build_id, root_ids, candidate_models)
     statement = _child_identity_joins(statement, child, occurrence).where(
         occurrence.build_id == build_id,
         occurrence.origin == "source",
-        occurrence.root_record_id.in_(root_ids),
+        occurrence.root_record_id == any_(bindparam("selected_source_root_ids", root_ids, type_=ARRAY(BigInteger))),
         occurrence.child_revision_id.is_not(None),
         occurrence.resolved_rejection_id.is_(None),
     )
     statement = _collapse_identical_children(statement, request.definition, registry, occurrence)
     statement, source_scope = _source_joins(statement, child, "child", candidate_models[Pack], occurrence)
     valid = and_(
-        _build_scope(request),
+        _build_scope(request, phase),
         plan.root_record_id.is_not(None),
         occurrence.record_kind == "child",
         child.child_revision_id.is_not(None),
@@ -440,10 +450,12 @@ def _source_child_stream(session, request, registry, build_id, root_rows, *, phy
             lambda candidate_models, _base_models: _children_statement(
                 request, registry, build_id, root_ids, candidate_models
             ),
-            reserve_bytes=sum(
-                graph._model_bytes(model for model in root[:-1] if model is not None) for root in root_rows
+            bounds=graph._ReadPage(
+                reserve_bytes=sum(
+                    graph._model_bytes(model for model in root[:-1] if model is not None) for root in root_rows
+                ),
+                row_limit=MAX_BATCH_ROWS // 2,
             ),
-            row_limit=MAX_BATCH_ROWS // 2,
         )
         return
     if request.page_row_limit <= len(root_rows):
@@ -515,20 +527,7 @@ def _source_input_with_digest(
 
     def documents(collection):
         """Consume a matching group; leave a later family or collection pending."""
-
-        if not pending_groups:
-            group = next(child_groups, None)
-            if group is not None:
-                pending_groups.append(group)
-        if not pending_groups:
-            return
-        position, child_rows = pending_groups[0]
-        expected = family_input.plan.root_record_id, collection
-        if position < expected:
-            raise CandidateRunnerError("source child stream is not in canonical family order")
-        if position != expected:
-            return
-        pending_groups.popleft()
+        child_rows = _source_group(child_groups, pending_groups, family_input.plan.root_record_id, collection)
         children = _validated_children(
             family_input, registry, collection, child_rows, child_counter, request=request if physical else None
         )
@@ -540,6 +539,23 @@ def _source_input_with_digest(
         {collection.name: documents(collection.name) for collection in request.definition.child_collections},
     )
     return replace(family_input, family_sha256=digest, child_count=next(child_counter))
+
+
+def _source_group(child_groups, pending_groups, root_id, collection):
+    if not pending_groups:
+        group = next(child_groups, None)
+        if group is not None:
+            pending_groups.append(group)
+    if not pending_groups:
+        return ()
+    position, child_rows = pending_groups[0]
+    expected = root_id, collection
+    if position < expected:
+        raise CandidateRunnerError("source child stream is not in canonical family order")
+    if position != expected:
+        return ()
+    pending_groups.popleft()
+    return child_rows
 
 
 def _digest_page(session, request, registry, build_id, root_rows, *, physical=False, prepared=None):
@@ -581,20 +597,23 @@ def _selected_root_row(row):
     return plan, source_root if plan.selection_kind == "source" else retained_root, *identity_fields
 
 
-def _physical_family_rows(session, request, build_id, query, *, row_limit, reserve_bytes=0, after=None, single=False):
+def _physical_family_rows(session, request, build_id, query, *, bounds, after=None, candidate_models=None):
     """Use the existing read authority with a bounded native-ID array payload query."""
     while True:
         with graph._read_transaction(session, request, build_id) as (_build, deadline):
-            statement, keys, models = query(*graph._build_storage_models(session, build_id))
+            storage = (
+                graph._build_storage_models(session, build_id) if candidate_models is None else (candidate_models, None)
+            )
+            statement, keys, models = query(*storage)
             if after is not None:
                 statement = statement.where(tuple_(*keys) > tuple(after))
             graph._prepare_read(session, request, deadline)
             metadata = session.execute(
                 statement.with_only_columns(*keys, graph._variable_bytes(*models), maintain_column_froms=True)
                 .order_by(*keys)
-                .limit(row_limit)
+                .limit(bounds.row_limit)
             ).all()
-            admitted = graph._admitted_keys(metadata, MAX_BATCH_BYTES - reserve_bytes)
+            admitted = graph._admitted_keys(metadata, MAX_BATCH_BYTES - bounds.reserve_bytes)
             if not admitted:
                 return
             identities = tuple(key[-1] for key in admitted)
@@ -613,7 +632,7 @@ def _physical_family_rows(session, request, build_id, query, *, row_limit, reser
             graph._require_budget(session.info["custom_import_build_read_deadline"])
             yield tuple(payload_row[: -len(keys)])
             graph._require_budget(session.info["custom_import_build_read_deadline"])
-        if single or len(admitted) == len(metadata) < row_limit:
+        if bounds.single_page or len(admitted) == len(metadata) < bounds.row_limit:
             return
 
 
@@ -639,9 +658,11 @@ def prepare_family_page(session, request, registry, build_id, after_root_id, *, 
             build_id,
             lambda candidate_models, base_models: _pending_statement(request, build_id, candidate_models, base_models),
             after=(after_root_id,),
-            row_limit=MAX_BATCH_ROWS // _root_fanout(request, registry),
-            reserve_bytes=MAX_BATCH_BYTES // 2,
-            single=True,
+            bounds=graph._ReadPage(
+                row_limit=MAX_BATCH_ROWS // _root_fanout(request, registry),
+                reserve_bytes=MAX_BATCH_BYTES // 2,
+                single_page=True,
+            ),
         )
     else:
         stream = graph._read_snapshot_rows(

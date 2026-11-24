@@ -281,6 +281,27 @@ async def run_segmented_snowflake_candidate(
     )
 
 
+async def _build_captured_output(session_factory, request, build_id, counts, *, compact_limits, writer_transports):
+    """Dispatch owned snapshots after SOURCE and leave existing builds on the legacy path."""
+    with failure_phase(FailurePhase.GRAPH):
+        if compact_limits is not None:
+            from process.custom_import.family_block_finalize import try_build_block_output
+
+            compact = await try_build_block_output(session_factory, request, build_id, counts, limits=compact_limits)
+            if compact is not None:
+                return compact
+        generation_id = await build_graph(session_factory, request, build_id)
+    if generation_id is None:
+        return None
+    with failure_phase(FailurePhase.OUTPUT):
+        return await build_output(
+            session_factory,
+            request,
+            build_id,
+            projection_transport=None if writer_transports is None else writer_transports.projection,
+        )
+
+
 async def build_segmented_capture(
     session_factory,
     request,
@@ -289,8 +310,11 @@ async def build_segmented_capture(
     *,
     writer_transports=None,
     retained_base=None,
+    compact_limits=None,
 ):
     """Build a bound capture. Replays require the original base and explicit activation."""
+    if compact_limits is not None and (writer_transports is not None or retained_base is None):
+        raise CandidateRunnerError("compact retained builds require the local owner and explicit base")
 
     counts = SourceOutcomeCounts(0, 0)
     if captured.status not in {"capture_sealed", "capture_bound"}:
@@ -308,18 +332,17 @@ async def build_segmented_capture(
         with failure_phase(FailurePhase.COUNTS):
             failure_identifiers(build_id=staged_source.build_id)
             counts = await count_source_outcomes(session_factory, build_request, staged_source.build_id)
-        with failure_phase(FailurePhase.GRAPH):
-            generation_id = await build_graph(session_factory, build_request, staged_source.build_id)
-        if generation_id is None:
+        output = await _build_captured_output(
+            session_factory,
+            build_request,
+            staged_source.build_id,
+            counts,
+            compact_limits=compact_limits,
+            writer_transports=writer_transports,
+        )
+        if output is None:
             status = await _finish(session_factory, request, captured, policy, "failed")
             return _result(status, captured, counts)
-        with failure_phase(FailurePhase.OUTPUT):
-            output = await build_output(
-                session_factory,
-                build_request,
-                staged_source.build_id,
-                projection_transport=None if writer_transports is None else writer_transports.projection,
-            )
     except CancellationRequested:
         status = await _finish(session_factory, request, captured, policy, "canceled")
         return _result(status, captured, counts)

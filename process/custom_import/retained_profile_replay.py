@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Rebuild a storage-profile successor from an already acquired sealed source."""
+"""Rebuild a storage successor from an already acquired sealed source."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def _require_profile_only(previous, successor):
         raise CandidateRunnerError("retained replay requires a storage-profile-only successor")
 
 
-async def _load_origin(session, successor, base, parent_statement):
+async def _load_origin(session, successor, base, parent_statement, *, same_binding=False):
     """Read the exact current generation and its sealed source under the old binding."""
 
     pointer = await load_current_pointer(session, successor.dataset_id)
@@ -96,7 +96,15 @@ async def _load_origin(session, successor, base, parent_statement):
         definition_revision_id=bundle.definition_revision_id,
         source_binding_revision_id=bundle.source_binding_revision_id,
     )
-    _require_profile_only(previous, successor)
+    if same_binding:
+        if (
+            previous != successor
+            or previous.definition.refresh_mode != "snapshot"
+            or not previous.binding.processing_policy
+        ):
+            raise CandidateRunnerError("compact replay requires the original snapshot binding")
+    else:
+        _require_profile_only(previous, successor)
     if bytes(bundle.source_binding_sha256) != previous.source_binding_sha256:
         raise CandidateRunnerError("retained replay source binding has changed")
     original = parent_statement(previous)
@@ -259,17 +267,30 @@ async def retained_profile_request_identity(session, successor, parent_statement
 
 
 async def run_retained_profile_replay(
-    session_factory, successor, request, statement, *, base, parent_statement, writer_transports=None
+    session_factory,
+    successor,
+    request,
+    statement,
+    *,
+    base,
+    parent_statement,
+    writer_transports=None,
+    compact_limits=None,
 ):
     """Reserve a replay and build the verified successor. Leave publication explicit."""
-
     policy = successor.binding.processing_policy
-    if base is None or base != successor.binding.retained_profile_base:
+    registered_base = successor.binding.retained_profile_base
+    has_same_binding = compact_limits is not None and registered_base is None
+    if base is None or (not has_same_binding and base != registered_base):
         raise CandidateRunnerError("retained replay base differs from the approved source binding")
+    if compact_limits is not None and writer_transports is not None:
+        raise CandidateRunnerError("compact retained replay requires the local owner")
     if writer_transports is not None:
         writer_transports.require_candidate_binding(request)
     async with session_factory() as session:
-        previous, parent_bundle, receipts = await _load_origin(session, successor, base, parent_statement)
+        previous, parent_bundle, receipts = await _load_origin(
+            session, successor, base, parent_statement, same_binding=has_same_binding
+        )
     origin_by_name = _origin_document(previous, parent_bundle, base)
     identity = _request_identity(origin_by_name, request.source_binding_sha256)
     copies_by_slot = {
@@ -303,4 +324,5 @@ async def run_retained_profile_replay(
         policy,
         writer_transports=writer_transports,
         retained_base=(base.generation_id, base.pointer_version),
+        compact_limits=compact_limits,
     )

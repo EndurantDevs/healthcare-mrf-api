@@ -760,6 +760,36 @@ async def test_hosted_execute_uses_registered_replay_scope(monkeypatch):
     credentials.assert_not_called()
 
 
+def test_compact_execute_pins_the_base_and_limits_without_source_credentials(monkeypatch, capsys):
+    loaded = _configured_loaded_binding()
+    database = SimpleNamespace(session_factory=Mock())
+    run = AsyncMock(return_value=CandidateRunResult(status="sealed_unpublished", execution_id=41))
+    credentials = Mock(side_effect=AssertionError("retained replay opened source credentials"))
+    monkeypatch.setattr(operator_cli, "run_retained_profile_replay", run)
+    monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", credentials)
+
+    async def execute(*, idempotency_key, compact_replay, **_binding_ids):
+        return await operator_cli._execute_loaded_candidate(
+            database, loaded, idempotency_key, None, compact_replay=compact_replay
+        )
+
+    monkeypatch.setattr(operator_cli, "_run_retained_snowflake_binding", execute)
+    args = "execute --definition-revision-id 32 --source-binding-revision-id 34 --idempotency-key synthetic-run".split()
+    base_args = ["--compact-base", "24", "3", "4" * 64]
+    with pytest.raises(SystemExit):
+        operator_cli.run_command([*args, *base_args])
+    run.assert_not_awaited()
+    capsys.readouterr()
+
+    assert operator_cli.run_command([*args, *base_args, "--compact-limits", "2097152", "65536"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "sealed_unpublished"
+    assert run.await_args.args[:2] == (database.session_factory, loaded)
+    assert run.await_args.kwargs["base"] == operator_cli.RetainedProfileBase(24, 3, "4" * 64)
+    limits = run.await_args.kwargs["compact_limits"]
+    assert (limits.max_spool_bytes, limits.max_record_bytes) == (2_097_152, 65_536)
+    credentials.assert_not_called()
+
+
 def test_resume_cli_dispatches_the_exact_retained_identity(monkeypatch, capsys):
     captured_by_key = {}
 

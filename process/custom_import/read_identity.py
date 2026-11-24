@@ -39,10 +39,11 @@ _PINNED_LAYOUT_SQL = """
          named AS (SELECT family_id, 'ci_snapshot_' || family_id::text AS schema_name FROM pinned)
     SELECT family_id,
            CASE WHEN family_id IS NULL THEN false ELSE
-               pg_catalog.to_regclass(pg_catalog.format('%I.custom_import_root_revision', schema_name)) IS NOT NULL
-               OR pg_catalog.to_regclass(
-               pg_catalog.format('%I.%I', schema_name, CAST(:block_family_name AS text))
-           ) IS NULL END AS legacy_snapshot,
+               pg_catalog.to_regclass(
+                   pg_catalog.format('%I.%I', schema_name, CAST(:block_family_name AS text))
+               ) IS NULL OR pg_catalog.to_regclass(
+                   pg_catalog.format('%I.%I', schema_name, CAST(:block_fragment_name AS text))
+               ) IS NULL END AS legacy_snapshot,
            schema_name
     FROM named
 """
@@ -97,7 +98,10 @@ def named_layout_query(invocation, parameters):
     """Resolve the registered layout in the same statement as its generation lock."""
     from process.custom_import.family_block_layout import ROLE_SPECS
 
-    return _PINNED_LAYOUT_SQL.format(invocation=invocation), parameters | {"block_family_name": ROLE_SPECS["family"][1]}
+    return _PINNED_LAYOUT_SQL.format(invocation=invocation), parameters | {
+        "block_family_name": ROLE_SPECS["family"][1],
+        "block_fragment_name": ROLE_SPECS["fragment"][1],
+    }
 
 
 async def _resolve_snapshot_result(session, pinned_target, *, include_layout):

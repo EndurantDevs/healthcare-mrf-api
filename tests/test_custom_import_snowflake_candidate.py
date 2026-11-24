@@ -761,3 +761,29 @@ async def test_registered_identity_failure_prevents_candidate_writes(monkeypatch
     validation.assert_awaited_once()
     for writer in writers:
         writer.assert_not_awaited()
+
+
+@pytest.mark.parametrize("compact_completed", (False, True))
+async def test_retained_snapshot_selects_one_output_path(monkeypatch, compact_completed):
+    from process.custom_import import family_block_finalize, snowflake_segmented_runner
+
+    session_factory, request, counts, limits = object(), object(), object(), object()
+    compact_result, legacy_result = object(), object()
+    compact = AsyncMock(return_value=compact_result if compact_completed else None)
+    legacy_graph, legacy_output = AsyncMock(return_value=81), AsyncMock(return_value=legacy_result)
+    monkeypatch.setattr(family_block_finalize, "try_build_block_output", compact)
+    monkeypatch.setattr(snowflake_segmented_runner, "build_graph", legacy_graph)
+    monkeypatch.setattr(snowflake_segmented_runner, "build_output", legacy_output)
+
+    result = await snowflake_segmented_runner._build_captured_output(
+        session_factory, request, 7, counts, compact_limits=limits, writer_transports=None
+    )
+
+    assert result is (compact_result if compact_completed else legacy_result)
+    compact.assert_awaited_once_with(session_factory, request, 7, counts, limits=limits)
+    if compact_completed:
+        legacy_graph.assert_not_called()
+        legacy_output.assert_not_called()
+    else:
+        legacy_graph.assert_awaited_once_with(session_factory, request, 7)
+        legacy_output.assert_awaited_once_with(session_factory, request, 7, projection_transport=None)

@@ -57,6 +57,8 @@ from db.models.custom_import import (
     CustomImportSourceStream,
     CustomImportWinner,
 )
+from db.models.custom_import_family_block import CustomImportFamilyBlockLayout
+from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import materialization as material
 from process.custom_import import publication, scalar_digest
 from process.custom_import.build_graph import (
@@ -1270,7 +1272,7 @@ def _exhaustive_materialization(session, request, registry, build_id, generation
     return verified_materialization
 
 
-async def _unchanged_base(session, request, build, materialization):
+async def _unchanged_base(session, request, build, materialization, *, compact_candidate=False):
     if build.base_generation_id is None:
         return None
     await _prepare_statement(session)
@@ -1283,6 +1285,24 @@ async def _unchanged_base(session, request, build, materialization):
         return None
     if not hmac.compare_digest(bytes(base_seal.effective_output_sha256), materialization.effective_output_sha256):
         return None
+    if compact_candidate:
+        # Equal content can still require publication to change the serving layout.
+        layout = CustomImportFamilyBlockLayout
+        parent = CustomImportSnapshotFamily
+        await _prepare_statement(session)
+        if not await session.scalar(
+            select(
+                select(layout.family_id)
+                .join(parent, parent.family_id == layout.family_id)
+                .where(
+                    parent.dataset_id == request.dataset_id,
+                    parent.generation_id == base.generation_id,
+                    layout.phase == "logged",
+                )
+                .exists()
+            )
+        ):
+            return None
     await _prepare_statement(session)
     pointer = await publication._locked_pointer(session, request.dataset_id)
     if (
@@ -1349,19 +1369,25 @@ async def _finalize_sealed_build(session, request, build, generation, candidate_
     return publication._receipt(event, replayed=False)
 
 
-async def _terminal_seal(session_factory, request, build_id, materialization):
+async def _terminal_seal(
+    session_factory, request, build_id, materialization, *, prepare_candidate=None, compact_candidate=False
+):
     async with _session(session_factory, transaction=True) as session:
         await session.execute(select(func.set_config("statement_timeout", str(request.statement_timeout_ms), True)))
         await publication._begin_finality_operation(session)
         build = await _lock_page(session, request, build_id)
         await _prepare_statement(session)
         generation = await session.get(CustomImportGeneration, build.generation_id, with_for_update=True)
+        if prepare_candidate is not None:
+            await prepare_candidate(session, build)
         await _prepare_statement(session)
         proof = await session.get(CustomImportBuildVerification, build_id)
         _proof_matches(build, generation, proof)
         if any(getattr(materialization, name) != getattr(proof, name) for name in _COUNT_NAMES):
             raise CandidateRunnerError("final structural proof counts differ")
-        unchanged_base = await _unchanged_base(session, request, build, materialization)
+        unchanged_base = await _unchanged_base(
+            session, request, build, materialization, compact_candidate=compact_candidate
+        )
         await _prepare_statement(session)
         execution = await session.get(CustomImportExecution, request.execution_id)
         await _prepare_statement(session)
