@@ -319,18 +319,14 @@ async def test_legacy_typed_mapping_uses_original_client_catalog_scope(monkeypat
     approval = mapping.TypedGraphApproval(
         approved, recipe.binding_coordinates, recipe.source_pin.catalog_descriptor, recipe.source_pin.catalog_generation
     )
-    actual_arguments = []
 
     async def read_bindings(query, *arguments):
-        if "bool_and" in query:
-            assert "'source_generation',$8::text" in query
-            actual_arguments.append(arguments)
-            expected = generation if approved_generation_matches else "e" * 64
-            return arguments[-1] == expected
+        assert "bool_and" in query and "'source_generation',$8::text" in query
         assert "array_agg(record_json->>'source_key' ORDER BY record_json->>'source_key')" in query
-        return ["network-one"]
+        expected = generation if approved_generation_matches else "e" * 64
+        return {"valid": arguments[-1] == expected, "approved_keys": ["network-one"]}
 
-    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=read_bindings))
+    connection = SimpleNamespace(fetchrow=AsyncMock(side_effect=read_bindings))
     verify = AsyncMock()
     monkeypatch.setattr(network_approved_source_bindings, "require_approved_network_source_bindings", verify)
     monkeypatch.setattr(mapping, "_mapping_workspace", AsyncMock(return_value=object()))
@@ -345,7 +341,8 @@ async def test_legacy_typed_mapping_uses_original_client_catalog_scope(monkeypat
         with pytest.raises(TypedFHIRGraphError, match="approved_catalog_scope"):
             await mapping._prepare_mapping_offices(connection, stage, approval, None, "control_example")
         offices.assert_not_awaited()
-    assert actual_arguments[0] == (7, *recipe.binding_coordinates.sql_parameters, generation)
+    connection.fetchrow.assert_awaited_once()
+    assert connection.fetchrow.await_args.args[1:] == (7, *recipe.binding_coordinates.sql_parameters, generation)
     verify.assert_awaited_once_with(connection, approved, recipe.binding_coordinates, control_schema="control_example")
 
 

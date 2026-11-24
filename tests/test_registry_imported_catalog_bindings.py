@@ -143,7 +143,8 @@ async def test_typed_mapping_selects_imported_scope_explicitly(catalog_case, mon
 
 @pytest.mark.asyncio
 async def test_all_manually_excluded_imported_networks_can_produce_an_empty_mapping():
-    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=[True, []]))
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={"valid": True, "approved_keys": []}))
     arguments = (7, "fhir", "source", "source_schema", "dataset", "producer", "edition", "a" * 64)
     assert await _approved_graph_keys(connection, "bindings", arguments, allow_empty=True) == []
-    assert connection.fetchval.await_args_list[-1].args[1:] == arguments
+    connection.fetchrow.assert_awaited_once()
+    assert connection.fetchrow.await_args.args[1:] == arguments
