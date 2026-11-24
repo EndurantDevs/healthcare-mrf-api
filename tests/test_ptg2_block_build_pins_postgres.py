@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
@@ -23,11 +24,8 @@ from tests.test_ptg_wave_recovery_storage_postgres import (
     _quote,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = ROOT / "alembic" / "versions" / (
-    "20260810130000_ptg2_block_build_pins.py"
-)
+MIGRATION_PATH = ROOT / "alembic" / "versions" / ("20260810130000_ptg2_block_build_pins.py")
 
 
 def _sqlalchemy_dsn() -> str:
@@ -55,7 +53,7 @@ async def _create_pin_base_tables(connection, schema: str) -> None:
             stored_byte_count bigint NOT NULL,
             payload bytea NOT NULL,
             created_at timestamptz NOT NULL DEFAULT transaction_timestamp()
-        )
+        ) PARTITION BY HASH (block_hash)
         """,
         f"""
         CREATE TABLE {schema}.ptg2_v3_gc_candidate (
@@ -67,6 +65,14 @@ async def _create_pin_base_tables(connection, schema: str) -> None:
     )
     for statement in statements:
         await connection.execute(text(statement))
+    for remainder in range(4):
+        await connection.execute(
+            text(
+                f"CREATE TABLE {schema}.block_{remainder} "
+                f"PARTITION OF {schema}.ptg2_v3_block "
+                f"FOR VALUES WITH (MODULUS 4, REMAINDER {remainder})"
+            )
+        )
 
 
 async def _create_pin_mapping_tables(connection, schema: str) -> None:
@@ -208,10 +214,7 @@ async def _prepare_peer_while_source_pin_locked(
     )
     async with sessions.begin() as holder:
         await holder.execute(
-            text(
-                f"SELECT block_hash FROM {schema}.ptg2_block_build_pin "
-                "WHERE snapshot_key = 1 FOR UPDATE"
-            )
+            text(f"SELECT block_hash FROM {schema}.ptg2_block_build_pin WHERE snapshot_key = 1 FOR UPDATE")
         )
         await shared_publish.prepare_v4_cas_block_stage(
             schema_name=schema_name,
@@ -220,10 +223,7 @@ async def _prepare_peer_while_source_pin_locked(
             build_token="source-1",
         )
         peer_pin_count = await database.scalar(
-            text(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin "
-                "WHERE snapshot_key = 2"
-            )
+            text(f"SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin WHERE snapshot_key = 2")
         )
         assert peer_pin_count == 1
 
@@ -277,29 +277,32 @@ async def _assert_pin_release_commit_and_rollback(
             ),
             {"block_hash": block_hash},
         )
-        assert await delete_shared_block_build_pins(
-            session,
-            schema_name=schema_name,
-            snapshot_key=2,
-            build_token="source-1",
-            pin_token="block_stage_source1",
-        ) == 1
-    with pytest.raises(RuntimeError, match="rollback pin delete"):
-        async with sessions.begin() as session:
-            assert await delete_shared_block_build_pins(
+        assert (
+            await delete_shared_block_build_pins(
                 session,
                 schema_name=schema_name,
-                snapshot_key=1,
-                build_token="source-0",
-                pin_token="block_stage_source0",
-            ) == 1
-            raise RuntimeError("rollback pin delete")
-    assert await database.scalar(
-        text(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin "
-            "WHERE snapshot_key = 1"
+                snapshot_key=2,
+                build_token="source-1",
+                pin_token="block_stage_source1",
+            )
+            == 1
         )
-    ) == 1
+    with pytest.raises(RuntimeError, match="rollback pin delete"):
+        async with sessions.begin() as session:
+            assert (
+                await delete_shared_block_build_pins(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_key=1,
+                    build_token="source-0",
+                    pin_token="block_stage_source0",
+                )
+                == 1
+            )
+            raise RuntimeError("rollback pin delete")
+    assert (
+        await database.scalar(text(f"SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin WHERE snapshot_key = 1")) == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -343,6 +346,25 @@ async def test_pinned_source_does_not_hold_shared_cas_row_or_peer(
         async with engine.begin() as connection:
             await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_block_pin_uses_partition_prunable_ordered_row_locks() -> None:
+    session = AsyncMock()
+    hashes = (b"a" * 32, b"b" * 32)
+
+    await build_pins._protect_pinned_hashes_from_gc(session, schema='"mrf"', block_hashes=hashes)
+
+    lock, clear_candidate = session.execute.await_args_list
+    lock_statement, lock_params = lock.args
+    delete_statement, delete_params = clear_candidate.args
+    assert "ORDER BY hash.block_hash" in str(lock_statement)
+    assert "CROSS JOIN LATERAL" in str(lock_statement)
+    assert "block.block_hash = requested.block_hash" in str(lock_statement)
+    assert "LIMIT 1" in str(lock_statement)
+    assert "FOR KEY SHARE OF block" in str(lock_statement)
+    assert 'DELETE FROM "mrf".ptg2_v3_gc_candidate' in str(delete_statement)
+    assert lock_params == delete_params == {"block_hashes": list(hashes)}
 
 
 def test_block_pin_migration_is_chained_and_gc_guarded(monkeypatch) -> None:
