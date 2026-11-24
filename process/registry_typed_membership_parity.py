@@ -37,7 +37,7 @@ async def require_order_index(connection, relation):
         raise ValueError("registry_typed_parity_index_required")
 
 
-async def _last_page_key(connection, query, after):
+async def _last_page_key(connection, query, after, *, page_rows=5000):
     condition = "TRUE" if after is None else "(" + ORDER + ")>" + _PARAMETERS
     page = await connection.prepare(
         "SELECT "
@@ -50,7 +50,7 @@ async def _last_page_key(connection, query, after):
         + condition
         + " ORDER BY "
         + ORDER
-        + " LIMIT 5000) page ORDER BY "
+        + f" LIMIT {int(page_rows)}) page ORDER BY "
         + ",".join(term + " DESC" for term in ORDER.split(","))
         + " LIMIT 1"
     )
