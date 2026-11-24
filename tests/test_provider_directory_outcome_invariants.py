@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -116,6 +117,63 @@ def test_partition_census_rejects_incomplete_checkpoint_chains(control, error):
         importer._partition_census_from_control(control)
 
 
+def _partition_settings(**overrides):
+    return {
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-01-01T08:00:00Z",
+        "minimum_width_seconds": 3600,
+        "ceiling": 2,
+        "planned_splits": ["root.0"],
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"end": "resolved_now"},
+        {"end": "2026-01-01T02:00:00Z"},
+        {"census_mode": "unfiltered-leaf-sum-v1"},
+        {"planned_splits": ["root.0", "root.0"]},
+        {"planned_splits": ["root.0.1"]},
+    ],
+)
+def test_partition_settings_reject_unusable_planned_splits(overrides):
+    with pytest.raises(ValueError, match="planned_splits"):
+        importer._build_partition_config(_partition_settings(**overrides))
+
+
+@pytest.mark.asyncio
+async def test_partition_seed_keeps_fresh_leaf_counts_and_twin_passes_required(monkeypatch):
+    config = importer._build_partition_config(_partition_settings())
+    plan = importer._new_last_updated_partition_plan(config)
+    census = importer.LastUpdatedCompletenessCensus(unfiltered_pre=5, ranged_root_pre=5)
+    state = importer.LastUpdatedPartitionState(
+        _context(), plan, census, "https://example.test/fhir/Practitioner", 2, 0, None
+    )
+    save = AsyncMock()
+    monkeypatch.setattr(importer, "_save_last_updated_partition_plan", save)
+
+    await importer._seed_partition_root_count("Practitioner", object, config, state)
+
+    save.assert_awaited_once()
+    controlled = importer._last_updated_partition_checkpoint_payload(config, plan, census)
+    restored = importer._last_updated_partition_resume_from_checkpoint(controlled, config).plan
+    assert restored.windows["root"].count == 5
+    assert [leaf.window_id for leaf in restored.pending_count_windows()] == ["root.0.0", "root.0.1", "root.1"]
+    assert all(leaf.count is None and not leaf.passes for leaf in restored.leaf_windows())
+    for window_id in ("root.0.0", "root.0.1", "root.1"):
+        restored.observe_count(window_id, importer.CountObservation.exact(1))
+    assert restored.failure.code == "split_count_mismatch"
+
+    payload = json.loads(controlled)
+    for window in payload["control"]["windows"]:
+        if window["window_id"] == "root.0":
+            window["split_reason"] = "timeout"
+    with pytest.raises(RuntimeError, match="checkpoint_invalid"):
+        importer._last_updated_partition_resume_from_checkpoint(json.dumps(payload), config)
+
+
 @pytest.mark.parametrize(
     "control,error",
     [
@@ -129,17 +187,17 @@ def test_partition_census_rejects_incomplete_checkpoint_chains(control, error):
 )
 def test_partition_windows_reject_malformed_checkpoint_markers(control, error):
     with pytest.raises(ValueError, match=error):
-        importer._partition_checkpoint_windows(control)
+        importer.time_partition.partition_checkpoint_windows(control)
 
 
 def test_partition_pass_restore_rejects_missing_and_uncounted_windows():
     counted_plan = SimpleNamespace(windows={"window-1": SimpleNamespace(count=1, passes={})})
     with pytest.raises(ValueError, match="repeats a window ID"):
-        importer._restore_partition_pass_markers(counted_plan, {})
+        importer.time_partition.restore_partition_pass_markers(counted_plan, {})
 
     uncounted_plan = SimpleNamespace(windows={"window-1": SimpleNamespace(count=None, passes={})})
     with pytest.raises(ValueError, match="completed an uncounted window"):
-        importer._restore_partition_pass_markers(
+        importer.time_partition.restore_partition_pass_markers(
             uncounted_plan,
             {"window-1": (1,)},
         )

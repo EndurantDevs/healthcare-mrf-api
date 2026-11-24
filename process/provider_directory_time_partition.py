@@ -7,11 +7,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import re
 import urllib.parse
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
 from process import provider_directory_bcbs_minnesota as bcbs_minnesota
@@ -432,6 +434,105 @@ def new_partition_plan(config, *, canonical_api_base: str | None = None) -> Part
         volatile_metadata_paths=config.volatile_metadata_paths,
         boundary_precision=config.boundary_precision,
     )
+
+
+def partition_checkpoint_windows(
+    control_dict: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, tuple[int, ...]]]:
+    """Decode persisted geometry and its external pass markers."""
+    control_windows = control_dict.get("windows")
+    if not isinstance(control_windows, list):
+        raise ValueError("checkpoint windows missing")
+    planner_windows: list[dict[str, Any]] = []
+    completed_passes_by_window: dict[str, tuple[int, ...]] = {}
+    for control_window in control_windows:
+        if not isinstance(control_window, dict):
+            raise ValueError("checkpoint window invalid")
+        window_id = control_window.get("window_id")
+        completed_passes = control_window.get("completed_passes")
+        if (
+            not isinstance(window_id, str)
+            or not isinstance(completed_passes, list)
+            or any(isinstance(pass_number, bool) or pass_number not in (1, 2) for pass_number in completed_passes)
+            or completed_passes not in ([], [1], [1, 2])
+        ):
+            raise ValueError("checkpoint pass markers invalid")
+        completed_passes_by_window[window_id] = tuple(completed_passes)
+        planner_windows.append(
+            {
+                **{key: field_value for key, field_value in control_window.items() if key != "completed_passes"},
+                "passes": {},
+            }
+        )
+    return planner_windows, completed_passes_by_window
+
+
+def partition_plan_from_control(
+    control_dict: dict[str, Any],
+    planner_windows: list[dict[str, Any]],
+    config,
+) -> PartitionPlan:
+    """Restore the planner using the current immutable configuration."""
+    config_identity = config.identity()
+    return PartitionPlan.from_dict(
+        {
+            "version": 2,
+            "config": {
+                "ceiling": config.ceiling,
+                "minimum_width_microseconds": config_identity["minimum_width_microseconds"],
+                "boundary_precision_microseconds": config_identity["boundary_precision_microseconds"],
+                "volatile_metadata_paths": list(config.volatile_metadata_paths),
+            },
+            "windows": planner_windows,
+            "failure": control_dict.get("failure"),
+        }
+    )
+
+
+def restore_partition_pass_markers(
+    plan: PartitionPlan,
+    completed_passes_by_window: dict[str, tuple[int, ...]],
+) -> PartitionPlan:
+    """Restore committed pass markers without loading fingerprint rows."""
+    if len(completed_passes_by_window) != len(plan.windows):
+        raise ValueError("checkpoint repeats a window ID")
+    for window_id, completed_passes in completed_passes_by_window.items():
+        window = plan.windows[window_id]
+        if completed_passes and window.count is None:
+            raise ValueError("checkpoint completed an uncounted window")
+        window.passes = {pass_number: WindowPass({}) for pass_number in completed_passes}
+    return plan
+
+
+@lru_cache(maxsize=16)
+def validate_planned_splits(split_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate a bounded set of parent-first branches from a previous partition tree."""
+    selected_ids = set(split_ids)
+    parents = selected_ids | {"root"}
+    if len(selected_ids) != len(split_ids) or any(
+        re.fullmatch(r"root(?:\.[01]){1,48}", window_id) is None or window_id.rpartition(".")[0] not in parents
+        for window_id in split_ids
+    ):
+        raise ValueError("planned_splits_invalid")
+    return tuple(sorted(split_ids, key=lambda window_id: (window_id.count("."), window_id)))
+
+
+def seed_planned_splits(plan: PartitionPlan, split_ids: tuple[str, ...]) -> None:
+    """Use only prior geometry after opening a new exact root census."""
+    if plan.status is not PlanStatus.COUNTING:
+        return
+    for window_id in split_ids:
+        plan.observe_count(window_id, CountObservation.split("planned"))
+        if plan.failure is not None:
+            raise ValueError("planned_splits_outside_partition_bounds")
+
+
+def verify_planned_splits(plan: PartitionPlan, split_ids: tuple[str, ...]) -> None:
+    """Require the exact configured geometry once the new root count justifies splitting."""
+    root_count = plan.windows["root"].count
+    expected = set(split_ids) if root_count is not None and root_count > plan.config.ceiling else set()
+    if {window.window_id for window in plan.windows.values() if window.split_reason == "planned"} != expected:
+        raise ValueError("checkpoint planned split geometry mismatch")
 
 
 @dataclass(frozen=True)

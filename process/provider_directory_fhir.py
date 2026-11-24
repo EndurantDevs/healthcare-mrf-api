@@ -1811,6 +1811,7 @@ class LastUpdatedPartitionConfig:
     maximum_pages_per_window: int | None = None
     versioned_search_limit: int | None = None
     census_mode: str | None = None
+    planned_splits: tuple[str, ...] = ()
 
     def identity(self) -> dict[str, Any]:
         """Return stable metadata identity without a moving resolved cutoff."""
@@ -1830,6 +1831,8 @@ class LastUpdatedPartitionConfig:
             identity_by_field["versioned_search_limit"] = self.versioned_search_limit
         if self.census_mode is not None:
             identity_by_field["census_mode"] = self.census_mode
+        if self.planned_splits:
+            identity_by_field["planned_splits"] = list(self.planned_splits)
         return identity_by_field
 
     def root_end(self) -> datetime.datetime:
@@ -3615,6 +3618,18 @@ def _partition_volatile_paths(raw_paths: Any) -> tuple[str, ...]:
     return tuple(raw_paths)
 
 
+def _partition_planned_splits(raw_splits: Any) -> tuple[str, ...]:
+    if raw_splits is None:
+        return ()
+    if (
+        not isinstance(raw_splits, list)
+        or len(raw_splits) > 4095
+        or any(not isinstance(window_id, str) or len(window_id) > 100 for window_id in raw_splits)
+    ):
+        raise ValueError("planned_splits_invalid")
+    return time_partition.validate_planned_splits(tuple(raw_splits))
+
+
 def _build_partition_config(
     resource_settings: dict[str, Any],
 ) -> LastUpdatedPartitionConfig:
@@ -3646,9 +3661,10 @@ def _build_partition_config(
         maximum_pages_per_window=maximum_pages,
         versioned_search_limit=capped_partition.search_limit(resource_settings, ceiling),
         census_mode=leaf_census.mode(resource_settings),
+        planned_splits=_partition_planned_splits(resource_settings.get("planned_splits")),
     )
     validation_end = partition_end or (partition_start + minimum_width)
-    PartitionPlan.create(
+    validation_plan = PartitionPlan.create(
         partition_start,
         validation_end,
         ceiling=ceiling,
@@ -3656,6 +3672,13 @@ def _build_partition_config(
         volatile_metadata_paths=volatile_paths,
         boundary_precision=boundary_precision,
     )
+    if partition_config.planned_splits:
+        if partition_end is None or partition_config.census_mode or partition_config.versioned_search_limit:
+            raise ValueError("planned_splits_require_fixed_ordinary_census")
+        root = validation_plan.windows["root"]
+        depth = partition_config.planned_splits[-1].count(".") + 1
+        if (root.end - root.start) // minimum_width < (1 << depth):
+            raise ValueError("planned_splits_outside_partition_bounds")
     return partition_config
 
 
@@ -47534,77 +47557,14 @@ def _partition_census_from_control(
     versioned_search_limit: int | None = None,
     census_mode: str | None = None,
     plan: PartitionPlan | None = None,
+    *,
+    planned_splits: tuple[str, ...] = (),
 ) -> LastUpdatedCompletenessCensus:
     if census_mode == leaf_census.CONTRACT:
         return leaf_census.restore(sys.modules[__name__], control_dict.get("census"), plan)
-    if plan is not None and any(window.split_reason == "planned" for window in plan.windows.values()):
-        raise ValueError("checkpoint planned split requires leaf census contract")
+    if plan is not None:
+        time_partition.verify_planned_splits(plan, planned_splits)
     return capped_partition.restore_census(sys.modules[__name__], control_dict, versioned_search_limit)
-
-
-def _partition_checkpoint_windows(
-    control_dict: dict[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, tuple[int, ...]]]:
-    control_windows = control_dict.get("windows")
-    if not isinstance(control_windows, list):
-        raise ValueError("checkpoint windows missing")
-    planner_windows: list[dict[str, Any]] = []
-    completed_passes_by_window: dict[str, tuple[int, ...]] = {}
-    for control_window in control_windows:
-        if not isinstance(control_window, dict):
-            raise ValueError("checkpoint window invalid")
-        window_id = control_window.get("window_id")
-        completed_passes = control_window.get("completed_passes")
-        if (
-            not isinstance(window_id, str)
-            or not isinstance(completed_passes, list)
-            or any(isinstance(pass_number, bool) or pass_number not in (1, 2) for pass_number in completed_passes)
-            or completed_passes not in ([], [1], [1, 2])
-        ):
-            raise ValueError("checkpoint pass markers invalid")
-        completed_passes_by_window[window_id] = tuple(completed_passes)
-        planner_windows.append(
-            {
-                **{key: field_value for key, field_value in control_window.items() if key != "completed_passes"},
-                "passes": {},
-            }
-        )
-    return planner_windows, completed_passes_by_window
-
-
-def _partition_plan_from_control(
-    control_dict: dict[str, Any],
-    planner_windows: list[dict[str, Any]],
-    config: LastUpdatedPartitionConfig,
-) -> PartitionPlan:
-    config_identity = config.identity()
-    return PartitionPlan.from_dict(
-        {
-            "version": 2,
-            "config": {
-                "ceiling": config.ceiling,
-                "minimum_width_microseconds": config_identity["minimum_width_microseconds"],
-                "boundary_precision_microseconds": config_identity["boundary_precision_microseconds"],
-                "volatile_metadata_paths": list(config.volatile_metadata_paths),
-            },
-            "windows": planner_windows,
-            "failure": control_dict.get("failure"),
-        }
-    )
-
-
-def _restore_partition_pass_markers(
-    plan: PartitionPlan,
-    completed_passes_by_window: dict[str, tuple[int, ...]],
-) -> PartitionPlan:
-    if len(completed_passes_by_window) != len(plan.windows):
-        raise ValueError("checkpoint repeats a window ID")
-    for window_id, completed_passes in completed_passes_by_window.items():
-        window = plan.windows[window_id]
-        if completed_passes and window.count is None:
-            raise ValueError("checkpoint completed an uncounted window")
-        window.passes = {pass_number: WindowPass({}) for pass_number in completed_passes}
-    return plan
 
 
 def _last_updated_partition_plan_from_checkpoint(
@@ -47623,19 +47583,23 @@ def _last_updated_partition_resume_from_checkpoint(
 ) -> LastUpdatedPartitionResume:
     try:
         control_dict = _partition_checkpoint_control(checkpoint_payload, config)
-        planner_windows, completed_passes_by_window = _partition_checkpoint_windows(control_dict)
-        restored_plan = _partition_plan_from_control(
+        planner_windows, completed_passes_by_window = time_partition.partition_checkpoint_windows(control_dict)
+        restored_plan = time_partition.partition_plan_from_control(
             control_dict,
             planner_windows,
             config,
         )
         return LastUpdatedPartitionResume(
-            plan=_restore_partition_pass_markers(
+            plan=time_partition.restore_partition_pass_markers(
                 restored_plan,
                 completed_passes_by_window,
             ),
             census=_partition_census_from_control(
-                control_dict, config.versioned_search_limit, config.census_mode, restored_plan
+                control_dict,
+                config.versioned_search_limit,
+                config.census_mode,
+                restored_plan,
+                planned_splits=config.planned_splits,
             ),
         )
     except (json.JSONDecodeError, TypeError, ValueError, PartitionPlanError) as exc:
@@ -49862,6 +49826,8 @@ async def _seed_partition_root_count(
         root_window.window_id,
         CountObservation.exact(ranged_root_pre),
     )
+    if config.planned_splits:
+        time_partition.seed_planned_splits(state.plan, config.planned_splits)
     await _save_last_updated_partition_plan(
         state.context,
         resource_type,
@@ -67612,8 +67578,11 @@ async def process_provider_directory_fhir_data(
         census_request,
     )
     from process.provider_directory_generic_source_artifacts import ordinary_overlay_followup, validate_source_only_task
+    from process.provider_directory_generic_source_policy import is_source_storage_required
 
     validate_source_only_task(sys.modules[__name__], task, requested_source_ids, census_request)
+    if bcbs_minnesota.PARTITION_HINTS_PARAM in task:
+        bcbs_minnesota.require_partition_hint_task(task, source_storage=is_source_storage_required())
     overlay_followup = ordinary_overlay_followup(sys.modules[__name__], task)
     from process.provider_directory_cms_npd import validate_source_scope as validate_cms_source_scope
 
@@ -68188,6 +68157,7 @@ async def process_provider_directory_fhir_data(
                 ctx["context"]["audit"] = metrics_by_key
                 raise
             metrics_by_key["provider_directory_endpoint_scope_resolved"] = resolved_endpoint_scope
+            importable = bcbs_minnesota.with_partition_hints(sys.modules[__name__], task, importable, resources)
             source_import_groups = _group_resource_import_sources(
                 importable,
                 linked_resource_limit=linked_resource_limit,

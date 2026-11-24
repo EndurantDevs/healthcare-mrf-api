@@ -65,6 +65,39 @@ def test_fresh_minnesota_plan_contains_updates_during_acquisition(carrier_source
     assert scoped_plan.windows["root"].end >= started + datetime.timedelta(days=1)
 
 
+def test_partition_hints_scope_the_fixed_cutoff_to_one_run(carrier_source):
+    task_by_field = {
+        "source_ids": [carrier_source["source_id"]],
+        "provider_directory_endpoint_scope": BASE,
+        "full_refresh": True,
+        "import_resources": True,
+        "allow_retained_pagination_reset": False,
+        directory.bcbs_minnesota.PARTITION_HINTS_PARAM: {
+            "Practitioner": {"end": "2026-01-01T00:00:00Z", "planned_splits": ["root.0"]},
+        },
+    }
+    resources = directory.PUBLIC_DIRECTORY_SEVEN_RESOURCES
+    directory.bcbs_minnesota.require_partition_hint_task(task_by_field, source_storage=True)
+    (working_source,) = directory.bcbs_minnesota.with_partition_hints(
+        directory, task_by_field, [carrier_source], resources
+    )
+    original, _ = directory._last_updated_partition_config(carrier_source, "Practitioner")
+    working, error = directory._last_updated_partition_config(working_source, "Practitioner")
+    assert original.end is None and not original.planned_splits
+    assert error is None and working.end == datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+    assert working.planned_splits == ("root.0",)
+    assert directory._last_updated_partition_config(working_source, "Organization") == (
+        directory._last_updated_partition_config(carrier_source, "Organization")
+    )
+
+    with pytest.raises(ValueError, match="hints_scope_invalid"):
+        directory.bcbs_minnesota.require_partition_hint_task({**task_by_field, "page_limit": 1}, source_storage=True)
+    with pytest.raises(ValueError, match="hints_scope_invalid"):
+        directory.bcbs_minnesota.require_partition_hint_task(task_by_field, source_storage=False)
+    with pytest.raises(ValueError, match="hints_scope_invalid"):
+        directory.bcbs_minnesota.with_partition_hints(directory, task_by_field, [carrier_source], ("Practitioner",))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("left_response", "right_response", "expected_counts", "retry_at"),

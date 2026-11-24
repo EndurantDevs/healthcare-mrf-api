@@ -11,6 +11,7 @@ API_BASE = "https://api.bluecrossmn.com/fhir/provider"
 CACHED_RESOURCES = frozenset({"InsurancePlan", "Location", "HealthcareService"})
 STRATEGY_VERSION = "provider-directory-fhir-minnesota-time-cache-v4"
 CACHE_TOTAL_KEY = "minnesota_cache_expected_total"
+PARTITION_HINTS_PARAM = "provider_directory_partition_hints"
 INITIAL_PAGE_COUNT = 50
 PAGE_COUNT_CAP = 500
 DIRECT_VERIFICATION_LIMIT = 16
@@ -19,6 +20,51 @@ ORGANIZATION_RECOVERY_LIMIT = 128
 _QUERY_NAMES = frozenset(
     {"_count", "_getpages", "_getpagesoffset", "_pretty", "_bundletype", "_summary", "_total", "_format"}
 )
+
+
+def require_partition_hint_task(task, *, source_storage):
+    """Accept geometry only for a scoped complete acquisition."""
+    if PARTITION_HINTS_PARAM not in task:
+        return
+    if not (
+        source_storage
+        and task.get("provider_directory_endpoint_scope") == API_BASE
+        and task.get("full_refresh") is True
+        and task.get("import_resources") is True
+        and task.get("allow_retained_pagination_reset") is False
+        and not any(task.get(field) for field in ("seed_only", "bulk_export", "resource_limit", "page_limit"))
+    ):
+        raise ValueError("provider_directory_partition_hints_scope_invalid")
+
+
+def with_partition_hints(directory, task, source_rows, resources):
+    """Apply per-run split geometry after catalog persistence and endpoint selection."""
+    if PARTITION_HINTS_PARAM not in task:
+        return source_rows
+    if (
+        len(source_rows) != 1
+        or task.get("source_ids") != [source_rows[0].get("source_id")]
+        or directory._canonical_base(source_rows[0].get("canonical_api_base") or source_rows[0].get("api_base"))
+        != API_BASE
+        or set(resources) != set(directory.PUBLIC_DIRECTORY_SEVEN_RESOURCES)
+    ):
+        raise ValueError("provider_directory_partition_hints_scope_invalid")
+    source = source_rows[0]
+    hints = task[PARTITION_HINTS_PARAM]
+    configured = directory._last_updated_partition_resource_configs(source)
+    if not isinstance(hints, dict) or not hints or not hints.keys() <= configured.keys():
+        raise ValueError("provider_directory_partition_hints_invalid")
+    for resource_type, geometry in hints.items():
+        if not isinstance(geometry, dict) or geometry.keys() != {"end", "planned_splits"}:
+            raise ValueError("provider_directory_partition_hints_invalid")
+        settings_by_name = {**configured[resource_type], **geometry}
+        if not directory._build_partition_config(settings_by_name).planned_splits:
+            raise ValueError("provider_directory_partition_hints_invalid")
+        configured[resource_type] = settings_by_name
+    metadata = directory._source_metadata(source)
+    config_key = directory.LAST_UPDATED_PARTITION_METADATA_KEY
+    partition_by_field = {**metadata[config_key], "resources": configured}
+    return [{**source, "metadata_json": {**metadata, config_key: partition_by_field}}]
 
 
 def _organization_proof_ids(directory, window_id, references, fingerprints):
