@@ -3,6 +3,7 @@
 
 import hashlib
 from dataclasses import replace
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -85,6 +86,27 @@ async def test_sparse_selected_edges_match_full_rows_with_missing_and_manual_add
 
 
 @pytest.mark.asyncio
+async def test_shared_slice_id_in_another_bucket_adds_no_network(search_db):
+    db, layout = search_db, search_db.second_layout
+    relation, arguments = compact_address_native_sql(layout, first_parameter=1, visible_membership_sql="TRUE")
+    selected_columns = "location_key,canonical_network_ids"
+    expected = await db.connection.fetch(
+        f"SELECT {selected_columns} FROM {relation} a WHERE cardinality(a.canonical_network_ids)>0 ORDER BY location_key",
+        *arguments,
+    )
+    refs = search._qualified(layout.ref_map)
+    await db.connection.execute(f"""INSERT INTO {refs}
+      (network_id,office_bucket,artifact_candidate_id,slice_id,row_count,content_sha256)
+      SELECT 1701,(office_bucket+1)%64,artifact_candidate_id,slice_id,row_count,content_sha256
+      FROM {refs} ORDER BY network_id LIMIT 1""")
+    descriptor = await search.prepare_network_geo_search(db.connection, db.search_target, layout)
+    actual = await db.connection.fetch(
+        f'SELECT {selected_columns} FROM "{db.search_target.schema_name}".{search.TABLE} ORDER BY location_key'
+    )
+    assert actual == expected and descriptor["row_count"] == len(expected) == 2
+
+
+@pytest.mark.asyncio
 async def test_no_active_edge_artifacts_builds_an_empty_verified_projection(search_db):
     db = search_db
     await db.connection.execute(f"DELETE FROM {search._qualified(db.second_layout.ref_map)}")
@@ -97,28 +119,27 @@ async def test_no_active_edge_artifacts_builds_an_empty_verified_projection(sear
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["missing", "extra"])
-async def test_final_comparison_rejects_missing_or_unselected_extra_rows(search_db, monkeypatch, fault):
-    db, original = search_db, search._source_pass
-    mutation_events = []
+async def test_insert_accounting_rejects_missing_or_extra_rows(search_db, monkeypatch, fault):
+    db, original = search_db, search._insert_projection
+    differences = []
 
-    async def mutate_after_projection(connection, table, layout, source, *, is_base):
-        inserted = await original(connection, table, layout, source, is_base=is_base)
-        if inserted and not mutation_events:
-            if fault == "missing":
-                await connection.execute(
-                    f"DELETE FROM {table} WHERE location_key=(SELECT min(location_key) FROM {table})"
-                )
-            else:
-                await connection.execute(
-                    f'INSERT INTO {table} SELECT (jsonb_populate_record(NULL::{table},to_jsonb(row)||\'{{"location_key":"extra-unselected"}}\'::jsonb)).* FROM {table} row LIMIT 1'
-                )
-            mutation_events.append(fault)
-        return inserted
+    async def change_insert(connection, table, layout):
+        async def fetchrow(statement, *arguments):
+            columns = ",".join(search.compact_identifier(name) for name in search._COLUMNS)
+            selected = f"SELECT {columns} FROM expected"
+            changed = selected + " WHERE FALSE" if fault == "missing" else selected + " UNION ALL " + selected
+            assert selected in statement
+            result = await connection.fetchrow(statement.replace(selected, changed, 1), *arguments)
+            if result["differs"]:
+                differences.append(result["row_count"])
+            return result
 
-    monkeypatch.setattr(search, "_source_pass", mutate_after_projection)
+        return await original(SimpleNamespace(fetchrow=fetchrow), table, layout)
+
+    monkeypatch.setattr(search, "_insert_projection", change_insert)
     with pytest.raises(search.NetworkGeoSearchError):
         await search.prepare_network_geo_search(db.connection, db.search_target, db.second_layout)
-    assert mutation_events == [fault]
+    assert differences == [0 if fault == "missing" else 4]
     assert (
         await db.connection.fetchval("SELECT to_regclass($1)", db.search_target.schema_name + "." + search.TABLE)
         is None

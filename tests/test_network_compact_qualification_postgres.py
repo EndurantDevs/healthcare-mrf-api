@@ -36,9 +36,15 @@ from tests.test_network_geo_search_api_sql import projection_api_case as project
 from tests.test_network_geo_search_api_sql import (
     test_postgres_search_projection_preserves_routes_and_unselected_fallback as test_postgres_search_projection_preserves_routes_and_unselected_fallback,
 )
+from tests.test_network_geo_search_keyed_postgres import (
+    test_insert_accounting_rejects_missing_or_extra_rows as test_insert_accounting_rejects_missing_or_extra_rows,
+)
 from tests.test_network_geo_search_postgres import search_db as search_db
 from tests.test_network_geo_search_postgres import (
     test_bounded_search_matches_full_compact_rows_and_custom_precedence as test_bounded_search_matches_full_compact_rows_and_custom_precedence,
+)
+from tests.test_network_geo_search_postgres import (
+    test_duplicate_office_fails_the_native_key_and_rolls_back_the_projection as test_duplicate_office_fails_the_native_key_and_rolls_back_the_projection,
 )
 from tests.test_network_geo_search_postgres import (
     test_old_incompatible_profile_has_no_search_receipt_or_heap as test_old_incompatible_profile_has_no_search_receipt_or_heap,
@@ -48,9 +54,6 @@ from tests.test_network_geo_search_postgres import (
 )
 from tests.test_network_geo_search_postgres import (
     test_search_keyset_reuses_direct_range_shape_after_first_batch as test_search_keyset_reuses_direct_range_shape_after_first_batch,
-)
-from tests.test_network_geo_search_postgres import (
-    test_search_parity_failure_rolls_back_only_its_new_projection as test_search_parity_failure_rolls_back_only_its_new_projection,
 )
 from tests.test_network_geo_search_postgres import (
     test_search_rejects_changed_index_identity_and_receipt_scope as test_search_rejects_changed_index_identity_and_receipt_scope,

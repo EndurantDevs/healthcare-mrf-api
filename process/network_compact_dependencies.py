@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Resolve named compact dependencies and their logical candidate readiness."""
 
+import hashlib
 from uuid import UUID
 
 from process.network_address_projection import PinnedAddressSource, _identifier
@@ -113,9 +114,23 @@ async def _verified_layout(connection, candidate, base, control_schema, *, api_r
     return bind_compact_geo_search_candidate(layout, candidate)
 
 
-async def compact_slice_ref_digest(connection, schema_name):
-    """Summarize compact slice references with set-based counts without row streaming."""
+async def compact_slice_ref_digest(connection, schema_name, *, include_reuse_keys=False):
+    """Summarize references, with exact reuse keys for newly prepared typed candidates."""
     namespace = _identifier(schema_name)
+    if include_reuse_keys:
+        digest = hashlib.sha256()
+
+        async def update(chunk):
+            """Hash the ordered native reference rows as they arrive."""
+            digest.update(chunk)
+
+        await connection.copy_from_query(
+            f"SELECT network_id,office_bucket,artifact_candidate_id,slice_id,row_count,content_sha256 "
+            f"FROM {namespace}.network_slice_ref ORDER BY network_id,office_bucket",
+            output=update,
+            format="binary",
+        )
+        return digest.hexdigest()
     summary = await connection.fetchrow(
         f"SELECT count(*)::bigint AS rows,"
         f" count(DISTINCT network_id)::bigint AS networks,"

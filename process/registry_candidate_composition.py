@@ -22,6 +22,7 @@ from process.network_em_provider_inputs import (
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_membership_candidate_lifecycle import (
     _locked_candidate,
+    _seal_network_candidate,
     create_network_candidate,
     seal_network_candidate,
 )
@@ -318,7 +319,9 @@ async def _copy_composition(connection, copy_target, control_schema, source_stag
             control_schema=control_schema,
             **inventory_options,
         )
-        await retain_registry_source_memberships(connection, copy_target, source_stage, control_schema=control_schema)
+        retained_source = await retain_registry_source_memberships(
+            connection, copy_target, source_stage, control_schema=control_schema
+        )
         await materialize_registry_composition(connection, copy_target, command_stage, control_schema=control_schema)
         if entries is not None:
             await _prepare_provider_only_rows(
@@ -329,12 +332,8 @@ async def _copy_composition(connection, copy_target, control_schema, source_stag
                 source_stage,
                 control_schema,
             )
-        await seal_network_candidate(
-            connection,
-            copy_target,
-            control_schema=control_schema,
-            source_stage=source_stage,
-            **inventory_options,
+        await _seal_network_candidate(
+            connection, copy_target, control_schema, source_stage, entries, retained_source=retained_source
         )
 
 

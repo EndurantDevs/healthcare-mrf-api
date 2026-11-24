@@ -13,6 +13,7 @@ from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_slices import PinnedMembershipSlices, _prepare_slices
 from process.network_membership_validation import _scope_report, _validated_candidate
 from process.registry_network_import_progress import network_publication_step
+from process.registry_typed_membership_parity import is_typed_candidate
 
 
 async def _previous_slices(connection, candidate, control_schema):
@@ -121,6 +122,7 @@ async def prepare_compact_network_readiness(
     edge_artifacts, geo_search = await _prepare_address_search(connection, copy_target, offices, slices, control_schema)
     scope = _scope_report(candidate, address_source)
     canonical_readiness_by_field = _slice_readiness(scope, report, slices)
+    has_typed_memberships = is_typed_candidate(candidate)
     serving_readiness_by_field = {
         "component": COMPONENT,
         "readiness_revision": 1,
@@ -131,7 +133,10 @@ async def prepare_compact_network_readiness(
         "index_definition_sha256": await compact_index_digest(connection, copy_target.schema_name, candidate=candidate),
         "address_artifact": artifact,
         "edge_artifacts": edge_artifacts,
-        "slice_ref_sha256": await compact_slice_ref_digest(connection, copy_target.schema_name),
+        "slice_ref_sha256": await compact_slice_ref_digest(
+            connection, copy_target.schema_name, include_reuse_keys=has_typed_memberships
+        ),
+        **({"slice_ref_revision": 2} if has_typed_memberships else {}),
         **({"geo_search": geo_search} if geo_search is not None else {}),
     }
     await connection.execute(

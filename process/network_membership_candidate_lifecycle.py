@@ -427,12 +427,14 @@ async def admit_network_membership_batch(
     return receipt
 
 
-async def _seal_membership_accounting(connection, copy_target, candidate_record, namespace):
+async def _seal_membership_accounting(connection, copy_target, candidate_record, namespace, *, composed_source=None):
     """Reconcile legacy receipts or qualified zero-batch effective membership counts."""
     try:
         retention = verify_registry_source_retention(candidate_record)
     except RegistrySourceRetentionError as error:
         raise MembershipCandidateError(str(error)) from None
+    if composed_source is not None and (candidate_record["state"] != "open" or composed_source != retention):
+        raise MembershipCandidateError("registry_source_retention_scope_invalid")
     if retention is None:
         batch_rows = await connection.fetchval(
             f"SELECT COALESCE(SUM(row_count),0) FROM {namespace}.network_membership_batch WHERE candidate_id=$1",
@@ -447,10 +449,13 @@ async def _seal_membership_accounting(connection, copy_target, candidate_record,
         if batch_counts["batch_rows"] != 0 or batch_counts["batch_count"] != 0:
             raise MembershipCandidateError("Qualified candidate batch accounting must be empty")
         batch_rows = candidate_record["accepted_rows"]
-    membership_rows = await connection.fetchval(f'SELECT COUNT(*) FROM "{copy_target.schema_name}".network_membership')
+    membership_rows = (
+        composed_source["effective_rows"]
+        if composed_source is not None
+        else await connection.fetchval(f'SELECT COUNT(*) FROM "{copy_target.schema_name}".network_membership')
+    )
     if not batch_rows == candidate_record["accepted_rows"] == candidate_record["expected_rows"] == membership_rows:
         raise MembershipCandidateError("Candidate aggregate membership accounting does not reconcile")
-    return retention
 
 
 async def seal_network_candidate(
@@ -462,6 +467,15 @@ async def seal_network_candidate(
     inventory_entries=None,
 ) -> dict:
     """Close new writes only after receipts, counter, expectation and raw rows agree."""
+    return await _seal_network_candidate(
+        connection, copy_target, control_schema, source_stage, inventory_entries, retained_source=None
+    )
+
+
+async def _seal_network_candidate(
+    connection, copy_target, control_schema, source_stage, inventory_entries, *, retained_source
+):
+    """Only the composing transaction holds both heap locks from verified writes through seal."""
     _require_transaction(connection, copy_target)
     namespace = _control_namespace(control_schema)
     async with connection.transaction():
@@ -474,11 +488,14 @@ async def seal_network_candidate(
             )
         if candidate_record["state"] == "rejected":
             raise MembershipCandidateError("Rejected candidates cannot be sealed")
-        await _seal_membership_accounting(connection, copy_target, candidate_record, namespace)
+        await _seal_membership_accounting(
+            connection, copy_target, candidate_record, namespace, composed_source=retained_source
+        )
         try:
-            await verify_registry_source_retention_rows(
-                connection, copy_target, candidate_record, source_stage=source_stage
-            )
+            if retained_source is None:
+                await verify_registry_source_retention_rows(
+                    connection, copy_target, candidate_record, source_stage=source_stage
+                )
             from process.registry_source_contribution_store import verify_registry_source_contributions_rows
 
             await verify_registry_source_contributions_rows(

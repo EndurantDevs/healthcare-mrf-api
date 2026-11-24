@@ -192,19 +192,6 @@ async def test_reuse_compares_logical_recipe_and_actual_data_layout(monkeypatch,
             await custom.verify_custom_address_source(connection, receipt)
 
 
-@pytest.mark.parametrize("differs", [False, True])
-async def test_retained_copy_preserves_complete_row_multiset(differs):
-    connection = SimpleNamespace(
-        fetchrow=AsyncMock(return_value={"expected_rows": 7, "actual_rows": 7, "differs": differs})
-    )
-    if differs:
-        with pytest.raises(custom.NetworkCustomAddressSourceError, match="full-row parity"):
-            await custom._verify_retained_rows(connection, '"base".addresses', '"candidate".addresses', 7)
-    else:
-        await custom._verify_retained_rows(connection, '"base".addresses', '"candidate".addresses', 7)
-    assert "EXCEPT ALL" in connection.fetchrow.await_args.args[0]
-
-
 async def test_prepared_reuse_has_no_session_or_role_census_dependency(monkeypatch):
     from uuid import UUID
 

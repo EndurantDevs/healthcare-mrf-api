@@ -6,10 +6,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from process.network_compact_dependencies import compact_slice_ref_digest
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
 from process.network_compact_readiness import NetworkCompactReadinessError, compact_index_digest
 from process.network_compact_slice_validation import verify_compact_slice_contents
-from process.network_compact_validation import _actual_memberships, _membership_sets_differ
+from process.network_compact_validation import _actual_memberships, _membership_sets_differ, _typed_memberships_match
 from process.network_typed_slice_native import _MATCH_ROWS, build_matched_facts, verify_work_refs
 from process.registry_typed_membership_parity import ORDER
 from tests.test_network_membership_slices_postgres import _candidate, _pin, _prepare, slice_db
@@ -25,7 +26,7 @@ async def _layout(db, target, receipt, artifacts=None):
     )
 
 
-@pytest.mark.parametrize("damage", ["extra", "missing"])
+@pytest.mark.parametrize("damage", ["extra", "missing", "duplicate-owner"])
 async def test_new_slice_validation_rejects_unowned_or_missing_edges(slice_db, damage):
     db = slice_db
     target = await _candidate(db, [(42, 0), (7, 0)])
@@ -36,10 +37,14 @@ async def test_new_slice_validation_rejects_unowned_or_missing_edges(slice_db, d
     ns = '"' + target.schema_name + '"'
     if damage == "extra":
         await db.connection.execute(f"INSERT INTO {ns}.network_office_edge VALUES($1,'extra-office')", uuid4())
-    else:
+    elif damage == "missing":
         await db.connection.execute(
             f"DELETE FROM {ns}.network_office_edge WHERE ctid=(SELECT min(ctid) FROM {ns}.network_office_edge)"
         )
+    else:
+        await db.connection.execute(f"""INSERT INTO {ns}.network_slice_ref
+            SELECT 45,office_bucket,artifact_candidate_id,slice_id,row_count,content_sha256
+            FROM {ns}.network_slice_ref WHERE network_id=42""")
     async with db.connection.transaction():
         with pytest.raises(NetworkCompactReadinessError):
             await verify_compact_slice_contents(db.connection, target, layout)
@@ -70,6 +75,21 @@ async def test_reused_slice_metadata_must_match_its_sealed_origin(slice_db):
     async with db.connection.transaction():
         with pytest.raises(NetworkCompactReadinessError):
             await verify_compact_slice_contents(db.connection, second, layout)
+
+
+async def test_exact_slice_reuse_metadata_detects_digest_change(slice_db):
+    db = slice_db
+    target = await _candidate(db, [(42, 0), (7, 1)])
+    async with db.connection.transaction():
+        await _prepare(db, target)
+    namespace = '"' + target.schema_name + '"'
+    counts = await compact_slice_ref_digest(db.connection, target.schema_name)
+    exact = await compact_slice_ref_digest(db.connection, target.schema_name, include_reuse_keys=True)
+    await db.connection.execute(
+        f"UPDATE {namespace}.network_slice_ref SET content_sha256=repeat('a',64) WHERE network_id=42"
+    )
+    assert await compact_slice_ref_digest(db.connection, target.schema_name) == counts
+    assert await compact_slice_ref_digest(db.connection, target.schema_name, include_reuse_keys=True) != exact
 
 
 async def test_compact_index_identity_requires_native_inverse_lookup(slice_db):
@@ -112,7 +132,7 @@ async def _reference_set_difference(connection, namespace, layout):
 
 
 @pytest.mark.parametrize("reuse", [False, True], ids=["generic", "retained-and-new"])
-@pytest.mark.parametrize("corruption", [None, "missing", "extra", "network"])
+@pytest.mark.parametrize("corruption", [None, "missing", "extra", "network", "same-count"])
 async def test_indexed_compact_set_parity_keeps_aliases_evidence_and_selected_reuse(slice_db, reuse, corruption):
     db = slice_db
     pairs = [(42, 0), (42, 0), (42, 1), (7, 1), (88, 2)]
@@ -140,10 +160,33 @@ async def test_indexed_compact_set_parity_keeps_aliases_evidence_and_selected_re
         await db.connection.execute(f"INSERT INTO {edge} VALUES($1,'extra-office')", selected["slice_id"])
     elif corruption == "network":
         await db.connection.execute(f"UPDATE {namespace}.network_slice_ref SET network_id=43 WHERE network_id=42")
+    elif corruption == "same-count":
+        await db.connection.execute(
+            f"UPDATE {edge} SET location_key='wrong-office' WHERE slice_id=$1", selected["slice_id"]
+        )
     async with db.connection.transaction(isolation="repeatable_read", readonly=True):
         is_different = corruption is not None
         assert await _reference_set_difference(db.connection, namespace, layout) is is_different
         assert await _membership_sets_differ(db.connection, namespace, layout) is is_different
+        assert (
+            await _typed_memberships_match(db.connection, namespace, layout, len(pairs) + int(reuse))
+            is not is_different
+        )
+
+
+async def test_typed_compact_validation_rejects_unbound_alias_with_same_serving_set(slice_db):
+    db = slice_db
+    target = await _set_candidate(db, [(42, 0), (42, 1)])
+    async with db.connection.transaction():
+        receipt = await _prepare(db, target)
+        layout = await _layout(db, target, receipt)
+    namespace = '"' + target.schema_name + '"'
+    await db.connection.execute(
+        f"DELETE FROM {namespace}.provider_location_binding WHERE location_id=$1", db.location_ids[1]
+    )
+    async with db.connection.transaction(isolation="repeatable_read", readonly=True):
+        assert await _membership_sets_differ(db.connection, namespace, layout) is False
+        assert await _typed_memberships_match(db.connection, namespace, layout, 2) is False
 
 
 async def test_indexed_compact_set_parity_accepts_empty_artifacts(slice_db):
@@ -157,6 +200,8 @@ async def test_indexed_compact_set_parity_accepts_empty_artifacts(slice_db):
     async with db.connection.transaction(isolation="repeatable_read", readonly=True):
         assert await _reference_set_difference(db.connection, namespace, layout) is False
         assert await _membership_sets_differ(db.connection, namespace, layout) is False
+        assert await _typed_memberships_match(db.connection, namespace, layout, 0) is True
+        assert await _typed_memberships_match(db.connection, namespace, layout, 1) is False
 
 
 async def test_compact_set_parity_preserves_readonly_without_reverse_index(slice_db):
