@@ -1542,8 +1542,13 @@ async def test_custom_retained_binary_copy_bounds_and_full_row_parity(custom_db,
     spools = _observe_bootstrap_spools(monkeypatch, bootstrap)
     proxy = BootstrapCopyConnection(fixture.connection)
     arguments = _arguments(fixture, seed.revision)
-    async with fixture.connection.transaction(isolation="repeatable_read"):
-        receipt = await prepare_custom_address_source(proxy, fixture.base, **arguments)
+    queries = []
+    with fixture.connection.query_logger(queries.append):
+        async with fixture.connection.transaction(isolation="repeatable_read"):
+            receipt = await prepare_custom_address_source(proxy, fixture.base, **arguments)
+    assert not any(
+        "EXCEPT ALL" in logged.query and "row_origin<>'network_custom'" in logged.query for logged in queries
+    )
     assert len(proxy.imports) >= 3 and all(0 < size <= byte_bound for size in proxy.import_bytes)
     assert all(copy_file.closed for copy_file in spools)
     assert all("OFFSET" not in query and "ORDER BY a.location_key" in query for query, _ in proxy.exports)
@@ -1645,25 +1650,19 @@ async def test_custom_retained_copy_requires_existing_key_and_bounded_row(custom
     assert await _prepare(fixture, seed.revision, arguments=arguments)
 
 
-async def test_custom_retained_copy_checks_full_row_parity(custom_db, monkeypatch):
-    """Matching COPY counts cannot hide altered retained values."""
-    import process.network_custom_address_source as custom
-
+async def test_custom_only_base_copies_no_old_offices(custom_db):
     fixture = custom_db
     seed = await _seed(fixture)
-    arguments = _arguments(fixture, seed.revision)
-    original_copy = custom._copy_projection_rows
-
-    async def altered_copy(connection, schema_name, query):
-        copied = await original_copy(connection, schema_name, query)
-        await connection.execute(f"UPDATE \"{schema_name}\".entity_address_unified SET first_line='Altered native row'")
-        return copied
-
-    with monkeypatch.context() as altered:
-        altered.setattr(custom, "_copy_projection_rows", altered_copy)
-        with pytest.raises(NetworkCustomAddressSourceError, match="full-row parity"):
-            await _prepare(fixture, seed.revision, arguments=arguments)
-    assert await _prepare(fixture, seed.revision, arguments=arguments)
+    await fixture.connection.execute(f"""UPDATE "{fixture.source_schema}".entity_address_unified
+        SET row_origin='network_custom'""")
+    proxy = BootstrapCopyConnection(fixture.connection)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        receipt = await prepare_custom_address_source(proxy, fixture.base, **_arguments(fixture, seed.revision))
+    assert not proxy.exports and not proxy.imports
+    rows = await fixture.connection.fetch(
+        f'SELECT location_key,row_origin FROM "{receipt.address_source.schema_name}".entity_address_unified'
+    )
+    assert len(rows) == 1 and rows[0]["location_key"] != "a" * 64 and rows[0]["row_origin"] == "network_custom"
 
 
 @pytest.fixture

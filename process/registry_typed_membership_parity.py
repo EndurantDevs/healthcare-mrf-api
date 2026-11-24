@@ -37,6 +37,17 @@ async def require_order_index(connection, relation):
         raise ValueError("registry_typed_parity_index_required")
 
 
+async def require_not_null_keys(connection, membership):
+    """Require the existing native membership key constraints."""
+    if not await connection.fetchval(
+        "SELECT count(*)=5 AND bool_and(attnotnull) FROM pg_attribute "
+        "WHERE attrelid=to_regclass($1) AND attname=ANY($2::text[]) AND NOT attisdropped",
+        membership,
+        COLUMNS.split(","),
+    ):
+        raise ValueError("registry_typed_parity_not_null_required")
+
+
 async def _last_page_key(connection, query, after, *, page_rows=5000):
     condition = "TRUE" if after is None else "(" + ORDER + ")>" + _PARAMETERS
     page = await connection.prepare(

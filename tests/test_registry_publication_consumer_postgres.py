@@ -576,7 +576,7 @@ async def test_provider_custody_timeout_retains_lease_and_resumes_exact_request(
 
 
 class _SealTimeoutConnection:
-    """Inject one real native query timeout inside the actual retention verifier."""
+    """Inject one real native query timeout during candidate seal accounting."""
 
     def __init__(self, connection):
         self.connection = connection
@@ -584,16 +584,14 @@ class _SealTimeoutConnection:
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
-    async def fetchval(self, *arguments, **options):
+    async def fetchrow(self, *arguments, **options):
         await self.connection.execute("SET LOCAL statement_timeout='1ms'")
-        return await self.connection.fetchval("SELECT pg_sleep(1)")
+        return await self.connection.fetchrow("SELECT pg_sleep(1)")
 
 
 def _cancel_database_read(fixture, queued, monkeypatch, boundary, failure_by_field):
     module, name = (
-        (serving_read, "_read_manifest")
-        if boundary == "manifest"
-        else (lifecycle, "verify_registry_source_retention_rows")
+        (serving_read, "_read_manifest") if boundary == "manifest" else (lifecycle, "_seal_membership_accounting")
     )
     original = getattr(module, name)
 
@@ -1482,7 +1480,7 @@ def _deadline_worker_config(fixture, arguments):
         "synthetic-service-token",
         arguments["config"],
         arguments["initial_address_sources"],
-        operation_seconds=3,
+        operation_seconds=15,
         preparation_roles=_worker_preparation_roles(fixture),
     )
 

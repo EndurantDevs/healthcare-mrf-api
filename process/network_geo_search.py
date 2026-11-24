@@ -194,71 +194,57 @@ async def _has_compatible_sources(connection, layout):
     return True
 
 
-def _batch_ctes(layout, source_relation, *, is_base, has_after=False):
-    """Keep ordered edge pages and exact address probes behind native subquery boundaries."""
+def _batch_ctes(layout, *, has_after=False):
+    """Read one ordered key range across the selected edge artifacts."""
     columns = ",".join("a." + compact_identifier(name) for name in SEARCH_COLUMNS)
-    override = ""
-    if is_base:
-        override = " WHERE a.row_origin<>'network_custom'"
-        if layout.custom is not None:
-            override += f" AND NOT EXISTS(SELECT FROM ONLY {_qualified(layout.custom)} custom WHERE custom.location_key=a.location_key OFFSET 0)"
-    memberships = []
+    keyset_predicate = "edge.location_key>$1::text" if has_after else "$1::text IS NULL"
+    key_pages, memberships = [], []
     for index, artifact in enumerate(layout.artifacts, 2):
-        edge = compact_identifier(artifact.schema_name) + ".network_office_edge"
-        memberships.append(f"""SELECT a.location_key,ref.network_id FROM effective a
-          JOIN LATERAL (SELECT slice_id FROM ONLY {edge} edge
-            WHERE edge.location_key=a.location_key OFFSET 0) edge ON TRUE
+        edge_table = compact_identifier(artifact.schema_name) + ".network_office_edge"
+        key_pages.append(f"""(SELECT edge.location_key FROM ONLY {edge_table} edge
+          WHERE {keyset_predicate} GROUP BY edge.location_key ORDER BY edge.location_key LIMIT {_BATCH_ROWS})""")
+        memberships.append(f"""SELECT edge.location_key,ref.network_id FROM bounds
+          CROSS JOIN LATERAL (SELECT edge.location_key,edge.slice_id FROM ONLY {edge_table} edge
+            WHERE {keyset_predicate} AND edge.location_key<=bounds.last_key OFFSET 0) edge
           JOIN ONLY {_qualified(layout.ref_map)} ref ON ref.slice_id=edge.slice_id
-          AND ref.artifact_candidate_id=${index}::uuid
-          AND ref.office_bucket=(get_byte(sha256(convert_to(a.location_key,'UTF8')),0)&63)""")
+            AND ref.artifact_candidate_id=${index}::uuid
+            AND ref.office_bucket=(get_byte(sha256(convert_to(edge.location_key,'UTF8')),0)&63)""")
+    key_sql = " UNION ALL ".join(key_pages) or "SELECT NULL::text AS location_key WHERE $1::text IS NULL AND FALSE"
     membership_sql = (
         " UNION ALL ".join(memberships) or "SELECT NULL::text AS location_key,NULL::integer AS network_id WHERE FALSE"
     )
-    keyset_predicate = "edge.location_key>$1::text" if has_after else "$1::text IS NULL"
-    key_pages = []
-    for index, artifact in enumerate(layout.artifacts, 2):
-        edge = compact_identifier(artifact.schema_name) + ".network_office_edge"
-        key_pages.append(f"""(SELECT edge.location_key FROM ONLY {edge} edge
-          WHERE {keyset_predicate} AND EXISTS(SELECT FROM ONLY {_qualified(layout.ref_map)} ref
-            WHERE ref.slice_id=edge.slice_id AND ref.artifact_candidate_id=${index}::uuid
-              AND ref.office_bucket=(get_byte(sha256(convert_to(edge.location_key,'UTF8')),0)&63) OFFSET 0)
-          GROUP BY edge.location_key ORDER BY edge.location_key LIMIT {_BATCH_ROWS})""")
-    key_sql = " UNION ALL ".join(key_pages) or "SELECT NULL::text AS location_key WHERE $1::text IS NULL AND FALSE"
+    offices = f"""SELECT {columns} FROM ONLY {_qualified(layout.base)} a
+      WHERE a.location_key=networks.location_key AND a.row_origin<>'network_custom'"""
+    if layout.custom is not None:
+        custom = _qualified(layout.custom)
+        offices += f""" AND NOT EXISTS(SELECT FROM ONLY {custom} custom WHERE custom.location_key=a.location_key)
+          UNION ALL SELECT {columns} FROM ONLY {custom} a WHERE a.location_key=networks.location_key"""
     return f"""key_page AS MATERIALIZED (
       SELECT location_key FROM ({key_sql}) selected_keys
       GROUP BY location_key ORDER BY location_key LIMIT {_BATCH_ROWS}
-    ), source_page AS MATERIALIZED (
-      SELECT {columns} FROM key_page selected
-      JOIN LATERAL (SELECT * FROM ONLY {_qualified(source_relation)} a
-        WHERE a.location_key=selected.location_key OFFSET 0) a ON TRUE
-    ), effective AS MATERIALIZED (SELECT {columns} FROM source_page a{override}),
-    memberships AS ({membership_sql}), network_arrays AS (
+    ), bounds AS MATERIALIZED (SELECT max(location_key) AS last_key FROM key_page),
+    memberships AS ({membership_sql}), networks AS (
       SELECT location_key,array_agg(DISTINCT network_id ORDER BY network_id) AS canonical_network_ids
       FROM memberships GROUP BY location_key
     ), expected AS MATERIALIZED (
-      SELECT {columns},{_GEO} AS geo,network_arrays.canonical_network_ids
-      FROM effective a JOIN network_arrays USING(location_key)
+      SELECT {columns},{_GEO} AS geo,networks.canonical_network_ids FROM networks
+      CROSS JOIN LATERAL ({offices} OFFSET 0) a
     )"""
 
 
-async def _source_pass(connection, target_table, layout, source, *, is_base):
-    """Verify the inserted rows against the same bounded projection."""
+async def _insert_projection(connection, target_table, layout):
+    """Count the selected and inserted offices in each bounded range."""
     columns = ",".join(compact_identifier(name) for name in _COLUMNS)
     tail = f""", inserted AS (INSERT INTO {target_table} ({columns}) SELECT {columns} FROM expected
-      RETURNING {columns})
-    SELECT (SELECT max(location_key) FROM key_page) AS last_key,
-      (SELECT count(*) FROM inserted) AS row_count,
-      EXISTS((SELECT {columns} FROM expected EXCEPT ALL SELECT {columns} FROM inserted)
-        UNION ALL (SELECT {columns} FROM inserted EXCEPT ALL SELECT {columns} FROM expected)) AS differs"""
-    statements = tuple(
-        "WITH " + _batch_ctes(layout, source, is_base=is_base, has_after=has_after) + tail
-        for has_after in (False, True)
-    )
+      RETURNING 1)
+    SELECT (SELECT last_key FROM bounds) AS last_key, accepted.row_count,
+      accepted.row_count<>(SELECT count(*) FROM expected) AS differs
+    FROM (SELECT count(*) AS row_count FROM inserted) accepted"""
+    statements = tuple("WITH " + _batch_ctes(layout, has_after=has_after) + tail for has_after in (False, True))
+    artifacts = tuple(UUID(artifact.candidate_id) for artifact in layout.artifacts)
     after, total = None, 0
     while True:
-        outcome = await connection.fetchrow(
-            statements[after is not None], after, *(UUID(artifact.candidate_id) for artifact in layout.artifacts)
-        )
+        outcome = await connection.fetchrow(statements[after is not None], after, *artifacts)
         _require(outcome["differs"] is False)
         if outcome["last_key"] is None:
             return total
@@ -278,11 +264,7 @@ async def _build_projection(connection, target, layout):
     await connection.execute(
         f"ALTER TABLE {table} ALTER COLUMN canonical_network_ids SET NOT NULL, ADD CHECK(cardinality(canonical_network_ids)>0 AND array_position(canonical_network_ids,NULL) IS NULL)"
     )
-    sources = ((layout.base, True),) + (((layout.custom, False),) if layout.custom is not None else ())
-    inserted = sum(
-        [await _source_pass(connection, table, layout, source, is_base=is_base) for source, is_base in sources]
-    )
-    _require(inserted == await connection.fetchval(f"SELECT count(*) FROM ONLY {table}"))
+    inserted = await _insert_projection(connection, table, layout)
     await connection.execute(f"ALTER TABLE {table} ADD PRIMARY KEY(location_key)")
     await _build_geo_search_index(connection, table)
     return inserted
@@ -314,19 +296,15 @@ async def prepare_network_geo_search(connection, copy_target, layout):
     )
     async with connection.transaction():
         count = await _build_projection(connection, copy_target, layout)
+        indexes = await _index_records(connection, compact_identifier(copy_target.schema_name) + "." + TABLE)
         descriptor_by_field = {
             "contract": CONTRACT,
             "scope": {field: getattr(copy_target, field) for field in _SCOPE_FIELDS},
             "table_name": TABLE,
             "row_count": count,
             "sources": json.loads(json.dumps(asdict(layout))),
-            "indexes": [
-                {field: index_record[field] for field in ("name", *_INDEX_FIELDS)}
-                for index_record in await _index_records(
-                    connection, compact_identifier(copy_target.schema_name) + "." + TABLE
-                )
-            ],
+            "indexes": [{field: index_record[field] for field in ("name", *_INDEX_FIELDS)} for index_record in indexes],
         }
         descriptor_by_field["sha256"] = _digest(descriptor_by_field)
-        await verify_geo_search_indexes(connection, descriptor_by_field)
+        require_geo_search_index_records(indexes, descriptor_by_field)
         return descriptor_by_field

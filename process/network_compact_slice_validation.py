@@ -24,15 +24,14 @@ async def verify_compact_slice_contents(connection, copy_target, layout):
         _require(mismatch is False)
     _require(
         await connection.fetchval(
-            f"""SELECT NOT EXISTS(SELECT 1 FROM {namespace}.network_office_edge edge
-              WHERE NOT EXISTS(SELECT 1 FROM {namespace}.network_slice_ref ref
-                WHERE ref.artifact_candidate_id=$1 AND ref.slice_id=edge.slice_id))
-            AND NOT EXISTS(SELECT 1 FROM {namespace}.network_slice_ref WHERE artifact_candidate_id=$1
-              GROUP BY slice_id HAVING count(*)<>1)
-            AND NOT EXISTS(SELECT 1 FROM {namespace}.network_slice_ref ref
-              LEFT JOIN (SELECT slice_id,count(*) AS edges FROM {namespace}.network_office_edge GROUP BY slice_id) edge
-                USING(slice_id)
-              WHERE ref.artifact_candidate_id=$1 AND coalesce(edge.edges,0)<>ref.row_count)""",
+            f"""WITH owned AS (
+              SELECT slice_id,count(*) AS owners,min(row_count) AS expected_rows
+              FROM {namespace}.network_slice_ref WHERE artifact_candidate_id=$1 GROUP BY slice_id
+            ), counted AS (
+              SELECT slice_id,count(*) AS actual_rows FROM {namespace}.network_office_edge GROUP BY slice_id
+            ) SELECT NOT EXISTS(
+              SELECT FROM owned FULL JOIN counted USING(slice_id)
+              WHERE owners IS DISTINCT FROM 1 OR actual_rows IS DISTINCT FROM expected_rows)""",
             current,
         )
     )

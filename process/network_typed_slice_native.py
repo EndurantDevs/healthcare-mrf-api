@@ -2,7 +2,13 @@
 """Bounded native preparation and content checks for typed membership slices."""
 
 from process.network_address_projection import _identifier
-from process.registry_typed_membership_parity import COLUMNS, ORDER, _last_page_key, require_order_index
+from process.registry_typed_membership_parity import (
+    COLUMNS,
+    ORDER,
+    _last_page_key,
+    require_not_null_keys,
+    require_order_index,
+)
 
 _DOMAIN = b"network-office-slice-v1\0"
 _METADATA_ROWS = 256
@@ -62,13 +68,7 @@ async def build_matched_facts(connection, schema, addresses, work, affected):
     """Count every duplicate in indexed inclusive ranges; aggregate only one key page."""
     membership = schema + ".network_membership"
     await require_order_index(connection, membership)
-    if not await connection.fetchval(
-        "SELECT count(*)=5 AND bool_and(attnotnull) FROM pg_attribute "
-        "WHERE attrelid=to_regclass($1) AND attname=ANY($2::text[]) AND NOT attisdropped",
-        membership,
-        COLUMNS.split(","),
-    ):
-        raise ValueError("registry_typed_parity_not_null_required")
+    await require_not_null_keys(connection, membership)
     locations = _identifier(work.strip('"') + "_locations")
     await connection.execute(f"""CREATE TEMP TABLE {work}(network_id integer,location_key text COLLATE "C",office_bucket integer,membership_rows bigint NOT NULL,
       UNIQUE NULLS NOT DISTINCT(network_id,office_bucket,location_key)) ON COMMIT DROP""")

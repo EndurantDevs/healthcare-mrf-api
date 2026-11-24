@@ -300,13 +300,14 @@ async def test_compact_final_checks_slice_data_and_returns_stored_accounting(mon
         custom=None,
     )
     events = []
-    monkeypatch.setattr(compact, "compact_readiness", lambda *arguments: events.append("readiness"))
+    monkeypatch.setattr(compact, "compact_readiness", lambda *arguments: (events.append("readiness"), {}))
     monkeypatch.setattr(compact, "_scope_report", lambda *arguments: {})
     monkeypatch.setattr(compact, "published_network_layout", lambda actual: layout)
     monkeypatch.setattr(
         compact, "verify_compact_slice_contents", AsyncMock(side_effect=lambda *arguments: events.append("slices"))
     )
     monkeypatch.setattr(compact, "is_typed_candidate", lambda actual: typed)
+    monkeypatch.setattr(compact, "_has_binding_location_index", AsyncMock(return_value=False))
     monkeypatch.setattr(
         compact, "_membership_sets_differ", AsyncMock(side_effect=lambda *arguments: events.append("sets") or False)
     )

@@ -669,6 +669,49 @@ async def test_source_construction_and_seal_refuse_incomplete_or_changed_source(
         await fixture.writer.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
 
 
+@pytest.mark.parametrize("already_retained", [False, True])
+async def test_composition_recounts_only_previously_retained_source(candidate_lifecycle, already_retained):
+    from process.registry_candidate_composition import _copy_composition
+    from process.registry_source_retention import RegistrySourceRetentionError, retain_registry_source_memberships
+    from tests.test_registry_source_retention import retention_receipt
+
+    fixture = candidate_lifecycle
+    source_relation = f'"{fixture.copy_target.schema_name}".network_membership_source'
+    receipt = retention_receipt(add_rows=0, remove_rows=0, suppressed_source_rows=0, effective_rows=2)
+    async with fixture.writer.transaction():
+        await _create(
+            fixture, expected_rows=2, source_retention=receipt, source_generations={"custom_membership": "b" * 64}
+        )
+        stage = await _retention_stage(fixture)
+        commands = await _command_stage(fixture)
+
+    arguments = (fixture.writer, fixture.copy_target, fixture.control_schema, stage, commands, {})
+    if already_retained:
+        async with fixture.writer.transaction():
+            await retain_registry_source_memberships(
+                fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
+            )
+            await fixture.writer.execute(
+                f"DELETE FROM {source_relation} WHERE ctid IN (SELECT ctid FROM {source_relation} LIMIT 1)"
+            )
+        with pytest.raises(RegistrySourceRetentionError, match="accounting_invalid"):
+            await _copy_composition(*arguments)
+        assert await _counts(fixture) == (0, 0, 0)
+        await fixture.writer.execute(f"INSERT INTO {source_relation} SELECT * FROM {source_relation}")
+    queries = []
+    with fixture.writer.query_logger(queries.append):
+        await _copy_composition(*arguments)
+    await asyncio.sleep(0)
+    assert sum(logged.query == f"SELECT count(*) FROM {source_relation}" for logged in queries) == int(already_retained)
+    assert not any(
+        logged.query == f"SELECT COUNT(*) FROM {source_relation.removesuffix('_source')}" for logged in queries
+    )
+    assert any(logged.query.startswith(f"INSERT INTO {source_relation} ") for logged in queries) == (
+        not already_retained
+    )
+    assert await _counts(fixture) == (2, 0, 2)
+
+
 async def test_source_registration_is_immutable_and_rejects_orphan_digest(candidate_lifecycle):
     from process.registry_source_retention import SUMMARY_KEY
     from tests.test_registry_source_retention import retention_receipt

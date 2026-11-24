@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import asyncpg
 import pytest
 
 from api.network_compact_address import compact_address_native_sql
@@ -37,13 +38,11 @@ async def test_search_keyset_reuses_direct_range_shape_after_first_batch():
             ]
         )
     )
-    assert (
-        await search._source_pass(connection, '"candidate".network_geo_search', layout, layout.base, is_base=True) == 3
-    )
+    assert await search._insert_projection(connection, '"candidate".network_geo_search', layout) == 3
     first, second, final = connection.fetchrow.await_args_list
     assert "WHERE $1::text IS NULL" in first.args[0]
     assert "WHERE edge.location_key>$1::text" in second.args[0]
-    assert "a.location_key=selected.location_key" in second.args[0]
+    assert "a.location_key=networks.location_key" in second.args[0]
     assert "IS NULL OR" not in second.args[0] and second.args[0] == final.args[0]
     assert first.args[1:] == (None, UUID(candidate_id))
     assert second.args[1:] == ("office-a", UUID(candidate_id))
@@ -71,27 +70,31 @@ async def test_search_generic_plan_uses_edge_range_and_exact_address_lookup(sear
     )
     await db.connection.execute(f"ANALYZE {edge}")
     await db.connection.execute("SET LOCAL plan_cache_mode='force_generic_plan'")
-    ctes = search._batch_ctes(layout, layout.base, is_base=True, has_after=True)
+    ctes = search._batch_ctes(layout, has_after=True)
     kinds = ",".join(("text", *("uuid" for _ in layout.artifacts)))
-    await db.connection.execute(f"PREPARE search_keyset({kinds}) AS WITH {ctes} SELECT location_key FROM source_page")
+    await db.connection.execute(f"PREPARE search_keyset({kinds}) AS WITH {ctes} SELECT location_key FROM expected")
     prepared_arguments = ",".join(
         ("'seek-04000'", *("'" + artifact.candidate_id + "'" for artifact in layout.artifacts))
     )
     explained = json.loads(
         await db.connection.fetchval(
-            f"EXPLAIN(ANALYZE,BUFFERS,FORMAT JSON) EXECUTE search_keyset({prepared_arguments})"
+            f"EXPLAIN(ANALYZE,BUFFERS,VERBOSE,FORMAT JSON) EXECUTE search_keyset({prepared_arguments})"
         )
     )
-    pending_nodes, index_conditions = [explained[0]["Plan"]], []
+    pending_nodes, nodes = [explained[0]["Plan"]], []
     while pending_nodes:
         plan_node = pending_nodes.pop()
-        index_conditions.append(plan_node.get("Index Cond", ""))
+        nodes.append(plan_node)
         pending_nodes.extend(plan_node.get("Plans", ()))
-    assert any("location_key" in condition and "> $1" in condition for condition in index_conditions), json.dumps(
-        explained
-    )
     assert any(
-        "location_key" in condition and "selected.location_key" in condition for condition in index_conditions
+        node.get("Relation Name") == "network_office_edge" and "> $1" in node.get("Index Cond", "") for node in nodes
+    ), json.dumps(explained)
+    assert any(
+        node.get("Schema") == layout.base.schema_name
+        and node.get("Relation Name") == layout.base.table_name
+        and "location_key" in node.get("Index Cond", "")
+        and " = " in node["Index Cond"]
+        for node in nodes
     ), json.dumps(explained)
     await db.connection.execute("DEALLOCATE search_keyset")
 
@@ -195,28 +198,16 @@ async def test_search_rejects_changed_index_identity_and_receipt_scope(search_db
 
 
 @pytest.mark.asyncio
-async def test_search_parity_failure_rolls_back_only_its_new_projection(search_db, monkeypatch):
+async def test_duplicate_office_fails_the_native_key_and_rolls_back_the_projection(search_db):
     db = search_db
-    original = search._source_pass
-    mutation_events = []
-
-    async def corrupt_insert(connection, table, layout, source, *, is_base):
-        async def fetchrow(statement, *args):
-            columns = ",".join(search.compact_identifier(name) for name in search._COLUMNS)
-            expected = f"SELECT {columns} FROM expected"
-            corrupted = expected.replace('"state_name"', "'ZZ'")
-            assert expected in statement
-            output = await connection.fetchrow(statement.replace(expected, corrupted, 1), *args)
-            if output["row_count"]:
-                mutation_events.append("changed")
-            return output
-
-        return await original(SimpleNamespace(fetchrow=fetchrow), table, layout, source, is_base=is_base)
-
-    monkeypatch.setattr(search, "_source_pass", corrupt_insert)
-    with pytest.raises(search.NetworkGeoSearchError):
+    custom = search._qualified(db.second_layout.custom)
+    primary_key = await db.connection.fetchval(
+        "SELECT conname FROM pg_constraint WHERE conrelid=to_regclass($1::text) AND contype='p'", custom
+    )
+    await db.connection.execute(f"ALTER TABLE {custom} DROP CONSTRAINT {search.compact_identifier(primary_key)}")
+    await db.connection.execute(f"INSERT INTO {custom} SELECT * FROM {custom} WHERE location_key=$1", db.keys[0])
+    with pytest.raises(asyncpg.UniqueViolationError):
         await search.prepare_network_geo_search(db.connection, db.search_target, db.second_layout)
-    assert mutation_events == ["changed"]
     assert (
         await db.connection.fetchval("SELECT to_regclass($1)", db.search_target.schema_name + "." + search.TABLE)
         is None

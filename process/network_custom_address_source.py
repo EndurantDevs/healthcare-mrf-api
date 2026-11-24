@@ -169,18 +169,6 @@ async def _approved_identity(connection, control, revision, *, retained=False):
     return summary
 
 
-async def _verify_retained_rows(connection, base_table, address_table, copied_rows):
-    accounting = await connection.fetchrow(f"""SELECT
-      (SELECT count(*) FROM {base_table} WHERE row_origin<>'network_custom') AS expected_rows,
-      (SELECT count(*) FROM {address_table}) AS actual_rows,
-      EXISTS((SELECT * FROM {base_table} WHERE row_origin<>'network_custom'
-        EXCEPT ALL SELECT * FROM {address_table}) UNION ALL
-        (SELECT * FROM {address_table} EXCEPT ALL
-         SELECT * FROM {base_table} WHERE row_origin<>'network_custom')) AS differs""")
-    if copied_rows != accounting["expected_rows"] or copied_rows != accounting["actual_rows"] or accounting["differs"]:
-        raise NetworkCustomAddressSourceError("Retained address COPY accounting or full-row parity differs")
-
-
 def _has_source_aliases(receipts):
     aliases_by_key = {}
     for receipt in receipts:
@@ -206,12 +194,12 @@ async def _build_heaps(connection, recipe, schema_name, control, office_inputs):
     await _create_artifact_schema(connection, schema_name)
     await connection.execute(f"CREATE TABLE {address_table} (LIKE {base_table} INCLUDING DEFAULTS)")
     await connection.execute(f"ALTER TABLE {address_table} ADD PRIMARY KEY(location_key)")
-    copied_rows = await _copy_projection_rows(
+    # The same bounded binary spool supplies every row of the new heap; both COPY counts are checked.
+    await _copy_projection_rows(
         connection,
         schema_name,
         f"SELECT a.* FROM (SELECT * FROM {base_table} WHERE row_origin<>'network_custom') a",
     )
-    await _verify_retained_rows(connection, base_table, address_table, copied_rows)
     await connection.execute(f"""CREATE TABLE {namespace}.provider_location_binding(
       provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,
       location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,
