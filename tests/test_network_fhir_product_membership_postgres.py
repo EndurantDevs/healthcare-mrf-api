@@ -16,6 +16,7 @@ from process import network_membership_slices as slices
 from process import registry_imported_selection_preview as preview
 from process import registry_membership_composition_stage as composition
 from process import registry_typed_membership_parity as membership_parity
+from process import registry_typed_source_stage as typed_stage
 from process.network_approved_membership_source import ApprovedMembershipSource, pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import (
@@ -381,6 +382,67 @@ async def test_pair_plan_duplicate_bindings_still_fail_count_closure_and_rollbac
             await mapping._require_mapping_counts(connection, stage, selected, totals)
     assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("memberships")) == 0
     assert await connection.fetchval("SHOW enable_nestloop") == "on"
+
+
+async def test_shared_membership_workspace_keeps_graph_multiplicity_and_rolls_back(planner_connection):
+    connection, _admin = planner_connection
+    stage, fixture = await _fixture(connection)
+    totals, expected = _expected()
+    async with connection.transaction():
+        await connection.execute("CREATE TEMP TABLE shared_memberships (" + mapping._MAPPING_DDL["memberships"] + ")")
+        graphs = [
+            await mapping._mapping_workspace(connection, stage, None, membership_table="shared_memberships")
+            for _ in range(2)
+        ]
+        for graph in graphs:
+            await connection.execute(
+                "INSERT INTO " + graph.relation("offices") + " SELECT * FROM " + fixture.relation("offices")
+            )
+
+        assert await mapping._map_pair_rows(connection, stage, graphs[0], _BINDINGS, _ARGUMENTS) == totals
+        with pytest.raises(TypedFHIRGraphError, match="mapping_counts"):
+            async with connection.transaction():
+                second = await mapping._map_pair_rows(connection, stage, graphs[1], _BINDINGS, _ARGUMENTS)
+                await mapping._require_mapping_counts(connection, stage, graphs[1], {**second, "mapped_pair_rows": 0})
+        assert await connection.fetchval("SELECT count(*) FROM pg_temp.shared_memberships") == len(expected)
+
+        assert await mapping._map_pair_rows(connection, stage, graphs[1], _BINDINGS, _ARGUMENTS) == totals
+        actual_memberships = await connection.fetch(
+            "SELECT * FROM pg_temp.shared_memberships ORDER BY network_id,provider_system,provider_id,location_id,evidence_id"
+        )
+        assert [tuple(membership) for membership in actual_memberships] == sorted(expected * 2)
+        assert graphs[0].table_names["provider_only"] != graphs[1].table_names["provider_only"]
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND relname LIKE 'typed_map_memberships_%'"
+            )
+            == 1
+        )
+
+
+async def test_merged_office_bindings_reclaim_inputs_and_reject_conflicts(planner_connection):
+    connection, _admin = planner_connection
+    async with connection.transaction():
+        relations = ("pg_temp.source_offices_a", "pg_temp.source_offices_b")
+        for relation, key in zip(relations, ("location-one", "location-two"), strict=True):
+            await connection.execute("CREATE TEMP TABLE " + relation + "(" + mapping._MAPPING_DDL["bindings"] + ")")
+            await connection.execute(
+                "INSERT INTO " + relation + " VALUES('npi','1234567893',$1,$2,'npi','1234567893')",
+                UUID(int=1),
+                key,
+            )
+        with pytest.raises(TypedFHIRGraphError, match="office_collision"):
+            async with connection.transaction():
+                await typed_stage._bindings(connection, relations)
+        assert await connection.fetchval("SELECT count(*) FROM " + relations[0]) == 1
+
+        await connection.execute("UPDATE " + relations[1] + " SET location_key='location-one'")
+        output = await typed_stage._bindings(connection, relations)
+        assert await connection.fetchval("SELECT location_key FROM pg_temp." + mapping._identifier(output)) == (
+            "location-one"
+        )
+        for relation in relations:
+            assert await connection.fetchval("SELECT pg_relation_size($1::regclass)", relation) == 0
 
 
 @pytest.mark.parametrize("original", ["on", "off"])

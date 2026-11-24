@@ -56,13 +56,19 @@ class TypedGraphMapping:
             _identifier(name)
 
 
-async def create_typed_mapping_tables(connection):
+async def create_typed_mapping_tables(connection, *, membership_table=None):
     """Precreate scratch before a read-only custodian snapshot, or in the producer transaction."""
     from process.network_fhir_typed_office_lookup import create_office_lookup_tables
 
-    names_by_kind = {kind: "typed_map_" + kind + "_" + uuid4().hex for kind in _MAPPING_DDL}
+    names_by_kind = {
+        kind: "typed_map_" + kind + "_" + uuid4().hex
+        for kind in _MAPPING_DDL
+        if kind != "memberships" or membership_table is None
+    }
     for kind, name in names_by_kind.items():
         await connection.execute("CREATE TEMP TABLE " + _identifier(name) + "(" + _MAPPING_DDL[kind] + ")")
+    if membership_table is not None:
+        names_by_kind["memberships"] = membership_table
     await create_office_lookup_tables(connection, names_by_kind["offices"])
     return names_by_kind
 
@@ -230,10 +236,15 @@ async def _match_offices(connection, mapping, address_source, matches):
     )
 
 
-async def _mapping_workspace(connection, stage, table_names):
+async def _mapping_workspace(connection, stage, table_names, *, membership_table=None):
     from process.network_fhir_typed_office_lookup import office_lookup_names
 
-    names_by_kind = await create_typed_mapping_tables(connection) if table_names is None else table_names
+    require(table_names is None or membership_table is None, "mapping_tables")
+    names_by_kind = (
+        await create_typed_mapping_tables(connection, membership_table=membership_table)
+        if table_names is None
+        else table_names
+    )
     require(type(names_by_kind) is dict and set(names_by_kind) == set(_MAPPING_DDL), "mapping_tables")
     names_by_kind = {**names_by_kind, **office_lookup_names(names_by_kind["offices"])}
     for kind, name in names_by_kind.items():
@@ -531,7 +542,7 @@ async def prepare_typed_graph_mapping(
     return mappings[0]
 
 
-async def _prepare_mapping_offices(connection, stage, approval, table_names, control_schema):
+async def _prepare_mapping_offices(connection, stage, approval, table_names, control_schema, *, membership_table=None):
     approved_source = approval.approved_source
     binding_coordinates, catalog_descriptor = approval.binding_coordinates, approval.catalog_descriptor
     stage.require_ready()
@@ -558,7 +569,7 @@ async def _prepare_mapping_offices(connection, stage, approval, table_names, con
         )
     else:
         bindings = await typed_graph_bindings(connection, approval, control_schema=control_schema)
-    mapping = await _mapping_workspace(connection, stage, table_names)
+    mapping = await _mapping_workspace(connection, stage, table_names, membership_table=membership_table)
     if approval.catalog_bindings is not None and table_names is None:
         bindings, arguments = await _prepare_mapping_bindings(connection, bindings, arguments, typed=use_typed_rows)
         approved = bindings
@@ -592,20 +603,31 @@ async def _finish_mapping(connection, prepared, address_source, matches, control
     return mapping
 
 
-async def map_typed_graph_batch(connection, inputs, *, address_source, runtime_roles, control_schema=None):
+async def map_typed_graph_batch(
+    connection, inputs, *, address_source, runtime_roles, control_schema=None, membership_table=None
+):
     """Resolve every approved office before scanning the pinned address snapshot once for this batch."""
     from process.network_fhir_typed_office_lookup import typed_office_lookup
 
     require(bool(inputs), "mapping_inputs")
     async with connection.transaction():
         prepared_mappings = [
-            await _prepare_mapping_offices(connection, stage, approval, names, control_schema)
+            await _prepare_mapping_offices(
+                connection, stage, approval, names, control_schema, membership_table=membership_table
+            )
             for stage, approval, names in inputs
         ]
         office_names = [selected[0].table_names["offices"] for selected in prepared_mappings]
-        async with typed_office_lookup(connection, office_names, address_source) as matches:
+        has_membership_stage = membership_table is not None
+        async with typed_office_lookup(
+            connection, office_names, address_source, owned_workspace=has_membership_stage
+        ) as matches:
             mappings = []
             for selected in prepared_mappings:
-                mappings.append(await _finish_mapping(connection, selected, address_source, matches, control_schema))
+                mapped = await _finish_mapping(connection, selected, address_source, matches, control_schema)
+                if has_membership_stage:
+                    # Truncate in the allocating savepoint to release the relation's storage now.
+                    await connection.execute("TRUNCATE " + mapped.relation("offices"))
+                mappings.append(mapped)
                 await network_source_mapped()
         return mappings

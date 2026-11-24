@@ -98,6 +98,7 @@ async def _bindings(connection, names):
             + source
             + " ON CONFLICT DO NOTHING"
         )
+        await connection.execute("TRUNCATE " + source)
     return name
 
 
@@ -235,16 +236,9 @@ async def _map_typed_recipes(
         address_source=address_source,
         runtime_roles=roles,
         control_schema=control_schema,
+        membership_table=table,
     )
     for recipe, mapped in zip(recipes, mappings, strict=True):
-        await connection.execute(
-            "INSERT INTO pg_temp."
-            + _identifier(table)
-            + " SELECT "
-            + ",".join(MEMBER_COLUMNS)
-            + " FROM "
-            + mapped.relation("memberships")
-        )
         contribution, derivation = _typed_mapping_documents(recipe, mapped)
         contributions.append(contribution)
         derivations.append(derivation)

@@ -1,7 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Bounded address lookup shared by one independently prepared mapping batch."""
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from uuid import UUID
 
 from process.network_address_projection import _identifier
@@ -72,14 +72,14 @@ async def _address_matches(connection, address, requested, matches):
 
 
 @asynccontextmanager
-async def typed_office_lookup(connection, office_names, address_source):
-    """Reuse empty mapping companions; success clears rows and rollback preserves their empty state."""
+async def typed_office_lookup(connection, office_names, address_source, *, owned_workspace=False):
+    """Reuse empty lookup relations, with rollback owned by the caller for fresh batch workspaces."""
     names_by_kind = office_lookup_names(office_names[0])
     requested = "pg_temp." + _identifier(names_by_kind["office_keys"])
     matches = "pg_temp." + _identifier(names_by_kind["office_matches"])
     offices = ["pg_temp." + _identifier(name) for name in office_names]
     address = _identifier(address_source.schema_name) + "." + _identifier(address_source.table_name)
-    async with connection.transaction():
+    async with nullcontext() if owned_workspace else connection.transaction():
         require(
             await connection.fetchval(
                 f"SELECT NOT EXISTS(SELECT FROM {requested}) AND NOT EXISTS(SELECT FROM {matches})"
@@ -91,4 +91,7 @@ async def typed_office_lookup(connection, office_names, address_source):
         await _address_matches(connection, address, requested, matches)
         await connection.execute(f"ANALYZE {matches}")
         yield matches
-        await connection.execute(f"DELETE FROM {matches}; DELETE FROM {requested}")
+        if owned_workspace:
+            await connection.execute(f"TRUNCATE {matches},{requested}")
+        else:
+            await connection.execute(f"DELETE FROM {matches}; DELETE FROM {requested}")
