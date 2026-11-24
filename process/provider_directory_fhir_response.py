@@ -87,6 +87,7 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
     MIN_TRANSIENT_SAMPLE = 12
     TRANSIENT_FAILURE_PERCENT = 25
     CONSECUTIVE_TRANSIENT_LIMIT = 4
+    MAX_TRANSIENT_FLOOR = 8
     MAX_SATURATION_GAP_SECONDS = 1.0
     MIN_SATURATED_SECONDS = 30.0
     MIN_HEALTHY_RESPONSES = 8
@@ -165,7 +166,7 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
             return
         self.recent_outcomes.append(outcome)
         if outcome == "transient" and self._has_excess_transient_failures():
-            self._back_off()
+            self._back_off(min(self.MAX_TRANSIENT_FLOOR, max(1, self.capacity // 4)))
         elif now < pacing_state.get("retry_after_monotonic", 0.0):
             self._reset_health()
         elif outcome == "healthy":
@@ -195,11 +196,11 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
             self.recent_outcomes.clear()
             self._reset_health()
 
-    def _back_off(self):
+    def _back_off(self, floor=1):
         self.recent_outcomes.clear()
         self._reset_health()
-        if self.limit > 1:
-            self.reduce()
+        if self.limit > floor:
+            self.limit = max(floor, self.limit // 2)
             self.reductions += 1
 
 
@@ -252,6 +253,36 @@ def _optum_request_outcome(response):
     ):
         return "healthy"
     return "other"
+
+
+def _is_retryable_optum_continuation(response):
+    return response[0] == 429 or _optum_request_outcome(response).startswith("transient_")
+
+
+async def fetch_partition_response(directory, request):
+    """Retry a mandatory Optum continuation on its original cursor before deferring the leaf."""
+    response = await directory._fetch_source_json(
+        request.source_record, request.current_url, timeout=request.fetch_options.timeout
+    )
+    if (
+        request.is_residual_only
+        or request.current_url == request.partition_start_url
+        or not _is_retryable_optum_continuation(response)
+        or not directory._has_fhir_continuation_query(request.current_url)
+        or not directory._uhc_partition_identity(
+            request.source_record, request.resource_type, request.partition_start_url
+        )
+    ):
+        return response
+    cooldown = await directory._retry_rest_pagination_after_cooldown(
+        request.source_record,
+        request.current_url,
+        response,
+        timeout=request.fetch_options.timeout,
+        deadline_at=request.fetch_options.deadline_at,
+        is_retryable=_is_retryable_optum_continuation,
+    )
+    return cooldown.fetch_result
 
 
 def strict_search_next_link(

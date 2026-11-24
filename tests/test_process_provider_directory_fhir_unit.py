@@ -26914,6 +26914,8 @@ async def test_proxied_uhc_postal_families_start_together_with_bounded_batches(m
     )
     monkeypatch.setattr(source_adapters, "resource_scan_estimates", AsyncMock(return_value={}))
     reference_closure = AsyncMock()
+    network_seed = AsyncMock(return_value=(200, {"resourceType": "Bundle", "entry": []}, None, 1))
+    monkeypatch.setattr(importer, "_fetch_source_json", network_seed)
     monkeypatch.setattr(importer.uhc_scan, "close_references", reference_closure)
     monkeypatch.setattr(importer.uhc_scan, "hydrate_saved_role_links", hydrate)
 
@@ -26922,6 +26924,7 @@ async def test_proxied_uhc_postal_families_start_together_with_bounded_batches(m
     assert started_resource_types == set(resources)
     assert hydrated_batches == expected_batches
     assert counts == {resource: 1 + sum(kind == resource for kind, _ in expected_batches) for resource in resources}
+    network_seed.assert_awaited_once()
     reference_closure.assert_awaited_once()
 
 

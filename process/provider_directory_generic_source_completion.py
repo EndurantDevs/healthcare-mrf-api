@@ -81,9 +81,8 @@ def _resource_callbacks(directory, candidate):
         )
         storage._require(resource_by_field["payload_hash"] == expected, "payload_hash_changed")
         if is_semantic:
-            directory._validated_semantic_dataset_payload(
-                resource_by_field, resource_by_field["resource_type"], contract
-            )
+            if resource_by_field["acquired_resource_sha256"] is not None:
+                raise RuntimeError("provider_directory_semantic_resource_subset_invalid")
             if resource_by_field["resource_type"] == "Practitioner":
                 directory._assert_practitioner_semantic_projection_as_of(
                     directory.ProviderDirectoryPractitioner,
@@ -140,15 +139,12 @@ def _active_arguments(binding_by_field):
     return resets.get("*", 0), storage._encoded(resets)
 
 
-async def _active_rows(connection, policy, binding_by_field, key, columns):
+async def _active_rows(connection, policy, binding_by_field, key, columns, *, ordered=True):
+    """Order complete keys for reduction. Independent validation only needs the active rows."""
     table = storage_relation(policy.schema, binding_by_field["tables"][key]["name"])
-    # Reset facts are fixed by the locked header. One indexed ordered scan replaces
-    # every historical per-key SELECT/FOR UPDATE and every per-row retry DELETE.
-    query = (
-        f"SELECT {','.join(storage_identifier(name) for name in columns)} FROM {table} "
-        + _active_where(key)
-        + 'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal,row_ordinal'
-    )
+    query = f"SELECT {','.join(storage_identifier(name) for name in columns)} FROM {table} " + _active_where(key)
+    if ordered:
+        query += 'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal,row_ordinal'
     async for row in connection.cursor(query, *_active_arguments(binding_by_field), prefetch=4096):
         yield dict(row)
 

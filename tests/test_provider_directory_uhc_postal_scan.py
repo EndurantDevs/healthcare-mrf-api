@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
@@ -64,7 +64,88 @@ def _role_url(prefix: str) -> str:
 
 @pytest.fixture(autouse=True)
 def _no_retry_delay(monkeypatch):
+    monkeypatch.setattr(uhc_scan, "LEAF_RETRY_DELAYS_SECONDS", (0.0, 0.0))
     monkeypatch.setattr(uhc_scan, "RETRY_DELAY_SECONDS", 0.0)
+
+
+def _organization_seed_pages(next_url):
+    first = _bundle(2, "Organization", "network-one")
+    first["entry"][0]["resource"]["type"] = [{"coding": [{"code": "ntwk"}]}]
+    first["entry"].append({"resource": {"resourceType": "Organization", "id": "not-a-network"}})
+    first["link"] = [{"relation": "next", "url": next_url}]
+    second = _bundle(2, "Organization", "network-two")
+    second["entry"][0]["resource"]["type"] = [{"coding": [{"code": "ntwk"}]}]
+    second["entry"].append(first["entry"][0])
+    first["entry"].append(
+        {
+            "resource": {
+                "resourceType": "Organization",
+                "id": "subsetted-network",
+                "type": [{"coding": [{"code": "ntwk"}]}],
+                "meta": {"tag": [{"code": "SUBSETTED"}]},
+            }
+        }
+    )
+    return first, second
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_status", (200, 504))
+async def test_optum_network_seed_follows_cursor_before_required_organization_scan(monkeypatch, next_status):
+    next_url = f"{BASE}?_getpages=synthetic&_getpagesoffset=100&_count=100"
+    first_page, second_page = _organization_seed_pages(next_url)
+    visits = []
+    written_ids = []
+
+    async def fetch(_source, url, **_kwargs):
+        visits.append(url)
+        assert source_proxy.PARTITION_CURSOR_KEY.get() == "Organization:type=ntwk"
+        if url == next_url:
+            return next_status, second_page if next_status == 200 else None, None, 1
+        assert _query(url) == {"_count": "100", "type": "ntwk"}
+        return 200, first_page, None, 1
+
+    async def persist(resource_type, model, rows):
+        assert resource_type == "Organization" and model is importer.ProviderDirectoryOrganization
+        written_ids.extend(row["resource_id"] for row in rows)
+        return len(rows)
+
+    async def scan(resource_type, **_kwargs):
+        assert resource_type == "Organization"
+        assert source_proxy.PARTITION_CURSOR_KEY.get() is None
+        assert written_ids == (["network-one", "network-two"] if next_status == 200 else ["network-one"])
+        return "required-scan"
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch)
+    monkeypatch.setattr(importer, "is_source_storage_required", lambda: True)
+    monkeypatch.setattr(source_proxy, "current_run", lambda: SimpleNamespace(enabled=lambda _source: True))
+    runner = SimpleNamespace(
+        source_record={**SOURCE, "_endpoint_dataset_id": "isolated-candidate"},
+        options=SimpleNamespace(
+            per_resource_limit=0,
+            page_limit=0,
+            timeout=3,
+            run_id="synthetic-run",
+            stream_batch_size=2,
+            resource_deadline_seconds=0,
+            cancel_ctx=None,
+            cancel_task=None,
+        ),
+        is_streaming=True,
+        effective_concurrency=1,
+        persist_batch=persist,
+        import_one=scan,
+        count_by_resource={"Organization": 0},
+    )
+    role_done = asyncio.Event()
+    role_done.set()
+    scan_result = await importer.ResourceGroupScanRunner._run_bounded(
+        runner, "Organization", asyncio.Semaphore(1), role_done
+    )
+
+    assert scan_result == "required-scan"
+    assert visits[1:] == [next_url]
+    assert runner.count_by_resource["Organization"] == len(written_ids)
 
 
 @pytest.mark.parametrize(
@@ -506,6 +587,8 @@ async def test_uhc_reference_closure_reads_missing_ids_and_counts_404(monkeypatc
     monkeypatch.setattr(uhc_scan, "_stored_rows", _stored_rows_factory(CLOSURE_STORED_ROWS_BY_TYPE))
     monkeypatch.setattr(importer, "_fetch_source_json", fetch)
     monkeypatch.setattr(importer, "is_source_storage_required", lambda: True)
+    resolve = Mock(wraps=importer._reference_resource_key)
+    monkeypatch.setattr(importer, "_reference_resource_key", resolve)
     diagnostics_by_type = _complete_diagnostics(
         "InsurancePlan", "Practitioner", "Organization", "Location", "PractitionerRole"
     )
@@ -522,6 +605,7 @@ async def test_uhc_reference_closure_reads_missing_ids_and_counts_404(monkeypatc
     )
 
     assert sorted(requested_paths) == ["Location/loc-gone", "Organization/net-1", "Practitioner/prac-2"]
+    assert [call.args for call in resolve.call_args_list].count(("Organization/net-1", "Organization")) == 1
     assert persisted_ids_by_model == {
         importer.ProviderDirectoryPractitioner: ["prac-2"],
         importer.ProviderDirectoryOrganization: ["net-1"],
@@ -576,6 +660,36 @@ async def test_uhc_reference_closure_waits_for_complete_scans(monkeypatch):
     await uhc_scan.close_references(importer, SOURCE, None, diagnostics_by_type, {}, timeout=3, run_id=None)
 
     assert "reference_closure" not in diagnostics_by_type["Practitioner"]
+
+
+@pytest.mark.asyncio
+async def test_initial_location_prefill_times_out_before_blocking_the_zip_scan(monkeypatch):
+    from process import provider_directory_generic_source_adapters as adapters
+
+    cancelled = asyncio.Event()
+
+    async def waiting_for_saved_links(*_args):
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(adapters, "missing_saved_role_links", waiting_for_saved_links)
+    monkeypatch.setattr(uhc_scan, "REFERENCE_PREFILL_DISCOVERY_SECONDS", 0.01)
+    persist_batch = AsyncMock()
+    writes = await uhc_scan.hydrate_saved_role_links(
+        importer,
+        {**SOURCE, "_endpoint_dataset_id": "isolated-candidate"},
+        "Location",
+        persist_batch,
+        asyncio.Event(),
+        timeout=3,
+        run_id="synthetic-run",
+        max_batches=1,
+    )
+
+    assert writes == 0 and cancelled.is_set()
+    persist_batch.assert_not_awaited()
 
 
 def test_uhc_route_uses_partitions_not_plan_graph(monkeypatch):
@@ -849,6 +963,23 @@ async def test_uhc_retried_multi_page_leaf_walks_every_page(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_uhc_retries_a_failed_first_page_after_a_gateway_burst(monkeypatch):
+    monkeypatch.setattr(uhc_scan, "LEAF_RETRY_DELAYS_SECONDS", (5.0, 30.0))
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", "1")
+    fetch = AsyncMock(
+        side_effect=[(502, {}, None, 1), (502, {}, None, 1), (200, _bundle(1, resource_id="role"), None, 1)]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(uhc_scan.asyncio, "sleep", sleep)
+
+    scan_result = await _scan_roles(monkeypatch, fetch, start_prefixes=("77030-4",))
+
+    assert scan_result.complete
+    assert [call.args[1] for call in fetch.await_args_list] == [_role_url("77030-4")] * 3
+    assert [call.args for call in sleep.await_args_list] == [(5.0,), (30.0,)]
+
+
+@pytest.mark.asyncio
 async def test_uhc_reference_reader_stops_workers_when_persist_fails(monkeypatch):
     persist_calls: list[int] = []
     release_other_reads = asyncio.Event()
@@ -888,29 +1019,30 @@ def _practitioner_fetch(fail_id=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("batch_ids", [("prac-1", "prac-2"), ("prac-1",), ("unexpected",)])
-async def test_uhc_reference_reader_accepts_only_matching_batch_results(monkeypatch, batch_ids):
+@pytest.mark.parametrize("resource_type", ("Practitioner", "Organization"))
+@pytest.mark.parametrize("batch_ids", [("one", "two"), ("one",), ("unexpected",)])
+async def test_uhc_reference_reader_accepts_only_matching_batch_results(monkeypatch, resource_type, batch_ids):
     calls = []
 
     async def fetch(_source, url, *, timeout):
         if ids := _query(url).get("_id"):
             calls.append(ids)
             bundle = _bundle(len(batch_ids))
-            bundle["entry"] = [{"resource": {"resourceType": "Practitioner", "id": row_id}} for row_id in batch_ids]
+            bundle["entry"] = [{"resource": {"resourceType": resource_type, "id": row_id}} for row_id in batch_ids]
             return 200, bundle, None, 1
         row_id = url.rsplit("/", 1)[-1]
         calls.append(row_id)
-        return 200, {"resourceType": "Practitioner", "id": row_id}, None, 1
+        return 200, {"resourceType": resource_type, "id": row_id}, None, 1
 
     monkeypatch.setattr(importer, "_fetch_source_json", fetch)
     persist = AsyncMock(side_effect=lambda _model, rows: len(rows))
     reader = uhc_scan._ReferenceReader(importer, SOURCE, persist, timeout=3, run_id=None, use_batches=True)
-    keys = [("Practitioner", "prac-1"), ("Practitioner", "prac-2")]
+    keys = [(resource_type, "one"), (resource_type, "two")]
 
     assert await reader.read(keys) == []
 
     accepted = set(batch_ids) if "unexpected" not in batch_ids else set()
-    assert calls == ["prac-1,prac-2", *(row_id for _, row_id in keys if row_id not in accepted)]
+    assert calls == ["one,two", *(row_id for _, row_id in keys if row_id not in accepted)]
     persisted = persist.await_args.args[1]
     assert {row["resource_id"] for row in persisted} == {row_id for _, row_id in keys}
 

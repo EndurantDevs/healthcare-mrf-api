@@ -179,6 +179,7 @@ def _retained_resource_cursor(input_rows):
     async def cursor(sql, *args, prefetch):
         directory = importlib.import_module("process.provider_directory_fhir")
         assert prefetch == 4096
+        assert "ORDER BY" not in sql
         if "raw_payload_json" in sql:
             return
         for group in input_rows:
