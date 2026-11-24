@@ -51,8 +51,14 @@ def _selected_json(fields):
 
 
 def _project_sql(plan_tiers=False):
-    extra_field = ",plan_network_refs jsonb" if plan_tiers else ""
-    carried_field = ",plan_network_refs" if plan_tiers else ""
+    # The plan pass has already validated the selector and stored its deduplicated references.
+    plan_references = ",plan.network_refs AS plan_network_refs" if plan_tiers else ""
+    plan_join = (
+        " LEFT JOIN {plans} plan ON resource_type IN ('OrganizationAffiliation','PractitionerRole') "
+        "AND plan.resource_id=split_part(raw->'insurance_plan_refs'->>0,'/',2)"
+        if plan_tiers
+        else ""
+    )
     role_fields = _ROLE_FIELDS + (("network_key_id",) if plan_tiers else ())
     extra_references = (
         "||ARRAY(SELECT ref FROM jsonb_array_elements_text(coalesce(plan_network_refs,'[]'::jsonb)) ref "
@@ -64,16 +70,13 @@ def _project_sql(plan_tiers=False):
     )
     return (
         """WITH raw_page AS MATERIALIZED (
- SELECT resource_type,resource_id,payload_hash,payload_json::jsonb raw,site_id"""
-        + carried_field
-        + """
- FROM jsonb_to_recordset($1::jsonb) r(resource_type text,resource_id text,payload_hash text,payload_json text,site_id uuid"""
-        + extra_field
-        + """)
+ SELECT resource_type,resource_id,payload_hash,
+ CASE WHEN jsonb_typeof(payload_json)='string' THEN (payload_json #>> '{{}}')::jsonb ELSE payload_json END raw,site_id
+ FROM jsonb_to_recordset($1::jsonb) r(resource_type text,resource_id text,payload_hash text,payload_json jsonb,site_id uuid)
  WHERE resource_type=ANY($2::text[])
 ) , parsed AS MATERIALIZED (
- SELECT resource_type,resource_id,payload_hash,site_id"""
-        + carried_field
+ SELECT resource_type,raw_page.resource_id,payload_hash,site_id"""
+        + plan_references
         + """,CASE
  WHEN resource_type IN ('Organization','Practitioner') THEN """
         + _selected_json(("npi", "active"))
@@ -83,7 +86,9 @@ def _project_sql(plan_tiers=False):
         + """
  ELSE """
         + _selected_json(role_fields)
-        + """ END p FROM raw_page
+        + " END p FROM raw_page"
+        + plan_join
+        + """
 ) INSERT INTO {cells}("""
         + ",".join(CELL_COLUMNS)
         + """ )
