@@ -22,7 +22,8 @@ from tests.test_provider_directory_profile_selection_coverage import (
 
 
 @pytest.mark.asyncio
-async def test_snapshot_reuses_real_owned_transaction_for_nested_selection(monkeypatch):
+@pytest.mark.parametrize("exact_readiness", [True, False])
+async def test_snapshot_reuses_real_owned_transaction_for_nested_selection(monkeypatch, exact_readiness):
     sessions = []
 
     def session_factory():
@@ -42,8 +43,8 @@ async def test_snapshot_reuses_real_owned_transaction_for_nested_selection(monke
             async with snapshot.profile_selection_snapshot() as nested_session:
                 assert selected_session is nested_session is owned_session
         assert owned_session.in_transaction()
-        assert await snapshot._selection_dataset_rows() == []
-        resolve.assert_awaited_once_with(owned_session, snapshot._schema())
+        assert await snapshot._selection_dataset_rows(exact_readiness=exact_readiness) == []
+        resolve.assert_awaited_once_with(owned_session, snapshot._schema(), include_full_header=exact_readiness)
         assert sessions == [owned_session]
 
 

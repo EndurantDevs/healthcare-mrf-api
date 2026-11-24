@@ -176,7 +176,7 @@ async def _selection_dataset_rows(
     from process.provider_directory_named_edition import named_editions_for_session, source_relation_sql
 
     async with profile_selection_snapshot() as session:
-        editions = await named_editions_for_session(session, _schema())
+        editions = await named_editions_for_session(session, _schema(), include_full_header=exact_readiness)
         # Publication updates source aliases, so the existing SHARE locks also keep named pointers stable.
         if (
             editions
