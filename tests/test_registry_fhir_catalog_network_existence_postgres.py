@@ -4,12 +4,15 @@
 import json
 
 import pytest
+from asyncpg import InsufficientPrivilegeError
 
 from process import registry_fhir_catalog_validation as validation
 from tests.test_registry_fhir_catalog_custody_postgres import (
     freeze_metadata,
-    metadata_custody as metadata_custody,
     seed_source_projection,
+)
+from tests.test_registry_fhir_catalog_custody_postgres import (
+    metadata_custody as metadata_custody,
 )
 
 
@@ -26,12 +29,8 @@ async def test_relationship_network_is_required_after_writer_closure(metadata_cu
         await fixture.loader.execute(f"DELETE FROM {namespace}.registry_fhir_catalog_network WHERE network_id=7")
         with pytest.raises(ValueError, match="set_validation_failed"):
             await freeze_metadata(fixture, snapshot=snapshot)
-        assert (
-            await fixture.connection.fetchval(
-                "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=$1", fixture.target.schema_name
-            )
-            == fixture.roles["loader"]
-        )
+        with pytest.raises(InsufficientPrivilegeError):
+            await fixture.loader.execute(f"UPDATE {namespace}.registry_fhir_catalog_network SET display_name='changed'")
 
 
 @pytest.mark.asyncio
@@ -58,6 +57,7 @@ async def test_relationship_network_check_uses_existing_primary_key(metadata_cus
             snapshot["metadata_approved_revision"],
             validation.canonical_json(snapshot["source_vector_json"]),
             snapshot["mapping_sha256"],
+            [],
         )
     )
     nodes = [explained[0]["Plan"]]

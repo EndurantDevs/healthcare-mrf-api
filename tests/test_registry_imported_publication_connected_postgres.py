@@ -1,10 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Synthetic native Source inputs cross real composition, publication and pinned API reads."""
 
-import hashlib
 import json
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -31,21 +30,29 @@ from process.registry_effective_network_catalog import (
     pair_network_catalog_generation,
 )
 from process.registry_fhir_catalog_custody import FHIRCatalogTarget
+from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
+from process.registry_fhir_catalog_sources import FHIRCatalogSourceDisposition, fhir_catalog_source_generation
 from process.registry_fhir_catalog_store import (
     admit_catalog_preparation,
     checkpoint_fhir_catalog_snapshot,
     create_fhir_catalog_candidate,
     named_catalog_preparation,
 )
-from process.registry_fhir_catalog_validation import metadata_generation
+from process.registry_fhir_catalog_sync import project_fhir_catalog_source, stage_fhir_catalog_source
+from process.registry_fhir_catalog_validation import (
+    canonical_json,
+    metadata_generation,
+    validate_fhir_catalog_candidate,
+)
 from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
-from process.registry_imported_catalog_preparation import stage_native_catalog_source
+from process.registry_imported_catalog_preparation import select_preparation_fhir_sources, stage_native_catalog_source
 from process.registry_network_catalog_read import RegistryNetworkCatalogQuery, read_registry_network_catalog
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig
 from process.registry_publication_worker import _configured_worker_runtime
 from process.registry_source_recipe_composition import SourceWitnessRuntime
 from tests.registry_restricted_publisher_support import restricted_source_publisher
+from tests.test_delta_dental_directory_normalization import delta_positive_descriptor as delta_positive_descriptor
 from tests.test_network_compact_publication_postgres import (
     _native_execution_url,
     _reader,
@@ -54,12 +61,14 @@ from tests.test_network_compact_publication_postgres import (
 from tests.test_network_compact_publication_postgres import (
     compact_publication_db as compact_publication_db,
 )
+from tests.test_registry_fhir_catalog_enrichment import source_row
 from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
 from tests.test_registry_fhir_catalog_sources import read_profile
 from tests.test_registry_native_provider_source_postgres import _native_provider_descriptor
 from tests.test_registry_native_ptg_scope_postgres import source_scope
 
 pytestmark = pytest.mark.asyncio
+_DELTA_NETWORK = "Example Dental Network"
 
 
 async def _native_inputs(fixture, schemas, monkeypatch):
@@ -110,27 +119,23 @@ async def _catalogue_mapping_pins(fixture, selected):
     selected["mapping_sha256"] = fingerprints[selected["metadata_approved_revision"]]["metadata"]
 
 
-async def _catalogue(fixture, schemas, descriptors, typed_recipe=None):
+async def _catalogue(fixture, schemas, descriptors, typed_recipe=None, *, delta_descriptor=None):
     """Seed prepared metadata from the real native set-based catalogue producer."""
     identity = uuid4()
     copy_target = FHIRCatalogTarget(*(str(uuid4()) for _ in range(3)), str(identity), "fhir_catalog_" + identity.hex)
     schemas.append(copy_target.schema_name)
     descriptors = [*descriptors, *([typed_recipe.source_pin.catalog_descriptor] if typed_recipe else [])]
+    if delta_descriptor is not None:
+        descriptors.append(delta_descriptor)
     selected = snapshot(
         standing_grant(),
+        descriptors,
         metadata_approved_revision=getattr(fixture, "approved_revision", 0),
         network_generation=None,
         manifest_sha256=None,
     )
     selected["schema_name"] = copy_target.schema_name
     await _catalogue_mapping_pins(fixture, selected)
-    selected["source_vector_json"] = sorted(
-        [
-            {"source_generation": digest(entry), "source_id": entry["coordinates"]["source_id"], "status": "current"}
-            for entry in descriptors
-        ],
-        key=lambda entry: (entry["source_id"], entry["source_generation"]),
-    )
     selected["accounting_json"] = {
         "imported_source_inventory": {
             "contract": "registry-imported-catalog-inputs-v1",
@@ -147,6 +152,9 @@ async def _catalogue(fixture, schemas, descriptors, typed_recipe=None):
             control_schema=fixture.control_schema,
         )
         for descriptor in descriptors:
+            if descriptor is delta_descriptor:
+                await _delta_catalogue(fixture, copy_target, selected, descriptor)
+                continue
             if descriptor.get("contract") != "registry-native-network-source-v1":
                 await _typed_catalogue(fixture, copy_target, selected, typed_recipe)
                 continue
@@ -167,6 +175,52 @@ async def _catalogue(fixture, schemas, descriptors, typed_recipe=None):
                 f'GRANT SELECT ON ALL TABLES IN SCHEMA "{copy_target.schema_name}" TO "{role}"'
             )
     return selected
+
+
+async def _delta_catalogue(fixture, copy_target, selected, descriptor):
+    """Use the ordinary selection and production projection with a synthetic Source replay."""
+    coordinates = descriptor["coordinates"]
+    disposition = FHIRCatalogSourceDisposition(
+        descriptor["endpoint_id"],
+        coordinates["dataset_id"],
+        tuple(descriptor["source_aliases"]),
+        1,
+        "accepted",
+        None,
+        descriptor,
+        datetime.now(timezone.utc),
+    )
+    inventory = SimpleNamespace(fhir_descriptors=(descriptor,), carried_fhir_descriptors=())
+    [preferred_disposition] = select_preparation_fhir_sources(inventory, (disposition,))
+    generation = fhir_catalog_source_generation(descriptor)
+    organization = source_row("Organization", "network-one", {"name": _DELTA_NETWORK, "type_codes": [{"code": "ntwk"}]})
+    [observed] = extract_fhir_catalog_batch((organization,), profile=descriptor["profile"]).organizations
+
+    async def replay(replayed_descriptor, write_observations):
+        assert replayed_descriptor == descriptor
+        await write_observations(
+            [(generation, "Organization", observed.resource_id, "organization", 0, canonical_json(asdict(observed)))]
+        )
+        return descriptor["admission"]["publication"]["claimed_resource_count"]
+
+    loader = fixture.writer_roles["owner_role"]
+    await stage_fhir_catalog_source(
+        None,
+        fixture.connection,
+        copy_target,
+        preferred_disposition,
+        loader_role=loader,
+        control_schema=fixture.control_schema,
+        source_export={"replay": replay},
+    )
+    await project_fhir_catalog_source(
+        fixture.connection,
+        copy_target,
+        preferred_disposition,
+        selected,
+        grant=standing_grant(control_schema=fixture.control_schema),
+        loader_role=loader,
+    )
 
 
 def _runtime(fixture, selected):
@@ -375,6 +429,47 @@ async def test_native_aca_ptg_composition_pairs_catalogue_and_preserves_pinned_r
         runtime = _runtime(fixture, selected)
         async with _native_sealer(fixture, runtime):
             await _publication_rounds(fixture, recipes, runtime, selected)
+    finally:
+        for schema in reversed(schemas):
+            await fixture.connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
+
+
+async def test_positive_delta_catalog_publishes_with_ordinary_network_generation(
+    compact_publication_db, delta_positive_descriptor, monkeypatch
+):
+    fixture, schemas = compact_publication_db, []
+    try:
+        recipes, descriptors = await _native_inputs(fixture, schemas, monkeypatch)
+        incumbent = await _catalogue(fixture, schemas, descriptors)
+        initial_runtime = _runtime(fixture, incumbent)
+        async with _native_sealer(fixture, initial_runtime):
+            initial = await _compose(fixture, recipes, initial_runtime)
+            await _publish(fixture, initial, incumbent)
+        async with _reader(fixture) as (_session, reader):
+            before, _providers = await _api(fixture, reader)
+        selected = await _catalogue(fixture, schemas, descriptors, delta_descriptor=delta_positive_descriptor)
+        runtime = _runtime(fixture, selected)
+        async with _native_sealer(fixture, runtime):
+            async with fixture.connection.transaction(readonly=True):
+                receipt = await validate_fhir_catalog_candidate(
+                    fixture.connection,
+                    SimpleNamespace(schema_name=selected["schema_name"]),
+                    selected,
+                    control_schema=fixture.control_schema,
+                )
+                assert receipt["tables"]["registry_fhir_catalog_source"]["rows"] == 3
+            candidate = await _compose(fixture, recipes, runtime, previous=before)
+            published = await _publish(fixture, candidate, selected)
+        async with _reader(fixture) as (_session, reader):
+            generation = published["generation_id"]
+            assert generation > before.generation_id
+            page = await read_registry_network_catalog(
+                reader,
+                RegistryNetworkCatalogQuery(generation_id=generation),
+                excluded_network_ids=(),
+                control_schema=fixture.control_schema,
+            )
+            assert _DELTA_NETWORK in {entry["display_name"] for entry in page["items"]}
     finally:
         for schema in reversed(schemas):
             await fixture.connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
