@@ -57,6 +57,46 @@ def test_extended_name_queries_preserve_legacy_scope_and_disclose_unverified_sea
         scope.validate_scope(selection)
 
 
+def test_membership_reconciliation_is_bound_to_both_diagnostics_and_header():
+    value = example()
+    key = scope.MEMBERSHIP_RECONCILIATION_KEY
+    reconciliation_by_field = {"search_edges": 4, "canonical_only_edges": 2}
+    diagnostics_by_resource = {
+        kind: {scope.SCOPE_KEY: deepcopy(value), key: dict(reconciliation_by_field)} for kind in scope.RESOURCE_TYPES
+    }
+    result = scope.publication_scope_metadata(diagnostics_by_resource, required=True)
+    assert result[key] == reconciliation_by_field
+    header_by_field = {**result, "resource_diagnostics": diagnostics_by_resource}
+    assert scope.published_header_scope(header_by_field) == result
+    with pytest.raises(RuntimeError, match="scope_invalid"):
+        scope.published_header_scope({**header_by_field, key: {"search_edges": 4, "canonical_only_edges": 1}})
+    diagnostics_by_resource["Organization"][key]["canonical_only_edges"] = False
+    with pytest.raises(RuntimeError, match="scope_invalid"):
+        scope.publication_scope_metadata(diagnostics_by_resource)
+
+
+@pytest.mark.parametrize("invalid_value", [None, False, 0.0])
+def test_published_header_rejects_invalid_membership_count_encodings(invalid_value):
+    key = scope.MEMBERSHIP_RECONCILIATION_KEY
+    counts_by_field = {"search_edges": 4, "canonical_only_edges": 0}
+    diagnostics_by_resource = {
+        kind: {scope.SCOPE_KEY: example(), key: dict(counts_by_field)} for kind in scope.RESOURCE_TYPES
+    }
+    expected = scope.publication_scope_metadata(diagnostics_by_resource)
+    invalid_counts = {**counts_by_field, "canonical_only_edges": invalid_value} if invalid_value is not None else None
+    header_by_field = {**expected, "resource_diagnostics": diagnostics_by_resource, key: invalid_counts}
+    with pytest.raises(RuntimeError, match="scope_invalid"):
+        scope.published_header_scope(header_by_field)
+    legacy_diagnostics_by_resource = {kind: {scope.SCOPE_KEY: example()} for kind in scope.RESOURCE_TYPES}
+    legacy_header_by_field = {
+        **scope.publication_scope_metadata(legacy_diagnostics_by_resource),
+        "resource_diagnostics": legacy_diagnostics_by_resource,
+    }
+    assert scope.published_header_scope(legacy_header_by_field)[scope.SCOPE_KEY] == example()
+    with pytest.raises(RuntimeError, match="scope_invalid"):
+        scope.published_header_scope({**legacy_header_by_field, key: None})
+
+
 @pytest.mark.parametrize(
     "counts",
     [

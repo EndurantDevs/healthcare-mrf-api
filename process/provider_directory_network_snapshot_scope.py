@@ -6,6 +6,7 @@ from string import ascii_uppercase, digits
 from typing import Any
 
 SCOPE_KEY = "network_institutional_scope"
+MEMBERSHIP_RECONCILIATION_KEY = "network_membership_reconciliation"
 SOURCE_CONFIG_KEY = "provider_directory_network_snapshot"
 PUBLICATION_KIND = "network_institutional_snapshot"
 RESOURCE_TYPES = ("Organization", "OrganizationAffiliation")
@@ -92,20 +93,44 @@ def validate_scope(value):
     return deepcopy(expected)
 
 
+def _membership_counts(record):
+    if MEMBERSHIP_RECONCILIATION_KEY not in record:
+        return None
+    counts_by_field = record[MEMBERSHIP_RECONCILIATION_KEY]
+    _require(
+        type(counts_by_field) is dict
+        and set(counts_by_field) == {"search_edges", "canonical_only_edges"}
+        and all(type(count) is int and count >= 0 for count in counts_by_field.values())
+    )
+    return counts_by_field
+
+
 def publication_scope_metadata(diagnostics, *, required=False):
     """Require identical scope labels on both selected resource families."""
     _require(type(diagnostics) is dict)
     _require(all(type(diagnostics.get(kind, {})) is dict for kind in RESOURCE_TYPES))
     scopes = [diagnostics.get(kind, {}).get(SCOPE_KEY) for kind in RESOURCE_TYPES]
+    membership_counts = [_membership_counts(diagnostics.get(kind, {})) for kind in RESOURCE_TYPES]
     if not required and all(scope is None for scope in scopes):
+        _require(all(counts is None for counts in membership_counts))
         return {}
     scope = validate_scope(scopes[0])
     _require(validate_scope(scopes[1]) == scope)
+    evidence, other_evidence = membership_counts
+    _require(evidence == other_evidence)
+    if evidence is not None:
+        discovery_counts = scope["discovery_counts"]
+        _require(
+            discovery_counts["affiliations"] <= evidence["search_edges"]
+            and evidence["search_edges"] + evidence["canonical_only_edges"]
+            <= discovery_counts["affiliations"] * discovery_counts["discovered_networks"]
+        )
     return {
         SCOPE_KEY: scope,
         "publication_kind": PUBLICATION_KIND,
         "endpoint_collection_complete": False,
         "endpoint_complete": False,
+        **({MEMBERSHIP_RECONCILIATION_KEY: dict(evidence)} if evidence is not None else {}),
     }
 
 
@@ -119,6 +144,7 @@ def published_header_scope(publication_metadata: dict[str, Any], *, source_id: s
         and publication_metadata.get("publication_kind") == PUBLICATION_KIND
         and publication_metadata.get("endpoint_complete") is False
         and publication_metadata.get("endpoint_collection_complete") is False
+        and _membership_counts(publication_metadata) == scope_metadata.get(MEMBERSHIP_RECONCILIATION_KEY)
     )
     if source_id == SOURCE_ID:
         scope = scope_metadata[SCOPE_KEY]

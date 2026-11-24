@@ -1,9 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Traverse native institutional affiliations from verified, source-owned Plan-Net networks."""
 
+import re
 from urllib.parse import urlencode, urlsplit
 
 from process import provider_directory_affiliation_hydration as fhir
+from process.provider_directory_fhir_response import is_access_denied_outcome
 
 SOURCE_ID = "pdfhir_16514e416a13c8b817e820bf"
 API_BASE = "https://fhir.excellusbcbs.com/fhir/api"
@@ -84,11 +86,29 @@ def _ids(entries):
     return ids
 
 
+async def _verify_affiliation_instance(host, source_record, key, expected, *, timeout):
+    url = f"{API_BASE}/{fhir.RESOURCE_TYPE}/{key}"
+    status, resource, error, _ = await host._fetch_source_json(source_record, url, timeout=timeout)
+    entry_by_field = {"resource": resource}
+    if status != 200 or error or fhir.affiliation_resource(entry_by_field)["id"] != key:
+        raise ValueError("network_snapshot_invalid_affiliation_read")
+    if any(tag.get("code") == "SUBSETTED" for tag in (resource.get("meta") or {}).get("tag", [])):
+        raise ValueError("network_snapshot_subsetted_affiliation_read")
+    base = urlsplit(API_BASE)
+    network_refs = sorted(fhir.network_refs(resource, base))
+    institution_ids = sorted(ref.removeprefix("Organization/") for ref in fhir.institution_refs(resource, base))
+    if network_refs != expected["network_refs"] or institution_ids != expected["institution_ids"]:
+        raise ValueError("network_snapshot_canonical_affiliation_confirmation_changed")
+    return _result()
+
+
 async def step(host, source_record, work, *, timeout, page_count):
     """Acquire one durable query page, emitting only observed follow-up work."""
     if not is_source(source_record):
         raise ValueError("network_snapshot_source_mismatch")
     kind, key = work["kind"], work["key"]
+    if kind == "verify_affiliation" and fhir.valid_id(key) and not work.get("url"):
+        return await _verify_affiliation_instance(host, source_record, key, work["payload"], timeout=timeout)
     if kind == "owner" and key == CONFIG["owner_reference"].split("/")[1] and not work.get("url"):
         owner_page = await read_organizations(host, source_record, [key], timeout=timeout)
         if (
@@ -146,6 +166,51 @@ def affiliation_result(source_record, entries):
     )
 
 
+async def _is_confirmed_missing_organization(host, source_record, key, outcome, *, timeout):
+    issues = outcome.get("issue")
+    if (
+        outcome.get("resourceType") != "OperationOutcome"
+        or not isinstance(issues, list)
+        or not issues
+        or any(not isinstance(issue, dict) or issue.get("severity") not in ("fatal", "error") for issue in issues)
+        or is_access_denied_outcome(outcome)
+    ):
+        return False
+    if all(issue.get("code") == "not-found" for issue in issues):
+        return True
+    # This origin reports the last segment of a missing network ID. Verify the full ID separately.
+    if (
+        len(issues) != 1
+        or issues[0].get("code") != "processing"
+        or not re.fullmatch(r"[0-9]{2}-[0-9]{2}-[0-9]{4}", key)
+        or issues[0].get("diagnostics") != f"No Networks found using {key[-4:]}"
+    ):
+        return False
+    url = f"{API_BASE}/Organization?{urlencode({'_id': key, '_count': 1})}"
+    entries, total, next_url = await fhir.search_page(host, source_record, "Organization", url, timeout=timeout)
+    return type(total) is int and total == 0 and not entries and next_url is None
+
+
+async def _read_organizations_by_id(host, source_record, ids, *, timeout):
+    """Resolve an ambiguous search through exact FHIR reads on the same origin."""
+    by_id = {}
+    for key in ids:
+        url = f"{API_BASE}/Organization/{key}"
+        status, resource, error, _ = await host._fetch_source_json(source_record, url, timeout=timeout)
+        if error or not isinstance(resource, dict):
+            raise ValueError("network_snapshot_invalid_organization_read")
+        if status == 404 and await _is_confirmed_missing_organization(
+            host, source_record, key, resource, timeout=timeout
+        ):
+            continue
+        if status != 200 or resource.get("resourceType") != "Organization" or resource.get("id") != key:
+            raise ValueError("network_snapshot_invalid_organization_read")
+        if any(tag.get("code") == "SUBSETTED" for tag in (resource.get("meta") or {}).get("tag", [])):
+            raise ValueError("network_snapshot_subsetted_organization_read")
+        by_id[key] = {"resource": resource, "fullUrl": url, "_retrieved_from": url}
+    return by_id
+
+
 async def read_organizations(host, source_record, ids, *, timeout):
     """Resolve bounded canonical IDs. Preserve source-unresolved references explicitly."""
     if (
@@ -155,6 +220,7 @@ async def read_organizations(host, source_record, ids, *, timeout):
         or len(set(ids)) != len(ids)
     ):
         raise ValueError("network_snapshot_invalid_organization_batch")
+    requested_ids = set(ids)
     by_id = {}
     stable_total = None
     async for entries, total, _ in fhir.canonical_pages(
@@ -165,13 +231,21 @@ async def read_organizations(host, source_record, ids, *, timeout):
         timeout=timeout,
         max_pages=fhir.BATCH_SIZE,
     ):
-        if type(total) is not int or not 0 <= total <= len(ids) or (stable_total is not None and stable_total != total):
+        if type(total) is not int or total < 0 or (stable_total is not None and stable_total != total):
             raise ValueError("network_snapshot_invalid_organization_total")
         stable_total = total
-        for key, entry in zip(_ids(entries), entries, strict=True):
-            if key not in ids or key in by_id:
-                raise ValueError("network_snapshot_unrequested_organization")
-            by_id[key] = entry
+        keys = [entry["resource"].get("id") for entry in entries]
+        if not all(map(fhir.valid_id, keys)):
+            raise ValueError("network_snapshot_duplicate_or_invalid_id")
+        returned_ids = set(keys)
+        if returned_ids - requested_ids:
+            raise ValueError("network_snapshot_unrequested_organization")
+        # This search can count repeated organizations and disagree about their native references.
+        if total > len(ids) or len(returned_ids) != len(keys) or by_id.keys() & returned_ids:
+            by_id = await _read_organizations_by_id(host, source_record, ids, timeout=timeout)
+            stable_total = len(by_id)
+            break
+        by_id.update(zip(keys, entries, strict=True))
     if len(by_id) != stable_total:
         raise ValueError("network_snapshot_partial_organization_batch")
     owned_networks = []
@@ -188,5 +262,5 @@ async def read_organizations(host, source_record, ids, *, timeout):
         frontier=owned_networks,
         ids=by_id,
         total=len(by_id),
-        missing_ids=sorted(set(ids) - by_id.keys()),
+        missing_ids=sorted(requested_ids - by_id.keys()),
     )

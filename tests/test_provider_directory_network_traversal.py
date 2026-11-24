@@ -2,10 +2,12 @@
 import importlib
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process import provider_directory_network_first_store as graph
 from process import provider_directory_network_traversal as walk
 
 directory = importlib.import_module("process.provider_directory_fhir")
@@ -91,6 +93,7 @@ async def test_native_network_traversal_discovers_and_reconciles_without_plan_id
         institution
     ]
     assert not org_batch["frontier"]
+    assert fetch.await_count == 6
 
 
 @pytest.mark.asyncio
@@ -153,6 +156,177 @@ async def test_organization_results_cannot_hide_truncation_or_widen_identity(mon
         monkeypatch.setattr(directory, "_fetch_source_json", AsyncMock(return_value=result))
         with pytest.raises(ValueError):
             await walk.read_organizations(directory, src, ["known"], timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["overfull", "same_page_repeat", "continuation_repeat"])
+async def test_ambiguous_organization_search_resolves_requested_ids_by_read(monkeypatch, shape):
+    src = source()
+    base = walk.API_BASE + "/Organization"
+    cursor = base + "?cursor=value%2B%2f"
+    first = organization("known", owner="Organization/other-one")
+    second = organization("known", owner="Organization/other-two")
+    canonical = organization("known", owner=walk.CONFIG["owner_reference"])
+    if shape == "continuation_repeat":
+        pages = [response([first], total=2, next_url=cursor), response([second], total=2)]
+    else:
+        total = 3 if shape == "overfull" else 2
+        pages = [response([first, second], total=total, next_url=cursor)]
+    missing_outcome_by_field = {
+        "resourceType": "OperationOutcome",
+        "issue": [{"severity": "error", "code": "not-found"}],
+    }
+    fetch = AsyncMock(side_effect=[*pages, (200, canonical, None, 1), (404, missing_outcome_by_field, None, 1)])
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    result = await walk.read_organizations(directory, src, ["known", "missing"], timeout=5)
+    exact = base + "/known"
+    assert result["entries"] == [{"resource": canonical, "fullUrl": exact, "_retrieved_from": exact}]
+    assert result["ids"] == ["known"] and result["missing_ids"] == ["missing"] and result["total"] == 1
+    assert [(item["kind"], item["key"]) for item in result["frontier"]] == [("network", "known")]
+    expected = [cursor] if shape == "continuation_repeat" else []
+    assert [call.args[1] for call in fetch.await_args_list[1:]] == [*expected, exact, base + "/missing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unexpected", ["other-id", "invalid/id"])
+async def test_ambiguous_organization_search_rejects_invalid_and_foreign_ids(monkeypatch, unexpected):
+    rows = [organization("known"), organization("known"), organization(unexpected)]
+    fetch = AsyncMock(return_value=response(rows, total=3))
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    with pytest.raises(ValueError, match="invalid_id|unrequested_organization"):
+        await walk.read_organizations(directory, source(), ["known", "second"], timeout=5)
+    fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_read",
+    [
+        (200, organization("wrong-id"), None, 1),
+        (400, {"resourceType": "OperationOutcome", "issue": [{"code": "processing"}]}, None, 1),
+        (200, {"resourceType": "OperationOutcome", "issue": [{"code": "processing"}]}, None, 1),
+        (404, {"resourceType": "OperationOutcome", "issue": "invalid"}, None, 1),
+        (404, {"resourceType": "OperationOutcome", "issue": [{}]}, None, 1),
+        (404, {"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "processing"}]}, None, 1),
+        (
+            404,
+            {
+                "resourceType": "OperationOutcome",
+                "issue": [
+                    {"severity": "error", "code": "processing", "diagnostics": "Access denied"},
+                ],
+            },
+            None,
+            1,
+        ),
+        (None, None, "source_fetch_timeout", 1),
+        (200, {**organization("missing"), "meta": {"tag": [{"code": "SUBSETTED"}]}}, None, 1),
+    ],
+)
+async def test_ambiguous_organization_search_fails_closed_on_invalid_reads(monkeypatch, bad_read):
+    canonical = organization("known")
+    pages = [response([canonical, canonical], total=2), (200, canonical, None, 1), bad_read]
+    fetch = AsyncMock(side_effect=pages)
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    with pytest.raises(ValueError, match="network_snapshot_(invalid|subsetted)_organization_read"):
+        await walk.read_organizations(directory, source(), ["known", "missing"], timeout=5)
+    assert fetch.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "search_state", ["exact_zero", "continuation", "match", "unknown_total", "boolean_total", "wrong_id", "short_id"]
+)
+async def test_excellus_missing_diagnostic_requires_closed_zero_exact_search(monkeypatch, search_state):
+    key = "5678" if search_state == "short_id" else "12-34-5678"
+    base = walk.API_BASE + "/Organization"
+    diagnostic_id = "5679" if search_state == "wrong_id" else key[-4:]
+    missing_outcome_by_field = {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            {"severity": "error", "code": "processing", "diagnostics": f"No Networks found using {diagnostic_id}"}
+        ],
+    }
+    has_match = search_state == "match"
+    followup = response(
+        [organization(key)] if has_match else [],
+        total=int(has_match),
+        next_url=base + "?cursor=more" if search_state == "continuation" else None,
+    )
+    if search_state == "unknown_total":
+        followup[1].pop("total")
+    if search_state == "boolean_total":
+        followup[1]["total"] = False
+    fetch = AsyncMock(side_effect=[response([], total=2), (404, missing_outcome_by_field, None, 1), followup])
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    if search_state == "exact_zero":
+        lookup_by_field = await walk.read_organizations(directory, source(), [key], timeout=5)
+        assert lookup_by_field["missing_ids"] == [key] and not lookup_by_field["entries"]
+    else:
+        with pytest.raises(ValueError):
+            await walk.read_organizations(directory, source(), [key], timeout=5)
+    urls = [call.args[1] for call in fetch.await_args_list]
+    assert urls[1:] == [f"{base}/{key}"] + (
+        [] if search_state in {"wrong_id", "short_id"} else [f"{base}?_id={key}&_count=1"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["rest_bundle", "rest_read"])
+async def test_organization_provenance_depends_on_retrieval_url(mode):
+    source_by_field = {**source(), "_endpoint_dataset_id": "candidate"}
+    model = object()
+    resource = organization("known")
+    exact = walk.API_BASE + "/Organization/known"
+    fetch_url = exact if mode == "rest_read" else walk.API_BASE + "/Organization?_id=known"
+    parse = Mock(return_value=(model, resource))
+    parser = SimpleNamespace(
+        parse_fhir_resource=parse,
+        RESOURCE_MODELS_BY_TYPE={"Organization": model},
+        _rest_bundle_acquisition=directory._rest_bundle_acquisition,
+    )
+    entry_by_field = {"resource": resource, "fullUrl": exact, "_retrieved_from": fetch_url}
+    persist = AsyncMock()
+    await graph.GraphStore(parser, source_by_field)._persist_entries(
+        {("Organization", "known"): entry_by_field},
+        [{"resource_type": "Organization", "resource_id": "known"}],
+        persist,
+    )
+    acquisition = parse.call_args.kwargs["acquisition"]
+    assert (acquisition.fetch_mode, acquisition.self_url, acquisition.fetch_url) == (mode, exact, fetch_url)
+    persist.assert_awaited_once_with(model, [resource])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_or_wrong", [None, "missing", "different", "subsetted", "network", "institution"])
+async def test_affiliation_verification_requires_a_full_exact_instance(monkeypatch, missing_or_wrong):
+    src = source()
+    resource_by_field = {
+        "resourceType": "OrganizationAffiliation",
+        "id": "different" if missing_or_wrong == "different" else "affiliation",
+        "network": [{"reference": "Organization/other" if missing_or_wrong == "network" else "Organization/network"}],
+        "participatingOrganization": {
+            "reference": "Organization/other" if missing_or_wrong == "institution" else "Organization/facility",
+        },
+    }
+    if missing_or_wrong == "subsetted":
+        resource_by_field["meta"] = {"tag": [{"code": "SUBSETTED"}]}
+    status = 404 if missing_or_wrong == "missing" else 200
+    fetch = AsyncMock(return_value=(status, resource_by_field, None, 1))
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    item_by_field = {
+        "kind": "verify_affiliation",
+        "key": "affiliation",
+        "url": None,
+        "payload": {"network_refs": ["Organization/network"], "institution_ids": ["facility"]},
+    }
+    if missing_or_wrong:
+        with pytest.raises(ValueError, match="network_snapshot_(?:invalid|subsetted|canonical)_affiliation_"):
+            await walk.step(directory, src, item_by_field, timeout=5, page_count=100)
+    else:
+        result = await walk.step(directory, src, item_by_field, timeout=5, page_count=100)
+        assert not result["entries"] and not result["frontier"] and result["next_url"] is None
+    fetch.assert_awaited_once_with(src, walk.API_BASE + "/OrganizationAffiliation/affiliation", timeout=5)
 
 
 @pytest.mark.asyncio

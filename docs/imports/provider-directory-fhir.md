@@ -663,8 +663,12 @@ published scope lists the additional searches and the unverified characters.
 Each search follows its issued pages sequentially. The importer deduplicates
 the resulting Organizations, verifies native ownership and follows network
 references in canonical OrganizationAffiliation records. It reconciles
-each owned network's distinct affiliation IDs with the total reported by the
+each owned network's distinct search result IDs with the total reported by the
 server. An affiliation shared by two networks is stored once with both links.
+Some completed searches omit links present in canonical affiliations. The
+importer checks those links with an exact read of each affected affiliation.
+The snapshot reports search edges and exact-confirmed additional edges
+separately in its membership reconciliation metadata.
 
 The snapshot records unresolved references. Its institution count includes
 distinct resolved Organizations named in an affiliation's `organization` or
