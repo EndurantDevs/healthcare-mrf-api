@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -71,6 +72,21 @@ async def test_complete_batch_replay_and_new_source_alias_reuse_ids(identity_dat
 
 
 @pytest.mark.asyncio
+async def test_organization_and_plan_tier_use_distinct_aliases_for_the_same_key(identity_database):
+    fixture = identity_database
+    rows = (FHIRNetworkIdentityInput("a" * 64, "endpoint-one", ("source-one",), "edition-one"),)
+    organization = await _allocate(fixture, rows)
+    options_by_field = {"approved_revision": 2, "control_schema": fixture.schema, "identity_kind": "plan_tier"}
+    async with fixture.connection.transaction():
+        tier = await allocate_fhir_catalog_network_ids(fixture.connection, rows, **options_by_field)
+        replay = await resolve_fhir_catalog_network_ids(fixture.connection, rows, **options_by_field)
+    assert tier["created_networks"] == 1
+    assert tier["rows"] == replay
+    assert not replay[0]["conflict"]
+    assert replay[0]["network_id"] != organization["rows"][0]["network_id"]
+
+
+@pytest.mark.asyncio
 async def test_genuine_scoped_legacy_alias_is_adopted_without_allocation(identity_database):
     fixture = identity_database
     network_id = await fixture.connection.fetchval(
@@ -84,12 +100,31 @@ async def test_genuine_scoped_legacy_alias_is_adopted_without_allocation(identit
         str(legacy),
         network_id,
     )
-    row = FHIRNetworkIdentityInput(
+    identity_input = FHIRNetworkIdentityInput(
         "network-one", "endpoint-one", ("source-one",), "edition-two", str(legacy), "reviewed-scope"
     )
-    result = await _allocate(fixture, (row,))
-    assert result["created_networks"] == 0 and result["rows"][0]["network_id"] == network_id
+    allocation = await _allocate(fixture, (identity_input,))
+    assert allocation["created_networks"] == 0 and allocation["rows"][0]["network_id"] == network_id
     assert await fixture.connection.fetchval(f'SELECT count(*) FROM "{fixture.schema}".network_registry_identity') == 1
+
+    other_id = await fixture.connection.fetchval(
+        f'INSERT INTO "{fixture.schema}".network_registry_identity(allocation_key) VALUES($1) RETURNING network_id',
+        uuid4(),
+    )
+    await fixture.connection.execute(
+        f'INSERT INTO "{fixture.schema}".network_registry_alias '
+        "VALUES('fhir','source-one','legacy_fhir_uuid',$1,'other-scope',$2,'other-evidence',now())",
+        str(legacy),
+        other_id,
+    )
+    checked = await _allocate(
+        fixture, (replace(identity_input, legacy_scope="other-scope"), replace(identity_input, legacy_scope="absent"))
+    )
+    assert checked["created_networks"] == 0
+    assert checked["rows"] == (
+        {"organization_id": "network-one", "network_id": min(network_id, other_id), "conflict": True},
+        {"organization_id": "network-one", "network_id": network_id, "conflict": False},
+    )
 
 
 @pytest.mark.asyncio
