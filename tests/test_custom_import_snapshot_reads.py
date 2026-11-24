@@ -294,6 +294,7 @@ async def test_context_binding_resolves_once_and_checks_only_named_layout(family
         "definition_revision_id": target.definition_revision_id,
         "schema_revision_id": target.schema_revision_id,
         "block_family_name": ROLE_SPECS["family"][1],
+        "block_fragment_name": ROLE_SPECS["fragment"][1],
     }
     assert session.connection.await_count == 1 and session.execute.await_count == 1
 

@@ -41,11 +41,13 @@ from process.custom_import.failure_diagnostics import (
     failure_phase,
 )
 from process.custom_import.family import RootFamily
+from process.custom_import.family_block_codec import FamilyBlockLimits
 from process.custom_import.registration_authority_operator import register_authority
 from process.custom_import.retained_profile_replay import retained_profile_request_identity, run_retained_profile_replay
 from process.custom_import.runner import CandidateRunResult
 from process.custom_import.runner_registry import database_now
 from process.custom_import.snowflake import FixedLocalKeyPairCredentialProvider
+from process.custom_import.snowflake_binding import RetainedProfileBase
 from process.custom_import.snowflake_bundle import SnowflakeBundleAcquisitionConnector
 from process.custom_import.snowflake_candidate import (
     SnowflakeBundleCandidateRequest,
@@ -167,6 +169,20 @@ def _parser() -> argparse.ArgumentParser:
         operation.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
         operation.add_argument("--source-binding-revision-id", required=True, type=_positive_identifier)
         operation.add_argument("--idempotency-key", required=True, type=_idempotency_key)
+        if command == "execute":
+            operation.add_argument(
+                "--compact-base",
+                nargs=3,
+                metavar=("GENERATION", "VERSION", "CAPTURE_SHA256"),
+                help="replay a sealed capture into compact storage with local owner access",
+            )
+            operation.add_argument(
+                "--compact-limits",
+                nargs=2,
+                type=_positive_identifier,
+                metavar=("SPOOL", "RECORD"),
+                help="maximum spool and record sizes in bytes for compact replay",
+            )
     for command in ("preflight", "discover", "estimate"):
         operation = commands.add_parser(command, allow_abbrev=False)
         operation.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
@@ -772,6 +788,7 @@ async def _run_retained_snowflake_binding(
     source_binding_revision_id: int,
     idempotency_key: str,
     database=db,
+    compact_replay=None,
 ) -> CandidateRunResult:
     """Run only the immutable source configuration loaded under database authority."""
 
@@ -788,16 +805,20 @@ async def _run_retained_snowflake_binding(
         with failure_phase(FailurePhase.ADMISSION_STAGE):
             async with load_admission_launch(loaded, idempotency_key=idempotency_key) or nullcontext() as handoff:
                 with failure_phase(FailurePhase.CAPTURE):
-                    return await _execute_loaded_candidate(database, loaded, idempotency_key, handoff)
+                    return await _execute_loaded_candidate(
+                        database, loaded, idempotency_key, handoff, compact_replay=compact_replay
+                    )
 
 
-async def _execute_loaded_candidate(database, loaded, idempotency_key, writer_transports):
+async def _execute_loaded_candidate(database, loaded, idempotency_key, writer_transports, *, compact_replay=None):
     """Open credentials only after the fixed launch stage has passed and entered."""
 
-    if getattr(loaded.binding, "retained_profile_base", None) is not None:
+    if compact_replay is not None or getattr(loaded.binding, "retained_profile_base", None) is not None:
         connector = _resume_connector(loaded)
         request = _operator_candidate_request(loaded, _retained_bundle_request(connector, loaded), idempotency_key)
-        return await _run_loaded_profile_replay(database, loaded, request, connector, writer_transports)
+        return await _run_loaded_profile_replay(
+            database, loaded, request, connector, writer_transports, compact_replay=compact_replay
+        )
     adapter = SnowflakePythonConnectorAdapter(role=loaded.binding.role, warehouse=loaded.binding.warehouse)
     with FixedLocalKeyPairCredentialProvider(FIXED_CREDENTIAL_DIRECTORY) as credential_provider:
         connector = SnowflakeBundleAcquisitionConnector(
@@ -884,17 +905,19 @@ def _retained_profile_statement(loaded):
     return connector.build_statement(_retained_bundle_request(connector, loaded))
 
 
-async def _run_loaded_profile_replay(database, loaded, request, connector, writer_transports):
-    """Use the registered replay scope through the ordinary hosted worker."""
+async def _run_loaded_profile_replay(database, loaded, request, connector, writer_transports, *, compact_replay=None):
+    """Use the registered profile or explicit owner replay scope."""
+    base, limits = (loaded.binding.retained_profile_base, None) if compact_replay is None else compact_replay
 
     return await run_retained_profile_replay(
         database.session_factory,
         loaded,
         request,
         connector.build_statement(request.bundle_request),
-        base=loaded.binding.retained_profile_base,
+        base=base,
         parent_statement=_retained_profile_statement,
         writer_transports=writer_transports,
+        compact_limits=limits,
     )
 
 
@@ -1077,13 +1100,29 @@ def _command_error_json(code, command, error, diagnostic):
     return json.dumps(document, separators=(",", ":"), sort_keys=True)
 
 
-def _run_worker_command(parsed):
+def _compact_replay_args(parsed):
+    base = getattr(parsed, "compact_base", None)
+    limits = getattr(parsed, "compact_limits", None)
+    if base is None and limits is None:
+        return {}
+    if base is None or limits is None:
+        raise ValueError("compact replay requires both its base and byte limits")
+    return {
+        "compact_replay": (
+            RetainedProfileBase(_positive_identifier(base[0]), _positive_identifier(base[1]), base[2]),
+            FamilyBlockLimits(max_spool_bytes=limits[0], max_record_bytes=limits[1]),
+        )
+    }
+
+
+def _run_worker_command(parsed, compact):
     operation = _run_retained_snowflake_binding if parsed.command == "execute" else _run_resumed_snowflake_binding
     candidate_result = asyncio.run(
         operation(
             definition_revision_id=parsed.definition_revision_id,
             source_binding_revision_id=parsed.source_binding_revision_id,
             idempotency_key=parsed.idempotency_key,
+            **compact,
         )
     )
     with failure_phase(FailurePhase.RECEIPT):
@@ -1101,7 +1140,8 @@ def _run_command(arguments, *, stream, diagnostic):
         preflight_limits = (
             _preflight_limits(parsed) if parsed.command in {"preflight", "discover", "estimate"} else None
         )
-    except SnowflakePreflightError:
+        compact = _compact_replay_args(parsed)
+    except SnowflakePreflightError, SnowflakeSourceBindingError, argparse.ArgumentTypeError, ValueError:
         parser.error("invalid")
     try:
         if parsed.command in {"register", "register-authority"}:
@@ -1111,7 +1151,7 @@ def _run_command(arguments, *, stream, diagnostic):
                 else asyncio.run(_register_snowflake_binding(stream=stream))
             )
         elif parsed.command in {"execute", "resume"}:
-            rendered = _run_worker_command(parsed)
+            rendered = _run_worker_command(parsed, compact)
         else:
             rendered = _run_preflight_command(parsed, preflight_limits)
         print(rendered)

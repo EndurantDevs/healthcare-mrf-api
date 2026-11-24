@@ -20,7 +20,7 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.schema import AddConstraint, CreateColumn, CreateIndex, CreateTable
 
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family_block_scalar_layout import append_scalar_columns, query_scalar_fields
@@ -29,6 +29,13 @@ from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.storage_layout import snapshot_schema, snapshot_tables
 
 _DIALECT = postgresql.dialect()
+_WINNER_COLUMNS = ("candidate_count", "context_child_key_sha256")
+_CANDIDATE_COUNT_CHECK = "candidate_count > 0"
+_CONTEXT_KEY_CHECK = (
+    "(context_collection_slot = 0 AND context_child_key_sha256 IS NULL) OR "
+    "(context_collection_slot > 0 AND context_child_key_sha256 IS NOT NULL AND "
+    "octet_length(context_child_key_sha256) = 32)"
+)
 _COMMON = {
     "root_record": (1, "custom_import_root_record"),
     "entity_binding": (2, "custom_import_entity_binding"),
@@ -254,7 +261,9 @@ class FamilyBlockLayout:
         tables_by_role = {role: common[name].to_metadata(metadata) for role, (_, name) in _COMMON.items()}
         winner = tables_by_role["winner"]
         winner.append_column(_big("candidate_count"))
-        winner.append_constraint(CheckConstraint("candidate_count > 0"))
+        winner.append_constraint(CheckConstraint(_CANDIDATE_COUNT_CHECK))
+        winner.append_column(Column("context_child_key_sha256", LargeBinary(32)))
+        winner.append_constraint(CheckConstraint(_CONTEXT_KEY_CHECK))
         tables_by_role.update(_new_tables(metadata, self.definition, self.collection_slots))
         # Common serving indexes are prepared after COPY, never built by LIKE.
         for table in tables_by_role.values():
@@ -288,6 +297,25 @@ def load_statements(family_id, layout):
             str(CreateTable(table).compile(dialect=_DIALECT)).replace("CREATE TABLE", "CREATE UNLOGGED TABLE", 1)
         )
     return tuple(statements)
+
+
+def candidate_layout_statements(binding):
+    """Extend the existing empty winner and create only compact leaves."""
+    tables = binding.tables_by_role
+    winner = tables["winner"]
+    target = _DIALECT.identifier_preparer.format_table(winner)
+    for name in _WINNER_COLUMNS:
+        column = CreateColumn(winner.c[name]).compile(dialect=_DIALECT)
+        yield "winner", f"ALTER TABLE {target} ADD COLUMN {column}"
+    for constraint in winner.constraints:
+        if isinstance(constraint, CheckConstraint) and str(constraint.sqltext) in (
+            _CANDIDATE_COUNT_CHECK,
+            _CONTEXT_KEY_CHECK,
+        ):
+            yield "winner", str(AddConstraint(constraint).compile(dialect=_DIALECT))
+    for role in _NEW:
+        ddl = str(CreateTable(tables[role]).compile(dialect=_DIALECT))
+        yield role, ddl.replace("CREATE TABLE", "CREATE UNLOGGED TABLE", 1)
 
 
 def projection_index_specifications(family_id, layout):

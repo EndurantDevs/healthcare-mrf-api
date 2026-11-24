@@ -18,6 +18,7 @@ from process.custom_import.query_projection_finality import (
     bind_materialization,
     load_generation_evidence,
 )
+from process.custom_import.read_identity import GenerationSnapshotBinding
 from tests.test_custom_import_query_projection_evidence import _fixture_digest, _generation, _manifest, _seal
 from tests.test_custom_import_query_projection_storage import _definition
 
@@ -157,12 +158,38 @@ async def test_finality_binds_exact_generation_and_seal_before_locking_manifest(
 
 @pytest.mark.asyncio
 async def test_explicit_legacy_seal_skips_lookup_but_advertised_seal_requires_revalidation(monkeypatch):
+    from process.custom_import import read_identity
+
     evidence = _evidence()
     legacy_seal = SimpleNamespace(**dict.fromkeys(evidence.seal_values()))
     load = AsyncMock(return_value=evidence)
     monkeypatch.setattr(finality, "load_generation_evidence", load)
+    pin = AsyncMock(return_value=GenerationSnapshotBinding(23, True, "ci_snapshot_23"))
+    monkeypatch.setattr(read_identity, "verify_generation_storage", pin)
     session, generation, definition = object(), _generation(), _definition()
     assert await finality.validate_sealed_projection(session, generation, legacy_seal, definition) is None
     load.assert_not_awaited()
+    pin.assert_not_awaited()
     assert await finality.validate_sealed_projection(session, generation, _seal(evidence), definition) == evidence
+    pin.assert_awaited_once_with(session, generation)
     load.assert_awaited_once_with(session, generation, definition)
+
+
+@pytest.mark.asyncio
+async def test_projection_replay_uses_pinned_compact_relations(monkeypatch):
+    definition = _definition()
+    generation = _generation()
+    evidence = _fixture_digest(definition).finish()
+    manifest = _manifest(definition, evidence, generation)
+    seal = _seal(evidence, generation)
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=seal), scalars=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: manifest))
+    )
+    lock = AsyncMock()
+    pin = GenerationSnapshotBinding(manifest.family_id, False, "ci_snapshot_23")
+    monkeypatch.setattr(finality, "lock_projection_tables", lock)
+    assert await finality.validate_sealed_projection(session, generation, seal, definition, snapshot=pin) == evidence
+    manifest.family_id += 1
+    with pytest.raises(QueryProjectionUnavailable, match="snapshot or definition differs"):
+        await finality.validate_sealed_projection(session, generation, seal, definition, snapshot=pin)
+    lock.assert_not_awaited()

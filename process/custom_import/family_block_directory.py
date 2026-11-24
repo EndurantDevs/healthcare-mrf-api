@@ -2,9 +2,9 @@
 
 """Bounded actual-ID directories and their separate internal storage commitment.
 
-The existing semantic family and codec-frame hashes remain unchanged. Before
-sealing, the owner must compare every directory entry with the fully verified
-codec record stream. Hashing an unverified directory does not prove membership.
+The existing semantic family and codec-frame hashes remain unchanged. A full
+reader verifies the directory independently against decoded record boundaries
+and actual IDs. A storage hash alone does not establish these relationships.
 """
 
 import hashlib
@@ -164,8 +164,8 @@ def storage_envelope_sha256(manifest, fragment_directory, memberships, *, check=
     This internal envelope extension does not recompute or rename semantic hashes.
     Fragment tuples are (ordinal, raw_bytes, first_record_ordinal,
     starting_record_count, first_record_offset, continuation_bytes). Memberships
-    are in (collection_slot, first_revision_id) order. Full closure must compare
-    the metadata with decoded records, independently of this commitment.
+    are in (collection_slot, first_revision_id) order. Full verification compares
+    the metadata with decoded records independently of this commitment.
     """
     digest = hashlib.sha256(_DOMAIN + b"envelope\x00")
 

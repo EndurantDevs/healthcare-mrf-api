@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 from collections import defaultdict, deque
-from contextlib import closing
+from contextlib import aclosing, closing
 
 from sqlalchemy import (
     BigInteger,
@@ -27,21 +27,25 @@ from sqlalchemy import (
 )
 from sqlalchemy import column as sql_column
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.orm import aliased
 
 from db.models.custom_import import (
     CustomImportBuildCandidateContext,
     CustomImportBuildFamily,
     CustomImportChildRevision,
     CustomImportChildScalar,
+    CustomImportDefinitionRevision,
     CustomImportEntityBinding,
     CustomImportFamilyChild,
     CustomImportFamilyRevision,
     CustomImportField,
     CustomImportGenerationFamily,
     CustomImportPack,
+    CustomImportRejection,
     CustomImportRootRecord,
     CustomImportRootRevision,
     CustomImportRootScalar,
+    CustomImportSchemaRevision,
     CustomImportSelectionProfile,
     CustomImportWinner,
 )
@@ -633,12 +637,8 @@ def _family_document(row, *, effective):
     }
 
 
-def _winner_query(models, generation):
-    """Read complete winner identities without fetching root or child payloads."""
-    winner, binding = models[CustomImportWinner], models[CustomImportEntityBinding]
-    family, root = models[CustomImportFamilyRevision], models[CustomImportRootRecord]
-    child = models[CustomImportChildRevision]
-    columns = (
+def _winner_commitment_columns(winner, binding, root, family, child_key):
+    return (
         winner.profile_slot,
         winner.entity_binding_id,
         winner.context_key_sha256,
@@ -650,9 +650,17 @@ def _winner_query(models, generation):
         binding.canonical_value,
         root.key_contract_sha256,
         root.logical_key_sha256,
-        func.coalesce(child.child_key_sha256, b""),
+        func.coalesce(child_key, b""),
         family.family_sha256,
     )
+
+
+def _winner_query(models, generation):
+    """Read complete winner identities without fetching root or child payloads."""
+    winner, binding = models[CustomImportWinner], models[CustomImportEntityBinding]
+    family, root = models[CustomImportFamilyRevision], models[CustomImportRootRecord]
+    child = models[CustomImportChildRevision]
+    columns = _winner_commitment_columns(winner, binding, root, family, child.child_key_sha256)
     keys = (columns[0], *columns[6:], columns[4], columns[2])
     statement = (
         publication._winner_material_statement(generation, models=models)
@@ -678,6 +686,239 @@ def _winner_document(row):
     )
     values = (row[0], row[2], row[4], *row[6:])
     return {name: publication._json_value(value) for name, value in zip(names, values, strict=True)}
+
+
+def _block_family_query(tables, generation):
+    member, family = tables["generation_family"].c, tables["family"].c
+    root, binding = tables["root_record"].c, tables["entity_binding"].c
+    return (
+        select(
+            root.root_record_id,
+            root.logical_key_sha256,
+            root.key_contract_sha256,
+            root.canonical_logical_key,
+            family.family_sha256,
+            family.child_count,
+            family.root_payload_sha256,
+            family.root_source_ordinal,
+            binding.adapter_id,
+            binding.value_sha256,
+            binding.canonical_value,
+            case((family.retained.is_(True), "retained"), else_="source"),
+        )
+        .select_from(member.family_revision_id.table)
+        .outerjoin(
+            family.family_revision_id.table,
+            (family.family_revision_id == member.family_revision_id) & (family.root_record_id == member.root_record_id),
+        )
+        .outerjoin(
+            root.root_record_id.table,
+            (root.root_record_id == member.root_record_id) & (root.dataset_id == member.dataset_id),
+        )
+        .outerjoin(
+            binding.entity_binding_id.table,
+            (binding.entity_binding_id == family.entity_binding_id) & (binding.dataset_id == member.dataset_id),
+        )
+        .where(
+            member.generation_id == generation.generation_id,
+            member.dataset_id == generation.dataset_id,
+            member.definition_revision_id == generation.definition_revision_id,
+            member.schema_revision_id == generation.schema_revision_id,
+        )
+        .order_by(root.logical_key_sha256)
+    )
+
+
+def _block_winner_query(tables, generation):
+    """Read winners in the same logical order from the scoped compact snapshot."""
+    winner, family = tables["winner"].c, tables["family"].c
+    root, binding = tables["root_record"].c, tables["entity_binding"].c
+    member = tables["generation_family"].c
+    profile = CustomImportSelectionProfile.__table__.c
+    columns = _winner_commitment_columns(winner, binding, root, family, winner.context_child_key_sha256)
+    return (
+        select(*columns, profile.profile_slot, profile.context_collection_slot, member.generation_id)
+        .select_from(winner.generation_id.table)
+        .outerjoin(
+            family.family_revision_id.table,
+            (family.family_revision_id == winner.family_revision_id)
+            & (family.entity_binding_id == winner.entity_binding_id),
+        )
+        .outerjoin(
+            root.root_record_id.table,
+            (root.root_record_id == family.root_record_id) & (root.dataset_id == winner.dataset_id),
+        )
+        .outerjoin(
+            binding.entity_binding_id.table,
+            (binding.entity_binding_id == winner.entity_binding_id) & (binding.dataset_id == winner.dataset_id),
+        )
+        .outerjoin(
+            member.generation_id.table,
+            (member.generation_id == winner.generation_id)
+            & (member.family_revision_id == family.family_revision_id)
+            & (member.root_record_id == family.root_record_id)
+            & (member.dataset_id == winner.dataset_id)
+            & (member.definition_revision_id == winner.definition_revision_id)
+            & (member.schema_revision_id == winner.schema_revision_id),
+        )
+        .outerjoin(
+            profile.profile_slot.table,
+            (profile.profile_slot == winner.profile_slot)
+            & (profile.dataset_id == winner.dataset_id)
+            & (profile.definition_revision_id == winner.definition_revision_id)
+            & (profile.schema_revision_id == winner.schema_revision_id),
+        )
+        .where(
+            winner.generation_id == generation.generation_id,
+            winner.dataset_id == generation.dataset_id,
+            winner.definition_revision_id == generation.definition_revision_id,
+            winner.schema_revision_id == generation.schema_revision_id,
+        )
+        .order_by(columns[0], *columns[6:], columns[4], columns[2])
+    )
+
+
+async def _add_block_commitments(session, generation, tables, proof, digests):
+    """Add the existing v2 family and winner frames directly from compact metadata."""
+    family_count = winner_count = 0
+    async with aclosing(
+        publication._stream_materialization_records(session, _block_family_query(tables, generation))
+    ) as family_rows:
+        async for family_row in family_rows:
+            if any(cell is None for cell in family_row):
+                raise publication.PublicationConflict("compact family commitment lacks its root, binding or family")
+            for effective, digest in enumerate(digests):
+                publication._add_digest_record(
+                    digest, "family_commitment", _family_document(family_row, effective=bool(effective))
+                )
+            family_count += 1
+    async with aclosing(
+        publication._stream_materialization_records(session, _block_winner_query(tables, generation))
+    ) as winner_rows:
+        async for winner_row in winner_rows:
+            winner_cells = winner_row[:-3]
+            profile_slot, collection_slot, member_generation = winner_row[-3:]
+            has_child = winner_cells[5] is not None
+            if (
+                profile_slot is None
+                or member_generation is None
+                or any(cell is None for cell in winner_cells[6:])
+                or winner_cells[4] != (collection_slot or 0)
+                or has_child != bool(collection_slot)
+                or len(winner_cells[11]) != (32 if has_child else 0)
+            ):
+                raise publication.PublicationConflict("compact winner commitment lacks its scope, binding or key")
+            publication._add_digest_record_to_all(digests, "winner_commitment", _winner_document(winner_cells))
+            winner_count += 1
+    if (family_count, winner_count) != (proof.family_count, proof.winner_count):
+        raise publication.PublicationConflict("compact commitments differ from structural counts")
+
+
+async def _block_sample_coverage(session, binding, proof, sampled_by_collection):
+    """Use native aggregate counts and record the scope of the actual decoded sample."""
+    from process.custom_import.build_source import _prepare_statement
+
+    runs = binding.tables_by_role["revision_run"]
+    winners = binding.tables_by_role["winner"]
+    await _prepare_statement(session)
+    children_by_slot = dict(
+        (
+            await session.execute(
+                select(runs.c.collection_slot, func.sum(runs.c.record_count))
+                .where(runs.c.collection_slot > 0)
+                .group_by(runs.c.collection_slot)
+            )
+        )
+        .tuples()
+        .all()
+    )
+    await _prepare_statement(session)
+    winners_by_slot = dict(
+        (await session.execute(select(winners.c.profile_slot, func.count()).group_by(winners.c.profile_slot)))
+        .tuples()
+        .all()
+    )
+    populations = [("root", 0, proof.root_count, sampled_by_collection[None])]
+    populations.extend(
+        ("child", slot, int(children_by_slot.pop(slot, 0)), sampled_by_collection[name])
+        for name, slot in sorted(binding.layout.collection_slots.items(), key=lambda item: item[1])
+    )
+    # Winner relationships and totals are checked over every row by structural SQL.
+    populations.extend(("winner", slot, winners_by_slot.pop(slot, 0), 0) for slot in range(1, proof.profile_count + 1))
+    if children_by_slot or winners_by_slot:
+        raise CandidateRunnerError("compact evidence population is outside the definition")
+    return [
+        {"kind": kind, "slot": slot, "population": population, "sampled": sampled, "capped": sampled < population}
+        for kind, slot, population, sampled in populations
+    ]
+
+
+async def verify_block_materialization(session, request, registry, generation, binding, proof, *, limits, check=None):
+    """Build v2 evidence from the frozen compact candidate and its actual semantic sample."""
+    from process.custom_import.family_block_sample import audit_block_sample
+
+    seed = _seed(generation, proof)
+    selection, sampled_by_collection = await audit_block_sample(
+        session, binding, request, registry, proof.build_id, seed, limits=limits, check=check
+    )
+    evidence_by_field = {
+        "contract": SAMPLE_CONTRACT,
+        "seed_sha256": seed.hex(),
+        "selection_sha256": selection,
+        "coverage": await _block_sample_coverage(session, binding, proof, sampled_by_collection),
+    }
+    return await frozen_block_materialization(session, generation, binding, proof, evidence_by_field)
+
+
+async def frozen_block_materialization(session, generation, binding, proof, evidence):
+    """Bind validated compact snapshot content using the existing v2 seal contract."""
+    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
+    from process.custom_import.query_projection_finality import bind_generation_materialization
+
+    counts = tuple(getattr(proof, name) for name in _output()._COUNT_NAMES)
+    publication._validate_verification_evidence(
+        MATERIALIZATION_CONTRACT,
+        evidence,
+        counts=(proof.root_count, proof.family_child_count, proof.winner_count, proof.profile_count),
+    )
+    source_digest = await publication._validated_source_bundle_digest(session, generation)
+    material = publication._new_digest("generation-materialization/v2")
+    effective = publication._new_digest("generation-effective-output/v2")
+    await publication._add_generation_identity_material(session, material, generation)
+    await publication._add_capture_material(session, material, generation)
+    for section, model, revision_id in (
+        ("definition", CustomImportDefinitionRevision, generation.definition_revision_id),
+        ("schema", CustomImportSchemaRevision, generation.schema_revision_id),
+    ):
+        revision = await session.get(model, revision_id)
+        if revision is None or revision.dataset_id != generation.dataset_id:
+            raise publication.PublicationConflict("compact materialization definition or schema differs")
+        publication._add_digest_record(effective, section, publication._materialization_document(revision))
+    for digest in (material, effective):
+        if await publication._add_definition_shape_material(session, digest, generation) != proof.profile_count:
+            raise publication.PublicationConflict("compact materialization profile count differs")
+    tables = binding.tables_by_role
+    model_map = {
+        CustomImportPack: aliased(CustomImportPack, tables["pack"], adapt_on_names=True),
+        CustomImportRejection: aliased(CustomImportRejection, tables["rejection"], adapt_on_names=True),
+    }
+    await publication._add_execution_material(session, material, generation, models=model_map)
+    await _add_block_commitments(session, generation, tables, proof, (material, effective))
+    publication._add_digest_record(material, "verification_evidence", evidence)
+    commitment = publication._Materialization(
+        source_digest,
+        material.digest(),
+        effective.digest(),
+        *counts,
+        materialization_contract=MATERIALIZATION_CONTRACT,
+        verification_evidence=evidence,
+    )
+    try:
+        return await bind_generation_materialization(
+            session, generation, commitment, binding.layout.definition, family_block_binding=binding
+        )
+    except QueryProjectionUnavailable as error:
+        raise publication.PublicationConflict(str(error)) from error
 
 
 def _compact_rows(session, request, build_id, query):

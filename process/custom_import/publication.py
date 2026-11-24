@@ -2340,8 +2340,8 @@ async def _validate_sealed_projection(session, generation, seal):
     from process.custom_import.read_identity import verify_generation_storage
 
     try:
-        await verify_generation_storage(session, generation)
-        await validate_sealed_projection(session, generation, seal)
+        snapshot = await verify_generation_storage(session, generation)
+        await validate_sealed_projection(session, generation, seal, snapshot=snapshot)
     except (CustomImportReadUnavailableError, QueryProjectionUnavailable) as exc:
         raise PublicationConflict(str(exc)) from exc
 

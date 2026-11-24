@@ -56,6 +56,7 @@ _CONTRACT = "custom-import/family-block/v1"
 _ENVELOPE_DOMAIN = b"custom-import/family-block/v1\x00storage\x00"
 _LENGTH = struct.Struct("!Q")
 _FRAGMENT = struct.Struct("!QQ")
+_DIRECTORY = struct.Struct("!qQqQ")
 
 
 class FamilyBlockResourceLimit(FamilyBlockError):
@@ -116,11 +117,24 @@ class _OwnedSpool(AbstractContextManager):
 class EncodedFamily(_OwnedSpool):
     """Completed encoding; its fragment iterator is replayable until close."""
 
+    _prefix = ()
+
     def fragments(self):
         """Replay every completed compressed fragment in original sequence."""
+        for _, frame in self.indexed_fragments():
+            yield frame
+
+    def indexed_fragments(self):
+        """Replay each fragment and its original record boundaries without decoding it."""
+        yield from self._prefix
+        yield from self._body_fragments()
+
+    def _body_fragments(self):
         self._file.seek(0)
         while prefix := self._file.read(_LENGTH.size):
-            yield self._file.read(_LENGTH.unpack(prefix)[0])
+            directory = _DIRECTORY.unpack(self._file.read(_DIRECTORY.size))
+            frame = self._file.read(_LENGTH.unpack(prefix)[0])
+            yield _indexed_fragment(directory, frame)
 
 
 class VerifiedFamily(_OwnedSpool):
@@ -160,70 +174,163 @@ def _header(definition, family_sha256, retained):
 
 
 class _Encoder:
-    def __init__(self, output):
+    def __init__(self, output, reserved_spool_bytes, *, prefix_bytes=0):
         self.output = output
+        self.reserved_spool_bytes = reserved_spool_bytes
         self.pending = bytearray()
         self.digest = hashlib.sha256(_ENVELOPE_DOMAIN)
         self.fragments = self.raw_bytes = self.stored_bytes = 0
+        self.next_record = self.record_starts = self.continuation = 0
+        self.first_record = self.first_offset = -1
+        self.prefix_bytes = prefix_bytes
+        self.prefix_raw_bytes = 0
+        self.prefix_frames = []
 
-    def write(self, value):
+    def write(self, value, *, is_record=False):
         """Frame one exact record, splitting it across bounded compressed fragments."""
         packed = msgpack.packb(value, use_bin_type=True)
         if len(packed) > self.output.limits.max_record_bytes:
             raise FamilyBlockResourceLimit("family record exceeds the caller's resource budget")
+        if is_record:
+            if self.record_starts == 0:
+                self.first_record, self.first_offset = self.next_record, len(self.pending)
+            self.record_starts += 1
+            self.next_record += 1
+        fragment_bytes = self.output.limits.fragment_bytes
+        remaining = _LENGTH.size + len(packed)
         for data in (_LENGTH.pack(len(packed)), packed):
             position = 0
             while position < len(data):
-                count = min(self.output.limits.fragment_bytes - len(self.pending), len(data) - position)
+                count = min(fragment_bytes - len(self.pending), len(data) - position)
                 self.pending.extend(memoryview(data)[position : position + count])
                 position += count
-                if len(self.pending) == self.output.limits.fragment_bytes:
+                remaining -= count
+                if len(self.pending) == fragment_bytes:
                     self.flush()
+                    self.continuation = min(fragment_bytes, remaining)
 
     def flush(self):
         """Persist a checksum-bearing fragment within the caller's spool budget."""
         if not self.pending:
             return
-        frame = _FRAGMENT.pack(self.fragments, len(self.pending)) + zstd.compress(
-            self.pending,
-            options={zstd.CompressionParameter.compression_level: 3, zstd.CompressionParameter.checksum_flag: True},
-        )
+        directory = (self.first_record, self.record_starts, self.first_offset, self.continuation)
+        is_header_fragment = self.raw_bytes < self.prefix_bytes
         self.raw_bytes += len(self.pending)
-        self.stored_bytes += _LENGTH.size + len(frame)
-        if max(self.raw_bytes, self.stored_bytes) > self.output.limits.max_spool_bytes:
-            raise FamilyBlockResourceLimit("family exceeds the caller's spool budget")
-        prefix = _LENGTH.pack(len(frame))
-        self.digest.update(prefix)
-        self.digest.update(frame)
-        self.output._file.write(prefix)
-        self.output._file.write(frame)
         self.fragments += 1
-        self.pending.clear()
+        if is_header_fragment:
+            self.prefix_raw_bytes += len(self.pending)
+            self._check_budget()
+            self.prefix_frames.append((self.pending, directory))
+            self.pending = bytearray()
+        else:
+            frame = _compress(self.fragments - 1, self.pending)
+            prefix = _LENGTH.pack(len(frame))
+            self.stored_bytes += len(prefix) + len(frame)
+            self._check_budget()
+            if not self.prefix_bytes:
+                self.digest.update(prefix)
+                self.digest.update(frame)
+            self.output._file.write(prefix)
+            self.output._file.write(_DIRECTORY.pack(*directory))
+            self.output._file.write(frame)
+            self.pending.clear()
+        self.first_record = self.first_offset = -1
+        self.record_starts = self.continuation = 0
+
+    def _check_budget(self):
+        spool_bytes = self.stored_bytes + self.fragments * _DIRECTORY.size + self.reserved_spool_bytes
+        if max(self.raw_bytes, spool_bytes + self.prefix_raw_bytes) > self.output.limits.max_spool_bytes:
+            raise FamilyBlockResourceLimit("family exceeds the caller's spool budget")
+
+    def finish_prefix(self, header):
+        """Fill the digest in the delayed header, preserving exact fragment boundaries."""
+        packed = _frame_object(header)
+        offset = 0
+        prefix_fragments = []
+        for ordinal, (raw, directory) in enumerate(self.prefix_frames):
+            count = min(len(raw), len(packed) - offset)
+            raw[:count] = packed[offset : offset + count]
+            offset += count
+            frame = _compress(ordinal, raw)
+            prefix_fragments.append(_indexed_fragment(directory, frame))
+            self.stored_bytes += _LENGTH.size + len(frame)
+        self.prefix_frames.clear()
+        self.prefix_raw_bytes = 0
+        self._check_budget()
+        self.output._prefix = tuple(prefix_fragments)
+        for _, frame in self.output.indexed_fragments():
+            self.digest.update(_LENGTH.pack(len(frame)))
+            self.digest.update(frame)
+
+    def complete(self, definition, family_sha256, child_count, *, retained):
+        """Finish the envelope and report the exact committed fragment sizes."""
+        self.write(["complete", child_count])
+        self.flush()
+        if self.prefix_bytes:
+            self.finish_prefix(_header(definition, family_sha256, retained))
+        return FamilyBlockManifest(
+            definition.digest,
+            family_sha256,
+            self.digest.digest(),
+            retained,
+            child_count,
+            self.fragments,
+            self.raw_bytes,
+            self.stored_bytes,
+        )
+
+
+def _indexed_fragment(directory, frame):
+    first, count, offset, continuation = directory
+    ordinal, raw_size = _FRAGMENT.unpack_from(frame)
+    return (ordinal, raw_size, None if first < 0 else first, count, None if offset < 0 else offset, continuation), frame
+
+
+def _compress(ordinal, raw):
+    return _FRAGMENT.pack(ordinal, len(raw)) + zstd.compress(
+        raw,
+        options={zstd.CompressionParameter.compression_level: 3, zstd.CompressionParameter.checksum_flag: True},
+    )
+
+
+def _frame_object(value):
+    packed = msgpack.packb(value, use_bin_type=True)
+    return _LENGTH.pack(len(packed)) + packed
 
 
 def _check_family_digest(definition, root_values, documents_by_collection, expected_digest, *, retained):
     if retained:
         for documents in documents_by_collection.values():
             deque(documents, maxlen=0)
-    else:
-        actual = runner_codec._family_hash_from_documents(definition, root_values, documents_by_collection)
-        if not hmac.compare_digest(actual, expected_digest):
-            raise FamilyBlockError("family semantic digest differs")
+        return expected_digest
+    actual = runner_codec._family_hash_from_documents(definition, root_values, documents_by_collection)
+    if expected_digest is not None and not hmac.compare_digest(actual, expected_digest):
+        raise FamilyBlockError("family semantic digest differs")
+    return actual
 
 
-def _encode(definition, root, children, expected_family_sha256, limits, *, retained):
+def _encode(definition, root, children, expected_family_sha256, limits, *, retained, reserved_spool_bytes=0):
     """Write ordered records with their existing semantic hash and exact byte census."""
     if type(definition) is not CustomImportDefinition or type(limits) is not FamilyBlockLimits:
         raise ValueError("family encoding requires a definition and resource bounds")
-    _sha256(expected_family_sha256)
+    needs_family_digest = expected_family_sha256 is None and not retained
+    placeholder = bytes(32) if needs_family_digest else expected_family_sha256
+    _sha256(placeholder)
+    _integer(reserved_spool_bytes, "reserved spool bytes", zero=True)
     if not isinstance(children, Mapping) or set(children) != set(definition.collections_by_name):
         raise FamilyBlockError("family collections differ")
     output = EncodedFamily(limits)
     try:
-        encoder = _Encoder(output)
-        encoder.write(_header(definition, expected_family_sha256, retained))
+        header = _header(definition, placeholder, retained)
+        encoder = _Encoder(
+            output, reserved_spool_bytes, prefix_bytes=len(_frame_object(header)) if needs_family_digest else 0
+        )
+        encoder.write(header)
         root_wire, _ = record_parts(definition, None, root, retained=retained)
-        encoder.write(root_wire)
+        output.root_payload_sha256 = runner_codec.digest_text("root-payload", root_wire[3])
+        output.root_scalar_count = len(root_wire[4])
+        output.child_scalar_count = 0
+        encoder.write(root_wire, is_record=True)
         root_values = (
             None if retained else runner_codec.payload_values(definition.root_fields, root_wire[3], label="family root")
         )
@@ -237,41 +344,41 @@ def _encode(definition, root, children, expected_family_sha256, limits, *, retai
                 wire, parts = record_parts(definition, name, child, retained=retained)
                 if previous is not None and parts < previous:
                     raise FamilyBlockError("family child documents are not ordered")
-                encoder.write(["record", wire])
+                encoder.write(["record", wire], is_record=True)
+                output.child_scalar_count += len(wire[4])
                 yield parts
                 previous = parts
             count_by_collection[name] = count
             encoder.write(["end", count])
 
         documents_by_collection = {name: documents(name) for name in sorted(children)}
-        _check_family_digest(
+        family_sha256 = _check_family_digest(
             definition, root_values, documents_by_collection, expected_family_sha256, retained=retained
         )
         child_count = sum(count_by_collection.values())
-        encoder.write(["complete", child_count])
-        encoder.flush()
-        output.manifest = FamilyBlockManifest(
-            definition.digest,
-            expected_family_sha256,
-            encoder.digest.digest(),
-            retained,
-            child_count,
-            encoder.fragments,
-            encoder.raw_bytes,
-            encoder.stored_bytes,
-        )
+        output.manifest = encoder.complete(definition, family_sha256, child_count, retained=retained)
         return output
     except BaseException:
         output.close()
         raise
 
 
-def encode_family(definition, root, children_by_collection, expected_family_sha256, *, limits):
-    """Encode fresh canonical records in existing child-document hash order."""
-    return _encode(definition, root, children_by_collection, expected_family_sha256, limits, retained=False)
+def encode_family(definition, root, children_by_collection, expected_family_sha256, *, limits, reserved_spool_bytes=0):
+    """Encode fresh canonical records, deriving their digest from the stream if absent."""
+    return _encode(
+        definition,
+        root,
+        children_by_collection,
+        expected_family_sha256,
+        limits,
+        retained=False,
+        reserved_spool_bytes=reserved_spool_bytes,
+    )
 
 
-def encode_retained_family(definition, root, children_by_collection, inherited_family_sha256, *, limits):
+def encode_retained_family(
+    definition, root, children_by_collection, inherited_family_sha256, *, limits, reserved_spool_bytes=0
+):
     """Encode a caller-proven retained family without redefining its semantic hash.
 
     The owner must first pin and verify the base, its exact original records and
@@ -279,7 +386,15 @@ def encode_retained_family(definition, root, children_by_collection, inherited_f
     checks. Opaque hydration is not semantic-read authority. Raw sparse hash
     checks remain here too. This is not a fallback for failed fresh decoding.
     """
-    return _encode(definition, root, children_by_collection, inherited_family_sha256, limits, retained=True)
+    return _encode(
+        definition,
+        root,
+        children_by_collection,
+        inherited_family_sha256,
+        limits,
+        retained=True,
+        reserved_spool_bytes=reserved_spool_bytes,
+    )
 
 
 def _read_object(source, limits):
@@ -318,7 +433,7 @@ def _child_wires(read, name, check):
         yield item[1]
 
 
-def _verify_records(output, check):
+def _verify_records(output, check, observe):
     """Check every record and collection count against the manifest before reading."""
     record_file, definition, manifest = output._file, output.definition, output.manifest
     record_file.seek(0)
@@ -333,7 +448,9 @@ def _verify_records(output, check):
         raise FamilyBlockError("family header differs from trusted evidence")
     if check is not None:
         check()
-    root, _ = record_from_wire(definition, None, read(), retained=manifest.retained)
+    root, parts = record_from_wire(definition, None, read(), retained=manifest.retained)
+    if observe is not None:
+        observe(None, root, parts)
     fields_by_collection = runner_codec.fields_by_collection(definition)
     count_by_collection = {}
 
@@ -343,7 +460,9 @@ def _verify_records(output, check):
         by_name = {field.field_id: field for field in fields}
         count, previous = 0, None
         for count, wire in enumerate(_child_wires(read, name, check), 1):
-            _, parts = _record_from_wire(definition, name, wire, fields, by_name, manifest.retained)
+            record, parts = _record_from_wire(definition, name, wire, fields, by_name, manifest.retained)
+            if observe is not None:
+                observe(name, record, parts)
             if previous is not None and parts < previous:
                 raise FamilyBlockError("family child documents are not ordered")
             yield parts
@@ -399,7 +518,7 @@ def _verify_fragments(output, fragments, check):
         raise FamilyBlockError("family storage digest differs")
 
 
-def verify_family(definition, fragments, manifest, *, limits, check=None):
+def verify_family(definition, fragments, manifest, *, limits, check=None, observe=None):
     """Verify every fragment, record and semantic commitment before exposing a family."""
     if type(definition) is not CustomImportDefinition or type(limits) is not FamilyBlockLimits:
         raise ValueError("family decoding requires a definition and resource bounds")
@@ -415,7 +534,7 @@ def verify_family(definition, fragments, manifest, *, limits, check=None):
     output.definition, output.manifest = definition, manifest
     try:
         _verify_fragments(output, fragments, check)
-        _verify_records(output, check)
+        _verify_records(output, check, observe)
         if check is not None:
             check()
         return output

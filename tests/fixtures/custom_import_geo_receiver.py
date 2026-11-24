@@ -156,8 +156,9 @@ class SyntheticSession(_Session):
         includes_layout = query_sql.lstrip().startswith("WITH pinned AS MATERIALIZED")
         if includes_layout:
             assert query_sql.count(f"(SELECT {resolver} AS family_id)") == 1
-            assert parameters.get("block_family_name") == "custom_import_block_family"
-            parameter_map = {key: value for key, value in parameters.items() if key != "block_family_name"}
+            parameter_map = dict(parameters)
+            assert parameter_map.pop("block_family_name") == "custom_import_block_family"
+            assert parameter_map.pop("block_fragment_name") == "custom_import_block_fragment"
         else:
             assert query_sql == f"SELECT {resolver}"
             parameter_map = parameters

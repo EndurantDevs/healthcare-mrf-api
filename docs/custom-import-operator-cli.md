@@ -45,6 +45,12 @@ authority, credential, SQL, path, or environment overrides. Registration does
 not itself acquire source records. `execute` uses the fixed local key-pair
 credential directory, the retained role/warehouse, and disabled secondary roles.
 
+For a compact snapshot rebuild, use `execute` with the existing local database
+owner access and add `--compact-base GENERATION VERSION CAPTURE_SHA256` and
+`--compact-limits SPOOL RECORD`. The limits are in bytes. The replay uses the
+sealed capture and the registered source binding, then returns the sealed
+candidate for explicit publication.
+
 Inspect only the selected fields of the approved relations:
 
 ```sh

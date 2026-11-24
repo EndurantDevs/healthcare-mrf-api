@@ -301,7 +301,9 @@ def _verify_membership_identities(member_data, identity_data, manifest, check):
         previous = membership.collection_slot, membership.last_revision_id
 
 
-def verify_stored_family(definition, collection_slots, fragment_rows, memberships, manifest, *, limits, check=None):
+def verify_stored_family(
+    definition, collection_slots, fragment_rows, memberships, manifest, *, limits, check=None, observe=None
+):
     """Fully verify the unchanged envelope, semantics, directories and actual IDs.
 
     Fragment and membership inputs must reach exact EOF; every owned scratch
@@ -321,7 +323,7 @@ def verify_stored_family(definition, collection_slots, fragment_rows, membership
         )
         if membership_count != manifest.membership_count or not hmac.compare_digest(digest, manifest.storage_sha256):
             raise FamilyBlockError("stored family envelope differs from trusted evidence")
-        verified = verify_family(definition, _frames(encoded), transient, limits=limits, check=check)
+        verified = verify_family(definition, _frames(encoded), transient, limits=limits, check=check, observe=observe)
         try:
             _verify_decoded_directory(verified, collection_slots, encoded, directory, identity_data, manifest, check)
             _verify_membership_identities(member_data, identity_data, manifest, check)

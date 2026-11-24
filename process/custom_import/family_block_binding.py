@@ -53,14 +53,17 @@ def _positive_identity(value):
 
 def check_projection_manifest(binding, manifest):
     """Bind projection data to its logical snapshot and canonical definition."""
+    if type(binding) is not FamilyBlockBinding:
+        raise QueryProjectionUnavailable("family block projection data binding is invalid")
+    check_projection_scope(manifest, binding.family_id, binding.layout.definition)
+
+
+def check_projection_scope(manifest, family_id, definition):
+    """Validate projection identity after the caller pins compact storage."""
     try:
-        if (
-            type(binding) is not FamilyBlockBinding
-            or _positive_identity(manifest.family_id) != _positive_identity(binding.family_id)
-            or not hmac.compare_digest(
-                _digest(manifest.definition_sha256, "projection definition"),
-                bytes.fromhex(binding.layout.definition.digest),
-            )
+        if _positive_identity(manifest.family_id) != _positive_identity(family_id) or not hmac.compare_digest(
+            _digest(manifest.definition_sha256, "projection definition"),
+            bytes.fromhex(definition.digest),
         ):
             raise QueryProjectionUnavailable("family block projection snapshot or definition differs")
     except (AttributeError, KeyError, TypeError, ValueError) as error:

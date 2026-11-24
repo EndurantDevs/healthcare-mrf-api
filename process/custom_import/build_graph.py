@@ -41,6 +41,7 @@ from process.custom_import import materialization as material
 from process.custom_import import publication
 from process.custom_import.build_graph_source_page import append_source_child_page
 from process.custom_import.build_source import (
+    _WINDOW,
     SourceBuildRequest,
     _assert_build_identity,
     _close_contexts,
@@ -433,17 +434,19 @@ async def _heartbeat(session_factory, request):
     build_id = None if request.continuation is None else request.continuation.build_id
     async with _page_session(session_factory, request, build_id) as (session, _build):
         await _prepare_statement(session)
+        window = session.info[_WINDOW]
+    return window
 
 
 @asynccontextmanager
-async def _renew_while_reading(session_factory, request):
+async def _renew_while_reading(session_factory, request, *, on_renew=None):
     """Keep long immutable scans live without extending the pinned deadline."""
 
     async def _renew():
         while True:
             await asyncio.sleep(min(5.0, request.lease_seconds / 3))
             try:
-                await _heartbeat(session_factory, request)
+                window = await _heartbeat(session_factory, request)
             except DBAPIError as error:
                 # A page writer can hold these locks through several bounded statements.
                 if (
@@ -452,6 +455,9 @@ async def _renew_while_reading(session_factory, request):
                     or not _is_child_page_bound_error(error)
                 ):
                     raise
+            else:
+                if on_renew is not None:
+                    on_renew(window)
 
     try:
         async with asyncio.TaskGroup() as tasks:
@@ -1324,16 +1330,8 @@ async def _consume_family_page(session_factory, request, registry, family_inputs
     await consume_family_page(session_factory, request, registry, family_inputs, prepared=prepared)
 
 
-async def _build_graph(session_factory, request: SourceBuildRequest, build_id: int) -> int | None:
-    """Finish a SQL-selected graph and atomically open its real generation."""
-
-    build = await _snapshot(session_factory, request, build_id)
-    if build.phase == "rejected":
-        return None
-    if build.generation_id is not None:
-        return build.generation_id
-    if build.phase != "graph":
-        raise CandidateRunnerError("graph construction requires completed source admission")
+async def _prepare_graph_plan(session_factory, request, build_id, build):
+    """Complete the shared native planner before selecting a writer."""
     await _prepare_snapshot_indexes(session_factory, request, build_id, "graph")
     async with _page_session(session_factory, request, build_id) as (session, _build):
         registry = await load_registry(session, request)
@@ -1347,6 +1345,20 @@ async def _build_graph(session_factory, request: SourceBuildRequest, build_id: i
             )
         await _heartbeat(session_factory, request)
         build = await _snapshot(session_factory, request, build_id)
+    return build, registry
+
+
+async def _build_graph(session_factory, request: SourceBuildRequest, build_id: int) -> int | None:
+    """Finish a SQL-selected graph and atomically open its real generation."""
+
+    build = await _snapshot(session_factory, request, build_id)
+    if build.phase == "rejected":
+        return None
+    if build.generation_id is not None:
+        return build.generation_id
+    if build.phase != "graph":
+        raise CandidateRunnerError("graph construction requires completed source admission")
+    build, registry = await _prepare_graph_plan(session_factory, request, build_id, build)
     after_root_id = 0
     while True:
         from process.custom_import.build_graph_prepared import PreparedChildren

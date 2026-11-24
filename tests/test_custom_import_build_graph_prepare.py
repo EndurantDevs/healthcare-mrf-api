@@ -24,10 +24,12 @@ from db.models.custom_import import (
 )
 from process.custom_import import build_graph as graph
 from process.custom_import import build_graph_prepare_page as prepare
-from process.custom_import import runner_codec, runner_graph
+from process.custom_import import family_block_source, runner_codec, runner_graph
 from process.custom_import.build_graph_prepared import PreparedChildren
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import RootFamily
+from process.custom_import.family_block_binding import FamilyBlockUnavailable, checked_binding
+from process.custom_import.family_block_codec import FamilyBlockLimits
 from process.custom_import.runner_codec import (
     digest_text,
     new_family_hash,
@@ -260,9 +262,60 @@ def _joined_root_rows(rows):
             (row[0], None, *row[1:]) if row[0].selection_kind == "retained" else (row[0], row[1], None, *row[2:])
             for row in rows
         ]
-        if rows and isinstance(rows[0][0], CustomImportBuildFamily)
+        if rows and len(rows[0]) == 7 and isinstance(rows[0][0], CustomImportBuildFamily)
         else rows
     )
+
+
+@pytest.mark.parametrize("count_difference", [0, 1])
+def test_admitted_source_pages_pack_exact_compact_blocks(monkeypatch, count_difference):
+    """Pack each admitted child and stage its unchanged typed query cells."""
+    request = _request()
+    registry = _registry(request.definition)
+    binding = checked_binding(17, request.definition, registry.child_collection_slots)
+    child_by_field = dict(rate_npi="0000000002", service_code="A100", amount=Decimal("1.000000000001"))
+    planned_roots = [
+        root_row(request, 1),
+        root_row(request, 2, child_values_by_collection={"rates": (child_by_field,)}, started=True),
+    ]
+    planned_roots[1][0].family_revision_id = None
+    child = child_row(request, planned_roots[1], child_by_field, 97)
+    child[2].pack_id, child[2].source_ordinal = 29, 5
+    actual_roots = [(*planned[:3], planned[-1]) for planned in planned_roots]
+    pages = [root_metadata(actual_roots), actual_roots, [(2, "rates", 1 + count_difference, True)]]
+    session = read_session(monkeypatch, [*pages, child_metadata([child]), [child]])
+    roots = family_block_source.read_block_roots(session, request, 7, binding, after_root_id=0)
+    limits = FamilyBlockLimits(1024 * 1024, 65_536, fragment_bytes=256, memory_bytes=4096)
+    query_rows, scalar_counts = [], []
+    packed = family_block_source.pack_source_page(
+        session,
+        request,
+        registry,
+        binding,
+        roots,
+        {1: (101, 201), 2: (102, 202)},
+        limits=limits,
+        stage_output=(
+            lambda role, cells: query_rows.append(cells) if role == "query_input" else None,
+            lambda root, child: scalar_counts.append((root, child)),
+        ),
+    )
+    if count_difference:
+        with pytest.raises(FamilyBlockUnavailable, match="before the SOURCE count"):
+            list(packed)
+    else:
+        family_rows = [cells for role, cells in packed if role == "family"]
+        root_hash = new_family_hash(request.definition, RootFamily(("0000000001",), roots[0].values, {"rates": ()}))
+        assert [cells[:5] for cells in family_rows] == [
+            (101, 1, 1001, 201, root_hash),
+            (102, 2, 1002, 202, planned_roots[1][5].family_sha256),
+        ]
+        assert [cells[7] for cells in family_rows] == [0, 1]
+        assert scalar_counts == [(2, 0), (2, 2)]
+        keys = (child[2].child_key_sha256, child[2].canonical_child_key)
+        assert query_rows == [(97, 102, 1, *keys, b"\x0a", None, "A100", Decimal("1.000000000001"))]
+    graph._build_storage_models.assert_not_called()
+    assert "custom_import_family_revision" not in str(session.execute.call_args_list[0].args[0])
 
 
 def track_streams(monkeypatch):
@@ -387,7 +440,9 @@ def test_mixed_page_retains_order_identity_and_legacy_digest(monkeypatch):
     # Every query is nonlocking; the child payload is one global root set.
     queries = [str(call.args[0].compile(dialect=postgresql.dialect())) for call in session.execute.call_args_list]
     assert all("FOR UPDATE" not in query for query in queries)
-    assert "root_record_id IN" in queries[2]
+    assert "root_record_id = ANY" in queries[2]
+    key_page = session.execute.call_args_list[2].args[0].compile(dialect=postgresql.dialect())
+    assert key_page.params["selected_source_root_ids"] == (2, 3)
 
 
 def test_large_family_streams_across_global_child_pages(monkeypatch):
@@ -770,6 +825,7 @@ def test_compiled_queries_bind_full_identity_and_duplicate_policy():
     children, keys, _ = prepare._children_statement(request, registry, 7, (1, 2), candidate_models)
     root_sql = str(roots.compile(dialect=postgresql.dialect()))
     child_sql = str(children.order_by(*keys).compile(dialect=postgresql.dialect()))
+    assert "ANY (%(selected_source_root_ids)s::BIGINT[])" in child_sql
     for term in (
         "custom_import_generation_family",
         "custom_import_generation_seal",

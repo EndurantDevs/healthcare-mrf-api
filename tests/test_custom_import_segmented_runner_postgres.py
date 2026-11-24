@@ -27,8 +27,9 @@ from db.models.custom_import import (
     CustomImportPublicationEvent,
     CustomImportRegistrationAuthority,
 )
+from db.models.custom_import_family_block import CustomImportFamilyBlockLayout
 from db.models.custom_import_storage import CustomImportSnapshotFamily
-from process.custom_import import snowflake_candidate
+from process.custom_import import compact_materialization, family_block_sample, runner_codec, snowflake_candidate
 from process.custom_import import snowflake_segmented_runner as runner
 from process.custom_import.definition import (
     ROOT_BOOLEAN_TRUE_STORAGE_PROFILE,
@@ -36,6 +37,7 @@ from process.custom_import.definition import (
     CustomImportDefinition,
     canonical_json,
 )
+from process.custom_import.family_block_codec import FamilyBlockLimits
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
 from process.custom_import.publication import activate_generation, rollback_generation
 from process.custom_import.read_core import (
@@ -357,7 +359,7 @@ async def _profile_source_base(case, baseline):
         )
 
 
-async def _replay_profile(case, original_statement, connector, request, baseline):
+async def _replay_profile(case, original_statement, connector, request, baseline, *, base=None, compact_limits=None):
     """Build from the parent capture with the successor's registered binding."""
 
     async with case.sessions() as session:
@@ -368,19 +370,34 @@ async def _replay_profile(case, original_statement, connector, request, baseline
         )
         generation = await session.get(CustomImportGeneration, baseline.generation_id)
         parent_capture_id = generation.capture_bundle_id
-        base = loaded.binding.retained_profile_base
+        base = base or loaded.binding.retained_profile_base
     args = (case.sessions, loaded, request, connector.build_statement(request.bundle_request))
 
     def parent_statement(_binding):
         return original_statement
 
-    with pytest.raises(CandidateRunnerError, match="retained replay base differs from the approved source binding"):
+    with pytest.raises(CandidateRunnerError, match="retained replay (base differs|source is unavailable)"):
         wrong = RetainedProfileBase(base.generation_id, base.pointer_version, "0" * 64)
-        await run_retained_profile_replay(*args, base=wrong, parent_statement=parent_statement)
-    unpublished = await run_retained_profile_replay(*args, base=base, parent_statement=parent_statement)
+        await run_retained_profile_replay(
+            *args, base=wrong, parent_statement=parent_statement, compact_limits=compact_limits
+        )
+    if compact_limits is not None:
+        with pytest.raises(CandidateRunnerError, match="compact retained replay requires the local owner"):
+            await run_retained_profile_replay(
+                *args,
+                base=base,
+                parent_statement=parent_statement,
+                writer_transports=object(),
+                compact_limits=compact_limits,
+            )
+    unpublished = await run_retained_profile_replay(
+        *args, base=base, parent_statement=parent_statement, compact_limits=compact_limits
+    )
     assert unpublished.status == "sealed_unpublished"
     assert unpublished.publication is None
-    recovered = await run_retained_profile_replay(*args, base=base, parent_statement=parent_statement)
+    recovered = await run_retained_profile_replay(
+        *args, base=base, parent_statement=parent_statement, compact_limits=compact_limits
+    )
     assert (recovered.status, recovered.execution_id, recovered.generation_id) == (
         unpublished.status,
         unpublished.execution_id,
@@ -415,6 +432,129 @@ async def _approve_profile_publication(case, request, baseline, candidate):
             expected_generation_id=baseline.generation_id,
             expected_pointer_version=baseline.publication.committed_pointer_version,
         )
+
+
+async def test_owner_retained_replay_seals_compact_candidate_before_publication(monkeypatch):
+    async with _source_case() as case:
+        await _install_storage_profile_fixture(case)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(
+                _install_snapshot_revision, case.schema_name, "20261104020000_custom_import_family_blocks"
+            )
+        connector, original, policy, _, _ = await _registered_runtime(case, monkeypatch, child_text=True)
+        baseline = await runner.run_segmented_snowflake_candidate(
+            case.sessions, connector, original, processing_policy=policy
+        )
+        assert baseline.status == "activated"
+        original_statement = connector.build_statement(original.bundle_request)
+        base = await _profile_source_base(case, baseline)
+        request = replace(original, idempotency_key="synthetic-compact-rebuild", lease_token=b"synthetic-compact-owner")
+        limits = FamilyBlockLimits(max_spool_bytes=16 * 1024**2, max_record_bytes=64 * 1024)
+        candidate = await _replay_profile(
+            case, original_statement, connector, request, baseline, base=base, compact_limits=limits
+        )
+        assert candidate.seal.effective_output_sha256 == baseline.seal.effective_output_sha256
+        async with case.sessions() as session:
+            layout = await session.scalar(
+                select(CustomImportFamilyBlockLayout)
+                .join(
+                    CustomImportSnapshotFamily,
+                    CustomImportSnapshotFamily.family_id == CustomImportFamilyBlockLayout.family_id,
+                )
+                .where(CustomImportSnapshotFamily.generation_id == candidate.generation_id)
+            )
+            assert layout is not None and layout.phase == "logged"
+        publication = await _approve_profile_publication(case, original, baseline, candidate)
+        await _assert_current_child_text_lookups(case, request, candidate.generation_id)
+        candidate = replace(candidate, publication=publication)
+        await _assert_unchanged_compact_replay(case, request, original_statement, candidate, limits)
+        rejected, carried = await _build_rejected_compact_refresh(case, monkeypatch, request, policy, candidate, limits)
+        await _assert_compact_refresh_publication(case, rejected, candidate, carried)
+
+
+async def _assert_unchanged_compact_replay(case, request, original_statement, candidate, limits):
+    compact_base = await _profile_source_base(case, candidate)
+    retry = replace(request, idempotency_key="synthetic-compact-refresh", lease_token=b"synthetic-refresh-owner")
+    async with case.sessions() as session:
+        loaded = await load_snowflake_source_binding(
+            session,
+            definition_revision_id=retry.definition_revision_id,
+            source_binding_revision_id=retry.source_binding_revision_id,
+        )
+    unchanged = await run_retained_profile_replay(
+        case.sessions,
+        loaded,
+        retry,
+        original_statement,
+        base=compact_base,
+        parent_statement=lambda _binding: original_statement,
+        compact_limits=limits,
+    )
+    assert unchanged.status == "no_change"
+    assert unchanged.publication.to_generation_id == candidate.generation_id
+    await _assert_current_child_text_lookups(case, retry, candidate.generation_id)
+
+
+async def _build_rejected_compact_refresh(case, monkeypatch, request, policy, candidate, limits):
+    compact_base = await _profile_source_base(case, candidate)
+    changed_b = _shared_row(_ROWS[1][4], key="b", amount=Decimal("7.25"))
+    connector, _, adapter, cursor, connection = _runtime(
+        monkeypatch, (_ROWS[0], changed_b, _ROWS[0]), partition_rows=1, processing_policy=policy
+    )
+    monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
+    rejected = replace(request, idempotency_key="synthetic-rejected-refresh", lease_token=b"synthetic-reject-owner")
+    captured = await runner._capture_for_build(case.sessions, connector, rejected, policy)
+    retained_key = runner_codec.root_key_hash_from_tuple(request.definition, (_ROWS[0][4],))
+    seed = next(
+        word.to_bytes(32, "big")
+        for word in range(256)
+        if int.from_bytes(hashlib.sha256(word.to_bytes(32, "big") + retained_key).digest()[:2], "big") % 5 == 0
+    )
+    monkeypatch.setattr(compact_materialization, "_seed", lambda *_args: seed)
+    sampled = AsyncMock(wraps=family_block_sample._sample_retained)
+    monkeypatch.setattr(family_block_sample, "_sample_retained", sampled)
+    carried = await runner.build_segmented_capture(
+        case.sessions,
+        rejected,
+        captured,
+        policy,
+        retained_base=(compact_base.generation_id, compact_base.pointer_version),
+        compact_limits=limits,
+    )
+    assert carried.status == "sealed_unpublished" and carried.rejection_count > 0
+    assert carried.seal.effective_output_sha256 != candidate.seal.effective_output_sha256
+    sampled.assert_awaited_once()
+    async with case.sessions() as session:
+        family_id = await session.scalar(
+            select(CustomImportSnapshotFamily.family_id).where(
+                CustomImportSnapshotFamily.generation_id == carried.generation_id
+            )
+        )
+        population = await session.execute(
+            text(
+                f'SELECT retained, count(*) FROM "{snapshot_schema(family_id)}".custom_import_block_family '
+                "GROUP BY retained ORDER BY retained"
+            )
+        )
+        assert population.all() == [(False, 1), (True, 1)]
+    return rejected, carried
+
+
+async def _assert_compact_refresh_publication(case, rejected, candidate, carried):
+    await _assert_current_child_text_lookups(case, rejected, candidate.generation_id)
+    cut = await _approve_profile_publication(case, rejected, candidate, carried)
+    assert cut.from_generation_id == candidate.generation_id
+    await _assert_current_child_text_lookups(case, rejected, carried.generation_id)
+    async with case.sessions() as session, session.begin():
+        rollback = await rollback_generation(
+            session,
+            dataset_id=rejected.dataset_id,
+            target_generation_id=candidate.generation_id,
+            expected_generation_id=carried.generation_id,
+            expected_pointer_version=cut.committed_pointer_version,
+        )
+        assert rollback.to_generation_id == candidate.generation_id
+    await _assert_current_child_text_lookups(case, rejected, candidate.generation_id)
 
 
 @pytest.mark.parametrize(
