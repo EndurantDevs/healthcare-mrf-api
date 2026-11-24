@@ -627,7 +627,7 @@ async def test_registered_source_preserves_duplicates_and_requires_stage_before_
         await fixture.writer.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
 
 
-@pytest.mark.parametrize("failure", ["stage_count", "native_row", "raw_count"])
+@pytest.mark.parametrize("failure", ["stage_count", "stage_rows", "native_row", "raw_count"])
 async def test_source_construction_and_seal_refuse_incomplete_or_changed_source(candidate_lifecycle, failure):
     from process.registry_source_retention import RegistrySourceRetentionError, retain_registry_source_memberships
     from tests.test_registry_source_retention import retention_receipt
@@ -639,8 +639,12 @@ async def test_source_construction_and_seal_refuse_incomplete_or_changed_source(
         stage = await _retention_stage(fixture, 1 if failure == "stage_count" else 2)
         if failure == "native_row":
             await fixture.writer.execute(f"UPDATE pg_temp.\"{stage.table_name}\" SET input_json='{{}}' WHERE ordinal=2")
-        if failure in {"stage_count", "native_row"}:
-            with pytest.raises(RegistrySourceRetentionError):
+        if failure == "stage_rows":
+            await fixture.writer.execute(f'DELETE FROM pg_temp."{stage.table_name}" WHERE ordinal=2')
+        if failure in {"stage_count", "stage_rows", "native_row"}:
+            with pytest.raises(
+                RegistrySourceRetentionError, match="retention_accounting_invalid" if failure == "stage_rows" else None
+            ):
                 await retain_registry_source_memberships(
                     fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
                 )
@@ -734,7 +738,7 @@ async def test_source_set_construction_uses_fixed_native_queries(candidate_lifec
                 fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
             )
             await asyncio.sleep(0)
-            assert len(logged_queries) == 8
+            assert len(logged_queries) == 6
         finally:
             fixture.writer.remove_query_logger(logged_queries.append)
         assert (
