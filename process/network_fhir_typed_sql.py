@@ -247,8 +247,9 @@ AND lx.eligible AND nx.eligible AND px.valid_npi AND (r.npi IS NULL OR p.npi=r.n
 AND a.canonical_identity LIKE '%|street'"""
 )
 
+PROVIDER_ONLY_PAGE_SIZE = 16384
 PROVIDER_ONLY_SQL = (
-    _role_page_sql(3)
+    _role_page_sql(3, PROVIDER_ONLY_PAGE_SIZE)
     + """SELECT nr.resource_id AS network_source_key,p.npi AS provider_id,r.resource_type,r.resource_id
 FROM role_page r """
     + _PARENT_LOOKUP

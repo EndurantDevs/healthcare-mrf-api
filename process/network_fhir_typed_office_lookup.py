@@ -28,24 +28,12 @@ async def create_office_lookup_tables(connection, office_name):
 
 async def _requested_keys(connection, offices, requested):
     for relation in offices:
-        after_keys = "", UUID(int=0)
-        while True:
-            upper = await connection.fetchrow(
-                f"SELECT provider_id,location_id FROM (SELECT provider_id,location_id FROM {relation} "
-                "WHERE (provider_id,location_id)>($1::text,$2::uuid) ORDER BY provider_id,location_id LIMIT 5000) page "
-                "ORDER BY provider_id DESC,location_id DESC LIMIT 1",
-                *after_keys,
-            )
-            if upper is None:
-                break
-            await connection.execute(
-                f"INSERT INTO {requested} SELECT provider_id,address_key FROM {relation} "
-                "WHERE (provider_id,location_id)>($1::text,$2::uuid) "
-                "AND (provider_id,location_id)<=($3::text,$4::uuid) ON CONFLICT DO NOTHING",
-                *after_keys,
-                *upper,
-            )
-            after_keys = tuple(upper)
+        await connection.execute(
+            f"INSERT INTO {requested} SELECT provider_id,address_key FROM {relation} "
+            "WHERE (provider_id,location_id)>($1::text,$2::uuid) ON CONFLICT DO NOTHING",
+            "",
+            UUID(int=0),
+        )
 
 
 async def _address_matches(connection, address, requested, matches):

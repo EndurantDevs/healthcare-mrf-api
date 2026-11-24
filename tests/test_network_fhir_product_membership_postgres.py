@@ -324,20 +324,25 @@ def _expected():
     return totals, sorted(membership_rows)
 
 
-async def _prepared_source_lookup(connection, bindings, arguments):
+async def _prepared_source_lookup(connection, bindings, arguments, additional_keys=0):
     checked = (
         "approved_network_bindings AS (WITH "
         + bindings
         + " SELECT network_id,record_json->>'source_key' AS source_key,record_json->'source_scope_json' AS source_scope "
-        "FROM approved_network_bindings),binding_check AS (SELECT false AS invalid)"
+        "FROM approved_network_bindings UNION ALL SELECT 1,'extra-'||n,"
+        "jsonb_build_object('organization_id','extra-'||n,'source_generation',$8::text) "
+        f"FROM generate_series(1,{additional_keys}) n),binding_check AS (SELECT false AS invalid)"
     )
     prepared, parameters = await mapping._prepare_mapping_bindings(connection, checked, arguments, typed=True)
+    assert prepared.count == additional_keys + 1
     return prepared, parameters
 
 
 @pytest.mark.parametrize("original", ["on", "off"])
-@pytest.mark.parametrize(("readonly", "prepared"), [(False, False), (True, False), (False, True)])
-async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connection, original, readonly, prepared):
+@pytest.mark.parametrize(("readonly", "additional_keys"), [(False, None), (True, None), (False, 0), (False, 5000)])
+async def test_pair_plan_exact_counts_evidence_and_nested_scope(
+    planner_connection, original, readonly, additional_keys
+):
     connection, _admin = planner_connection
     stage, selected = await _fixture(connection)
     await connection.execute("SELECT set_config('enable_nestloop',$1,false)", original)
@@ -345,8 +350,8 @@ async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connecti
         nested = "off" if original == "on" else "on"
         await connection.execute("SELECT set_config('enable_nestloop',$1,true)", nested)
         bindings, arguments = _BINDINGS, _ARGUMENTS
-        if prepared:
-            bindings, arguments = await _prepared_source_lookup(connection, bindings, arguments)
+        if additional_keys is not None:
+            bindings, arguments = await _prepared_source_lookup(connection, bindings, arguments, additional_keys)
         totals = await mapping._map_pair_rows(connection, stage, selected, bindings, arguments)
         expected_totals, expected_rows = _expected()
         assert totals == expected_totals
@@ -360,7 +365,7 @@ async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connecti
         assert await connection.fetchval("SHOW enable_nestloop") == nested
         assert await connection.fetchval("SHOW transaction_read_only") == ("on" if readonly else "off")
     assert await connection.fetchval("SHOW enable_nestloop") == original
-    if prepared:
+    if additional_keys is not None:
         assert await connection.fetchval("SELECT to_regclass($1)", bindings.relation) is None
 
 
@@ -392,15 +397,16 @@ async def test_pair_plan_database_error_restores_scope(planner_connection, origi
 
 
 class _PausedPage:
-    def __init__(self, connection):
+    def __init__(self, connection, expected_nestloop):
         self.connection, self.pages = connection, 0
+        self.expected_nestloop = expected_nestloop
 
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
     async def fetchrow(self, query, *arguments):
         if "mapped_pair_rows" in query:
-            assert await self.connection.fetchval("SHOW enable_nestloop") == "off"
+            assert await self.connection.fetchval("SHOW enable_nestloop") == self.expected_nestloop
             self.pages += 1
             if self.pages == 2:
                 await self.connection.execute("SELECT pg_sleep(30)")
@@ -413,13 +419,17 @@ async def _wait_for_sleep(admin, pid):
 
 
 @pytest.mark.parametrize("original", ["on", "off"])
-async def test_pair_plan_real_cancellation_rolls_back_completed_pages(planner_connection, original):
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_pair_plan_real_cancellation_rolls_back_completed_pages(planner_connection, original, prepared):
     connection, admin = planner_connection
     stage, selected = await _fixture(connection)
     await connection.execute("SELECT set_config('enable_nestloop',$1,false)", original)
-    observed = _PausedPage(connection)
+    observed = _PausedPage(connection, original if prepared else "off")
     async with connection.transaction():
-        task = asyncio.create_task(mapping._map_pair_rows(observed, stage, selected, _BINDINGS, _ARGUMENTS))
+        bindings, arguments = _BINDINGS, _ARGUMENTS
+        if prepared:
+            bindings, arguments = await _prepared_source_lookup(connection, bindings, arguments)
+        task = asyncio.create_task(mapping._map_pair_rows(observed, stage, selected, bindings, arguments))
         try:
             await asyncio.wait_for(_wait_for_sleep(admin, connection.get_server_pid()), 5)
         finally:
