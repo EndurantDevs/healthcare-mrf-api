@@ -14,11 +14,13 @@ import pytest
 from process import network_fhir_typed_source as typed
 from process.network_fhir_plan_tier_graph import plan_tier_source_projection
 from process.network_fhir_retained_capture_contract import registry_location_id
+from process.network_fhir_source_witness_contract import SourceWitnessOrigin
 from process.network_fhir_typed_contract import ADDRESS_FIELDS, CELL_COLUMNS, KINDS, PAIR_COLUMNS
 from process.network_fhir_typed_mapping import _approved_graph_keys
 from process.network_fhir_typed_sql import PLAN_TIER_PROVIDER_ONLY_SQL
 from process.registry_fhir_plan_tier import source_key
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+from tests.test_network_fhir_source_witness_contract import origin_fields
 from tests.test_registry_fhir_plan_tier_bindings import tier_document
 from tests.test_registry_fhir_plan_tier_pipeline import plan_tier_rows
 
@@ -57,13 +59,17 @@ async def _project(connection, stage, source_rows, *, checker=False, plan_tiers=
         for source_row in sorted(
             source_rows, key=lambda source_row: (source_row["resource_type"], source_row["resource_id"])
         ):
-            wire = await projection.prepare((source_row,), _wire((source_row,))) if plan_tiers else _wire((source_row,))
+            wire = (
+                await projection.prepare((source_row,), _wire((source_row,)), include_references=checker)
+                if plan_tiers
+                else _wire((source_row,))
+            )
             if checker:
                 await typed._check_page(
                     connection, stage, wire, "https://example.test/fhir", date(2026, 1, 1), plan_tiers=plan_tiers
                 )
             else:
-                await typed._project_page(connection, stage, wire, plan_tiers=plan_tiers)
+                await typed._project_page(connection, stage, wire, plan_table=projection.table if plan_tiers else None)
     # This pair-query component uses one fixed synthetic canonical office; canonicalization is unchanged.
     await connection.execute(
         "INSERT INTO "
@@ -132,17 +138,53 @@ async def test_canonical_plan_tier_maps_exact_provider_office_and_independent_ch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("serialized", (False, True))
+async def test_location_writer_stays_within_the_encoded_source_page(native_connection, serialized):
+    origin = SourceWitnessOrigin(**(origin_fields() | {"dataset_id": "x"}))
+    payload = {"first_line": 'Rue de l’Église "Nord"', "note": "東京" * 4096}
+    page = (
+        {
+            "dataset_id": origin.dataset_id,
+            "resource_type": "Location",
+            "resource_id": "site",
+            "payload_hash": "a" * 64,
+            "payload_json": json.dumps(payload, ensure_ascii=False) if serialized else payload,
+            "acquired_resource_sha256": None,
+        },
+    )
+    source_size = len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode())
+    wire_rows, _ = typed._page_rows(page, origin, {"Location": 0}, None)
+
+    async def execute(query, encoded_rows, kinds):
+        assert len(encoded_rows.encode()) == source_size
+        return await native_connection.execute(query, encoded_rows, kinds)
+
+    async with typed._workspace(native_connection) as stage:
+        await typed._project_page(SimpleNamespace(execute=execute), stage, wire_rows)
+        assert (
+            await native_connection.fetchval("SELECT first_line FROM " + stage.relation("cells"))
+            == payload["first_line"]
+        )
+
+
+@pytest.mark.asyncio
 async def test_plan_tier_checker_rejects_inactive_organization_network(native_connection):
     source_rows = plan_tier_rows(1, "dataset-one")
     for row in source_rows:
         if row["resource_type"] == "PractitionerRole":
             row["payload_json"]["network_refs"] = ["Organization/current", "Organization/inactive"]
-    for identity in ("current", "inactive"):
+        if row["resource_type"] == "InsurancePlan":
+            row["payload_json"]["network_refs"] = [
+                "Organization/current",
+                "Organization/plan-only",
+                "Organization/plan-only",
+            ]
+    for identity in ("current", "inactive", "plan-only"):
         source_rows.append(
             {
                 "resource_type": "Organization",
                 "resource_id": identity,
-                "payload_json": {"active": identity == "current"},
+                "payload_json": {"active": identity != "inactive"},
                 "payload_hash": "a" * 64,
             }
         )
@@ -150,7 +192,11 @@ async def test_plan_tier_checker_rejects_inactive_organization_network(native_co
         async with typed._workspace(native_connection) as stage:
             await _project(native_connection, stage, source_rows, checker=checker)
             keys = await native_connection.fetch("SELECT network_source_key FROM " + stage.relation("pairs"))
-            assert sorted(row["network_source_key"] for row in keys) == [source_key(tier_document()), "current"]
+            assert sorted(row["network_source_key"] for row in keys) == [
+                source_key(tier_document()),
+                "current",
+                "plan-only",
+            ]
 
 
 @pytest.mark.asyncio

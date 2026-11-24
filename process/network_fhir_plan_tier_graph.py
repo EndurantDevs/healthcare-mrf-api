@@ -83,7 +83,7 @@ class _PlanProjection:
         if records:
             await self.connection.copy_records_to_table(self.table, schema_name="pg_temp", records=records)
 
-    async def prepare(self, page, source_rows):
+    async def prepare(self, page, source_rows, *, include_references=True):
         """Validate distinct role selectors against original plan evidence before adding references."""
         await self._plans(page)
         selections_by_resource, pending_by_selector = {}, {}
@@ -123,12 +123,14 @@ class _PlanProjection:
                     "plan_tier_plan_changed",
                 )
                 self.cache[encoded] = _references(_decoded(canonical_plan["network_refs"]))
-        prepared_rows = []
-        for source_row in source_rows:
-            selected = selections_by_resource.get((source_row["resource_type"], source_row["resource_id"]))
-            prepared_rows.append(
-                {**source_row, "plan_network_refs": list(self.cache[selected]) if selected is not None else []}
-            )
+        prepared_rows = source_rows
+        if include_references:
+            prepared_rows = []
+            for source_row in source_rows:
+                selected = selections_by_resource.get((source_row["resource_type"], source_row["resource_id"]))
+                prepared_rows.append(
+                    {**source_row, "plan_network_refs": list(self.cache[selected]) if selected is not None else []}
+                )
         while len(self.cache) > 4096:
             self.cache.popitem(last=False)
         return prepared_rows

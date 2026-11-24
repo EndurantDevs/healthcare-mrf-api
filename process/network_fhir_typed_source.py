@@ -159,21 +159,20 @@ def _page_rows(page, origin, counts, after):
                     "resource_type": kind,
                     "resource_id": identity,
                     "payload_hash": resource_row["payload_hash"],
-                    "payload_json": resource_row["payload_json"]
-                    if type(resource_row["payload_json"]) is str
-                    else json.dumps(resource_row["payload_json"]),
+                    "payload_json": resource_row["payload_json"],
                     "site_id": str(registry_location_id(origin.source_id, identity)) if kind == "Location" else None,
                 }
             )
     return wire_rows, after
 
 
-async def _project_page(connection, stage, rows, *, plan_tiers=False):
+async def _project_page(connection, stage, rows, *, plan_table=None):
     if not rows:
         return
+    query = PLAN_TIER_PROJECT_SQL if plan_table else PROJECT_SQL
     inserted = await connection.execute(
-        (PLAN_TIER_PROJECT_SQL if plan_tiers else PROJECT_SQL).format(cells=stage.relation("cells")),
-        json.dumps(rows, separators=(",", ":")),
+        query.format(cells=stage.relation("cells"), plans="pg_temp." + _identifier(plan_table) if plan_table else None),
+        json.dumps(rows, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
         list(KINDS),
     )
     require(inserted == "INSERT 0 " + str(len(rows)), "projected_shape")
@@ -239,7 +238,8 @@ def _network_reference_targets(references, base, plan_tiers):
 
 def _raw_projection(resource_row, base, as_of, *, plan_tiers=False):
     """Independent raw parser: no producer cells, overlay NPI or Source record-id cache is consulted."""
-    raw_payload = json.loads(resource_row["payload_json"])
+    source_payload = resource_row["payload_json"]
+    raw_payload = json.loads(source_payload if type(source_payload) is str else json.dumps(source_payload))
     require(type(raw_payload) is dict, "raw_payload")
     kind = resource_row["resource_type"]
     is_entity, is_role = (
@@ -337,7 +337,7 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
                 stage.require_ready(complete=False)
                 source_rows, after = _page_rows(page, origin, counts, after)
                 if plan_projection is not None:
-                    source_rows = await plan_projection.prepare(page, source_rows)
+                    source_rows = await plan_projection.prepare(page, source_rows, include_references=checker)
                 if checker:
                     await _check_page(
                         connection,
@@ -348,7 +348,9 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
                         **({"plan_tiers": True} if plan_tiers else {}),
                     )
                 else:
-                    await _project_page(connection, stage, source_rows, **({"plan_tiers": True} if plan_tiers else {}))
+                    await _project_page(
+                        connection, stage, source_rows, **({"plan_table": plan_projection.table} if plan_tiers else {})
+                    )
         finally:
             await drain_operation(iterator.aclose(), preserve_cancellation=True)
         require(counts == dict(origin.resource_counts), "source_counts")
