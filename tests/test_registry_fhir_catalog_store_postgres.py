@@ -4,7 +4,9 @@
 import asyncio
 import json
 import os
+from contextvars import copy_context
 from datetime import datetime, timezone
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -25,6 +27,7 @@ class CountConnection:
         self.connection = connection
         self.statements = 0
         self.copies = 0
+        self.copy_tables = []
 
     def __getattr__(self, name):
         return getattr(self.connection, name)
@@ -43,6 +46,7 @@ class CountConnection:
 
     async def copy_records_to_table(self, *arguments, **keywords):
         self.copies += 1
+        self.copy_tables.append(arguments[0])
         return await self.connection.copy_records_to_table(*arguments, **keywords)
 
 
@@ -539,3 +543,76 @@ async def test_registered_catalog_cannot_be_reopened_for_candidate_writes(storag
         )
         == before
     )
+
+
+@pytest.mark.asyncio
+async def test_reused_landing_keeps_each_write_atomic_and_mutable(storage_database):
+    fixture = storage_database
+    candidate = await target(fixture)
+    connection = CountConnection(fixture.connection)
+    table = "registry_fhir_catalog_network"
+    write = partial(
+        store.write_fhir_catalog_rows,
+        connection,
+        candidate,
+        table,
+        loader_role=fixture.loader,
+        control_schema=fixture.control,
+    )
+    relation = f'"{candidate.schema_name}".{table}'
+    first, second = network_rows(NEW, 2)
+    invalid = (*second[:2], " ", *second[3:])
+    updated = (*first[:2], "Updated", *first[3:])
+    async with connection.transaction(isolation="repeatable_read"):
+        async with store.fhir_catalog_copy_landings(connection, candidate):
+            await write([first])
+            with pytest.raises(asyncpg.CheckViolationError):
+                await write([second, invalid], max_rows=1)
+            assert await connection.fetchval(f"SELECT count(*) FROM {relation}") == 1
+            assert (await write([updated], mode="preserve"))["affected_rows"] == 0
+            assert (await write([first, updated, second]))["affected_rows"] == 2
+            assert await connection.fetchval(f"SELECT display_name FROM {relation} WHERE network_id=1") == "Updated"
+            await register(fixture, candidate)
+            with pytest.raises(ValueError, match="snapshot_immutable"):
+                await write([first])
+    assert len(set(connection.copy_tables)) == 1
+    assert await connection.fetchval("SELECT to_regclass($1)", "pg_temp." + connection.copy_tables[0]) is None
+
+
+@pytest.mark.asyncio
+async def test_copy_landings_follow_only_the_candidate_and_session(storage_database):
+    fixture = storage_database
+    candidate, other = await target(fixture), await target(fixture)
+    connection = CountConnection(fixture.connection)
+    write = partial(
+        store.write_fhir_catalog_rows,
+        connection,
+        table="registry_fhir_catalog_network",
+        copy_rows=network_rows(NEW, 1),
+        loader_role=fixture.loader,
+        control_schema=fixture.control,
+    )
+    peer = await asyncpg.connect(fixture.dsn.replace("postgresql+asyncpg://", "postgresql://"))
+    try:
+        async with connection.transaction():
+            async with store.fhir_catalog_copy_landings(connection, candidate):
+                inherited = copy_context()
+                await write(candidate)
+                await write(other)
+                await write(candidate)
+                async with peer.transaction():
+                    await store.write_fhir_catalog_rows(
+                        peer,
+                        candidate,
+                        "registry_fhir_catalog_network",
+                        network_rows(NEW, 2)[1:],
+                        loader_role=fixture.loader,
+                        control_schema=fixture.control,
+                    )
+        async with connection.transaction():
+            await asyncio.create_task(write(candidate), context=inherited)
+    finally:
+        await peer.close()
+    primary, separate, reused, standalone = connection.copy_tables
+    assert primary == reused
+    assert len({primary, separate, standalone}) == 3
