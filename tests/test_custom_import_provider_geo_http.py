@@ -368,7 +368,9 @@ async def test_geo_scope_preserves_cursor_binding_and_exact_hydration(monkeypatc
             return scoped
 
         preparer.service.scope_npi_entity_relation = scope
+        assert not import_context.has_native_scope
         context = await native_scope_preparer(native_geo_entity_scope())
+        assert context.has_native_scope
         assert context.prepared is scoped and preparer.prepared is scoped
         assert await _prepare_geo_cursor(prepare_cursor, session, native_args) is None
         assert prepare_cursor.__self__.scope_preparer.prepared is scoped

@@ -229,7 +229,8 @@ def _common_ctes(
         and import_context.require_match
         and not import_context.prepared.normalized_order_terms,
     )
-    materialization = " MATERIALIZED" if import_context.require_match else ""
+    # Keep optional unscoped SQL inlineable, so the join can narrow the import.
+    materialization = " MATERIALIZED" if import_context.require_match or import_context.has_native_scope else ""
     relation_cte = f"{_IMPORT_RELATION} AS{materialization} ({import_context.compiled.sql})"
     eligible_cte = (
         f"eligible_geo AS MATERIALIZED (\n    SELECT * FROM {_NATIVE_GEO_RELATION}"

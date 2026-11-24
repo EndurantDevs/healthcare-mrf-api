@@ -106,7 +106,9 @@ class _ProviderScopePreparer:
         """Compile the scoped relation for provider list and address queries."""
 
         prepared = await self.prepare(native_entity_scope)
-        return ProviderImportQuery(prepared, compile_npi_entity_relation(prepared.statement), self.query.require_match)
+        return ProviderImportQuery(
+            prepared, compile_npi_entity_relation(prepared.statement), self.query.require_match, has_native_scope=True
+        )
 
 
 def _provider_relation_query(
