@@ -114,6 +114,29 @@ async def test_shared_lookup_pages_requested_keys_and_keeps_missing_offices(serv
         assert await connection.fetchval("SELECT count(*) FROM lookup_addresses") == 5
 
 
+async def test_office_page_respects_byte_limit(serving_schema, monkeypatch):
+    connection, _, _ = serving_schema
+    async with connection.transaction():
+        address, mappings = await _fixture(connection)
+        selected = mappings[0]
+        office_table = selected.relation("offices")
+        async with lookup.typed_office_lookup(connection, [selected.table_names["offices"]], address) as matches:
+            await connection.execute(
+                "UPDATE " + office_table + " SET canonical_identity=repeat('x',1000) WHERE provider_id<>$1",
+                _PROVIDER,
+            )
+            monkeypatch.setattr(mapping, "_OFFICE_PAGE_BYTES", 800)
+            with pytest.raises(ValueError, match="office_bounds"):
+                await mapping._match_offices(connection, selected, address, matches)
+            assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("bindings")) == 0
+            await connection.execute(
+                "UPDATE " + office_table + " SET canonical_identity=repeat('x',650) WHERE provider_id<>$1",
+                _PROVIDER,
+            )
+            await mapping._match_offices(connection, selected, address, matches)
+            assert await connection.fetchval("SELECT location_key FROM " + selected.relation("bindings")) == "2"
+
+
 async def _mixed_offices(connection, selected):
     import ptg2_address_canon as native
 

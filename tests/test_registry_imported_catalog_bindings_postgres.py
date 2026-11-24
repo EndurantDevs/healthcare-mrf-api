@@ -186,3 +186,17 @@ async def test_native_ambiguous_manual_rebind_refuses_complete_source(imported_c
     async with case.connection.transaction(isolation="repeatable_read", readonly=True):
         with pytest.raises(ValueError, match="binding_conflict"):
             await _bindings(case)
+
+
+@pytest.mark.asyncio
+async def test_published_fhir_override_can_hash_on_source_key(imported_catalog):
+    case = imported_catalog
+    async with case.connection.transaction(readonly=True):
+        bindings = await _bindings(case)
+        await case.connection.execute("SET LOCAL enable_nestloop=off; SET LOCAL enable_mergejoin=off")
+        plan_lines = await case.connection.fetch(
+            "EXPLAIN (COSTS OFF) WITH " + bindings + " SELECT binding_id FROM manual_bindings",
+            case.approved.approved_revision,
+            *case.coordinates.sql_parameters,
+        )
+    assert any("Hash Cond:" in line[0] and "'source_key'" in line[0] for line in plan_lines)

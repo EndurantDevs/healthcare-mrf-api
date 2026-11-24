@@ -134,6 +134,7 @@ def table_sql(namespace, table, *, trigram_schema="public"):
         ),
         "registry_fhir_catalog_binding": (
             ("registry_fhir_catalog_binding_network_idx", "(metadata_generation,network_id,binding_id)"),
+            ("registry_fhir_catalog_binding_source_idx", "(metadata_generation,source_id)"),
         ),
     }
     statements.extend(

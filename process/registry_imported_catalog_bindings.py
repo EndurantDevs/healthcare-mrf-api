@@ -83,7 +83,7 @@ async def published_fhir_catalog_bindings_sql(connection, scope, approved, coord
     )
     if native is None or _document(native) != descriptor:
         raise ValueError("registry_imported_catalog_source_changed")
-    bindings = _binding_sql(control, catalog, scope.metadata_generation)
+    bindings = _binding_sql(control, catalog, scope.metadata_generation, source_system=coordinates.source_system)
     invalid = await connection.fetchval(
         "WITH " + bindings + " SELECT EXISTS(SELECT FROM effective_bindings WHERE conflicting "
         "OR (overridden AND NOT excluded AND manual_network_key IS NULL)) OR EXISTS(SELECT FROM approved_network_bindings "
@@ -96,10 +96,13 @@ async def published_fhir_catalog_bindings_sql(connection, scope, approved, coord
     return bindings
 
 
-def _binding_sql(control, catalog, metadata_generation):
+def _binding_sql(control, catalog, metadata_generation, *, source_system=None):
     from process.registry_binding_override_sql import binding_override_identity_sql
 
     override_identity = binding_override_identity_sql("m.record_json", "c.document_json", "c.source_aliases")
+    if source_system == "fhir":
+        # FHIR exact and alias overrides both require the same key. Expose it as a hashable join condition.
+        override_identity = "m.record_json->>'source_key'=c.document_json->>'source_key' AND " + override_identity
     # The validated hex generation is a literal so existing bounded graph queries keep their eight parameters.
     return f"""catalog_bindings AS MATERIALIZED (
       SELECT b.*,coalesce(s.descriptor_json->'source_aliases',jsonb_build_array(s.descriptor_json->'coordinates'->'source_id')) AS source_aliases

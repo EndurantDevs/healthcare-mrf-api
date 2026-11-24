@@ -23,6 +23,7 @@ from process.uhc_flex_practitioner_async_safety import drain_operation
 MEMBER_COLUMNS = ("network_id", "provider_system", "provider_id", "location_id", "evidence_id")
 BINDING_COLUMNS = ("provider_system", "provider_id", "location_id", "location_key", "entity_type", "entity_id")
 _PAIR_KEYS = ("resource_type", "resource_id", "network_source_key", "location_resource_id")
+_OFFICE_PAGE_BYTES = 8 * 1024**2
 _MAPPING_DDL = {
     "provider_only": "network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,evidence_id text NOT NULL,PRIMARY KEY(network_id,provider_system,provider_id,evidence_id)",
     "offices": "provider_id text NOT NULL,location_id uuid NOT NULL,address_key uuid NOT NULL,canonical_identity text NOT NULL,location_key text,PRIMARY KEY(provider_id,location_id)",
@@ -212,25 +213,27 @@ async def _match_offices(connection, mapping, address_source, matches):
     query = (
         "WITH requested AS MATERIALIZED (SELECT * FROM "
         + mapping.relation("offices")
-        + " WHERE (provider_id,location_id)>($1::text,$2::uuid) ORDER BY provider_id,location_id LIMIT $3) SELECT o.*,a.location_key AS matched_key,"
+        + " WHERE (provider_id,location_id)>($1::text,$2::uuid) ORDER BY provider_id,location_id LIMIT $3), "
+        + "page AS MATERIALIZED (SELECT o.*,a.location_key AS matched_key,"
         + fields
         + " FROM requested o LEFT JOIN LATERAL (SELECT a.* FROM "
         + matches
         + " matched JOIN LATERAL (SELECT * FROM "
         + address
-        + " a WHERE a.location_key=matched.location_key OFFSET 0) a ON true WHERE (matched.provider_id,matched.address_key)=(o.provider_id,o.address_key) AND a.entity_type='npi' AND a.entity_id=o.provider_id AND a.npi=o.provider_id::bigint AND a.address_key=o.address_key AND a.type='practice' AND a.address_precision='street' AND a.inferred_npi IS NULL LIMIT 2) a ON true ORDER BY o.provider_id,o.location_id"
+        + " a WHERE a.location_key=matched.location_key OFFSET 0) a ON true WHERE (matched.provider_id,matched.address_key)=(o.provider_id,o.address_key) AND a.entity_type='npi' AND a.entity_id=o.provider_id AND a.npi=o.provider_id::bigint AND a.address_key=o.address_key AND a.type='practice' AND a.address_precision='street' AND a.inferred_npi IS NULL LIMIT 2) a ON true) "
+        + "SELECT p.*,bounds.page_fits FROM (SELECT coalesce(sum(octet_length(record_send(p))),0)"
+        + f"<={_OFFICE_PAGE_BYTES} AS page_fits FROM page p) bounds LEFT JOIN page p ON bounds.page_fits "
+        + "ORDER BY p.provider_id,p.location_id"
     )
     after, limit = ("", UUID(int=0)), 1000
     while True:
-        size = await connection.fetchval(
-            "SELECT coalesce(sum(octet_length(record_send(page))),0) FROM (" + query + ") page", *after, limit
-        )
-        if size > 8 * 1024**2:
+        # An oversized or empty page returns only the bounds row.
+        office_rows = await connection.fetch(query, *after, limit)
+        if not office_rows[0]["page_fits"]:
             require(limit > 1, "office_bounds")
             limit = max(1, limit // 2)
             continue
-        office_rows = await connection.fetch(query, *after, limit)
-        if not office_rows:
+        if office_rows[0]["provider_id"] is None:
             break
         after = office_rows[-1]["provider_id"], office_rows[-1]["location_id"]
         matched_rows = _single_office_matches(office_rows)
@@ -287,24 +290,19 @@ async def _approved_graph_keys(connection, bindings, arguments, *, allow_empty=F
             " OR (record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1' "
             "AND record_json->'source_scope_json'->>'source_generation'=$8::text)"
         )
-    valid = await connection.fetchval(
+    selected = await connection.fetchrow(
         "WITH "
         + bindings
         + (" SELECT " if allow_empty else " SELECT count(*)>0 AND ")
         + "coalesce(bool_and(coalesce(record_json->'source_scope_json'=jsonb_build_object('organization_id',record_json->>'source_key','source_generation',$8::text)"
         + tier_condition
-        + ",false)),true) FROM approved_network_bindings",
+        + ",false)),true) AS valid, "
+        + "coalesce(array_agg(record_json->>'source_key' ORDER BY record_json->>'source_key') "
+        + "FILTER (WHERE $8::text IS NOT NULL),ARRAY[]::text[]) AS approved_keys FROM approved_network_bindings",
         *arguments,
     )
-    require(valid is True, "approved_catalog_scope")
-    approved_keys = await connection.fetchval(
-        "WITH "
-        + bindings
-        + " SELECT coalesce(array_agg(record_json->>'source_key' ORDER BY record_json->>'source_key'),ARRAY[]::text[]) "
-        "FROM approved_network_bindings WHERE $8::text IS NOT NULL",
-        *arguments,
-    )
-    return approved_keys
+    require(selected["valid"] is True, "approved_catalog_scope")
+    return selected["approved_keys"]
 
 
 @dataclass(frozen=True)

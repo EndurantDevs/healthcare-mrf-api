@@ -272,12 +272,17 @@ async def test_copy_batches_are_bounded(storage_database):
             await store.create_fhir_catalog_indexes(
                 fixture.connection, candidate, loader_role=fixture.loader, control_schema=fixture.control
             )
-            == 9
+            == 10
         )
     assert (
         await fixture.connection.fetchval("SELECT count(*) FROM pg_indexes WHERE schemaname=$1", candidate.schema_name)
-        == 15
+        == 16
     )
+    source_index = await fixture.connection.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname='registry_fhir_catalog_binding_source_idx'",
+        candidate.schema_name,
+    )
+    assert source_index.endswith("(metadata_generation, source_id)")
     assert (
         await fixture.connection.fetchval(
             "SELECT reltuples FROM pg_class WHERE oid=$1::regclass",
