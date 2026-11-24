@@ -13,7 +13,7 @@ import pytest
 from process import registry_imported_catalog_bindings as imported
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_fhir_typed_mapping import _approved_graph_keys
+from process.network_fhir_typed_mapping import _approved_graph_keys, _prepare_mapping_bindings
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
 from tests.test_registry_fhir_catalog_sources import descriptor as source_descriptor
 
@@ -186,6 +186,26 @@ async def test_native_ambiguous_manual_rebind_refuses_complete_source(imported_c
     async with case.connection.transaction(isolation="repeatable_read", readonly=True):
         with pytest.raises(ValueError, match="binding_conflict"):
             await _bindings(case)
+
+
+@pytest.mark.asyncio
+async def test_prepared_fhir_lookup_preserves_approved_keys_and_rejects_later_ambiguity(imported_catalog):
+    case = imported_catalog
+    arguments = (case.approved.approved_revision, *case.coordinates.sql_parameters, case.generation)
+    async with case.connection.transaction():
+        bindings = await imported.published_catalog_binding_query(
+            case.connection, case.scope, case.approved, case.coordinates, case.descriptor, control_schema=case.control
+        )
+        prepared, parameters = await _prepare_mapping_bindings(case.connection, bindings, arguments, typed=True)
+        rows = await case.connection.fetch(
+            "SELECT source_key,network_id FROM " + prepared.relation + " ORDER BY source_key"
+        )
+        assert parameters == (case.generation,)
+        assert [tuple(row) for row in rows] == [("network-10", 10), ("network-20", 50)]
+        await _binding_override(case, "network-20", 60, False)
+        with pytest.raises(ValueError, match="registry_imported_catalog_binding_conflict"):
+            async with case.connection.transaction():
+                await _prepare_mapping_bindings(case.connection, bindings, arguments, typed=True)
 
 
 @pytest.mark.asyncio

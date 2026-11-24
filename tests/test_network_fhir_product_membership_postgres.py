@@ -324,6 +324,17 @@ def _expected():
     return totals, sorted(membership_rows)
 
 
+async def _prepared_source_lookup(connection, bindings, arguments):
+    checked = (
+        "approved_network_bindings AS (WITH "
+        + bindings
+        + " SELECT network_id,record_json->>'source_key' AS source_key,record_json->'source_scope_json' AS source_scope "
+        "FROM approved_network_bindings),binding_check AS (SELECT false AS invalid)"
+    )
+    prepared, parameters = await mapping._prepare_mapping_bindings(connection, checked, arguments, typed=True)
+    return prepared, parameters
+
+
 @pytest.mark.parametrize("original", ["on", "off"])
 @pytest.mark.parametrize(("readonly", "prepared"), [(False, False), (True, False), (False, True)])
 async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connection, original, readonly, prepared):
@@ -335,7 +346,7 @@ async def test_pair_plan_exact_counts_evidence_and_nested_scope(planner_connecti
         await connection.execute("SELECT set_config('enable_nestloop',$1,true)", nested)
         bindings, arguments = _BINDINGS, _ARGUMENTS
         if prepared:
-            bindings, arguments = await mapping._prepare_mapping_bindings(connection, bindings, arguments)
+            bindings, arguments = await _prepared_source_lookup(connection, bindings, arguments)
         totals = await mapping._map_pair_rows(connection, stage, selected, bindings, arguments)
         expected_totals, expected_rows = _expected()
         assert totals == expected_totals

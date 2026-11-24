@@ -330,17 +330,30 @@ async def office_input_pairs(serving_schema):
     return connection, stage, selected
 
 
-async def test_streamed_office_inputs_keep_only_approved_identities(office_input_pairs):
+async def _office_approval(connection, indexed, keys):
+    if not indexed:
+        return keys
+    await connection.execute("CREATE TEMP TABLE IF NOT EXISTS office_bound_keys(source_key text PRIMARY KEY)")
+    await connection.execute("TRUNCATE pg_temp.office_bound_keys")
+    await connection.execute("INSERT INTO pg_temp.office_bound_keys SELECT unnest($1::text[])", keys)
+    return mapping._PreparedBindingRows("pg_temp.office_bound_keys")
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+async def test_streamed_office_inputs_keep_only_approved_identities(office_input_pairs, indexed):
     connection, stage, selected = office_input_pairs
     observed = SimpleNamespace(
         execute=AsyncMock(wraps=connection.execute),
         fetchrow=AsyncMock(wraps=connection.fetchrow),
         fetchval=AsyncMock(wraps=connection.fetchval),
     )
+    empty = await _office_approval(connection, indexed, [])
     async with connection.transaction(readonly=True):
-        await mapping._office_inputs(connection, stage, selected, [])
+        await mapping._office_inputs(connection, stage, selected, empty)
         assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("offices")) == 0
-        await mapping._office_inputs(observed, stage, selected, ["approved"])
+    approved = await _office_approval(connection, indexed, ["approved"])
+    async with connection.transaction(readonly=True):
+        await mapping._office_inputs(observed, stage, selected, approved)
         assert await connection.fetchval(
             "SELECT array_agg(canonical_identity) FROM " + selected.relation("offices")
         ) == [
@@ -351,10 +364,12 @@ async def test_streamed_office_inputs_keep_only_approved_identities(office_input
 
 
 @pytest.mark.parametrize("field,value", [("address_key", UUID(int=1)), ("canonical_identity", "different")])
-async def test_streamed_office_inputs_roll_back_distant_conflicts(office_input_pairs, field, value):
+@pytest.mark.parametrize("indexed", [False, True])
+async def test_streamed_office_inputs_roll_back_distant_conflicts(office_input_pairs, field, value, indexed):
     connection, stage, selected = office_input_pairs
     await connection.execute(f"UPDATE pg_temp.office_input_pairs SET {field}=$1 WHERE resource_id='05002'", value)
+    approved = await _office_approval(connection, indexed, ["approved"])
     with pytest.raises(ValueError, match="registry_fhir_typed_office_collision"):
         async with connection.transaction(readonly=True):
-            await mapping._office_inputs(connection, stage, selected, ["approved"])
+            await mapping._office_inputs(connection, stage, selected, approved)
     assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("offices")) == 0
