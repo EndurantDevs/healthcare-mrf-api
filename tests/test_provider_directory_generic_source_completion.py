@@ -838,6 +838,89 @@ async def test_real_organization_v4_union_matches_the_existing_canonical_contrac
     )
 
 
+def _replayed_optum_observation(directory, resource_type, code, *, source_base, outcome):
+    from process.provider_directory_organization_hash import canonical_organization_payload
+    from process.provider_directory_resource_hash import canonical_practitioner_payload
+
+    resource_id = "example"
+    tags = [
+        {"system": "http://optum.com/fhir/wm/system/2021/07/resourceid", "code": code},
+        {"system": "http://example.test/classification", "code": "one"},
+    ]
+    payload_by_field = {
+        "resource_id": resource_id,
+        "resource_url": f"{source_base}/{resource_type}/{resource_id}",
+        "fhir_fetch_url": f"{source_base}/{resource_type}" if code == "first" else source_base,
+        "active": True,
+        "fhir_meta": {"tag": tags, "lastUpdated": "2026-08-11" if code == "first" else "2026-08-10"},
+    }
+    if code == "second" and outcome == "changed-content":
+        payload_by_field["active"] = False
+    if code == "second" and outcome == "changed-classification":
+        tags[1]["code"] = "two"
+    if code == "second" and outcome == "ambiguous-tag":
+        tags.append(dict(tags[0]))
+    if code == "second" and outcome == "forged-full-url":
+        payload_by_field["fhir_fetch_url"] = "https://example.test/fhir"
+    if resource_type == "Practitioner":
+        payload_by_field = canonical_practitioner_payload({**payload_by_field, "names": [{"family": "Example"}]})
+    if resource_type == "Organization":
+        payload_by_field = canonical_organization_payload(payload_by_field)
+    return {
+        **_resource(resource_id),
+        "resource_type": resource_type,
+        "payload_json": payload_by_field,
+        "payload_hash": directory.resource_payload_sha256_for_contract(
+            payload_by_field, directory.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT, resource_type=resource_type
+        ),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_type,outcome",
+    [
+        *[
+            (family, "replay")
+            for family in ("Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole")
+        ],
+        *[
+            ("Location", conflict)
+            for conflict in (
+                "other-endpoint",
+                "changed-content",
+                "changed-classification",
+                "ambiguous-tag",
+                "forged-full-url",
+            )
+        ],
+    ],
+)
+async def test_replayed_optum_resource_id_tag_preserves_semantic_content(resource_type, outcome):
+    from importlib import import_module
+
+    directory = import_module("process.provider_directory_fhir")
+    candidate = SimpleNamespace(
+        resource_hash_contract=directory.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of="2026-08-10",
+    )
+    source_base = "https://example.test/fhir" if outcome == "other-endpoint" else directory.UHC_PROVIDER_DIRECTORY_BASE
+    resource_rows = [
+        _replayed_optum_observation(directory, resource_type, code, source_base=source_base, outcome=outcome)
+        for code in ("first", "second")
+    ]
+    first, second = resource_rows
+    assert first["payload_hash"] != second["payload_hash"]
+    prepare, merge = completion._resource_callbacks(directory, candidate)
+    reduced_rows = completion._reduced_rows(_stream(resource_rows), dataset_id="dataset", prepare=prepare, merge=merge)
+    if outcome != "replay":
+        with pytest.raises(ValueError, match="provider_directory_.*payload_conflict"):
+            await anext(reduced_rows)
+        return
+    assert [resource_row async for resource_row in reduced_rows] == [second]
+    assert first["payload_json"]["fhir_meta"]["tag"][0]["code"] == "first"
+
+
 @pytest.mark.parametrize("outcome", ["valid", "native-conflict", "repeat-only"])
 async def test_merged_role_completion_checks_input_and_reduced_output_before_indexing(monkeypatch, outcome):
     connection = SimpleNamespace(

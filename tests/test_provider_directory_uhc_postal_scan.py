@@ -663,6 +663,50 @@ async def test_uhc_reference_closure_waits_for_complete_scans(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("page_count", [1, 2])
+async def test_uhc_reference_closure_preserves_unreadable_scan_gaps(monkeypatch, page_count):
+    rows_by_type = {
+        "OrganizationAffiliation": [{"resource_id": "aff-1", "participating_organization_ref": "Organization/o-9"}]
+    }
+    fetch_organization = AsyncMock(
+        return_value=(200, {"resourceType": "Organization", "id": "o-9", "name": "Example"}, None, 1)
+    )
+    persist = AsyncMock(return_value=1)
+    monkeypatch.setattr(uhc_scan, "_stored_rows", _stored_rows_factory(rows_by_type))
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_organization)
+    monkeypatch.setattr(importer, "is_source_storage_required", lambda: True)
+    diagnostics = _complete_diagnostics("Organization", "OrganizationAffiliation", "Location")
+    gap_error = "partition_errors_1_last_optum_unreadable_search_slots"
+    diagnostics["Location"].update(
+        complete=False,
+        error=gap_error,
+        bounded=False,
+        next_url_remaining=False,
+        source_fetch={"unreadable_optum_slot_count": 2, "unreadable_optum_page_count": page_count},
+    )
+
+    await uhc_scan.close_references(
+        importer,
+        {**SOURCE, "_endpoint_dataset_id": "dataset_synthetic"},
+        persist,
+        diagnostics,
+        {},
+        timeout=3,
+        run_id=None,
+    )
+
+    if page_count == 1:
+        fetch_organization.assert_awaited_once()
+        persist.assert_awaited_once()
+        assert diagnostics["Organization"]["reference_closure"]["fetched"] == 1
+    else:
+        fetch_organization.assert_not_awaited()
+        persist.assert_not_awaited()
+    assert diagnostics["Location"]["error"] == gap_error
+    assert not importer._is_resource_diagnostic_acquisition_complete(diagnostics["Location"])
+
+
+@pytest.mark.asyncio
 async def test_initial_location_prefill_times_out_before_blocking_the_zip_scan(monkeypatch):
     from process import provider_directory_generic_source_adapters as adapters
 

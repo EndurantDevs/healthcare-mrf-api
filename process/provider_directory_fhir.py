@@ -102,6 +102,7 @@ from process import provider_directory_mvp as mvp
 from process import provider_directory_named_edition as named_source_editions
 from process import provider_directory_network_first_intake as network_first
 from process import provider_directory_network_traversal as network_traversal
+from process import provider_directory_optum_pages as optum_pages
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_pacificsource as pacificsource
 from process import provider_directory_postal_checkpoint as postal_checkpoint
@@ -40033,6 +40034,8 @@ async def _fetch_source_json_attempt(
         ),
     )
     status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
+    if fhir_response.is_optum_partition_page_error(fetch_result):
+        return fetch_result, True, False, False
     should_retry_empty_collection = bool(
         empty_collection_retry_delays
         and _is_empty_fhir_search_set(
@@ -47164,12 +47167,14 @@ async def _partition_page_bounded_outcome(
 
 async def _fetch_valid_partition_bundle(
     request: PartitionPageRequest,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | optum_pages.RecoveredPage | None:
     """Fetch one page and record bounded protocol failures."""
-    status_code, fhir_payload, fetch_error, _elapsed = await fhir_response.fetch_partition_response(
-        sys.modules[__name__], request
-    )
+    fetch_result = await fhir_response.fetch_partition_response(sys.modules[__name__], request)
+    status_code, fhir_payload, fetch_error, _elapsed = fetch_result
     if status_code != 200 or fetch_error:
+        recovered = await optum_pages.recover_partition_page(sys.modules[__name__], request, fetch_result)
+        if recovered is not None:
+            return recovered
         if uhc_scan.is_source(sys.modules[__name__], request.source_record):
             uhc_scan.defer_failed_leaf(sys.modules[__name__], request, fetch_error or f"http_{status_code}")
         else:
@@ -47244,6 +47249,8 @@ async def _fetch_partition_page(
     fhir_payload = await _fetch_valid_partition_bundle(request)
     if fhir_payload is None:
         return PartitionPageFetchResult(next_url=None, outcome="failed")
+    if isinstance(fhir_payload, optum_pages.RecoveredPage):
+        return await optum_pages.consume_recovered_page(sys.modules[__name__], request, fhir_payload)
     bounded_outcome = await _partition_page_bounded_outcome(
         request.source_record,
         request.resource_type,
@@ -47274,7 +47281,8 @@ async def _fetch_partition_page(
         request.state,
         is_partition_failed_on_page,
     )
-    return replace(page_result, rows_fetched=rows_fetched)
+    reported_total = fhir_payload.get("total") if request.current_url == request.partition_start_url else None
+    return replace(page_result, rows_fetched=rows_fetched, reported_total=reported_total)
 
 
 async def _should_continue_partition_chain(
@@ -47314,24 +47322,15 @@ async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
     has_split_children = False
     is_residual_only = False
     rows_fetched = 0
+    expected_total = None
     current_url: str | None = request.request_url
     while current_url and not request.state.stop_event.is_set():
         if not await _should_continue_partition_chain(request, current_url):
             break
         page_fetch_result = await _fetch_partition_page(
-            PartitionPageRequest(
-                source_record=request.source_record,
-                resource_type=request.resource_type,
-                start_url_queue=request.start_url_queue,
-                state=request.state,
-                partition_start_url=request.request_url,
-                current_url=current_url,
-                is_residual_only=is_residual_only,
-                pending_resource_rows=pending_resource_rows,
-                fetch_options=request.fetch_options,
-                page_identities=request.page_identities,
-            )
+            request.page_request(current_url, is_residual_only, pending_resource_rows, expected_total)
         )
+        expected_total = page_fetch_result.reported_total or expected_total
         current_url = page_fetch_result.next_url
         rows_fetched += page_fetch_result.rows_fetched
         is_partition_failed = is_partition_failed or page_fetch_result.outcome == "failed"
@@ -47489,7 +47488,8 @@ async def _fetch_partitioned_resource_rows(
         error=state.error_message or ("deadline_reached" if state.deadline_reached else None),
         fetch_mode="partitioned_paged",
         deadline_reached=state.deadline_reached,
-        fetch_diagnostic=(
+        fetch_diagnostic=optum_pages.unreadable_diagnostic(state)
+        or (
             uhc_scan.unenumerable_residual(sys.modules[__name__], source_record, resource_type, start_urls)
             if is_complete
             else None

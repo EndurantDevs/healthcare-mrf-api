@@ -5,6 +5,7 @@ import asyncio
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -17,6 +18,15 @@ BASE = importer.UHC_PROVIDER_DIRECTORY_BASE
 PROBE = f"{BASE}/InsurancePlan?_count=1"
 CURSOR = f"{BASE}?_getpages=opaque%2Btoken&_getpagesoffset=100"
 ERROR = (500, {"resourceType": "OperationOutcome"}, None, 1)
+PAGE_ERROR = (
+    500,
+    {
+        "resourceType": "OperationOutcome",
+        "issue": [{"severity": "error", "code": "processing", "diagnostics": "Fhir Server Unknown Exception."}],
+    },
+    None,
+    1,
+)
 PAGE = (200, {"resourceType": "Bundle", "type": "searchset", "entry": []}, None, 1)
 GOOD_PROBE = (
     200,
@@ -229,3 +239,34 @@ async def test_known_apostrophe_500s_do_not_open_outage(monkeypatch, shared_sour
             assert await fetch_partition(request) == ERROR
     assert send.await_count == 20
     assert "outage_pauses" not in response.request_concurrency_snapshot(shared_source)
+
+
+async def test_query_local_500s_do_not_pause_sibling_scans(monkeypatch, shared_source):
+    send = AsyncMock(side_effect=[PAGE_ERROR] * outage.OUTAGE_SAMPLE_SIZE + [PAGE])
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", send)
+    async with importer._source_http_session_scope(force=True, request_concurrency=32):
+        for partition in range(outage.OUTAGE_SAMPLE_SIZE):
+            assert await fetch_partition(search_request(shared_source, partition)) == PAGE_ERROR
+        assert await fetch_partition(search_request(shared_source, 100, resource_type="Practitioner")) == PAGE
+    snapshot = response.request_concurrency_snapshot(shared_source)
+    assert snapshot["http_500_responses"] == outage.OUTAGE_SAMPLE_SIZE
+    assert "outage_pauses" not in snapshot and send.await_count == outage.OUTAGE_SAMPLE_SIZE + 1
+
+
+async def test_query_local_first_page_500_uses_the_existing_smaller_counts(monkeypatch):
+    source_by_field = {"api_base": BASE, "_provider_directory_request_pacing_state": {}}
+    send = AsyncMock(side_effect=[PAGE_ERROR, PAGE_ERROR, PAGE])
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", send)
+    async with importer._source_http_session_scope(force=True, request_concurrency=32):
+        assert (await fetch_partition(search_request(source_by_field, 1)))[:3] == PAGE[:3]
+    queries = [parse_qs(urlsplit(call.args[1]).query) for call in send.await_args_list]
+    assert queries == [{"_count": [str(count)], "name": ["A1"]} for count in (100, 25, 10)]
+
+
+async def test_query_local_continuation_500_is_returned_without_replaying_cursor(monkeypatch):
+    source_by_field = {"api_base": BASE, "_provider_directory_request_pacing_state": {}}
+    send = AsyncMock(return_value=PAGE_ERROR)
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", send)
+    async with importer._source_http_session_scope(force=True, request_concurrency=32):
+        assert await fetch_partition(search_request(source_by_field, 1, current_url=CURSOR)) == PAGE_ERROR
+    send.assert_awaited_once_with(source_by_field, CURSOR, timeout=14)

@@ -12,6 +12,29 @@ OUTAGE_FAILURE_COUNT = 18
 OUTAGE_DISTINCT_PARTITIONS = 4
 PROBE_DELAYS = (60, 300, 900)
 CANCELLATION_POLL_SECONDS = 30
+PAGE_ERROR_DIAGNOSTICS = "Fhir Server Unknown Exception."
+
+
+def is_page_error(response):
+    """Recognize the exact query-local error returned for an unreadable search slice."""
+    status, payload, transport_error, _elapsed = response
+    if status != 500 or transport_error or not isinstance(payload, dict):
+        return False
+    issues = payload.get("issue")
+    if payload.get("resourceType") != "OperationOutcome" or not isinstance(issues, list) or len(issues) != 1:
+        return False
+    issue = issues[0]
+    return (
+        isinstance(issue, dict)
+        and issue.get("severity") == "error"
+        and issue.get("code") == "processing"
+        and issue.get("diagnostics") == PAGE_ERROR_DIAGNOSTICS
+    )
+
+
+def is_backend_outage_response(response):
+    """Keep a query-local operation error out of shared outage accounting."""
+    return response[0] in HTTP_OUTAGE_STATUSES and not is_page_error(response)
 
 
 class OptumOutage:
@@ -26,17 +49,17 @@ class OptumOutage:
         self.http_500_responses = 0
         self.probes = 0
 
-    def observe(self, status, now, epoch):
+    def observe(self, response, now, epoch):
         """Count backend responses and pause after a sustained cross-partition outage."""
-        if status == 500:
+        if response[0] == 500:
             self.http_500_responses += 1
         context = PARTITION_REQUEST.get()
         if context is None or self.probe_after is not None or epoch != self.epoch:
             return
         request, identity = context
-        if not identity or "'" in identity or "%27" in identity:
+        if not identity or "'" in identity or "%27" in identity or is_page_error(response):
             return
-        failure = (request.resource_type, identity) if status in HTTP_OUTAGE_STATUSES else None
+        failure = (request.resource_type, identity) if is_backend_outage_response(response) else None
         self.samples.append(failure)
         if (
             len(self.samples) < OUTAGE_SAMPLE_SIZE
