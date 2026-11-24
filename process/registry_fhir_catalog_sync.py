@@ -3,9 +3,11 @@
 
 import hashlib
 import json
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
+from functools import partial
 from time import perf_counter
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -81,6 +83,7 @@ from process.registry_fhir_catalog_store import (
     catalog_snapshot_preparation,
     checkpoint_fhir_catalog_snapshot,
     copy_fhir_catalog_snapshot,
+    copy_pending_fhir_observations,
     create_fhir_catalog_candidate,
     create_fhir_catalog_indexes,
     discard_fhir_catalog_candidate,
@@ -235,6 +238,9 @@ async def prepare_fhir_catalog_snapshot(
         raise
 
 
+_OBSERVATION_READER = ContextVar("catalog_observation_reader", default=None)
+
+
 @asynccontextmanager
 async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
     profiles_by_key = {}
@@ -260,7 +266,14 @@ async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
                 exports_by_profile[key] = await reads.enter_async_context(
                     open_source_owned_catalog_export(source_export, profile, registry_connection)
                 )
-        yield source_connection, workspace, exports_by_profile
+        open_donor_reader = (
+            partial(nullcontext, registry_connection) if profiles_by_key else lambda: sealer_pool.acquire()
+        )
+        reading = _OBSERVATION_READER.set(open_donor_reader)
+        try:
+            yield source_connection, workspace, exports_by_profile
+        finally:
+            _OBSERVATION_READER.reset(reading)
 
 
 async def _prepare_fhir_catalog_snapshot(
@@ -1008,6 +1021,9 @@ async def _project_catalog_sources(
         )
     source_connection, reference_workspace, exports_by_profile = source_reads
     cached_generations = {entry["source_generation"] for entry in previous["source_vector_json"]} if previous else set()
+    donor_by_generation = await _reuse_catalog_observations(
+        config, loader, copy_target, snapshot, previous, current_by_generation
+    )
     projection_receipts = []
     for generation, disposition in current_by_generation.items():
         native_projection = await _project_native_catalog_source(config, loader, copy_target, disposition, snapshot)
@@ -1024,14 +1040,10 @@ async def _project_catalog_sources(
         extraction_by_kind = {"reused_observations": True}
         needs_refresh = needs_plan_tier_refresh(previous, snapshot, disposition.descriptor)
         if needs_refresh:
-            namespace = storage_identifier(copy_target.schema_name)
-            await loader.execute(
-                f"DELETE FROM {namespace}.registry_fhir_catalog_observation WHERE source_generation=$1", generation
-            )
-            await loader.execute(
-                f"DELETE FROM {namespace}.registry_fhir_catalog_source WHERE source_generation=$1", generation
-            )
-        if generation not in cached_generations or needs_refresh:
+            await _remove_stale_observations(loader, copy_target, generation)
+        if generation in donor_by_generation:
+            extraction_by_kind["reused_metadata_generation"] = donor_by_generation[generation]
+        elif generation not in cached_generations or needs_refresh:
             extraction_by_kind = await stage_fhir_catalog_source(
                 source_connection,
                 loader,
@@ -1058,6 +1070,28 @@ async def _project_catalog_sources(
         if report:
             report.source_prepared(generation, extraction_by_kind, projection)
     return projection_receipts
+
+
+async def _reuse_catalog_observations(config, loader, copy_target, snapshot, previous, current_by_generation):
+    open_donor_reader = _OBSERVATION_READER.get()
+    if open_donor_reader is None:
+        return {}
+    return await copy_pending_fhir_observations(
+        loader,
+        copy_target,
+        snapshot,
+        previous,
+        current_by_generation,
+        open_donor_reader(),
+        loader_role=config.loader_role,
+        control_schema=config.grant.control_schema,
+    )
+
+
+async def _remove_stale_observations(loader, copy_target, generation):
+    namespace = storage_identifier(copy_target.schema_name)
+    for table in ("registry_fhir_catalog_observation", "registry_fhir_catalog_source"):
+        await loader.execute(f"DELETE FROM {namespace}.{table} WHERE source_generation=$1", generation)
 
 
 async def _refresh_retained_descriptor(loader, copy_target, generation, disposition):

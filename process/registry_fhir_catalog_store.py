@@ -10,6 +10,8 @@ from dataclasses import asdict
 from datetime import date, datetime
 from uuid import UUID, uuid4
 
+from asyncpg import InsufficientPrivilegeError, InvalidSchemaNameError, UndefinedTableError
+
 from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import table_sql
 from process.registry_fhir_catalog_custody import (
@@ -17,6 +19,7 @@ from process.registry_fhir_catalog_custody import (
     FHIRCatalogTarget,
     validate_fhir_catalog_snapshot_record,
 )
+from process.registry_fhir_catalog_observation import CATALOG_OBSERVATION_CONTRACT
 from process.registry_fhir_catalog_projection import BINDING_COLUMNS, NETWORK_COLUMNS, RELATIONSHIP_COLUMNS
 from process.registry_fhir_catalog_validation import canonical_json, snapshot_inputs
 
@@ -526,6 +529,102 @@ def _previous_totals_sql(previous_schema, table_names):
         for table in table_names
     )
     return "SELECT " + selects
+
+
+async def copy_pending_fhir_observations(
+    connection, copy_target, snapshot, previous, current_by_generation, donor_reader, *, loader_role, control_schema
+):
+    """Copy exact observed facts from one validated, unpublished candidate before normal projection."""
+    carried_generations = (
+        {entry["source_generation"] for entry in previous["source_vector_json"]} if previous else set()
+    )
+    wanted_by_generation = {
+        generation: disposition
+        for generation, disposition in current_by_generation.items()
+        if generation not in carried_generations
+        and isinstance(disposition.descriptor, dict)
+        and isinstance(admission := disposition.descriptor.get("admission"), dict)
+        and admission.get("contract") == CATALOG_OBSERVATION_CONTRACT
+    }
+    if not wanted_by_generation:
+        return {}
+    transform_by_generation = {
+        entry["source_generation"]: entry.get("extraction_transform")
+        for entry in snapshot["source_vector_json"]
+        if entry["source_generation"] in wanted_by_generation
+    }
+    donor = await _select_observation_donor(donor_reader, control_schema, snapshot, transform_by_generation)
+    if donor is None:
+        return {}
+    donor_schema = storage_identifier(donor["schema_name"])
+    candidate_schema = _target(copy_target)
+    requested_descriptors = [
+        {
+            "generation": generation,
+            "descriptor": wanted_by_generation[generation].descriptor,
+            "accepted_at": wanted_by_generation[generation].accepted_at.isoformat(),
+        }
+        for generation in donor["generations"]
+    ]
+    try:
+        async with connection.transaction():
+            await _mutable(connection, copy_target, loader_role, control_schema)
+            generations = await _copy_observation_rows(
+                connection, candidate_schema, donor_schema, requested_descriptors
+            )
+    except UndefinedTableError, InvalidSchemaNameError, InsufficientPrivilegeError:
+        # An unavailable optional donor rolls back the partial copy and falls back to ordinary extraction.
+        return {}
+    return dict.fromkeys(generations, donor["metadata_generation"])
+
+
+async def _select_observation_donor(donor_reader, control_schema, snapshot, transform_by_generation):
+    async with donor_reader as sealer:
+        return await sealer.fetchrow(
+            "SELECT s.schema_name,s.metadata_generation,overlap.generations "
+            f"FROM {storage_identifier(control_schema)}.registry_fhir_catalog_snapshot s "
+            "JOIN hp_snapshot_retention.preparation_relation r ON r.schema_name=s.schema_name "
+            "AND r.relation_name='registry_fhir_catalog_observation' "
+            "JOIN hp_snapshot_retention.preparation p ON p.preparation_id=r.preparation_id "
+            "AND p.node_id=$5 AND p.importer_id='catalog' AND p.dataset_key=s.metadata_generation "
+            "AND p.state='validated' AND NOT p.cancellation_requested "
+            "CROSS JOIN LATERAL (SELECT array_agg(v->>'source_generation') AS generations "
+            "FROM jsonb_array_elements(source_vector_json) v WHERE v->>'status'='current' "
+            "AND $4::jsonb ? (v->>'source_generation') "
+            "AND ($4::jsonb->>(v->>'source_generation')) IS NOT DISTINCT FROM (v->>'extraction_transform')) overlap "
+            "WHERE standing_grant_sha256=$1 AND metadata_approved_revision=$2 AND projector_version=$3 "
+            "AND s.published_at IS NULL "
+            "AND overlap.generations IS NOT NULL "
+            "ORDER BY cardinality(overlap.generations) DESC,as_of DESC,metadata_generation DESC LIMIT 1",
+            snapshot["standing_grant_sha256"],
+            snapshot["metadata_approved_revision"],
+            snapshot["projector_version"],
+            canonical_json(transform_by_generation),
+            control_schema,
+        )
+
+
+async def _copy_observation_rows(connection, candidate_schema, donor_schema, requested_descriptors):
+    source_rows = await connection.fetch(
+        f"INSERT INTO {candidate_schema}.registry_fhir_catalog_source "
+        "(source_generation,source_id,descriptor_json,profile,source_rows,observation_rows,accepted_at) "
+        "SELECT s.source_generation,s.source_id,s.descriptor_json,s.profile,s.source_rows,s.observation_rows,r.accepted_at "
+        f"FROM {donor_schema}.registry_fhir_catalog_source s JOIN jsonb_to_recordset($1::jsonb) "
+        "AS r(generation text,descriptor jsonb,accepted_at timestamptz) "
+        "ON s.source_generation=r.generation AND s.descriptor_json=r.descriptor "
+        "RETURNING source_generation,observation_rows",
+        canonical_json(requested_descriptors),
+    )
+    generations = [copied_source["source_generation"] for copied_source in source_rows]
+    columns = ",".join(TABLE_COLUMNS["registry_fhir_catalog_observation"])
+    copied = await connection.execute(
+        f"INSERT INTO {candidate_schema}.registry_fhir_catalog_observation ({columns}) "
+        f"SELECT {columns} FROM {donor_schema}.registry_fhir_catalog_observation WHERE source_generation=ANY($1::text[])",
+        generations,
+    )
+    if int(copied.rsplit(" ", 1)[1]) != sum(copied_source["observation_rows"] for copied_source in source_rows):
+        _invalid("observation_count_changed")
+    return generations
 
 
 async def copy_fhir_catalog_snapshot(

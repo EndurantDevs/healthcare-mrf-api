@@ -5,6 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import asyncpg
@@ -14,6 +15,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from db.models.registry_publication_request import RegistryPublicationRequest
+from process import registry_fhir_catalog_sync as sync
 from process.registry_fhir_catalog_custody import FHIRCatalogTarget
 from process.registry_fhir_catalog_grant import (
     FHIRCatalogStandingGrant,
@@ -33,6 +35,7 @@ from process.registry_fhir_catalog_registry_reader import (
 )
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation, iter_fhir_catalog_sources
 from process.registry_fhir_catalog_store import (
+    admit_catalog_preparation,
     catalog_snapshot_preparation,
     copy_fhir_catalog_snapshot,
     create_fhir_catalog_indexes,
@@ -372,8 +375,14 @@ async def test_named_pipeline_validates_each_observed_endpoint_against_real_data
 
 async def _replace_source(case):
     source = case.source
+    if source.layout == "SCOPED":
+        await source.admin.execute(
+            f'CREATE TABLE "{source.schema}".resources_two PARTITION OF "{source.schema}".provider_directory_dataset_resource '
+            "FOR VALUES IN ('dataset-two')"
+        )
     await source.admin.execute(
-        f"UPDATE \"{source.header_schema}\".provider_directory_endpoint_dataset SET status='superseded',is_current=false"
+        f'UPDATE "{source.header_schema}".provider_directory_endpoint_dataset '
+        "SET status='superseded',is_current=false WHERE dataset_id='dataset-one'"
     )
     await source.admin.execute(f'''INSERT INTO "{source.header_schema}".provider_directory_endpoint_dataset
       (dataset_id,endpoint_id,acquisition_root_run_id,dataset_hash,status,is_current,published_at,resource_count,
@@ -382,8 +391,126 @@ async def _replace_source(case):
       SELECT 'dataset-two',endpoint_id,'second-publication',repeat('e',64),'published',true,published_at,resource_count,
        'dataset-one',publication_metadata_json,publication_metadata_sha256,content_proof_admission_version,
        content_proof_admission_kind,content_proof_admission_sha256,
-       jsonb_set(candidate_storage_json,'{{identity,dataset_id}}','"dataset-two"') FROM "{source.header_schema}".provider_directory_endpoint_dataset''')
+       jsonb_set(candidate_storage_json,'{{identity,dataset_id}}','"dataset-two"') FROM "{source.header_schema}".provider_directory_endpoint_dataset WHERE dataset_id='dataset-one'
+      ''')
     await _source_facts(source, edition="dataset-two", retain_old=False)
+
+
+async def _observation_dispositions(case):
+    async with case.source_pool.acquire() as reader, reader.transaction(isolation="repeatable_read", readonly=True):
+        return {
+            fhir_catalog_source_generation(disposition.descriptor): disposition
+            async for page in iter_fhir_catalog_sources(
+                reader, case.source.profile, observation_contract=CATALOG_OBSERVATION_CONTRACT
+            )
+            for disposition in page
+        }
+
+
+async def test_unpublished_observation_reuse_requires_completed_compatible_validation(observation_case):
+    case = observation_case
+    pending, _, accounting = await prepare_fhir_catalog_snapshot(
+        case.config, case.fixture.loader, case.source_pool, case.sealer_pool
+    )
+    assert accounting["preparation_state"] == "handed_off"
+    case.fixture.schemas.append(pending["schema_name"])
+    copy_target = await _new_catalog_target(case.fixture)
+    source_by_generation = await _observation_dispositions(case)
+
+    async def copy(snapshot):
+        async with case.fixture.loader.transaction():
+            return await sync.copy_pending_fhir_observations(
+                case.fixture.loader,
+                copy_target,
+                snapshot,
+                None,
+                source_by_generation,
+                case.sealer_pool.acquire(),
+                loader_role=case.config.loader_role,
+                control_schema=case.grant.control_schema,
+            )
+
+    assert not await copy(pending)
+    await _freeze(case, FHIRCatalogTarget(**catalog_snapshot_preparation(pending)["target"]), pending)
+    for change in (
+        {"metadata_approved_revision": pending["metadata_approved_revision"] + 1},
+        {"standing_grant_sha256": "0" * 64},
+        {"projector_version": "fhir-catalog/v1"},
+        {"source_vector_json": [{**pending["source_vector_json"][0], "extraction_transform": sync.PROJECTOR_VERSION}]},
+    ):
+        assert not await copy({**pending, **change})
+    generation, disposition = next(iter(source_by_generation.items()))
+    for descriptor in (None, {**disposition.descriptor, "source_uri": "https://example.test/other"}):
+        source_by_generation[generation] = replace(disposition, descriptor=descriptor)
+        assert not await copy(pending)
+    source_by_generation[generation] = disposition
+    observation = f'"{pending["schema_name"]}".registry_fhir_catalog_observation'
+    loader = '"' + case.config.loader_role + '"'
+    await case.fixture.connection.execute(f"REVOKE SELECT ON {observation} FROM {loader}")
+    assert not await copy(pending)
+    await case.fixture.connection.execute(f"GRANT SELECT ON {observation} TO {loader}")
+    assert await copy(pending) == {generation: pending["metadata_generation"]}
+    async with case.fixture.publisher.transaction():
+        store, preparation, claim = await admit_catalog_preparation(
+            case.fixture.publisher,
+            pending,
+            control_schema=case.grant.control_schema,
+            roles=case.config.preparation_roles,
+        )
+        assert preparation["state"] == "validated"
+        await store.request_cancel(str(preparation["preparation_id"]), preparation["admission_sha256"])
+    assert not await copy(pending)
+    async with case.fixture.publisher.transaction():
+        assert (await store.abandon(claim, reason_sha256="c" * 64))["state"] == "abandoned"
+    assert not await copy(pending)
+    assert await case.fixture.connection.fetchval("SELECT to_regclass($1)", observation) is not None
+
+
+@pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
+async def test_reuses_only_matching_unpublished_observations_after_one_edition_changes(observation_case, monkeypatch):
+    case = observation_case
+    serving, _, _ = await _prepare(case)
+    await _publish(case, serving)
+    await _add_second_scope_entry(case.source, published=True)
+    pending, _, _ = await _prepare(case)
+    await _replace_source(case)
+    async with case.fixture.reader.transaction(isolation="repeatable_read", readonly=True):
+        before = await _query(case)
+        with monkeypatch.context() as patch:
+            created = AsyncMock(wraps=sync.create_fhir_catalog_candidate)
+            patch.setattr(sync, "create_fhir_catalog_candidate", created)
+            patch.setattr(
+                sync, "stage_fhir_catalog_source", AsyncMock(side_effect=RuntimeError("interrupted source replay"))
+            )
+            with pytest.raises(RuntimeError, match="interrupted source replay"):
+                await _prepare(case)
+        created.assert_awaited_once()
+        failed_schema = created.await_args.args[1].schema_name
+        assert await case.fixture.connection.fetchval("SELECT to_regnamespace($1)::text", failed_schema) is None
+        successor, previous, accounting = await _prepare(case)
+        assert previous["metadata_generation"] == before["metadata_generation"] == serving["metadata_generation"]
+        extractions = [receipt["extraction"] for receipt in accounting["sources"]]
+        assert [extraction for extraction in extractions if extraction.get("reused_observations")] == [
+            {"reused_observations": True, "reused_metadata_generation": pending["metadata_generation"]}
+        ]
+        assert len(extractions) == 2 and any(extraction.get("source_rows", 0) > 0 for extraction in extractions)
+        retained = next(
+            entry["source_generation"] for entry in pending["source_vector_json"] if entry["source_id"] == "alias-c"
+        )
+        original = (
+            f'SELECT * FROM "{pending["schema_name"]}".registry_fhir_catalog_observation WHERE source_generation=$1'
+        )
+        copied = (
+            f'SELECT * FROM "{successor["schema_name"]}".registry_fhir_catalog_observation WHERE source_generation=$1'
+        )
+        assert not await case.fixture.connection.fetchval(
+            f"SELECT EXISTS(({original} EXCEPT ALL {copied}) UNION ALL ({copied} EXCEPT ALL {original}))", retained
+        )
+        await _publish(case, successor, previous)
+        assert await _query(case) == before
+    assert (await _query(case))["metadata_generation"] == successor["metadata_generation"]
+    repeated, head, _ = await _prepare(case)
+    assert repeated is None and head["metadata_generation"] == successor["metadata_generation"]
 
 
 async def test_sealed_point_in_time_publication_survives_reimport_and_disappearance(observation_case):
