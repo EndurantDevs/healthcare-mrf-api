@@ -2,7 +2,7 @@
 """Prepare and checkpoint imported Source graphs through the installed Source factories."""
 
 import asyncio
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import replace
 from uuid import UUID
 
@@ -124,15 +124,14 @@ async def _prepare_native_recipes(capture_transaction, runtime, generation, prev
     inventory = await current_imported_source_inventory()
     if inventory.token != generation:
         raise ValueError("registry_imported_preparation_catalog_changed")
+    native_by_generation = defaultdict(list)
+    for recipe in previous:
+        if type(recipe.source_pin) is PinnedNativeProviderMembershipSource:
+            native_by_generation[recipe.source_pin.catalog_generation].append(recipe)
     prepared_recipes = []
     for source_document in inventory.native_sources:
         descriptor = native_catalog_descriptor(source_document)
-        matching_recipes = [
-            recipe
-            for recipe in previous
-            if type(recipe.source_pin) is PinnedNativeProviderMembershipSource
-            and recipe.source_pin.catalog_generation == digest(descriptor)
-        ]
+        matching_recipes = native_by_generation.get(digest(descriptor), ())
         if len(matching_recipes) > 1:
             raise ValueError("registry_imported_preparation_predecessor_ambiguous")
         if matching_recipes:
