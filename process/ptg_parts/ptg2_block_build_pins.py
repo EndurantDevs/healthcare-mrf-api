@@ -16,20 +16,15 @@ from process.ptg_parts.ptg2_lifecycle_lock import (
     configure_ptg2_lifecycle_transaction,
 )
 
-
 PTG2_BLOCK_BUILD_PIN_TABLE = "ptg2_block_build_pin"
-PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS_ENV = (
-    "HLTHPRT_PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS"
-)
+PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS_ENV = "HLTHPRT_PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS"
 PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS_DEFAULT = 21_600
 
 
 def _lease_seconds() -> int:
     raw_seconds = os.getenv(PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS_ENV)
     try:
-        lease_seconds = int(raw_seconds) if raw_seconds is not None else (
-            PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS_DEFAULT
-        )
+        lease_seconds = int(raw_seconds) if raw_seconds is not None else (PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS_DEFAULT)
     except ValueError:
         lease_seconds = PTG2_BLOCK_BUILD_PIN_LEASE_SECONDS_DEFAULT
     if lease_seconds <= 0:
@@ -42,9 +37,7 @@ def _lease_deadline() -> datetime:
 
 
 def _normalized_hashes(block_hashes: Iterable[bytes]) -> tuple[bytes, ...]:
-    normalized_hashes = tuple(
-        sorted({bytes(block_hash) for block_hash in block_hashes})
-    )
+    normalized_hashes = tuple(sorted({bytes(block_hash) for block_hash in block_hashes}))
     if any(len(block_hash) != 32 for block_hash in normalized_hashes):
         raise ValueError("PTG block build pins require 32-byte hashes")
     return normalized_hashes
@@ -260,14 +253,23 @@ async def _protect_pinned_hashes_from_gc(
     schema: str,
     block_hashes: tuple[bytes, ...],
 ) -> None:
+    # Lock in hash order, using one partition per lookup even under a generic plan.
     await session.execute(
         db.text(
             f"""
-            SELECT block.block_hash
-              FROM {schema}.ptg2_v3_block AS block
-             WHERE block.block_hash = ANY(CAST(:block_hashes AS bytea[]))
-             ORDER BY block.block_hash
-             FOR KEY SHARE OF block
+            SELECT locked.block_hash
+              FROM (
+                    SELECT hash.block_hash
+                      FROM unnest(CAST(:block_hashes AS bytea[])) AS hash(block_hash)
+                     ORDER BY hash.block_hash
+                   ) AS requested
+             CROSS JOIN LATERAL (
+                    SELECT block.block_hash
+                      FROM {schema}.ptg2_v3_block AS block
+                     WHERE block.block_hash = requested.block_hash
+                     LIMIT 1
+                     FOR KEY SHARE OF block
+                   ) AS locked
             """
         ),
         {"block_hashes": list(block_hashes)},
