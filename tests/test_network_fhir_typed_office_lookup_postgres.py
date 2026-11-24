@@ -4,6 +4,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -287,3 +288,50 @@ async def test_precreated_mapping_companions_work_in_read_only_snapshot(serving_
         assert await connection.fetchval("SHOW transaction_read_only") == "on"
         assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("bindings")) == 1
         assert await _lookup_rows(connection) == 0
+
+
+@pytest.fixture
+async def office_input_pairs(serving_schema):
+    connection, _, _ = serving_schema
+    await connection.execute("CREATE TEMP TABLE office_input_pairs(" + PAIR_DDL + ")")
+    await connection.execute(
+        """INSERT INTO office_input_pairs
+        SELECT CASE WHEN n=5003 THEN 'excluded' ELSE 'approved' END,'npi',$1,
+          md5(CASE WHEN n IN (1,5002,5003) THEN 'first' ELSE 'second' END)::uuid,
+          md5('address')::uuid,CASE WHEN n=5003 THEN 'different' ELSE 'same' END,
+          'PractitionerRole',lpad(n::text,5,'0'),'location','direct',1 FROM generate_series(1,5003) n""",
+        _PROVIDER,
+    )
+    stage = SimpleNamespace(relation=lambda kind: "pg_temp.office_input_pairs")
+    selected = mapping.TypedGraphMapping(stage, await mapping.create_typed_mapping_tables(connection), {})
+    return connection, stage, selected
+
+
+async def test_streamed_office_inputs_keep_only_approved_identities(office_input_pairs):
+    connection, stage, selected = office_input_pairs
+    observed = SimpleNamespace(
+        execute=AsyncMock(wraps=connection.execute),
+        fetchrow=AsyncMock(wraps=connection.fetchrow),
+        fetchval=AsyncMock(wraps=connection.fetchval),
+    )
+    async with connection.transaction(readonly=True):
+        await mapping._office_inputs(connection, stage, selected, [])
+        assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("offices")) == 0
+        await mapping._office_inputs(observed, stage, selected, ["approved"])
+        assert await connection.fetchval(
+            "SELECT array_agg(canonical_identity) FROM " + selected.relation("offices")
+        ) == [
+            "same",
+            "same",
+        ]
+    assert (observed.execute.await_count, observed.fetchrow.await_count, observed.fetchval.await_count) == (1, 0, 1)
+
+
+@pytest.mark.parametrize("field,value", [("address_key", UUID(int=1)), ("canonical_identity", "different")])
+async def test_streamed_office_inputs_roll_back_distant_conflicts(office_input_pairs, field, value):
+    connection, stage, selected = office_input_pairs
+    await connection.execute(f"UPDATE pg_temp.office_input_pairs SET {field}=$1 WHERE resource_id='05002'", value)
+    with pytest.raises(ValueError, match="registry_fhir_typed_office_collision"):
+        async with connection.transaction(readonly=True):
+            await mapping._office_inputs(connection, stage, selected, ["approved"])
+    assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("offices")) == 0

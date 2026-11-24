@@ -154,19 +154,13 @@ def _range(prefix, start):
 
 
 async def _office_inputs(connection, stage, mapping, approved_keys):
-    async for low, high in _pair_ranges(connection, stage):
-        await connection.execute(
-            "INSERT INTO "
-            + mapping.relation("offices")
-            + "(provider_id,location_id,address_key,canonical_identity) SELECT DISTINCT provider_id,location_id,address_key,canonical_identity FROM "
-            + stage.relation("pairs")
-            + " p WHERE "
-            + _range("p.", 1)
-            + " AND network_source_key=ANY($9::text[]) ON CONFLICT DO NOTHING",
-            *low,
-            *high,
-            approved_keys,
-        )
+    # The office primary key removes repeats without sorting the complete graph.
+    column_sql = "provider_id,location_id,address_key,canonical_identity"
+    await connection.execute(
+        f"INSERT INTO {mapping.relation('offices')} ({column_sql}) SELECT {column_sql} FROM {stage.relation('pairs')} "
+        "WHERE network_source_key=ANY($1::text[]) ON CONFLICT DO NOTHING",
+        approved_keys,
+    )
     require(
         await connection.fetchval(
             "SELECT NOT EXISTS(SELECT FROM "
