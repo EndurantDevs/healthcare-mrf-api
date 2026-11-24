@@ -64,6 +64,7 @@ async def _named_replacement_rows(fixture, *, is_typed):
         ("other-endpoint", "catalog-a", "other", "edition-old", replacement_key),
         ("other-scope", "catalog-b", "endpoint", "edition-old", replacement_key),
         ("absent", "catalog-a", "endpoint", "edition-old", "not-replaced"),
+        ("mismatched-key", "catalog-a", "endpoint", "edition-old", replacement_key),
     )
     binding_id_by_generation = {}
     for generation, catalog, endpoint, payload_schema, source_key in source_specs:
@@ -79,7 +80,7 @@ async def _named_replacement_rows(fixture, *, is_typed):
         binding_id_by_generation[generation] = binding_id
         binding_by_field = {
             "source_id": "previous-alias",
-            "source_key": source_key,
+            "source_key": "different-key" if generation == "mismatched-key" else source_key,
             "dataset_schema": payload_schema,
             "evidence_id": generation + ":Organization/" + source_key,
             "source_scope": {"kind": "uhc_plan_tier_v1", "source_generation": generation},
@@ -122,11 +123,15 @@ async def test_named_successor_retires_bindings_across_payload_schemas(metadata_
         await sync._replace_observed_bindings(
             fixture.connection, '"' + schema + '"', successor_descriptor_by_field, [replacement_key]
         )
-    retained_binding_ids = {binding_id_by_generation[name] for name in ("other-endpoint", "other-scope", "absent")}
+    retained_binding_ids = {
+        binding_id_by_generation[name] for name in ("other-endpoint", "other-scope", "absent", "mismatched-key")
+    }
     for kind in ("binding", "relationship"):
         binding_rows = await fixture.connection.fetch(f"SELECT binding_id FROM {relation_by_kind[kind]}")
         assert {binding_row["binding_id"] for binding_row in binding_rows} == retained_binding_ids
-    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {relation_by_kind['source']}") == 5
+    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {relation_by_kind['source']}") == len(
+        binding_id_by_generation
+    )
     assert successor_descriptor_by_field["coordinates"]["dataset_schema"] == "edition-new"
 
 

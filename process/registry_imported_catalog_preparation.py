@@ -75,8 +75,6 @@ async def replaced_fhir_generations(connection, previous, accepted):
         fhir_feed(descriptor): source_edition(descriptor) for descriptor in inventory.carried_fhir_descriptors
     }
     descriptors = inventory.fhir_descriptors
-    if not descriptors and not carried_by_feed:
-        return ()
     enrichment_feeds = {
         fhir_feed(descriptor)
         for descriptor in (*descriptors, *inventory.carried_fhir_descriptors)
@@ -99,6 +97,9 @@ async def replaced_fhir_generations(connection, previous, accepted):
     generations = []
     for prior_source in sorted(prior_sources, key=lambda prior: prior["source_generation"] not in current_generations):
         descriptor = json.loads(prior_source["descriptor"])
+        if descriptor.get("complete") is not True:
+            generations.append(prior_source["source_generation"])
+            continue
         feed = fhir_feed(descriptor)
         if feed in enrichment_feeds and not is_practitioner_enrichment(descriptor):
             continue
@@ -185,7 +186,11 @@ def require_preparation_fhir_inventory(inventory, accepted):
 
 def select_preparation_fhir_sources(inventory, accepted):
     """Project only the recognized current edition of each directory feed."""
-    published_sources = [source for source in accepted if source.descriptor["profile"] == "published_normalized"]
+    published_sources = [
+        source
+        for source in accepted
+        if source.descriptor["profile"] == "published_normalized" and source.descriptor["complete"] is True
+    ]
     preferred, _ = select_fhir_editions(
         [source.descriptor for source in published_sources],
         inventory.carried_fhir_descriptors,

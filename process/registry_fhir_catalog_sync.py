@@ -1971,19 +1971,22 @@ async def _replace_observed_bindings(connection, namespace, descriptor, organiza
     """Replace this source's observed networks only; missing networks keep old rows."""
     from process.registry_fhir_catalog_observed_source import catalog_replacement_scope, catalog_replacement_scope_sql
 
-    arguments = (organization_ids, descriptor["endpoint_id"], catalog_replacement_scope(descriptor))
+    # OFFSET 0 keeps the indexed lookup per evidence ID when a page contains only missing keys.
     selection = (
-        f"SELECT b.binding_id FROM {namespace}.registry_fhir_catalog_binding b "
-        f"JOIN {namespace}.registry_fhir_catalog_source s ON "
-        "b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key') "
-        "WHERE b.document_json->>'source_key'=ANY($1::text[]) AND s.descriptor_json->>'endpoint_id'=$2 "
-        f"AND {catalog_replacement_scope_sql('s.descriptor_json')}=$3"
+        "SELECT exact.binding_id "
+        f"FROM {namespace}.registry_fhir_catalog_source s CROSS JOIN unnest($1::text[]) AS observed(source_key) "
+        f"CROSS JOIN LATERAL (SELECT binding_id FROM {namespace}.registry_fhir_catalog_binding b "
+        "WHERE (b.document_json->>'evidence_id') COLLATE \"C\"=s.source_generation||':Organization/'||observed.source_key "
+        "AND b.document_json->>'source_key'=observed.source_key OFFSET 0) exact "
+        f"WHERE s.descriptor_json->>'endpoint_id'=$2 AND {catalog_replacement_scope_sql('s.descriptor_json')}=$3"
     )
     await connection.execute(
-        f"DELETE FROM {namespace}.registry_fhir_catalog_relationship WHERE binding_id IN ({selection})", *arguments
-    )
-    await connection.execute(
-        f"DELETE FROM {namespace}.registry_fhir_catalog_binding WHERE binding_id IN ({selection})", *arguments
+        f"WITH replaced AS (DELETE FROM {namespace}.registry_fhir_catalog_binding WHERE binding_id IN ({selection}) "
+        "RETURNING binding_id) "
+        f"DELETE FROM {namespace}.registry_fhir_catalog_relationship WHERE binding_id IN (SELECT binding_id FROM replaced)",
+        organization_ids,
+        descriptor["endpoint_id"],
+        catalog_replacement_scope(descriptor),
     )
 
 
