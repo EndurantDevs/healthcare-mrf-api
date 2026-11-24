@@ -178,6 +178,8 @@ async def retry_failed_leaves(directory, source_record, resource_type, start_url
         await asyncio.sleep(RETRY_DELAY_SECONDS * (retry_round + 1))
         retry_urls = list(state.retry_leaf_urls)
         state.retry_leaf_urls.clear()
+        if isinstance(start_url_queue, asyncio.LifoQueue):
+            retry_urls.reverse()
         for request_url in retry_urls:
             start_url_queue.put_nowait(request_url)
         await directory._execute_partition_fetch_workers(

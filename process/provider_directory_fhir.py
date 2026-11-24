@@ -47117,7 +47117,7 @@ def _enqueue_adaptive_partition_children(
         current_url,
         fhir_payload,
     )
-    for child_url in child_urls:
+    for child_url in reversed(child_urls) if isinstance(start_url_queue, asyncio.LifoQueue) else child_urls:
         child_identity = _uhc_partition_identity(source_record, resource_type, child_url)
         if child_identity not in state.completed_partition_identities:
             start_url_queue.put_nowait(child_url)
