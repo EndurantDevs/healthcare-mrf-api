@@ -4,7 +4,7 @@
 
 import re
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -17,6 +17,7 @@ from sqlalchemy.sql.selectable import Exists
 
 from db.models import custom_import as models
 from process.custom_import import grouped_read, query_projection_evidence, read_core, read_identity
+from process.custom_import.family_block_layout import ROLE_SPECS
 from process.custom_import.storage_layout import SNAPSHOT_MODELS, snapshot_models, snapshot_schema, snapshot_tables
 from tests import custom_import_grouped_child_support as grouped_child
 from tests import test_custom_import_grouped_read as grouped_rows
@@ -238,11 +239,12 @@ async def test_single_family_provider_page_distinct_and_ties_use_snapshot_aliase
 def _resolver_session(value, schema="mrf"):
     options_by_name = {"schema_translate_map": {"mrf": schema}}
     connection = SimpleNamespace(
-        sync_connection=SimpleNamespace(get_execution_options=lambda: options_by_name), dialect=postgresql.dialect()
+        sync_connection=SimpleNamespace(get_execution_options=lambda: options_by_name),
+        dialect=postgresql.dialect(),
     )
     return SimpleNamespace(
         connection=AsyncMock(return_value=connection),
-        execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: value)),
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: value, one=lambda: value)),
     )
 
 
@@ -255,6 +257,7 @@ async def test_resolver_uses_exact_typed_target_and_trusted_control_schema(famil
     statement, parameters = session.execute.await_args.args
     assert str(statement).startswith('SELECT "control""namespace".resolve_custom_import_generation_snapshot(')
     assert str(statement).count(" AS bigint)") == 4
+    assert "pg_catalog" not in str(statement) and "MATERIALIZED" not in str(statement)
     assert parameters == {
         "generation_id": target.generation_id,
         "dataset_id": target.dataset_id,
@@ -262,6 +265,77 @@ async def test_resolver_uses_exact_typed_target_and_trusted_control_schema(famil
         "schema_revision_id": target.schema_revision_id,
     }
     assert session.connection.await_count == 1 and session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family_id,legacy_snapshot", [(None, False), (17, False), (17, True), (2**63 - 1, True)])
+async def test_context_binding_resolves_once_and_checks_only_named_layout(family_id, legacy_snapshot):
+    schema_name = None if family_id is None else snapshot_schema(family_id)
+    session = _resolver_session((family_id, legacy_snapshot, schema_name), 'control"namespace')
+    target = provider._target()
+
+    pin = await read_identity.resolve_generation_snapshot_binding(session, target)
+    assert pin == read_identity.GenerationSnapshotBinding(family_id, legacy_snapshot, schema_name)
+    assert [field.name for field in fields(pin)] == ["family_id", "legacy_snapshot", "schema_name"]
+
+    statement, parameters = session.execute.await_args.args
+    sql = str(statement)
+    assert sql.lstrip().startswith("WITH pinned AS MATERIALIZED (SELECT")
+    assert sql.count('"control""namespace".resolve_custom_import_generation_snapshot(') == 1
+    assert sql.count(" AS bigint)") == 4
+    assert "'ci_snapshot_' || family_id::text AS schema_name" in sql
+    assert "CASE WHEN family_id IS NULL THEN false" in sql
+    assert "pg_catalog.to_regclass(" in sql
+    assert "pg_catalog.format('%I.%I', schema_name" in sql
+    assert "pg_class" not in sql and "oid" not in sql and "relowner" not in sql
+    assert parameters == {
+        "generation_id": target.generation_id,
+        "dataset_id": target.dataset_id,
+        "definition_revision_id": target.definition_revision_id,
+        "schema_revision_id": target.schema_revision_id,
+        "block_family_name": ROLE_SPECS["family"][1],
+    }
+    assert session.connection.await_count == 1 and session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family_id", [False, 0, -1, 2**63, "17", 17.0])
+async def test_context_binding_rejects_invalid_logical_family(family_id):
+    session = _resolver_session((family_id, False, "ci_snapshot_17"))
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="snapshot identity"):
+        await read_identity.resolve_generation_snapshot_binding(session, provider._target())
+    assert session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family_id,legacy_snapshot", [(17, None), (17, 0), (17, 1), (17, "false"), (None, True)])
+async def test_context_binding_rejects_malformed_layout(family_id, legacy_snapshot):
+    session = _resolver_session((family_id, legacy_snapshot, "ci_snapshot_17"))
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="snapshot layout"):
+        await read_identity.resolve_generation_snapshot_binding(session, provider._target())
+    assert session.execute.await_count == 1
+
+
+@pytest.mark.parametrize("schema_name", [None, "", "bad\x00name", 17])
+def test_snapshot_binding_requires_a_qualified_schema_name(schema_name):
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="schema name"):
+        read_identity.GenerationSnapshotBinding(17, False, schema_name)
+
+
+def test_canonical_storage_does_not_accept_a_snapshot_schema():
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="canonical storage"):
+        read_identity.GenerationSnapshotBinding(None, False, "ci_snapshot_17")
+
+
+@pytest.mark.asyncio
+async def test_copied_snapshot_pin_is_independent_of_connection_objects():
+    target = provider._target()
+    first = _resolver_session((17, False, "ci_snapshot_17"))
+    second = _resolver_session((17, False, "ci_snapshot_17"))
+    assert first.connection.return_value is not second.connection.return_value
+    assert await read_identity.resolve_generation_snapshot_binding(first, target) == (
+        await read_identity.resolve_generation_snapshot_binding(second, target)
+    )
 
 
 @pytest.mark.asyncio
@@ -274,19 +348,39 @@ async def test_resolver_rejects_invalid_native_id_without_a_legacy_fallback(fami
 
 
 @pytest.mark.asyncio
-async def test_resolver_requires_explicit_control_schema_and_propagates_sql_errors():
+@pytest.mark.parametrize(
+    "resolve", [read_identity.resolve_generation_snapshot, read_identity.resolve_generation_snapshot_binding]
+)
+async def test_resolver_requires_explicit_control_schema_and_propagates_sql_errors(resolve):
     session = _resolver_session(17, None)
     with pytest.raises(read_core.CustomImportReadUnavailableError, match="explicit model schema"):
-        await read_identity.resolve_generation_snapshot(session, provider._target())
+        await resolve(session, provider._target())
     session.execute.assert_not_awaited()
     for sqlstate in ("42883", "42501", "23514"):
         failure = DBAPIError("resolver", {}, SimpleNamespace(sqlstate=sqlstate))
         session = _resolver_session(17)
         session.execute.side_effect = failure
         with pytest.raises(DBAPIError) as caught:
-            await read_identity.resolve_generation_snapshot(session, provider._target())
+            await resolve(session, provider._target())
         assert caught.value is failure
         assert session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resolve", [read_identity.resolve_generation_snapshot, read_identity.resolve_generation_snapshot_binding]
+)
+async def test_retired_snapshot_remains_unavailable_without_layout_fallback(resolve):
+    driver = Exception()
+    driver.sqlstate = "55000"
+    driver.message = "custom_import_snapshot_retired"
+    failure = DBAPIError("resolver", {}, driver)
+    session = _resolver_session(17)
+    session.execute.side_effect = failure
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="storage is retired") as caught:
+        await resolve(session, provider._target())
+    assert caught.value.__cause__ is failure
+    assert session.execute.await_count == 1
 
 
 def _context_metadata(monkeypatch):
@@ -304,11 +398,12 @@ def _context_metadata(monkeypatch):
 @pytest.mark.asyncio
 async def test_context_resolves_fresh_but_existing_context_binding_stays_pinned(monkeypatch):
     context = _context_metadata(monkeypatch)
-    session = _resolver_session(17)
+    session = _resolver_session((17, True, "ci_snapshot_17"))
     first = await read_core._load_read_context(session, context.target)
-    session.execute.return_value = SimpleNamespace(scalar_one=lambda: 18)
+    session.execute.return_value = SimpleNamespace(one=lambda: (18, True, "ci_snapshot_18"))
     second = await read_core._load_read_context(session, context.target)
-    assert first.storage_models is snapshot_models(17) and second.storage_models is snapshot_models(18)
+    assert first.storage_models is snapshot_models(17, schema_name="ci_snapshot_17")
+    assert second.storage_models is snapshot_models(18, schema_name="ci_snapshot_18")
     assert first.model(models.CustomImportWinner) is not second.model(models.CustomImportWinner)
     assert session.execute.await_count == 2
     _assert_routing(read_core._winner_statement(first), 17)
@@ -332,9 +427,21 @@ def test_context_keeps_exact_alias_objects_across_metadata_cache_eviction():
     _assert_routing(grouped_read.prepare_relation(context, grouped_child.query(), _SCOPE).statement, 17)
 
 
+def _assert_pinned_projection_read(session, context):
+    query_projection_evidence.read_projection_tables.assert_awaited_once_with(
+        session,
+        context.target,
+        context.definition,
+        snapshot_family_id=17,
+        family_block_binding=None,
+        schema_name="ci_snapshot_17",
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resolver_failure", [False, True])
 async def test_authorization_and_snapshot_validation_precede_cached_search(monkeypatch, resolver_failure):
+    """Apply authorization and resolve the pinned snapshot before checking cached data."""
     context = _context_metadata(monkeypatch)
     events = []
 
@@ -354,9 +461,7 @@ async def test_authorization_and_snapshot_validation_precede_cached_search(monke
     cached = read_core.SearchPage(context.target, 0, (), None, 1100, plan.fingerprint, read_core._scope_digest(_SCOPE))
 
     async def cache_get(key):
-        query_projection_evidence.read_projection_tables.assert_awaited_once_with(
-            session, context.target, context.definition, snapshot_family_id=17
-        )
+        _assert_pinned_projection_read(session, context)
         events.append("cache")
         return cached
 
@@ -370,23 +475,22 @@ async def test_authorization_and_snapshot_validation_precede_cached_search(monke
         events.append("resolve")
         if resolver_failure:
             raise DBAPIError("resolver", {}, SimpleNamespace(sqlstate="42883"))
-        return SimpleNamespace(scalar_one=lambda: 17)
+        return SimpleNamespace(one=lambda: (17, True, "ci_snapshot_17"))
 
     session.execute.side_effect = resolve
+
+    async def search():
+        return await service.search(
+            session, authorization=read_core.ExtensionReadAuthorization("synthetic"), request=request
+        )
+
     if resolver_failure:
         with pytest.raises(DBAPIError):
-            await service.search(
-                session, authorization=read_core.ExtensionReadAuthorization("synthetic"), request=request
-            )
+            await search()
         assert events == ["authorize", "resolve"]
         cache.get.assert_not_awaited()
     else:
-        assert (
-            await service.search(
-                session, authorization=read_core.ExtensionReadAuthorization("synthetic"), request=request
-            )
-            is cached
-        )
+        assert await search() is cached
         assert events == ["authorize", "resolve", "cache"]
         read_core.verify_published_generation.assert_awaited_once_with(session, context.target)
     cache.set.assert_not_awaited()

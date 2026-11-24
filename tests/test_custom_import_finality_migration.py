@@ -122,6 +122,7 @@ _SEALED_APPEND_UPGRADE_TAIL = (
     "20261119230000_clinical_code_catalog_page_index",
     "20261121050000_custom_import_rooted_text",
     "20261123182000_custom_import_root_boolean_index",
+    "20261104020000_custom_import_family_blocks",
 )
 
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"

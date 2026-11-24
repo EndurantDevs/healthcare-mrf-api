@@ -20,6 +20,7 @@ from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
 from api import provider_geo_sql, provider_list_sql
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
+from db.models.custom_import import CustomImportChildScalar
 from process.custom_import import grouped_query, grouped_read, read_core
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.read_core import (
@@ -284,9 +285,7 @@ def _candidate_context(context, ambiguous):
             grouped_query.CustomImportChildRevision: aliased(
                 grouped_query.CustomImportChildRevision, revisions, adapt_on_names=True
             ),
-            grouped_query.CustomImportChildScalar: aliased(
-                grouped_query.CustomImportChildScalar, select(scalars).subquery(), adapt_on_names=True
-            ),
+            CustomImportChildScalar: aliased(CustomImportChildScalar, select(scalars).subquery(), adapt_on_names=True),
         },
     )
     selected_roots = select(

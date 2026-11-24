@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 
 from sqlalchemy import and_, inspect, literal, select
 
-from db.models.custom_import import CustomImportEntityBinding, CustomImportRootScalar, CustomImportWinner
+from db.models.custom_import import CustomImportEntityBinding, CustomImportWinner
 from process.custom_import import grouped_child_read as child
 from process.custom_import import read_core as core
 from process.custom_import.definition import canonical_json
@@ -168,7 +168,7 @@ def _query_field(context, field_id):
 
 def _join_root_scalar(statement, context, field, *, prefix="root"):
     family = context.model(core.CustomImportFamilyRevision)
-    scalar = inspect(context.model(CustomImportRootScalar)).selectable.alias(f"{prefix}_slot_{field.field_slot}")
+    scalar = inspect(core._field_scalar_model(context, field)).selectable.alias(f"{prefix}_slot_{field.field_slot}")
     statement = statement.outerjoin(
         scalar,
         and_(

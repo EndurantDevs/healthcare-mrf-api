@@ -77,10 +77,10 @@ def snapshot_schema(family_id: int) -> str:
 
 
 @lru_cache(maxsize=32)
-def snapshot_tables(family_id: int):
+def snapshot_tables(family_id: int, *, schema_name: str | None = None):
     """Clone the fixed row shapes without mutating canonical model metadata."""
 
-    metadata = MetaData(schema=snapshot_schema(family_id))
+    metadata = MetaData(schema=snapshot_schema(family_id) if schema_name is None else schema_name)
     tables_by_name = {}
     for model in SNAPSHOT_MODELS:
         snapshot_table = model.__table__.to_metadata(metadata, schema=metadata.schema)
@@ -139,14 +139,14 @@ def snapshot_load_statements(family_id: int) -> tuple[str, ...]:
 
 
 @lru_cache(maxsize=32)
-def snapshot_models(family_id: int):
+def snapshot_models(family_id: int, *, schema_name: str | None = None):
     """Compile fixed hot aliases after a caller verifies its registry binding.
 
     Only metadata is cached, never authority or current-generation resolution.
     Canonical control tables and global natural-key interners stay unchanged.
     """
 
-    tables_by_name = snapshot_tables(family_id)
+    tables_by_name = snapshot_tables(family_id, schema_name=schema_name)
     return MappingProxyType(
         {model: aliased(model, tables_by_name[model.__tablename__], adapt_on_names=True) for model in SNAPSHOT_MODELS}
     )

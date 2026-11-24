@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hmac
+from dataclasses import dataclass
 
 from sqlalchemy import and_, select, text
 from sqlalchemy.exc import DBAPIError
@@ -33,14 +34,73 @@ from process.custom_import.read_contracts import (
     PinnedReadTarget,
 )
 
+_PINNED_LAYOUT_SQL = """
+    WITH pinned AS MATERIALIZED (SELECT {invocation} AS family_id),
+         named AS (SELECT family_id, 'ci_snapshot_' || family_id::text AS schema_name FROM pinned)
+    SELECT family_id,
+           CASE WHEN family_id IS NULL THEN false ELSE
+               pg_catalog.to_regclass(pg_catalog.format('%I.custom_import_root_revision', schema_name)) IS NOT NULL
+               OR pg_catalog.to_regclass(
+               pg_catalog.format('%I.%I', schema_name, CAST(:block_family_name AS text))
+           ) IS NULL END AS legacy_snapshot,
+           schema_name
+    FROM named
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationSnapshotBinding:
+    """One authorized logical snapshot and its schema-qualified storage layout."""
+
+    family_id: int | None
+    legacy_snapshot: bool
+    schema_name: str | None = None
+
+    def __post_init__(self):
+        _snapshot_family_id(self.family_id)
+        if type(self.legacy_snapshot) is not bool or (self.family_id is None and self.legacy_snapshot):
+            raise CustomImportReadUnavailableError("generation snapshot layout is invalid")
+        if self.family_id is None:
+            if self.schema_name is not None:
+                raise CustomImportReadUnavailableError("canonical storage cannot select a snapshot schema")
+        elif type(self.schema_name) is not str or not self.schema_name or "\x00" in self.schema_name:
+            raise CustomImportReadUnavailableError("generation snapshot schema name is invalid")
+
 
 async def resolve_generation_snapshot(session: AsyncSession, pinned_target: PinnedReadTarget) -> int | None:
-    """Resolve a published generation to its qualified snapshot table family.
+    """Resolve an authorized generation through the existing snapshot entrypoint.
 
     Only an explicit NULL permits canonical legacy storage. Missing functions,
     invalid bindings, or SQL errors must never select another storage family.
     """
 
+    result = await _resolve_snapshot_result(session, pinned_target, include_layout=False)
+    return _snapshot_family_id(result.scalar_one())
+
+
+async def resolve_generation_snapshot_binding(
+    session: AsyncSession, pinned_target: PinnedReadTarget
+) -> GenerationSnapshotBinding:
+    """Resolve a snapshot once and distinguish its named block-family relation."""
+    result = await _resolve_snapshot_result(session, pinned_target, include_layout=True)
+    family_id, legacy_snapshot, schema_name = result.one()
+    return GenerationSnapshotBinding(family_id, legacy_snapshot, schema_name)
+
+
+def _snapshot_family_id(family_id):
+    if family_id is not None and (type(family_id) is not int or not 0 < family_id < 2**63):
+        raise CustomImportReadUnavailableError("generation snapshot identity is invalid")
+    return family_id
+
+
+def named_layout_query(invocation, parameters):
+    """Resolve the registered layout in the same statement as its generation lock."""
+    from process.custom_import.family_block_layout import ROLE_SPECS
+
+    return _PINNED_LAYOUT_SQL.format(invocation=invocation), parameters | {"block_family_name": ROLE_SPECS["family"][1]}
+
+
+async def _resolve_snapshot_result(session, pinned_target, *, include_layout):
     connection = await session.connection()
     model_schema = CustomImportGeneration.__table__.schema
     schema_map = connection.sync_connection.get_execution_options().get("schema_translate_map") or {}
@@ -48,28 +108,26 @@ async def resolve_generation_snapshot(session: AsyncSession, pinned_target: Pinn
     if not schema:
         raise CustomImportReadUnavailableError("generation snapshot resolver requires an explicit model schema")
     quoted = connection.dialect.identifier_preparer.quote_schema(schema)
+    invocation = (
+        f"{quoted}.resolve_custom_import_generation_snapshot("
+        "CAST(:generation_id AS bigint), CAST(:dataset_id AS bigint), "
+        "CAST(:definition_revision_id AS bigint), CAST(:schema_revision_id AS bigint))"
+    )
+    statement = f"SELECT {invocation}"
+    parameters_by_name = {
+        "generation_id": pinned_target.generation_id,
+        "dataset_id": pinned_target.dataset_id,
+        "definition_revision_id": pinned_target.definition_revision_id,
+        "schema_revision_id": pinned_target.schema_revision_id,
+    }
+    if include_layout:
+        statement, parameters_by_name = named_layout_query(invocation, parameters_by_name)
     try:
-        snapshot_binding_result = await session.execute(
-            text(
-                f"SELECT {quoted}.resolve_custom_import_generation_snapshot("
-                "CAST(:generation_id AS bigint), CAST(:dataset_id AS bigint), "
-                "CAST(:definition_revision_id AS bigint), CAST(:schema_revision_id AS bigint))"
-            ),
-            {
-                "generation_id": pinned_target.generation_id,
-                "dataset_id": pinned_target.dataset_id,
-                "definition_revision_id": pinned_target.definition_revision_id,
-                "schema_revision_id": pinned_target.schema_revision_id,
-            },
-        )
+        return await session.execute(text(statement), parameters_by_name)
     except DBAPIError as error:
         if _is_snapshot_error(error, "55000", "custom_import_snapshot_retired"):
             raise CustomImportReadUnavailableError("pinned generation storage is retired") from error
         raise
-    family_id = snapshot_binding_result.scalar_one()
-    if family_id is not None and (type(family_id) is not int or not 0 < family_id < 2**63):
-        raise CustomImportReadUnavailableError("generation snapshot identity is invalid")
-    return family_id
 
 
 def _is_snapshot_error(error: DBAPIError, code: str, message: str) -> bool:
@@ -78,10 +136,10 @@ def _is_snapshot_error(error: DBAPIError, code: str, message: str) -> bool:
     )
 
 
-async def verify_generation_storage(session: AsyncSession, generation) -> None:
+async def verify_generation_storage(session: AsyncSession, generation) -> GenerationSnapshotBinding:
     """Pin sealed storage before accepting a retained seal or generation status."""
 
-    await resolve_generation_snapshot(
+    return await resolve_generation_snapshot_binding(
         session,
         PinnedReadTarget(
             dataset_id=generation.dataset_id,

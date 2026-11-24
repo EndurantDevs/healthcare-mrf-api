@@ -117,13 +117,15 @@ def _expected_columns(table):
     return [_column_shape(column, ordinal) for ordinal, column in enumerate(table.c, 1)]
 
 
-async def validate_projection_table(session, family_id, name, definition, *, prepare=None):
+async def validate_projection_table(session, family_id, name, definition, *, prepare=None, schema_name=None):
     """Require the defined columns and native keys at the qualified table name."""
 
     if type(name) is not str or name not in (*QUERY_PROJECTION_TABLE_NAMES, DEFAULT_ROOTS):
         raise QueryProjectionUnavailable("projection relation name is invalid")
     table = (
-        default_root_table(family_id) if name == DEFAULT_ROOTS else query_projection_tables(family_id, definition)[name]
+        default_root_table(family_id, schema_name=schema_name)
+        if name == DEFAULT_ROOTS
+        else query_projection_tables(family_id, definition, schema_name=schema_name)[name]
     )
     if prepare is not None:
         await prepare(session)
@@ -131,7 +133,7 @@ async def validate_projection_table(session, family_id, name, definition, *, pre
         (
             await session.execute(
                 _CATALOG_LAYOUT,
-                {"schema_name": snapshot_schema(family_id), "table_name": name},
+                {"schema_name": table.schema, "table_name": name},
             )
         )
         .mappings()
@@ -244,7 +246,7 @@ def _index_specs(manifest, definition):
     return expected_by_name
 
 
-async def validate_projection_indexes(session, manifest, definition, *, prepare=None):
+async def validate_projection_indexes(session, manifest, definition, *, prepare=None, schema_name=None):
     """Require every configured native btree before completion and pinned reads."""
 
     _definition_binding(manifest, definition)
@@ -268,7 +270,7 @@ async def validate_projection_indexes(session, manifest, definition, *, prepare=
             await session.execute(
                 _CATALOG_INDEXES,
                 {
-                    "schema_name": snapshot_schema(manifest.family_id),
+                    "schema_name": schema_name if schema_name is not None else snapshot_schema(manifest.family_id),
                     "index_names": list(expected_by_name),
                 },
             )
@@ -356,7 +358,9 @@ async def _validate_parent(session, manifest, require_complete, prepare):
         raise QueryProjectionUnavailable("projection snapshot or definition binding differs")
 
 
-async def lock_projection_tables(session, manifest, definition, *, require_complete=True, prepare=None):
+async def lock_projection_tables(
+    session, manifest, definition, *, require_complete=True, prepare=None, schema_name=None
+):
     """Pin qualified leaves and revalidate logical bindings in the same read transaction."""
 
     if not session.in_transaction():
@@ -364,9 +368,12 @@ async def lock_projection_tables(session, manifest, definition, *, require_compl
     _manifest_shape(manifest, require_complete)
     _definition_binding(manifest, definition)
     await _validate_parent(session, manifest, require_complete, prepare)
-    tables_by_name = query_projection_tables(manifest.family_id, definition)
+    tables_by_name = query_projection_tables(manifest.family_id, definition, schema_name=schema_name)
     if has_default_roots(definition, manifest.capability_sha256):
-        tables_by_name = {**tables_by_name, DEFAULT_ROOTS: default_root_table(manifest.family_id)}
+        tables_by_name = {
+            **tables_by_name,
+            DEFAULT_ROOTS: default_root_table(manifest.family_id, schema_name=schema_name),
+        }
     preparer = postgresql.dialect().identifier_preparer
     names = ",".join(preparer.format_table(table) for table in tables_by_name.values())
     if prepare is not None:
@@ -374,7 +381,9 @@ async def lock_projection_tables(session, manifest, definition, *, require_compl
     await session.execute(text(f"LOCK TABLE {names} IN ACCESS SHARE MODE"))
     await _validate_parent(session, manifest, require_complete, prepare)
     for name in tables_by_name:
-        await validate_projection_table(session, manifest.family_id, name, definition, prepare=prepare)
+        await validate_projection_table(
+            session, manifest.family_id, name, definition, prepare=prepare, schema_name=schema_name
+        )
     if require_complete or manifest.phase == "complete":
-        await validate_projection_indexes(session, manifest, definition, prepare=prepare)
+        await validate_projection_indexes(session, manifest, definition, prepare=prepare, schema_name=schema_name)
     return tables_by_name

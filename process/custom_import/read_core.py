@@ -6,7 +6,7 @@ This module deliberately has no HTTP registration or policy implementation.
 An extension-facing adapter verifies its own authorization material, supplies a
 stable authorization scope through :class:`ExtensionReadAuthorizer`, and maps
 these typed results to its transport.  The read core then permits only an
-explicit sealed generation and one exact selection profile.
+explicit published generation and one exact selection profile.
 
 Search starts from a persisted ``CustomImportWinner``.  A child predicate or
 order therefore always addresses that winner's one selected context child; it
@@ -16,7 +16,7 @@ member of that one immutable family, subject to a hard all-or-nothing bound.
 
 Integration assumes a host constructs the pinned target from its own trusted
 configuration, injects the authorization verifier and cursor secret, and
-calls this service only after the P1 publication flow has sealed the selected
+calls this service only after the P1 publication flow has published the selected
 generation.  Transport registration and materialization ownership remain
 outside this package.
 """
@@ -67,6 +67,8 @@ from process.custom_import.definition import (
     canonical_sha256,
     load_json_definition,
 )
+from process.custom_import.family_block_binding import FamilyBlockUnavailable
+from process.custom_import.family_block_records import FamilyBlockError
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_CURSOR_TTL_SECONDS,
@@ -108,7 +110,7 @@ from process.custom_import.read_cursor import (
     ReadCursorState,
 )
 from process.custom_import.read_identity import (
-    resolve_generation_snapshot,
+    resolve_generation_snapshot_binding,
     verified_definition,
     verify_published_generation,
 )
@@ -288,7 +290,7 @@ class SearchItem:
 
 @dataclass(frozen=True, slots=True)
 class SearchPage:
-    """One exact-count page over a sealed winner selection."""
+    """One exact-count page over a published winner selection."""
 
     target: PinnedReadTarget
     total: int
@@ -427,6 +429,7 @@ class _ReadContext:
     default_profile_slot: int | None = None
     storage_models: Mapping | None = None
     projection_tables: Mapping | None = None
+    family_block_binding: object | None = None
 
     def model(self, canonical_model):
         """Bind hot reads to this verified family without redirecting control rows."""
@@ -1030,6 +1033,8 @@ async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> Asy
         if _is_statement_timeout(error):
             raise CustomImportReadUnavailableError("bounded read is unavailable") from None
         raise
+    except FamilyBlockError, FamilyBlockUnavailable:
+        raise CustomImportReadUnavailableError("pinned family block is unavailable") from None
 
 
 @asynccontextmanager
@@ -1198,14 +1203,27 @@ async def _load_read_context(session: AsyncSession, pinned_target: PinnedReadTar
     profile = await _exact_profile(session, pinned_target)
     profile_slot, profile_context_slot = _verified_profile(profile, definition, collection_slots)
     await _verified_field_rows(session, pinned_target, definition, collection_slots)
-    snapshot_family_id = await resolve_generation_snapshot(session, pinned_target)
+    snapshot = await resolve_generation_snapshot_binding(session, pinned_target)
+    snapshot_family_id = snapshot.family_id
+    from process.custom_import.family_block_binding import resolve_pinned_family_block_binding
+    from process.custom_import.family_block_read_models import read_models
     from process.custom_import.query_projection_evidence import QueryProjectionUnavailable, read_projection_tables
 
     try:
+        block_binding = None
+        if snapshot_family_id is not None and not snapshot.legacy_snapshot:
+            block_binding = await resolve_pinned_family_block_binding(session, snapshot, definition, collection_slots)
+            if block_binding is None:
+                raise FamilyBlockUnavailable("unresolved snapshot has no family block binding")
         projection_tables = await read_projection_tables(
-            session, pinned_target, definition, snapshot_family_id=snapshot_family_id
+            session,
+            pinned_target,
+            definition,
+            snapshot_family_id=snapshot_family_id,
+            family_block_binding=block_binding,
+            schema_name=snapshot.schema_name,
         )
-    except QueryProjectionUnavailable:
+    except QueryProjectionUnavailable, FamilyBlockUnavailable:
         raise CustomImportReadUnavailableError("pinned query projection is unavailable") from None
     context = _ReadContext(
         target=pinned_target,
@@ -1214,8 +1232,15 @@ async def _load_read_context(session: AsyncSession, pinned_target: PinnedReadTar
         profile_context_slot=profile_context_slot,
         collection_slots_by_name=collection_slots,
         collection_names_by_slot={slot: name for name, slot in collection_slots.items()},
-        storage_models=None if snapshot_family_id is None else snapshot_models(snapshot_family_id),
+        storage_models=(
+            read_models(block_binding, pinned_target)
+            if block_binding is not None
+            else None
+            if snapshot_family_id is None
+            else snapshot_models(snapshot_family_id, schema_name=snapshot.schema_name)
+        ),
         projection_tables=projection_tables,
+        family_block_binding=block_binding,
     )
     if definition.query.entity_selection is not None:
         from process.custom_import.grouped_read import bind_default_profile
@@ -1998,7 +2023,7 @@ def _winner_identity_statement(context: _ReadContext):
     root_model = context.model(CustomImportRootRevision)
     generation_family_model = context.model(CustomImportGenerationFamily)
 
-    return (
+    statement = (
         select(winner_model, family_model, root_model)
         .select_from(winner_model)
         .join(
@@ -2029,6 +2054,11 @@ def _winner_identity_statement(context: _ReadContext):
             ),
         )
     )
+    if getattr(context, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_read_models import identity_options
+
+        statement = statement.options(*identity_options(context))
+    return statement
 
 
 def _pinned_generation_winner_statement(winner_statement, context: _ReadContext):
@@ -2079,7 +2109,7 @@ def _context_child_winner_statement(winner_statement, context: _ReadContext):
     family_child_model = context.model(CustomImportFamilyChild)
     child_model = context.model(CustomImportChildRevision)
 
-    return (
+    statement = (
         winner_statement.add_columns(child_model)
         .join(
             family_child_model,
@@ -2104,24 +2134,38 @@ def _context_child_winner_statement(winner_statement, context: _ReadContext):
         )
         .where(winner_model.context_collection_slot == context.profile_context_slot)
     )
+    if getattr(context, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_read_models import identity_options
+
+        statement = statement.options(*identity_options(context, child=True))
+    return statement
+
+
+def _field_scalar_model(context, field):
+    if getattr(context, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_read_sql import field_scalar_model
+
+        return field_scalar_model(context, field)
+    return context.model(CustomImportRootScalar if field.collection is None else CustomImportChildScalar)
 
 
 def _predicate_condition(predicate: _NormalizedFilter, context: _ReadContext):
     winner_model = context.model(CustomImportWinner)
     family_model = context.model(CustomImportFamilyRevision)
-    root_scalar_model = context.model(CustomImportRootScalar)
-    child_scalar_model = context.model(CustomImportChildScalar)
+    scalar_model = _field_scalar_model(context, predicate.field)
 
     if predicate.field.collection is None:
         return _scalar_predicate(
-            root_scalar_model,
+            scalar_model,
             predicate,
-            _root_scalar_conditions(predicate.field, family_model.root_revision_id, context),
+            _root_scalar_conditions(predicate.field, family_model.root_revision_id, context, scalar_model=scalar_model),
         )
     return _scalar_predicate(
-        child_scalar_model,
+        scalar_model,
         predicate,
-        _child_scalar_conditions(predicate.field, winner_model.context_child_revision_id, context),
+        _child_scalar_conditions(
+            predicate.field, winner_model.context_child_revision_id, context, scalar_model=scalar_model
+        ),
     )
 
 
@@ -2157,9 +2201,11 @@ def _has_scalar_comparison(column, operator: str, value: object | None):
     raise CustomImportReadRequestError("filter operator is unsupported")
 
 
-def _root_scalar_conditions(field: Field, root_revision_id, context: _ReadContext) -> tuple[object, ...]:
+def _root_scalar_conditions(
+    field: Field, root_revision_id, context: _ReadContext, *, scalar_model=None
+) -> tuple[object, ...]:
     family_model = context.model(CustomImportFamilyRevision)
-    root_scalar_model = context.model(CustomImportRootScalar)
+    root_scalar_model = scalar_model if scalar_model is not None else _field_scalar_model(context, field)
 
     return (
         root_scalar_model.root_revision_id == root_revision_id,
@@ -2170,9 +2216,11 @@ def _root_scalar_conditions(field: Field, root_revision_id, context: _ReadContex
     )
 
 
-def _child_scalar_conditions(field: Field, child_revision_id, context: _ReadContext) -> tuple[object, ...]:
+def _child_scalar_conditions(
+    field: Field, child_revision_id, context: _ReadContext, *, scalar_model=None
+) -> tuple[object, ...]:
     family_model = context.model(CustomImportFamilyRevision)
-    child_scalar_model = context.model(CustomImportChildScalar)
+    child_scalar_model = scalar_model if scalar_model is not None else _field_scalar_model(context, field)
 
     assert field.collection is not None
     collection_slot = context.collection_slots_by_name[field.collection]
@@ -2236,15 +2284,14 @@ def _winner_order_terms(context: _ReadContext, order_terms: tuple[ReadOrderTerm,
 def _order_scalar_expression(field: Field, context: _ReadContext):
     winner_model = context.model(CustomImportWinner)
     family_model = context.model(CustomImportFamilyRevision)
-    root_scalar_model = context.model(CustomImportRootScalar)
-    child_scalar_model = context.model(CustomImportChildScalar)
+    scalar_model = _field_scalar_model(context, field)
 
     if field.collection is None:
-        scalar_model = root_scalar_model
-        conditions = _root_scalar_conditions(field, family_model.root_revision_id, context)
+        conditions = _root_scalar_conditions(field, family_model.root_revision_id, context, scalar_model=scalar_model)
     else:
-        scalar_model = child_scalar_model
-        conditions = _child_scalar_conditions(field, winner_model.context_child_revision_id, context)
+        conditions = _child_scalar_conditions(
+            field, winner_model.context_child_revision_id, context, scalar_model=scalar_model
+        )
     value_column = getattr(scalar_model, _SCALAR_COLUMNS[field.value_type])
     return select(value_column).where(*conditions, scalar_model.value_state == "value").scalar_subquery()
 
@@ -2324,11 +2371,15 @@ async def _root_scalar_rows(
     root_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
 ) -> dict[tuple[int, int], Row]:
+    if getattr(context, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_read import scalar_rows
+
+        return await scalar_rows(session, context, root_revision_ids, fields, child=False)
     root_scalar_model = context.model(CustomImportRootScalar)
 
     if not fields:
         return {}
-    rows = (
+    persisted_scalars = (
         await session.execute(
             select(
                 root_scalar_model.root_revision_id,
@@ -2344,7 +2395,7 @@ async def _root_scalar_rows(
             )
         )
     ).all()
-    return {(row.root_revision_id, row.field_slot): row for row in rows}
+    return {(scalar_row.root_revision_id, scalar_row.field_slot): scalar_row for scalar_row in persisted_scalars}
 
 
 async def _child_scalar_rows(
@@ -2353,11 +2404,15 @@ async def _child_scalar_rows(
     child_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
 ) -> dict[tuple[int, int], Row]:
+    if getattr(context, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_read import scalar_rows
+
+        return await scalar_rows(session, context, child_revision_ids, fields, child=True)
     child_scalar_model = context.model(CustomImportChildScalar)
 
     if not fields or not child_revision_ids:
         return {}
-    rows = (
+    persisted_scalars = (
         await session.execute(
             select(
                 child_scalar_model.child_revision_id,
@@ -2373,7 +2428,7 @@ async def _child_scalar_rows(
             )
         )
     ).all()
-    return {(row.child_revision_id, row.field_slot): row for row in rows}
+    return {(scalar_row.child_revision_id, scalar_row.field_slot): scalar_row for scalar_row in persisted_scalars}
 
 
 def _selected_row_to_search_item(
@@ -2613,6 +2668,10 @@ async def _hydrate_selected_families(
         or sum(selected_row[1].child_count for selected_row in selected_rows) > MAX_DETAIL_CHILDREN
     ):
         raise CustomImportReadUnavailableError("selected families exceed the bounded detail child limit")
+    if getattr(context, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_read import hydrate_families
+
+        return await hydrate_families(session, context, selected_rows, scope_digest)
     root_fields = _detail_root_fields(context.definition)
     root_rows_by_key = await _root_scalar_rows(
         session, context, tuple(selected_row[2].root_revision_id for selected_row in selected_rows), root_fields

@@ -963,27 +963,29 @@ def _validate_projection_pair(
         raise ScalarProjectionError("a stable field slot cannot bind multiple hot projection slots")
 
 
-def _validate_typed_scalar(scalar: TypedScalar) -> None:
+def _validate_typed_scalar(scalar: TypedScalar) -> object | None:
+    """Validate one scalar and return its original logical value."""
     if scalar.value_state not in {"value", "null"}:
         raise ScalarProjectionError("scalar value_state must be value or null")
     if scalar.field_type not in _FIELD_TYPES:
         raise ScalarProjectionError("scalar row has an unsupported field type")
-    values = (
-        scalar.string_value,
-        scalar.integer_value,
-        scalar.decimal_value,
-        scalar.boolean_value,
-        scalar.date_value,
-        scalar.timestamp_value,
+    present = (
+        scalar.string_value is not None,
+        scalar.integer_value is not None,
+        scalar.decimal_value is not None,
+        scalar.boolean_value is not None,
+        scalar.date_value is not None,
+        scalar.timestamp_value is not None,
     )
     if scalar.value_state == "null":
-        if any(value is not None for value in values):
+        if any(present):
             raise ScalarProjectionError("null scalar rows cannot contain a typed value")
-        return
+        return None
     logical_value = scalar.logical_value
-    if logical_value is None or sum(value is not None for value in values) != 1:
+    if logical_value is None or sum(present) != 1:
         raise ScalarProjectionError("value scalar rows require exactly one typed value")
     _normalized_scalar_value(scalar.field_type, logical_value, "synthetic")
+    return logical_value
 
 
 def _root_scalar_model(row: RootScalarProjection) -> CustomImportRootScalar:
