@@ -84,6 +84,7 @@ from process.registry_fhir_catalog_store import (
     create_fhir_catalog_candidate,
     create_fhir_catalog_indexes,
     discard_fhir_catalog_candidate,
+    fhir_catalog_copy_landings,
     has_catalog_snapshot_validation,
     named_catalog_preparation_roles,
     replace_fhir_catalog_relationships,
@@ -865,8 +866,12 @@ async def _build_source_catalog_candidate(
     from process.registry_imported_catalog_preparation import retire_replaced_catalog_sources
 
     await retire_replaced_catalog_sources(loader, copy_target, snapshot, previous, config.grant.control_schema)
-    accounting_by_phase["manual"] = await project_manual_fhir_catalog(loader, copy_target, snapshot, **options_by_name)
-    with extraction_transform(snapshot["projector_version"]):
+    async with AsyncExitStack() as writes:
+        await writes.enter_async_context(fhir_catalog_copy_landings(loader, copy_target))
+        accounting_by_phase["manual"] = await project_manual_fhir_catalog(
+            loader, copy_target, snapshot, **options_by_name
+        )
+        writes.enter_context(extraction_transform(snapshot["projector_version"]))
         accounting_by_phase["sources"] = await _project_catalog_sources(
             config,
             loader,

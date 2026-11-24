@@ -4,6 +4,8 @@
 import json
 import os
 import re
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import date, datetime
 from uuid import UUID, uuid4
@@ -57,6 +59,7 @@ _KEYS = {
 DEFAULT_ROWS = 1000
 DEFAULT_BYTES = 8 * 1024 * 1024
 MAX_BYTES = 34 * 1024 * 1024
+_COPY_LANDINGS = ContextVar("fhir_catalog_copy_landings", default=None)
 
 
 def named_catalog_preparation_roles(configured=None):
@@ -408,6 +411,35 @@ def _write_options(options):
     return tuple(option_by_name[name] for name in ("mode", "columns", "max_rows", "max_bytes"))
 
 
+def _create_landing_sql(landing, namespace, table):
+    return f"CREATE TEMP TABLE {landing} (LIKE {namespace}.{table} INCLUDING DEFAULTS) ON COMMIT DROP"
+
+
+@asynccontextmanager
+async def fhir_catalog_copy_landings(connection, target):
+    """Create this private candidate's COPY tables in its outer transaction, before any per-write savepoints."""
+    _transaction(connection)
+    namespace = _target(target)
+    landings_by_table = {table: "fhir_landing_" + uuid4().hex for table in TABLE_COLUMNS}
+    await connection.execute(
+        ";".join(_create_landing_sql(name, namespace, table) for table, name in landings_by_table.items())
+    )
+    scope_by_field = {"writer": connection, "candidate": target, "tables": landings_by_table}
+    token = _COPY_LANDINGS.set(scope_by_field)
+    try:
+        yield
+    finally:
+        _COPY_LANDINGS.reset(token)
+        scope_by_field.clear()  # Child tasks can inherit this context and outlive the transaction.
+
+
+def _shared_landing(connection, target, table):
+    scope = _COPY_LANDINGS.get()
+    if scope and scope["writer"] is connection and scope["candidate"] is target:
+        return scope["tables"][table]
+    return None
+
+
 async def write_fhir_catalog_rows(
     connection,
     copy_target,
@@ -425,15 +457,15 @@ async def write_fhir_catalog_rows(
     conflict = _conflict(table, selected_columns, mode)
     _bounds(max_rows, max_bytes)
     namespace = _target(copy_target)
-    landing = "fhir_landing_" + uuid4().hex
+    shared_landing = _shared_landing(connection, copy_target, table)
+    landing = shared_landing or "fhir_landing_" + uuid4().hex
     column_sql = ",".join(selected_columns)
     keys = ",".join(name for name, _ in _KEYS[table])
     accounting_by_name = {"input_rows": 0, "affected_rows": 0, "batches": 0, "payload_bytes": 0}
     async with connection.transaction():
         await _mutable(connection, copy_target, loader_role, control_schema)
-        await connection.execute(
-            f"CREATE TEMP TABLE {landing} (LIKE {namespace}.{table} INCLUDING DEFAULTS) ON COMMIT DROP"
-        )
+        if shared_landing is None:
+            await connection.execute(_create_landing_sql(landing, namespace, table))
         for batch_rows, batch_bytes in _batches(copy_rows, selected_columns, max_rows, max_bytes):
             await connection.execute(f"TRUNCATE pg_temp.{landing}")
             await connection.copy_records_to_table(
@@ -447,7 +479,8 @@ async def write_fhir_catalog_rows(
             accounting_by_name["affected_rows"] += int(command_status.rsplit(" ", 1)[-1])
             accounting_by_name["batches"] += 1
             accounting_by_name["payload_bytes"] += batch_bytes
-        await connection.execute(f"DROP TABLE pg_temp.{landing}")
+        if shared_landing is None:
+            await connection.execute(f"DROP TABLE pg_temp.{landing}")
     return accounting_by_name
 
 

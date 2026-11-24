@@ -2,7 +2,7 @@
 """Source labels refresh metadata while committed source facts and identities stay pinned."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -422,6 +422,7 @@ async def test_metadata_only_candidate_copies_existing_snapshot_and_pins_all_pro
 
     for name in ("create_fhir_catalog_candidate", "create_fhir_catalog_indexes", "project_manual_fhir_catalog"):
         monkeypatch.setattr(sync, name, AsyncMock(return_value={}))
+    monkeypatch.setattr(sync, "fhir_catalog_copy_landings", lambda *_args: nullcontext())
     copied = AsyncMock(return_value={"rows": 3})
     monkeypatch.setattr(sync, "copy_fhir_catalog_snapshot", copied)
     for name in (
