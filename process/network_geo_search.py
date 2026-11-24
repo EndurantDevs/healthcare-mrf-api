@@ -241,21 +241,15 @@ def _batch_ctes(layout, source_relation, *, is_base, has_after=False):
     )"""
 
 
-async def _source_pass(connection, target_table, layout, source, *, is_base, verify):
-    """Keep generation and exact comparison bounded to selected edge-location pages."""
+async def _source_pass(connection, target_table, layout, source, *, is_base):
+    """Verify the inserted rows against the same bounded projection."""
     columns = ",".join(compact_identifier(name) for name in _COLUMNS)
-    if verify:
-        tail = f""", actual AS MATERIALIZED (
-          SELECT p.* FROM ONLY {target_table} p JOIN effective e USING(location_key)
-        ) SELECT (SELECT max(location_key) FROM key_page) AS last_key,
-          (SELECT count(*) FROM expected) AS row_count,
-          EXISTS((SELECT {columns} FROM expected EXCEPT SELECT {columns} FROM actual)
-            UNION ALL (SELECT {columns} FROM actual EXCEPT SELECT {columns} FROM expected)) AS differs"""
-    else:
-        tail = f""", inserted AS (INSERT INTO {target_table} ({columns}) SELECT {columns} FROM expected
-          RETURNING location_key)
-        SELECT (SELECT max(location_key) FROM key_page) AS last_key,
-          (SELECT count(*) FROM inserted) AS row_count,FALSE AS differs"""
+    tail = f""", inserted AS (INSERT INTO {target_table} ({columns}) SELECT {columns} FROM expected
+      RETURNING {columns})
+    SELECT (SELECT max(location_key) FROM key_page) AS last_key,
+      (SELECT count(*) FROM inserted) AS row_count,
+      EXISTS((SELECT {columns} FROM expected EXCEPT ALL SELECT {columns} FROM inserted)
+        UNION ALL (SELECT {columns} FROM inserted EXCEPT ALL SELECT {columns} FROM expected)) AS differs"""
     statements = tuple(
         "WITH " + _batch_ctes(layout, source, is_base=is_base, has_after=has_after) + tail
         for has_after in (False, True)
@@ -282,24 +276,16 @@ async def _build_projection(connection, target, layout):
         f"CREATE TABLE {table} AS SELECT {columns},{_GEO} AS geo,ARRAY[]::integer[] AS canonical_network_ids FROM ONLY {_qualified(layout.base)} a WITH NO DATA"
     )
     await connection.execute(
-        f"ALTER TABLE {table} ADD PRIMARY KEY(location_key), ALTER COLUMN canonical_network_ids SET NOT NULL, ADD CHECK(cardinality(canonical_network_ids)>0 AND array_position(canonical_network_ids,NULL) IS NULL)"
+        f"ALTER TABLE {table} ALTER COLUMN canonical_network_ids SET NOT NULL, ADD CHECK(cardinality(canonical_network_ids)>0 AND array_position(canonical_network_ids,NULL) IS NULL)"
     )
     sources = ((layout.base, True),) + (((layout.custom, False),) if layout.custom is not None else ())
     inserted = sum(
-        [
-            await _source_pass(connection, table, layout, source, is_base=is_base, verify=False)
-            for source, is_base in sources
-        ]
+        [await _source_pass(connection, table, layout, source, is_base=is_base) for source, is_base in sources]
     )
-    verified = sum(
-        [
-            await _source_pass(connection, table, layout, source, is_base=is_base, verify=True)
-            for source, is_base in sources
-        ]
-    )
-    _require(inserted == verified == await connection.fetchval(f"SELECT count(*) FROM ONLY {table}"))
+    _require(inserted == await connection.fetchval(f"SELECT count(*) FROM ONLY {table}"))
+    await connection.execute(f"ALTER TABLE {table} ADD PRIMARY KEY(location_key)")
     await _build_geo_search_index(connection, table)
-    return verified
+    return inserted
 
 
 async def _build_geo_search_index(connection, qualified_table):

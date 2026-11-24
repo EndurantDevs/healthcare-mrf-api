@@ -101,8 +101,9 @@ async def test_final_comparison_rejects_missing_or_unselected_extra_rows(search_
     db, original = search_db, search._source_pass
     mutation_events = []
 
-    async def mutate_before_verify(connection, table, layout, source, *, is_base, verify):
-        if verify and not mutation_events:
+    async def mutate_after_projection(connection, table, layout, source, *, is_base):
+        inserted = await original(connection, table, layout, source, is_base=is_base)
+        if inserted and not mutation_events:
             if fault == "missing":
                 await connection.execute(
                     f"DELETE FROM {table} WHERE location_key=(SELECT min(location_key) FROM {table})"
@@ -112,9 +113,9 @@ async def test_final_comparison_rejects_missing_or_unselected_extra_rows(search_
                     f'INSERT INTO {table} SELECT (jsonb_populate_record(NULL::{table},to_jsonb(row)||\'{{"location_key":"extra-unselected"}}\'::jsonb)).* FROM {table} row LIMIT 1'
                 )
             mutation_events.append(fault)
-        return await original(connection, table, layout, source, is_base=is_base, verify=verify)
+        return inserted
 
-    monkeypatch.setattr(search, "_source_pass", mutate_before_verify)
+    monkeypatch.setattr(search, "_source_pass", mutate_after_projection)
     with pytest.raises(search.NetworkGeoSearchError):
         await search.prepare_network_geo_search(db.connection, db.search_target, db.second_layout)
     assert mutation_events == [fault]
