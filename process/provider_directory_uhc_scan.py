@@ -3,9 +3,10 @@
 
 import asyncio
 import re
+import time
 import urllib.parse
 from contextlib import aclosing
-from functools import partial
+from functools import lru_cache, partial
 from itertools import batched, islice
 
 from db.plan_release_storage import storage_relation
@@ -21,11 +22,13 @@ BARE_ZIP_ERROR = "uhc_bare_zip_postal_codes_unverified"
 REFERENCE_CLOSURE_ERROR = "uhc_reference_closure_incomplete"
 REFERENCE_SOURCE_TYPES = ("InsurancePlan", "PractitionerRole", "OrganizationAffiliation")
 REFERENCE_TARGET_TYPES = ("Practitioner", "Organization", "Location")
-REFERENCE_BATCH_SIZE = {"Practitioner": 15, "Location": 10}
+REFERENCE_BATCH_SIZE = {"Practitioner": 15, "Organization": 15, "Location": 10}
 ROLE_LINK_FIELDS = {"Practitioner": "practitioner_ref", "Organization": "organization_ref", "Location": "location_refs"}
+LEAF_RETRY_DELAYS_SECONDS = (5.0, 30.0)
 RETRY_ROUNDS = 2
 RETRY_DELAY_SECONDS = 2.0
 REFERENCE_FLUSH_ROWS = 500
+REFERENCE_PREFILL_DISCOVERY_SECONDS = 10.0
 _DIGITS = "0123456789"
 _ZIP5 = re.compile(r"[0-9]{5}")
 _PARTIAL_ZIP4 = re.compile(r"[0-9]{5}-[0-9]{1,3}")
@@ -172,10 +175,13 @@ def defer_failed_leaf(directory, request, fetch_error):
 
 async def retry_failed_leaves(directory, source_record, resource_type, start_url_queue, state, fetch_options):
     """Re-walk leaves whose pages still failed after transport retries, then record what remains."""
-    for retry_round in range(RETRY_ROUNDS):
+    for delay_seconds in LEAF_RETRY_DELAYS_SECONDS:
         if not state.retry_leaf_urls or state.stop_event.is_set():
             break
-        await asyncio.sleep(RETRY_DELAY_SECONDS * (retry_round + 1))
+        deadline_at = fetch_options.deadline_at
+        if deadline_at is not None:
+            delay_seconds = min(delay_seconds, max(0.0, deadline_at - time.monotonic()))
+        await asyncio.sleep(delay_seconds)
         retry_urls = list(state.retry_leaf_urls)
         state.retry_leaf_urls.clear()
         if isinstance(start_url_queue, asyncio.LifoQueue):
@@ -204,13 +210,6 @@ async def _stored_rows(directory, dataset_id, resource_type):
             yield stored_row["payload_json"]
 
 
-def _missing_row_references(directory, resource_row, fields_by_target, acquired_ids_by_type):
-    for target_type, reference, _field in directory._row_linked_reference_candidates(resource_row, fields_by_target):
-        resource_key = directory._reference_resource_key(reference, target_type)
-        if resource_key and resource_key[1] not in acquired_ids_by_type[target_type]:
-            yield resource_key
-
-
 async def _missing_references(directory, dataset_id, resource_types):
     """Hold only ids: acquired targets, then references from roles, affiliations and plans."""
     acquired_ids_by_type = {
@@ -219,6 +218,13 @@ async def _missing_references(directory, dataset_id, resource_types):
     for target_type, acquired_ids in acquired_ids_by_type.items():
         async for resource_row in _stored_rows(directory, dataset_id, target_type):
             acquired_ids.add(resource_row.get("resource_id"))
+
+    @lru_cache(maxsize=16_384)
+    def missing_key(target_type, reference):
+        """Reuse the parsed key against the fixed acquired-ID snapshot."""
+        key = directory._reference_resource_key(reference, target_type)
+        return key if key and key[1] not in acquired_ids_by_type[target_type] else None
+
     missing_keys = set()
     for source_type in (resource_type for resource_type in REFERENCE_SOURCE_TYPES if resource_type in resource_types):
         fields_by_target = {
@@ -227,9 +233,11 @@ async def _missing_references(directory, dataset_id, resource_types):
             if target_type in acquired_ids_by_type
         }
         async for resource_row in _stored_rows(directory, dataset_id, source_type):
-            missing_keys.update(
-                _missing_row_references(directory, resource_row, fields_by_target, acquired_ids_by_type)
-            )
+            for target_type, reference, _field in directory._row_linked_reference_candidates(
+                resource_row, fields_by_target
+            ):
+                if key := missing_key(target_type, reference):
+                    missing_keys.add(key)
     return sorted(missing_keys)
 
 
@@ -413,9 +421,16 @@ async def hydrate_saved_role_links(
     from process.provider_directory_generic_source_adapters import missing_saved_role_links
 
     concurrency = max(1, directory._partition_fetch_concurrency() // 8)
-    keys = await missing_saved_role_links(
-        directory, source_record["_endpoint_dataset_id"], resource_type, ROLE_LINK_FIELDS[resource_type]
-    )
+    discovery_budget = REFERENCE_PREFILL_DISCOVERY_SECONDS if max_batches is not None else None
+    try:
+        async with asyncio.timeout(discovery_budget):
+            keys = await missing_saved_role_links(
+                directory, source_record["_endpoint_dataset_id"], resource_type, ROLE_LINK_FIELDS[resource_type]
+            )
+    except TimeoutError:
+        if max_batches is None:
+            raise
+        return 0
     reader = _ReferenceReader(
         directory, source_record, persist, timeout=timeout, run_id=run_id, use_batches=True, concurrency=concurrency
     )
@@ -427,12 +442,76 @@ async def hydrate_saved_role_links(
     return reader.written_by_type[resource_type]
 
 
+async def _seed_network_organizations(directory, runner):
+    """Persist the small explicit network search through the ordinary Optum cursor."""
+    resource_type = "Organization"
+    source_record = runner.source_record
+    options = runner.options
+    start_url = directory._resource_start_url(source_record, resource_type, page_count=100)
+    if not start_url:
+        return 0
+    request_url = directory._url_with_query_item(start_url, "type", "ntwk")
+    seen_ids = set()
+
+    async def persist_networks(model, rows):
+        """Write only full Organizations with an explicit network coding."""
+        networks = []
+        for row in rows:
+            if row["resource_id"] in seen_ids or not any(coding.get("code") == "ntwk" for coding in row["type_codes"]):
+                continue
+            if any(tag.get("code") == "SUBSETTED" for tag in (row.get("fhir_meta") or {}).get("tag", ())):
+                continue
+            seen_ids.add(row["resource_id"])
+            networks.append(row)
+        return await runner.persist_batch(resource_type, model, networks) if networks else 0
+
+    state = directory.PartitionFetchState(directory.ProviderDirectoryOrganization, [])
+    request = directory.PartitionChainRequest(
+        source_record=source_record,
+        resource_type=resource_type,
+        start_url_queue=asyncio.Queue(),
+        state=state,
+        request_url=request_url,
+        fetch_options=directory.PartitionFetchOptions(
+            timeout=directory._source_resource_timeout(source_record, resource_type, options.timeout),
+            run_id=options.run_id,
+            row_batch_handler=persist_networks,
+            row_batch_size=resource_batch_size(directory, runner, source_record),
+            retain_rows=False,
+            deadline_at=(
+                time.monotonic() + options.resource_deadline_seconds if options.resource_deadline_seconds > 0 else None
+            ),
+            max_pages=100,
+            cancel_ctx=options.cancel_ctx,
+            cancel_task=options.cancel_task,
+        ),
+    )
+    token = source_proxy.PARTITION_CURSOR_KEY.set("Organization:type=ntwk")
+    try:
+        await directory._fetch_partition_url_chain(request)
+    finally:
+        source_proxy.PARTITION_CURSOR_KEY.reset(token)
+    return state.written_count
+
+
 async def hydrate_before_scan(directory, runner, resource_type, role_done):
-    """Start Location intake with one batch of IDs already known from roles."""
-    if resource_type != "Location" or role_done.is_set() or not directory.is_source_storage_required():
+    """Seed network Organizations and one batch of Locations before their full scans."""
+    if resource_type not in {"Organization", "Location"} or not directory.is_source_storage_required():
         return
     proxy_run = source_proxy.current_run()
     if not proxy_run or not proxy_run.enabled(runner.source_record):
+        return
+    if resource_type == "Organization":
+        if (
+            is_source(directory, runner.source_record)
+            and runner.source_record.get("_endpoint_dataset_id")
+            and runner.is_streaming
+            and runner.options.per_resource_limit <= 0
+            and runner.options.page_limit <= 0
+        ):
+            runner.count_by_resource[resource_type] += await _seed_network_organizations(directory, runner)
+        return
+    if role_done.is_set():
         return
     written = await hydrate_saved_role_links(
         directory,

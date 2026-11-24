@@ -664,6 +664,60 @@ async def _stream(rows):
         yield row
 
 
+@pytest.mark.parametrize(
+    ("stale_hash", "acquired", "error"),
+    [
+        (False, None, None),
+        (True, None, "payload_hash_changed"),
+        (False, "f" * 64, "semantic_resource_subset_invalid"),
+        (True, "f" * 64, "payload_hash_changed"),
+    ],
+)
+def test_semantic_observation_hashes_once_and_keeps_refusal_order(monkeypatch, stale_hash, acquired, error):
+    from importlib import import_module
+
+    directory = import_module("process.provider_directory_fhir")
+    row_by_field = {
+        **_resource("one"),
+        "resource_type": "Location",
+        "payload_json": {"resource_id": "one", "active": True},
+    }
+    contract = directory.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    row_by_field["payload_hash"] = directory.resource_payload_sha256_for_contract(
+        row_by_field["payload_json"], contract, resource_type=row_by_field["resource_type"]
+    )
+    if stale_hash:
+        row_by_field["payload_hash"] = "0" * 64
+    row_by_field["acquired_resource_sha256"] = acquired
+    hash_payload = Mock(wraps=directory.resource_payload_sha256_for_contract)
+    monkeypatch.setattr(directory, "resource_payload_sha256_for_contract", hash_payload)
+    prepare, _merge_rows = completion._resource_callbacks(directory, SimpleNamespace(resource_hash_contract=contract))
+    if error:
+        error_type = GenericCandidateError if stale_hash else RuntimeError
+        with pytest.raises(error_type, match=error):
+            prepare(row_by_field)
+    else:
+        assert prepare(row_by_field) == row_by_field
+    hash_payload.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["resource_input", "witness_input"])
+async def test_independent_validation_reads_the_same_active_scope_without_sorting(key):
+    cursor = Mock(side_effect=lambda *args, **kwargs: _stream([{"resource_id": "one"}]))
+    connection, policy = SimpleNamespace(cursor=cursor), SimpleNamespace(schema="source")
+    binding_by_field = {"tables": {key: {"name": key}}, "resets": {"*": 2, "Location": 7}}
+    args = (connection, policy, binding_by_field, key, ("resource_id",))
+    assert [row async for row in completion._active_rows(*args)] == [
+        row async for row in completion._active_rows(*args, ordered=False)
+    ]
+    ordered, unordered = cursor.call_args_list
+    assert ordered.args[0].split("ORDER BY")[0] == unordered.args[0]
+    assert "ORDER BY" in ordered.args[0] and "ORDER BY" not in unordered.args[0]
+    assert ordered.args[1:] == unordered.args[1:] == (2, completion.storage._encoded(binding_by_field["resets"]))
+    assert ordered.kwargs == unordered.kwargs == {"prefetch": 4096}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [completion._RECHECK_ROWS, completion._RECHECK_ROWS + 1, 10**10])
 async def test_reduced_heap_rechecks_validate_every_returned_row_with_bounded_sampling(count):

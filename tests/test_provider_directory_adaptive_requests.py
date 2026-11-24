@@ -141,6 +141,22 @@ async def test_optum_reduces_for_a_high_transient_rate_after_minimum_sample(monk
     assert snapshot["transient_http_503"] == len(failure_indices)
 
 
+async def test_optum_transient_floor_keeps_throttle_reductions_below_it(monkeypatch):
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    shared_source = source(base)
+    responses = [(502, {}, None, 0)] * 12 + [(429, {}, None, 0)] * 3 + [(502, {}, None, 0)] * 4
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", AsyncMock(side_effect=responses))
+    observed_limits = []
+    async with importer._source_http_session_scope(force=True, request_concurrency=32):
+        for index in range(len(responses)):
+            await importer._fetch_source_json_once(shared_source, f"{base}/{index}", timeout=1)
+            observed_limits.append(request_concurrency_snapshot(shared_source)["limit"])
+    assert observed_limits == [32] * 3 + [16] * 4 + [8] * 5 + [4, 2, 1] + [1] * 4
+    snapshot = request_concurrency_snapshot(shared_source)
+    assert snapshot["transient_http_502"] == 16
+    assert snapshot["reductions"] == 5 and snapshot["throttled_responses"] == 3
+
+
 async def test_optum_recovers_only_after_healthy_time_at_capacity_and_pending_demand(monkeypatch, source_request_clock):
     """Require both sustained utilization and healthy finishes in the current allowance."""
     base = importer.UHC_PROVIDER_DIRECTORY_BASE

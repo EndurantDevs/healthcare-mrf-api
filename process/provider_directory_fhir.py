@@ -40309,14 +40309,20 @@ async def _retry_rest_pagination_after_cooldown(
     *,
     timeout: int,
     deadline_at: float | None,
+    is_retryable: Callable[[tuple[int | None, dict[str, Any] | None, str | None, int]], bool] | None = None,
 ) -> RestPaginationCooldownResult:
     """Retry one unchanged checkpoint URL after terminal quick-retry failures."""
+
+    def should_retry(response):
+        """Check each retry response against the cursor's transport policy."""
+        if is_retryable is not None:
+            return is_retryable(response)
+        return _is_rest_pagination_cooldown_failure(response[0], response[2], source_record=source_record)
+
     retries = 0
     wait_seconds = 0.0
-    while retries < REST_PAGINATION_COOLDOWN_RETRY_CAP:
-        status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
-        if not _is_rest_pagination_cooldown_failure(status_code, fetch_error, source_record=source_record):
-            break
+    while retries < REST_PAGINATION_COOLDOWN_RETRY_CAP and should_retry(fetch_result):
+        status_code, fhir_payload, _fetch_error, _elapsed_ms = fetch_result
         if source_selection.should_defer_census_retry(sys.modules[__name__], source_record, fhir_payload):
             break
         delay_seconds = _rest_pagination_cooldown_delay_seconds(
@@ -40348,18 +40354,12 @@ async def _retry_rest_pagination_after_cooldown(
                 wait_seconds=wait_seconds,
                 deadline_blocked=True,
             )
-    status_code, _fhir_payload, fetch_error, _elapsed_ms = fetch_result
-    is_failure_transient = _is_rest_pagination_cooldown_failure(
-        status_code,
-        fetch_error,
-        source_record=source_record,
-    )
     return RestPaginationCooldownResult(
         fetch_result=fetch_result,
         retries=retries,
         wait_seconds=wait_seconds,
         recovered=(retries > 0 and fetch_result[0] == 200 and fetch_result[2] is None),
-        exhausted=(is_failure_transient and retries >= REST_PAGINATION_COOLDOWN_RETRY_CAP),
+        exhausted=(retries >= REST_PAGINATION_COOLDOWN_RETRY_CAP and should_retry(fetch_result)),
     )
 
 
@@ -47166,10 +47166,8 @@ async def _fetch_valid_partition_bundle(
     request: PartitionPageRequest,
 ) -> dict[str, Any] | None:
     """Fetch one page and record bounded protocol failures."""
-    status_code, fhir_payload, fetch_error, _elapsed = await _fetch_source_json(
-        request.source_record,
-        request.current_url,
-        timeout=request.fetch_options.timeout,
+    status_code, fhir_payload, fetch_error, _elapsed = await fhir_response.fetch_partition_response(
+        sys.modules[__name__], request
     )
     if status_code != 200 or fetch_error:
         if uhc_scan.is_source(sys.modules[__name__], request.source_record):

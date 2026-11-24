@@ -1996,7 +1996,7 @@ async def _validate_transition_payloads(connection, policy, candidate_by_field):
         ("resource_input", RESOURCE_COLUMNS, prepare),
         ("witness_input", WITNESS_COLUMNS, completion._witness),
     ):
-        async for row in completion._active_rows(connection, policy, candidate_by_field, key, columns):
+        async for row in completion._active_rows(connection, policy, candidate_by_field, key, columns, ordered=False):
             _require(row["dataset_id"] == identity["dataset_id"], "transition_input_changed")
             validate(row)
 
