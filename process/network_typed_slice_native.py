@@ -6,6 +6,7 @@ from process.registry_typed_membership_parity import COLUMNS, ORDER, _last_page_
 
 _DOMAIN = b"network-office-slice-v1\0"
 _METADATA_ROWS = 256
+_MATCH_ROWS = 50_000
 
 
 def _parameters(start):
@@ -31,15 +32,23 @@ async def _insert_matched_page(connection, tables, bounds, affected):
     ordered_fields = ",".join("m." + term for term in ORDER.split(","))
     statement = await connection.prepare(
         f"""WITH source_page AS NOT MATERIALIZED (
-      SELECT m.* FROM {membership} m WHERE {condition} ORDER BY {ordered_fields} FETCH FIRST 5000 ROWS WITH TIES
+      SELECT m.* FROM {membership} m WHERE {condition} ORDER BY {ordered_fields} FETCH FIRST {_MATCH_ROWS} ROWS WITH TIES
+    ), subjects AS NOT MATERIALIZED (
+      SELECT network_id,provider_system,provider_id,location_id,count(*)::bigint AS membership_rows
+      FROM source_page GROUP BY network_id,provider_system,provider_id,location_id
     ), matched AS NOT MATERIALIZED (
-      SELECT m.network_id,a.location_key,(get_byte(sha256(convert_to(a.location_key,'UTF8')),0)&63)::integer AS office_bucket
-      FROM source_page m LEFT JOIN {bindings} b USING(provider_system,provider_id,location_id)
+      SELECT m.network_id,a.location_key,m.membership_rows
+      FROM subjects m LEFT JOIN LATERAL (
+        SELECT location_key,entity_type,entity_id FROM {bindings} binding
+        WHERE (binding.provider_system,binding.provider_id,binding.location_id)=(m.provider_system,m.provider_id,m.location_id)
+        OFFSET 0
+      ) b ON TRUE
       LEFT JOIN {addresses} a ON a.location_key=b.location_key AND a.entity_type=b.entity_type AND a.entity_id=b.entity_id
       WHERE {affected_filter}
     ), accumulated AS (
-      INSERT INTO {work} AS prior SELECT network_id,location_key,office_bucket,count(*)::bigint
-      FROM matched GROUP BY network_id,location_key,office_bucket
+      INSERT INTO {work} AS prior SELECT network_id,location_key,
+        (get_byte(sha256(convert_to(location_key,'UTF8')),0)&63)::integer,sum(membership_rows)::bigint
+      FROM matched GROUP BY network_id,location_key
       ON CONFLICT(network_id,office_bucket,location_key) DO UPDATE SET membership_rows=prior.membership_rows+excluded.membership_rows
       RETURNING location_key
     ) INSERT INTO {locations} SELECT DISTINCT location_key FROM accumulated WHERE location_key IS NOT NULL ON CONFLICT DO NOTHING"""
@@ -66,7 +75,9 @@ async def build_matched_facts(connection, schema, addresses, work, affected):
     await connection.execute(f'CREATE TEMP TABLE {locations}(location_key text COLLATE "C" PRIMARY KEY) ON COMMIT DROP')
     after = None
     while (
-        endpoint := await _last_page_key(connection, "SELECT " + COLUMNS + " FROM " + membership, after)
+        endpoint := await _last_page_key(
+            connection, "SELECT " + COLUMNS + " FROM " + membership, after, page_rows=_MATCH_ROWS
+        )
     ) is not None:
         upper_keys = tuple(endpoint)
         await _insert_matched_page(

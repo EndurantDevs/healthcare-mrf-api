@@ -10,7 +10,7 @@ from process.network_compact_layout import CompactAddressRelation, CompactEdgeAr
 from process.network_compact_readiness import NetworkCompactReadinessError, compact_index_digest
 from process.network_compact_slice_validation import verify_compact_slice_contents
 from process.network_compact_validation import _actual_memberships, _membership_sets_differ
-from process.network_typed_slice_native import build_matched_facts, verify_work_refs
+from process.network_typed_slice_native import _MATCH_ROWS, build_matched_facts, verify_work_refs
 from process.registry_typed_membership_parity import ORDER
 from tests.test_network_membership_slices_postgres import _candidate, _pin, _prepare, slice_db
 
@@ -196,6 +196,33 @@ async def _independent_native_work(db, target):
             "ALTER TABLE independent_facts ADD PRIMARY KEY(network_id,office_bucket,location_key)"
         )
     return '"independent_facts"'
+
+
+@pytest.mark.parametrize("select_bucket", [False, True])
+async def test_native_facts_keep_all_evidence_at_page_boundary(slice_db, select_bucket):
+    db = slice_db
+    target = await _candidate(db, [(7, 0), (42, 1), (99, 2)])
+    namespace = '"' + target.schema_name + '"'
+    async with db.connection.transaction():
+        await db.connection.execute(f"CREATE INDEX ON {namespace}.network_membership({ORDER})")
+        await db.connection.execute(f"""INSERT INTO {namespace}.network_membership
+            SELECT network_id,provider_system,provider_id,location_id,evidence_id
+            FROM {namespace}.network_membership CROSS JOIN generate_series(1,{_MATCH_ROWS}) WHERE network_id=42""")
+        await db.connection.execute(f"DELETE FROM {namespace}.provider_location_binding WHERE location_key='office-a'")
+        affected = None
+        if select_bucket:
+            await db.connection.execute("""CREATE TEMP TABLE changed_buckets ON COMMIT DROP AS
+                SELECT 42 AS network_id,get_byte(sha256(convert_to('office-b','UTF8')),0)&63 AS office_bucket""")
+            affected = '"changed_buckets"'
+        counts = await build_matched_facts(
+            db.connection, namespace, '"' + db.source_schema + '".retained_addresses', '"source_facts"', affected
+        )
+        assert counts["invalid_memberships"] == (0 if select_bucket else 1)
+        assert counts["invalid_location_keys"] == 0
+        assert counts["membership_rows"] == _MATCH_ROWS + (1 if select_bucket else 3)
+        actual = await db.connection.fetch("SELECT network_id,membership_rows FROM source_facts ORDER BY network_id")
+        expected_rows = [(42, _MATCH_ROWS + 1)]
+        assert list(map(tuple, actual)) == (expected_rows if select_bucket else [(7, 1), *expected_rows, (99, 1)])
 
 
 def _reference_mutations(namespace):
