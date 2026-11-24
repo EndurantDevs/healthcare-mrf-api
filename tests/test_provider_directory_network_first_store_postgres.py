@@ -642,6 +642,27 @@ async def published_graph(graph, monkeypatch):
             await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
+async def test_compact_edition_read_keeps_bindings_and_source_aliases(graph, published_graph):
+    from process import provider_directory_named_edition as named
+
+    connection = graph.connection
+    catalog = published_graph.options["catalog_schema"]
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        full = await named.named_current_editions(connection, catalog)
+        compact = await named.named_current_editions(connection, catalog, include_full_header=False)
+
+    (full_edition,) = full
+    (binding,) = compact
+    assert (binding.endpoint_id, binding.dataset_id, binding.schema_name, binding.source_ids) == (
+        full_edition.endpoint_id,
+        full_edition.dataset_id,
+        full_edition.schema_name,
+        full_edition.source_ids,
+    )
+    assert binding.header["publication_metadata_json"] == {"source_ids": list(binding.source_ids)}
+    assert full_edition.header["publication_metadata_json"] == published_graph.metadata
+
+
 async def test_followup_reads_exact_named_header_with_absent_or_stale_legacy_header(graph, published_graph):
     from process import provider_directory_named_edition as named
     from process import provider_directory_network_snapshot_scope as scope

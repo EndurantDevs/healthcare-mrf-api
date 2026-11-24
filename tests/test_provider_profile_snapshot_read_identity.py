@@ -87,20 +87,21 @@ async def test_loader_failure_and_cancellation_cleanup_snapshot_metadata(metadat
 
 async def test_named_directory_editions_are_reused_only_for_the_same_unfiltered_snapshot(metadata, monkeypatch):
     session = _Session()
-    read_editions = AsyncMock(side_effect=[(), ("filtered",), ("new-edition",)])
+    read_editions = AsyncMock(side_effect=[(), ("filtered",), ("full-header",), ("new-edition",)])
     monkeypatch.setattr(directory_stage, "_copy_driver", AsyncMock())
     monkeypatch.setattr(named_editions, "named_current_editions", read_editions)
 
     async with snapshots._read_snapshot_scope(session, "published", include_detail=True):
         assert await npi._named_directory_editions(session, "published") == ()
         assert await npi._named_directory_editions(session, "published", ("source",)) == ("filtered",)
+        assert await named_editions.named_editions_for_session(session, "published") == ("full-header",)
         assert await npi._named_directory_editions(session, "published") == ()
-        assert read_editions.await_count == 2
+        assert read_editions.await_count == 3
 
     assert session.info == {"api_reader_verified": True}
     async with snapshots._read_snapshot_scope(session, "published", include_detail=True):
         assert await npi._named_directory_editions(session, "published") == ("new-edition",)
-    assert read_editions.await_count == 3
+    assert read_editions.await_count == 4
 
 
 async def test_names_replaced_after_snapshot_start_fail_before_any_loader(metadata):
