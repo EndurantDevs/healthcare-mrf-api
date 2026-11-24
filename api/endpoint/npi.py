@@ -965,7 +965,7 @@ async def _named_directory_editions(session, schema, source_ids=None):
     """Keep generation-scoped network responses on their existing source pin."""
     if current_network_address_scope() is not None:
         return ()
-    return await named_editions_for_session(session, schema, source_ids)
+    return await named_editions_for_session(session, schema, source_ids, include_full_header=False)
 
 
 def _schema_cache_key(table_name: str) -> str:

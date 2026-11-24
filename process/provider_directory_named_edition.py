@@ -14,6 +14,10 @@ _ADDRESS_EDITIONS = ContextVar("provider_directory_address_editions", default=()
 POINTER_SCHEMA = "provider_directory_editions"
 POINTER_TABLE = "current_edition"
 HEADER = "provider_directory_endpoint_dataset"
+_HEADER_BINDING_FIELDS = (
+    "endpoint_id,dataset_id,status,is_current,published_at,superseded_at,acquisition_root_run_id,dataset_hash,"
+    "resource_count,jsonb_build_object('source_ids',publication_metadata_json->'source_ids') AS publication_metadata_json"
+)
 PAYLOAD_TABLES = frozenset(
     (
         "provider_directory_dataset_resource",
@@ -67,16 +71,17 @@ async def find_current_edition(connection, catalog_schema, endpoint_id):
     return await current_edition(connection, catalog_schema, endpoint_id)
 
 
-async def read_edition_header(connection, schema, dataset_id):
+async def read_edition_header(connection, schema, dataset_id, *, include_full_header=True):
     """Read one immutable edition without consulting database-local metadata."""
     header = storage_relation(schema, HEADER)
+    projection = "*" if include_full_header else _HEADER_BINDING_FIELDS
     return await connection.fetchrow(
-        f"SELECT * FROM {header} WHERE dataset_id=$1 AND status='published' AND published_at IS NOT NULL",
+        f"SELECT {projection} FROM {header} WHERE dataset_id=$1 AND status='published' AND published_at IS NOT NULL",
         dataset_id,
     )
 
 
-async def named_current_editions(connection, catalog_schema, source_ids=None):
+async def named_current_editions(connection, catalog_schema, source_ids=None, *, include_full_header=True):
     """Resolve logical headers once in the caller's read transaction."""
     _require(
         source_ids is None or not isinstance(source_ids, str) and all(_text(source_id, 96) for source_id in source_ids)
@@ -97,12 +102,12 @@ async def named_current_editions(connection, catalog_schema, source_ids=None):
     )
     editions = []
     for pointer_record in pointer_records:
-        editions.append(await _read_named_edition(connection, catalog_schema, pointer_record))
+        editions.append(await _read_named_edition(connection, catalog_schema, pointer_record, include_full_header))
     _require(len({edition.endpoint_id for edition in editions}) == len(editions))
     return tuple(editions)
 
 
-async def _read_named_edition(connection, catalog_schema, pointer_record):
+async def _read_named_edition(connection, catalog_schema, pointer_record, include_full_header):
     """Validate one logical pointer and its immutable published header."""
     endpoint_id = pointer_record["endpoint_id"]
     dataset_id = pointer_record["dataset_id"]
@@ -114,7 +119,9 @@ async def _read_named_edition(connection, catalog_schema, pointer_record):
     if pointer_record["previous_schema_name"] is not None:
         _require(_text(pointer_record["previous_dataset_id"], 96))
         storage_identifier(pointer_record["previous_schema_name"])
-    header_record = await read_edition_header(connection, schema_name, dataset_id)
+    header_record = await read_edition_header(
+        connection, schema_name, dataset_id, include_full_header=include_full_header
+    )
     _require(header_record is not None)
     header_by_field = dict(header_record)
     publication_metadata = header_by_field.get("publication_metadata_json")
@@ -149,16 +156,21 @@ async def _read_named_edition(connection, catalog_schema, pointer_record):
     )
 
 
-async def named_editions_for_session(session, catalog_schema, source_ids=None):
+async def named_editions_for_session(session, catalog_schema, source_ids=None, *, include_full_header=True):
     """Use the caller's transaction and reuse an unfiltered provider snapshot."""
     from process.provider_directory_projection_stage import _copy_driver
 
-    editions_by_schema = getattr(session, "info", {}).get("provider_profile_named_editions")
-    if source_ids is not None or editions_by_schema is None:
-        return await named_current_editions(await _copy_driver(session), catalog_schema, source_ids)
-    if catalog_schema not in editions_by_schema:
-        editions_by_schema[catalog_schema] = await named_current_editions(await _copy_driver(session), catalog_schema)
-    return editions_by_schema[catalog_schema]
+    edition_cache = getattr(session, "info", {}).get("provider_profile_named_editions")
+    if source_ids is not None or edition_cache is None:
+        return await named_current_editions(
+            await _copy_driver(session), catalog_schema, source_ids, include_full_header=include_full_header
+        )
+    cache_key = (catalog_schema, include_full_header)
+    if cache_key not in edition_cache:
+        edition_cache[cache_key] = await named_current_editions(
+            await _copy_driver(session), catalog_schema, include_full_header=include_full_header
+        )
+    return edition_cache[cache_key]
 
 
 def _literal(value):
