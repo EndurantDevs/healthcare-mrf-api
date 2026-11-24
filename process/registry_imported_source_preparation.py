@@ -26,7 +26,7 @@ from process.registry_imported_source_reuse import (
     is_compatible_typed_recipe,
     predecessor_recipes,
 )
-from process.registry_network_import_progress import NETWORK_PROGRESS, network_import_stage
+from process.registry_network_import_progress import NETWORK_PROGRESS, network_import_stage, network_publication_step
 from process.registry_source_recipe_composition import SourceWitnessRuntime
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -296,4 +296,5 @@ async def prepare_imported_source_recipes(capture_transaction, *, request_id, en
         recipes.append(recipe)
         (created if is_new else reused).append(recipe.source_pin.capture["schema_name"])
     await network_import_stage("Membership publication")
+    await network_publication_step("Mapping sources", unit="source", total=len(recipes))
     return ImportedSourcePreparation(tuple(recipes), tuple(created), tuple(reused))

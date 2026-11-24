@@ -14,6 +14,7 @@ from process.network_fhir_source_witness_contract import digest
 from process.provider_directory_profile import valid_npi_sql
 from process.registry_imported_catalog_bindings import published_catalog_binding_query, require_valid_catalog_bindings
 from process.registry_native_network_catalog import native_network_definitions, validate_native_catalog_descriptor
+from process.registry_network_import_progress import network_source_mapped
 
 PREFIX = "registry_native_provider_"
 CONTRACT = "registry-native-provider-capture-v1"
@@ -514,6 +515,7 @@ async def append_native_provider_stages(
                     retained_captures=retained_captures,
                 )
             )
+            await network_source_mapped(batch=True)
     _, recipe_hash = _source_stage_recipes(recipes, True)
     generations = base.source_generations + tuple(
         digest([stage.capture_sha256, stage.mapping_sha256]) for stage in mapped_stages

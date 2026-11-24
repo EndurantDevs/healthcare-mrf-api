@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import sys
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -222,6 +222,42 @@ async def test_graph_progress_keeps_first_safe_failure_after_status_write_error(
     assert failure.progress["denominator_state"] == "unknown"
     assert failure.control_error_code == code and source_label in str(failure)
     assert "private_key" not in str(failure) and "later" not in str(failure)
+
+
+@pytest.mark.asyncio
+async def test_publication_progress_reports_source_and_index_counts(monkeypatch):
+    from process import network_compact_preparation as compact
+    from process import registry_network_import_progress as progress
+
+    @asynccontextmanager
+    async def validate_candidate(*_args, **_kwargs):
+        await progress.network_source_mapped()
+        await progress.network_source_mapped(batch=True)
+        yield {}, None
+
+    monkeypatch.setattr(compact, "_validated_candidate", validate_candidate)
+    monkeypatch.setattr(compact, "_previous_slices", AsyncMock(return_value=None))
+    monkeypatch.setattr(compact, "_prepare_slices", AsyncMock(return_value=None))
+    events = []
+    monkeypatch.setattr(progress, "write_live_progress", lambda **fields: events.append(fields))
+    report = progress.NetworkImportProgress(total=1, committed=1)
+    with progress.NETWORK_PROGRESS.set(report):
+        await progress.network_publication_step("Unrelated status")
+        await progress.network_import_stage("Membership publication")
+        await progress.network_publication_step("Mapping sources", unit="source", total=2)
+        await compact._validated_slices(None, None, None, {}, "registry", None)
+        await progress.network_publication_step("Building serving indexes", unit="index", total=3)
+        await progress.network_publication_step("Building serving indexes", unit="index", done=1, total=3)
+        await progress.network_publication_step("Validating final membership snapshot")
+    assert [event["done"] for event in events] == [0, 0, 1, 2, 0, 0, 1, 0]
+    assert events[3]["message"] == "Mapping sources (2 of 2)"
+    assert events[4]["message"] == "Building serving slices"
+    assert events[6]["message"] == "Building serving indexes (1 of 3)"
+    assert events[-1]["counters"] == {"graphs_committed": 1, "graphs_reused": 0}
+    assert "total" not in events[-1] and "phase_pct" not in events[-1]
+    assert events[0]["stage_id"] == "membership_publication"
+    assert events[-1]["stage_id"] == "membership_publication_validating_final_membership_snapshot"
+    assert all(event["phase"] == "Membership publication" for event in events)
 
 
 @pytest.mark.asyncio

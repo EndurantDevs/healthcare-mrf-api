@@ -50,9 +50,13 @@ class NetworkImportProgress:
     committed: int = 0
     reused: int = 0
     source_failure: tuple[str, tuple[str, str]] | None = None
+    publication_step: str | None = None
+    publication_unit: str = "phase"
+    publication_done: int = 0
+    publication_total: int | None = None
 
     def fields(self):
-        """Graph fractions describe only capture, including recovered editions."""
+        """Report bounded work in the current step with overall completion unknown."""
         progress_by_name = {
             "phase": self.stage,
             "stage_id": self.stage.lower().replace(" ", "_"),
@@ -78,6 +82,21 @@ class NetworkImportProgress:
                     basis="phase",
                     phase_pct=100 * ready / self.total if self.total else 0,
                     message=summary,
+                )
+        if self.publication_step is not None:
+            progress_by_name.update(
+                message=self.publication_step,
+                unit=self.publication_unit,
+                done=self.publication_done,
+                stage_id="membership_publication_" + self.publication_step.lower().replace(" ", "_"),
+            )
+            if self.publication_total is not None:
+                done, total = self.publication_done, self.publication_total
+                progress_by_name.update(
+                    total=total,
+                    basis="phase",
+                    phase_pct=100 * done / total if total else 100,
+                    message=f"{self.publication_step} ({done} of {total})",
                 )
         return progress_by_name
 
@@ -109,7 +128,8 @@ class NetworkImportProgress:
         subject = f" for {source}" if source else ""
         progress_by_name = self.fields()
         summary = progress_by_name.pop("detail", None)
-        progress_by_name["message"] = ". ".join(filter(None, (f"{self.stage} failed{subject}", reason, summary)))
+        label = self.publication_step or self.stage
+        progress_by_name["message"] = ". ".join(filter(None, (f"{label} failed{subject}", reason, summary)))
         return NetworkImportFailure(code, progress_by_name)
 
 
@@ -127,3 +147,24 @@ async def network_import_stage(stage):
     if (progress := NETWORK_PROGRESS.get()) is not None:
         progress.stage = stage
         await progress.emit()
+
+
+async def network_publication_step(label, *, unit="phase", done=0, total=None):
+    """Report milestones only for the ordinary rebuild publishing a generation."""
+    progress = NETWORK_PROGRESS.get()
+    if progress is not None and progress.stage == STAGES[-1]:
+        progress.publication_step = label
+        progress.publication_unit = unit
+        progress.publication_done = done
+        progress.publication_total = total
+        await progress.emit()
+
+
+async def network_source_mapped(*, batch=False):
+    """Count completed mappings and coalesce status writes from small native sources."""
+    progress = NETWORK_PROGRESS.get()
+    if progress is not None and progress.publication_unit == "source":
+        progress.publication_done += 1
+        done = progress.publication_done
+        if not batch or done % 10 == 0 or done == progress.publication_total:
+            await progress.emit()

@@ -18,6 +18,7 @@ from process.registry_fhir_catalog_sources import (
     fhir_catalog_source_generation,
     validate_fhir_catalog_source_descriptor,
 )
+from process.registry_network_import_progress import network_source_mapped
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 MEMBER_COLUMNS = ("network_id", "provider_system", "provider_id", "location_id", "evidence_id")
@@ -619,8 +620,8 @@ async def map_typed_graph_batch(connection, inputs, *, address_source, runtime_r
         ]
         office_names = [selected[0].table_names["offices"] for selected in prepared_mappings]
         async with typed_office_lookup(connection, office_names, address_source) as matches:
-            mappings = [
-                await _finish_mapping(connection, selected, address_source, matches, control_schema)
-                for selected in prepared_mappings
-            ]
+            mappings = []
+            for selected in prepared_mappings:
+                mappings.append(await _finish_mapping(connection, selected, address_source, matches, control_schema))
+                await network_source_mapped()
         return mappings
