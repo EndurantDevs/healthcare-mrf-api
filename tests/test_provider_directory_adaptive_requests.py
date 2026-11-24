@@ -98,14 +98,12 @@ async def test_concurrent_load_failures_share_one_reduction_only_for_optum(monke
             await finish(tasks)
 
 
-async def test_optum_sparse_transient_responses_keep_full_admission(monkeypatch):
-    """Failure observations age out of the pressure window between isolated faults."""
+@pytest.mark.parametrize("failure_indices", [(0, 31, 63), range(0, 160, 13)])
+async def test_optum_sparse_transient_responses_keep_full_admission(monkeypatch, failure_indices):
+    """Intermittent gateway and timeout errors leave the configured allowance available."""
     base = importer.UHC_PROVIDER_DIRECTORY_BASE
-    failure_by_index = {
-        0: (502, {}, None, 0),
-        31: (504, {}, None, 0),
-        63: (None, {}, "request timed out", 0),
-    }
+    failures = ((502, {}, None, 0), (504, {}, None, 0), (None, {}, "request timed out", 0))
+    failure_by_index = {index: failures[position % len(failures)] for position, index in enumerate(failure_indices)}
 
     async def fetch(_source, url, *, timeout):
         return failure_by_index.get(int(url.rsplit("/", 1)[1]), SUCCESS)
@@ -113,13 +111,34 @@ async def test_optum_sparse_transient_responses_keep_full_admission(monkeypatch)
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", fetch)
     shared_source = source(base)
     async with importer._source_http_session_scope(force=True, request_concurrency=32):
-        for index in range(65):
+        for index in range(max(failure_indices) + 2):
             response = await importer._fetch_source_json_once(shared_source, f"{base}/{index}", timeout=1)
             assert response == failure_by_index.get(index, SUCCESS)
     snapshot = request_concurrency_snapshot(shared_source)
     assert snapshot["limit"] == snapshot["capacity"] == 32
     assert snapshot["reductions"] == snapshot["throttled_responses"] == 0
     assert snapshot["transient_failures"] == len(failure_by_index)
+    assert snapshot["transient_http_502"] == len(failure_indices[::3])
+    assert snapshot["transient_http_504"] == len(failure_indices[1::3])
+    assert snapshot["transient_timeout"] == len(failure_indices[2::3])
+
+
+@pytest.mark.parametrize("failure_indices", [(0, 2, 4, 11), (3, 7, 11)])
+async def test_optum_reduces_for_a_high_transient_rate_after_minimum_sample(monkeypatch, failure_indices):
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    shared_source = source(base)
+
+    async def fetch(_source, url, *, timeout):
+        return (503, {}, None, 0) if int(url.rsplit("/", 1)[1]) in failure_indices else SUCCESS
+
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", fetch)
+    async with importer._source_http_session_scope(force=True, request_concurrency=32):
+        for index in range(12):
+            await importer._fetch_source_json_once(shared_source, f"{base}/{index}", timeout=1)
+            assert request_concurrency_snapshot(shared_source)["limit"] == (32 if index < 11 else 16)
+    snapshot = request_concurrency_snapshot(shared_source)
+    assert snapshot["reductions"] == 1
+    assert snapshot["transient_http_503"] == len(failure_indices)
 
 
 async def test_optum_recovers_only_after_healthy_time_at_capacity_and_pending_demand(monkeypatch, source_request_clock):
@@ -234,10 +253,10 @@ async def test_optum_stale_throttle_preserves_current_failure_window(monkeypatch
     """A throttle from a higher allowance cannot erase a new failure cluster."""
     base = importer.UHC_PROVIDER_DIRECTORY_BASE
     shared_source = source(base)
-    network = BlockedRequests(14)
+    network = BlockedRequests(16)
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", network.fetch)
     async with importer._source_http_session_scope(force=True, request_concurrency=8):
-        tasks = [start_fetch(dict(shared_source), index, base) for index in range(14)]
+        tasks = [start_fetch(dict(shared_source), index, base) for index in range(16)]
 
         async def complete(index, response=SUCCESS):
             network.results[index] = response
@@ -247,18 +266,20 @@ async def test_optum_stale_throttle_preserves_current_failure_window(monkeypatch
 
         try:
             await network.wait(range(8))
-            assert await complete(0, (503, {}, None, 0)) == 8
-            assert await complete(1, (503, {}, None, 0)) == 8
-            await network.wait([8, 9])
-            assert await complete(2, (503, {}, None, 0)) == 4
-            for index in (3, 4, 6, 7):
+            for index in range(3):
+                assert await complete(index, (503, {}, None, 0)) == 8
+                await network.wait([index + 8])
+            assert await complete(3, (503, {}, None, 0)) == 4
+            for index in (4, 6, 7, 8, 9, 10):
                 assert await complete(index) == 4
-            for index in (10, 11):
+            for index in (11, 12, 13):
                 await network.wait([index])
                 assert await complete(index, (504, {}, None, 0)) == 4
-            await network.wait([12])
+            await network.wait([14])
             assert await complete(5, (429, {}, None, 0)) == 4
-            assert await complete(12, (None, {}, "ServerDisconnectedError", 0)) == 2
+            assert await complete(14, (None, {}, "ServerDisconnectedError", 0)) == 2
+            snapshot = request_concurrency_snapshot(shared_source)
+            assert snapshot["transient_disconnect"] == snapshot["throttled_responses"] == 1
         finally:
             await finish(tasks)
 
@@ -510,6 +531,25 @@ async def test_limited_response_delays_sibling_by_retry_after(monkeypatch, sourc
         assert await importer._fetch_source_json_once(dict(shared_source), f"{base}/1", timeout=1) == SUCCESS
     assert source_request_clock.now == 12.0
     assert source_request_clock.delays == [2.0]
+
+
+@pytest.mark.parametrize("status", [429, 503, 504])
+async def test_optum_oversized_retry_after_caps_immediate_retry(monkeypatch, source_request_clock, status):
+    base = importer.UHC_PROVIDER_DIRECTORY_BASE
+    response = (status, {importer.SOURCE_RETRY_AFTER_FIELD: "9" * 400}, None, 0)
+    fetch = AsyncMock(side_effect=[response, SUCCESS])
+    advance_clock = asyncio.sleep
+
+    async def bounded_sleep(delay):
+        assert 0 <= delay <= 600
+        await advance_clock(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", bounded_sleep)
+    monkeypatch.setattr(importer, "_fetch_source_json_unpaced", fetch)
+    async with importer._source_http_session_scope(force=True, request_concurrency=4):
+        assert await importer._fetch_source_json(source(base), f"{base}/PractitionerRole", timeout=1) == SUCCESS
+    assert fetch.await_count == 2
+    assert source_request_clock.delays == [600.0]
 
 
 class SourceWaveHarness:

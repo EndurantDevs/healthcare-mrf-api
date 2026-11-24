@@ -84,7 +84,9 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
     """Back off for rate limits or clustered transport failures."""
 
     RESPONSE_WINDOW_SIZE = 32
-    TRANSIENT_FAILURE_LIMIT = 3
+    MIN_TRANSIENT_SAMPLE = 12
+    TRANSIENT_FAILURE_PERCENT = 25
+    CONSECUTIVE_TRANSIENT_LIMIT = 4
     MAX_SATURATION_GAP_SECONDS = 1.0
     MIN_SATURATED_SECONDS = 30.0
     MIN_HEALTHY_RESPONSES = 8
@@ -96,6 +98,7 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
         self.request_seconds = 0.0
         self.reductions = self.recoveries = 0
         self.throttled_responses = self.transient_failures = 0
+        self.transient_by_kind: dict[str, int] = {}
         self.recent_outcomes = deque(maxlen=self.RESPONSE_WINDOW_SIZE)
         self._reset_health()
 
@@ -154,16 +157,28 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
                 self._back_off()
             return
         outcome = _optum_request_outcome(response)
-        self.transient_failures += outcome == "transient"
+        if outcome.startswith("transient_"):
+            self.transient_failures += 1
+            self.transient_by_kind[outcome] = self.transient_by_kind.get(outcome, 0) + 1
+            outcome = "transient"
         if not is_current_epoch:
             return
         self.recent_outcomes.append(outcome)
-        if outcome == "transient" and self.recent_outcomes.count("transient") >= self.TRANSIENT_FAILURE_LIMIT:
+        if outcome == "transient" and self._has_excess_transient_failures():
             self._back_off()
         elif now < pacing_state.get("retry_after_monotonic", 0.0):
             self._reset_health()
         elif outcome == "healthy":
             self._try_recover(now)
+
+    def _has_excess_transient_failures(self):
+        window = self.recent_outcomes
+        failures = window.count("transient")
+        has_sustained_failures = (
+            len(window) >= self.MIN_TRANSIENT_SAMPLE and failures * 100 >= len(window) * self.TRANSIENT_FAILURE_PERCENT
+        )
+        tail_length = self.CONSECUTIVE_TRANSIENT_LIMIT
+        return has_sustained_failures or list(window)[-tail_length:] == ["transient"] * tail_length
 
     def _try_recover(self, now):
         successes = self.recent_outcomes.count("healthy")
@@ -206,29 +221,28 @@ def request_concurrency_snapshot(source_record: Mapping[str, Any]) -> dict[str, 
         "recoveries": slots.recoveries,
         "throttled_responses": slots.throttled_responses,
         "transient_failures": slots.transient_failures,
+        **slots.transient_by_kind,
     }
 
 
 def _response_limits_concurrency(response):
     """Reduce load for throttling, unavailable upstreams and transport timeouts."""
     status, _payload, error, _elapsed = response
-    return status in {429, 503, 504} or bool(error and any(word in error.lower() for word in ("timeout", "timed out")))
+    return status in {429, 503, 504} or _request_timed_out(error)
+
+
+def _request_timed_out(error):
+    return bool(error and any(word in error.lower() for word in ("timeout", "timed out")))
 
 
 def _optum_request_outcome(response):
     status, payload, error, _elapsed = response
-    if (
-        status == 502
-        or _response_limits_concurrency(response)
-        or error
-        in {
-            "ClientConnectionResetError",
-            "ClientOSError",
-            "ConnectionResetError",
-            "ServerDisconnectedError",
-        }
-    ):
-        return "transient"
+    if status in {502, 503, 504}:
+        return f"transient_http_{status}"
+    if _request_timed_out(error):
+        return "transient_timeout"
+    if error in {"ClientConnectionResetError", "ClientOSError", "ConnectionResetError", "ServerDisconnectedError"}:
+        return "transient_disconnect"
     resource_type = payload.get("resourceType") if isinstance(payload, dict) else None
     if (
         status == 200
