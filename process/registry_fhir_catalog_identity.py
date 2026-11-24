@@ -116,11 +116,15 @@ def _prepared(identity_inputs, *, identity_kind="organization"):
     return identity_rows
 
 
+# OFFSET 0 keeps each lookup on the full alias key even with stale registry statistics.
 _RESOLVE_SQL = """WITH candidates AS (
-  SELECT s.ordinal,a.network_id FROM {stage} s JOIN {control}.network_registry_alias a
-    ON a.source_system='fhir' AND a.source_id=ANY(s.source_aliases)
-      AND ((a.alias_type=$3 AND a.alias_value=s.organization_id AND a.scope_key=$2)
-        OR (a.alias_type='legacy_fhir_uuid' AND a.alias_value=s.legacy_uuid::text AND a.scope_key=s.legacy_scope))
+  SELECT s.ordinal,a.network_id FROM {stage} s
+  CROSS JOIN LATERAL (VALUES ($3,s.organization_id,$2),
+    ('legacy_fhir_uuid',s.legacy_uuid::text,s.legacy_scope)) k(alias_type,alias_value,scope_key)
+  CROSS JOIN LATERAL (SELECT network_id FROM {control}.network_registry_alias
+    WHERE source_system='fhir' AND source_id=ANY(s.source_aliases)
+      AND alias_type=k.alias_type AND alias_value=k.alias_value AND scope_key=k.scope_key OFFSET 0) a
+  WHERE k.alias_value IS NOT NULL
   UNION
   SELECT s.ordinal,(b.record_json->>'network_id')::integer FROM {stage} s
     JOIN {control}.registry_approved_record b ON b.approved_revision=$1 AND b.record_kind='network_binding'
@@ -225,9 +229,9 @@ async def _append_aliases(connection, stage, control, alias_type):
     invalid = await connection.fetchval(
         f"""SELECT EXISTS(SELECT FROM {stage} s
       CROSS JOIN LATERAL unnest(s.source_aliases) alias_name
-      LEFT JOIN {control}.network_registry_alias a ON a.source_system='fhir' AND a.source_id=alias_name
-        AND a.alias_type=$2 AND a.alias_value=s.organization_id AND a.scope_key=$1
-      WHERE NOT s.conflict AND a.network_id IS DISTINCT FROM s.network_id)""",
+      WHERE NOT s.conflict AND (SELECT a.network_id FROM {control}.network_registry_alias a
+        WHERE a.source_system='fhir' AND a.source_id=alias_name AND a.alias_type=$2
+          AND a.alias_value=s.organization_id AND a.scope_key=$1) IS DISTINCT FROM s.network_id)""",
         ALIAS_SCOPE,
         alias_type,
     )
