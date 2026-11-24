@@ -385,30 +385,45 @@ async def test_unmeasured_chains_get_first_round_then_largest_total_first(graph)
         assert [item["key"] for item in await store.pending()] == ["unmeasured", "large", "small"]
 
 
-async def test_completed_owned_network_cannot_omit_canonical_positive(graph):
-    store = graph.store
-    await store.prepare([work(key="n1"), work(key="n2")])
-    async with store.transaction():
-        by_key = {item["key"]: item for item in await store.pending()}
-        await store.apply(
+async def test_completed_owned_network_requires_exact_confirmation_of_unreturned_membership(graph):
+    graph_store = graph.store
+    await graph_store.prepare([work(key="n1"), work(key="n2")])
+    membership_entry_by_field = {
+        "resource": {
+            "resourceType": "OrganizationAffiliation",
+            "id": "a",
+            "network": [{"reference": "Organization/n1"}, {"reference": "Organization/n2"}],
+            "participatingOrganization": {"reference": "Organization/facility"},
+        }
+    }
+    async with graph_store.transaction():
+        by_key = {work_item["key"]: work_item for work_item in await graph_store.pending()}
+        await graph_store.apply(
             [by_key["n1"]], result(ids=["a"], memberships=[("a", "Organization/n1")], total=1), graph.persist
         )
-        await store.apply([by_key["n2"]], result(ids=[], total=0), graph.persist)
-        await store.retain_entries(
-            [
-                {
-                    "resource": {
-                        "resourceType": "OrganizationAffiliation",
-                        "id": "a",
-                        "network": [{"reference": "Organization/n1"}, {"reference": "Organization/n2"}],
-                    }
-                }
-            ],
-            graph.persist,
-        )
+        await graph_store.apply([by_key["n2"]], result(ids=[], total=0), graph.persist)
+        await graph_store._retain_owned_roots(result(frontier=[work("organization", "n1")]))
+        await graph_store.retain_entries([membership_entry_by_field], graph.persist)
     with pytest.raises(ValueError, match="canonical_membership_omitted"):
-        async with store.transaction():
-            await store.finish()
+        async with graph_store.transaction():
+            await graph_store.finish()
+    async with graph_store.transaction():
+        await graph_store.enqueue_affiliation_checks()
+        await graph_store.enqueue_affiliation_checks()
+        (confirmation,) = await graph_store.pending()
+        assert confirmation["kind"] == "verify_affiliation" and confirmation["key"] == "a"
+        assert confirmation["payload"] == {
+            "network_refs": ["Organization/n1", "Organization/n2"],
+            "institution_ids": ["facility"],
+        }
+    async with graph_store.transaction():
+        assert await graph_store.pending() == [confirmation]
+        await graph_store.apply([confirmation], result(), graph.persist)
+        proof, reconciliation = await graph_store.finish()
+        assert proof["membership_queries_complete"] == 2
+        assert reconciliation == {"search_edges": 1, "canonical_only_edges": 1}
+        assert await graph.connection.fetchval(f"SELECT total FROM {graph_store.table('work')} WHERE key='n2'") == 0
+        assert await graph_store.counts() == {"OrganizationAffiliation": 1}
 
 
 async def test_copy_uses_candidate_schema(graph):

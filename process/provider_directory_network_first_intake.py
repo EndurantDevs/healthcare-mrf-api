@@ -174,6 +174,9 @@ class _GraphIntake:
                 if work_items or organization_work
                 else await self.store.pending_affiliations(self.concurrency * hydration.BATCH_SIZE)
             )
+            if not (work_items or organization_work or networks_by_id):
+                await self.store.enqueue_affiliation_checks()
+                work_items = await self.store.pending(limit=self.concurrency)
         if work_items:
             operations = [
                 traversal.step(
@@ -215,13 +218,15 @@ class _GraphIntake:
                     break
             await self.cancel_check()
             async with self.store.transaction():
-                proof = await self.store.finish()
+                proof, membership_reconciliation = await self.store.finish()
                 counts_by_type = await self._checkpoints(complete=True)
-        return _group_summary(self.directory, self.source, proof, counts_by_type, self._concurrency_metrics())
+        return _group_summary(
+            self.directory, self.source, proof, counts_by_type, self._concurrency_metrics(), membership_reconciliation
+        )
 
 
-def _group_summary(directory, source_record, proof, counts_by_type, concurrency):
-    from process.provider_directory_network_snapshot_scope import make_scope
+def _group_summary(directory, source_record, proof, counts_by_type, concurrency, membership_reconciliation):
+    from process.provider_directory_network_snapshot_scope import MEMBERSHIP_RECONCILIATION_KEY, make_scope
 
     config = directory._source_metadata(source_record)["provider_directory_network_snapshot"]
     scope = make_scope(
@@ -241,6 +246,7 @@ def _group_summary(directory, source_record, proof, counts_by_type, concurrency)
             "rows_fetched": counts_by_type.get(kind, 0),
             "rows_written": counts_by_type.get(kind, 0),
             "network_institutional_scope": scope,
+            MEMBERSHIP_RECONCILIATION_KEY: membership_reconciliation,
         }
         for kind in RESOURCE_TYPES
     }

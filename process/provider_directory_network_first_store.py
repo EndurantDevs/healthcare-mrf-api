@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.native_copy_cleanup import cleanup_interrupted_copy
@@ -138,9 +139,13 @@ class GraphStore:
         """Serialize overlapping name searches while scheduling independent network chains."""
         work = self.table("work")
         rows = await self.connection.fetch(
-            f"SELECT kind,key,url,payload,pages,total FROM {work} WHERE NOT done AND (kind='organization')=$1 "
-            f"AND (kind<>'roots' OR key=(SELECT min(key) FROM {work} WHERE kind='roots' AND NOT done)) "
-            "ORDER BY total IS NOT NULL,total DESC NULLS FIRST,kind,key LIMIT $2",
+            f"SELECT w.kind,w.key,w.url,w.pages,w.total,CASE WHEN w.kind='verify_affiliation' THEN "
+            "jsonb_build_object('network_refs',r.network_refs,'institution_ids',r.institution_ids) "
+            f"ELSE w.payload END AS payload FROM {work} w LEFT JOIN {self.table('resources')} r "
+            "ON w.kind='verify_affiliation' AND r.resource_type='OrganizationAffiliation' AND r.resource_id=w.key "
+            "WHERE NOT w.done AND (w.kind='organization')=$1 "
+            f"AND (w.kind<>'roots' OR w.key=(SELECT min(key) FROM {work} WHERE kind='roots' AND NOT done)) "
+            "ORDER BY w.total IS NOT NULL,w.total DESC NULLS FIRST,w.kind,w.key LIMIT $2",
             organizations,
             limit,
         )
@@ -153,6 +158,22 @@ class GraphStore:
             limit,
         )
         return {row["resource_id"]: set(row["networks"]) for row in rows}
+
+    def _canonical_only_memberships(self):
+        return (
+            f"SELECT r.resource_id FROM {self.table('resources')} r CROSS JOIN LATERAL unnest(r.network_refs) n(reference) "
+            f"JOIN {self.table('work')} w ON w.kind='network' AND w.done AND n.reference='Organization/'||w.key "
+            f"WHERE r.resource_type='OrganizationAffiliation' AND NOT EXISTS(SELECT 1 FROM {self.table('members')} m "
+            "WHERE m.resource_id=r.resource_id AND m.network_ref=n.reference)"
+        )
+
+    async def enqueue_affiliation_checks(self):
+        """Schedule one exact read per affiliation with a canonical-only link."""
+        await self.connection.execute(
+            f"INSERT INTO {self.table('work')}(kind,key,payload) "
+            "SELECT DISTINCT 'verify_affiliation',record.resource_id,'{}'::jsonb "
+            f"FROM ({self._canonical_only_memberships()}) record ON CONFLICT DO NOTHING"
+        )
 
     def _unique_entries(self, entries):
         require(len(entries) <= 4096, "entry_batch_too_large")
@@ -204,21 +225,22 @@ class GraphStore:
     async def _persist_entries(self, entries_by_key, inserted_keys, persist):
         rows_by_model = {}
         for resource_key in inserted_keys:
-            entry = entries_by_key[resource_key["resource_type"], resource_key["resource_id"]]
+            kind, key = resource_key["resource_type"], resource_key["resource_id"]
+            entry = entries_by_key[kind, key]
+            fetch_url = entry.get("_retrieved_from")
+            acquisition = self.directory._rest_bundle_acquisition(entry, fetch_url, self.source)
+            base = self.source.get("canonical_api_base") or self.source.get("api_base")
+            if kind == "Organization" and fetch_url == f"{base}/Organization/{key}":
+                acquisition = replace(acquisition, fetch_mode="rest_read")
             parsed = self.directory.parse_fhir_resource(
                 self.source["source_id"],
                 entry["resource"],
                 resource_url=entry.get("fullUrl"),
-                acquisition=self.directory._rest_bundle_acquisition(
-                    entry,
-                    entry.get("_retrieved_from"),
-                    self.source,
-                ),
+                acquisition=acquisition,
                 run_id=self.source.get("_network_snapshot_run_id"),
             )
             require(
-                parsed is not None
-                and parsed[0] is self.directory.RESOURCE_MODELS_BY_TYPE[resource_key["resource_type"]],
+                parsed is not None and parsed[0] is self.directory.RESOURCE_MODELS_BY_TYPE[kind],
                 "parse_failed",
             )
             rows_by_model.setdefault(parsed[0], []).append(parsed[1])
@@ -438,7 +460,7 @@ class GraphStore:
         }
 
     async def finish(self):
-        """Require complete work and bidirectional membership reconciliation."""
+        """Require complete work and retain observed canonical membership coverage."""
         require(
             not await self.connection.fetchval(f"SELECT EXISTS(SELECT 1 FROM {self.table('work')} WHERE NOT done)"),
             "work_remaining",
@@ -449,13 +471,13 @@ class GraphStore:
             f"SELECT EXISTS(SELECT 1 FROM {self.table('members')} m JOIN {self.table('resources')} r ON r.resource_type='OrganizationAffiliation' AND r.resource_id=m.resource_id WHERE NOT m.network_ref=ANY(r.network_refs))"
         )
         require(not conflicts, "fresh_candidate_required:late_network_conflict")
-        omitted = await self.connection.fetchval(
-            f"SELECT EXISTS(SELECT 1 FROM {self.table('resources')} r CROSS JOIN LATERAL unnest(r.network_refs) n(reference) "
-            f"JOIN {self.table('work')} w ON w.kind='network' AND w.done AND n.reference='Organization/'||w.key "
-            f"WHERE r.resource_type='OrganizationAffiliation' AND NOT EXISTS(SELECT 1 FROM {self.table('members')} m "
-            "WHERE m.resource_id=r.resource_id AND m.network_ref=n.reference))"
+        reconciliation = await self.connection.fetchrow(
+            "SELECT count(*) AS edge_count,count(*) FILTER (WHERE w.key IS NULL) AS unconfirmed "
+            f"FROM ({self._canonical_only_memberships()}) record LEFT JOIN {self.table('work')} w "
+            "ON w.kind='verify_affiliation' AND w.key=record.resource_id AND w.done"
         )
-        require(not omitted, "fresh_candidate_required:canonical_membership_omitted")
+        require(reconciliation["unconfirmed"] == 0, "canonical_membership_omitted")
+        search_edges = await self.connection.fetchval(f"SELECT count(*) FROM {self.table('members')}")
         missing_root = await self.connection.fetchval(
             f"SELECT EXISTS(SELECT 1 FROM {self.table('roots')} r WHERE NOT EXISTS("
             f"SELECT 1 FROM {self.table('work')} w WHERE w.kind='network' AND w.key=r.resource_id AND w.done))"
@@ -467,7 +489,7 @@ class GraphStore:
             "closure_incomplete",
         )
         await self.connection.execute(f"UPDATE {self.table('state')} SET complete=true WHERE singleton")
-        return proof
+        return proof, {"search_edges": search_edges, "canonical_only_edges": reconciliation["edge_count"]}
 
 
 async def cleanup_published(directory, candidate):
