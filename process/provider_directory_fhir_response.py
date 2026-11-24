@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, nullcontext
 from typing import Any, Awaitable, Callable, Mapping
 
 from process.provider_directory_fetch_types import ResourceFetchResult
+from process.provider_directory_optum_outage import HTTP_OUTAGE_STATUSES, PARTITION_REQUEST, OptumOutage
 
 SOURCE_HTTP_REQUEST_SLOTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "provider_directory_http_request_slots", default=None
@@ -100,6 +101,7 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
         self.reductions = self.recoveries = 0
         self.throttled_responses = self.transient_failures = 0
         self.transient_by_kind: dict[str, int] = {}
+        self.outage = OptumOutage()
         self.recent_outcomes = deque(maxlen=self.RESPONSE_WINDOW_SIZE)
         self._reset_health()
 
@@ -120,6 +122,7 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
         if self.started == self.completed and not self.waiters:
             self._reset_health()
         epoch = self.reductions + self.recoveries
+        outage_epoch = self.outage.epoch
         send_limit = self.limit
         started_at = directory.time.monotonic()
         self.started += 1
@@ -144,6 +147,8 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
                 self.last_saturated_at = now
             previous = self.limit
             self._adjust(epoch, send_limit, response, now, pacing_state)
+            if response is not None:
+                self.outage.observe(response[0], now, outage_epoch)
             self._log_limit_change(directory, previous)
 
     def _adjust(self, epoch, send_limit, response, now, pacing_state):
@@ -210,6 +215,7 @@ def request_concurrency_snapshot(source_record: Mapping[str, Any]) -> dict[str, 
     slots = pacing_state.get("optum_request_slots")
     if slots is None or not slots.started:
         return None
+    outage = slots.outage
     return {
         "capacity": slots.capacity,
         "limit": slots.limit,
@@ -223,6 +229,16 @@ def request_concurrency_snapshot(source_record: Mapping[str, Any]) -> dict[str, 
         "throttled_responses": slots.throttled_responses,
         "transient_failures": slots.transient_failures,
         **slots.transient_by_kind,
+        **({"http_500_responses": outage.http_500_responses} if outage.http_500_responses else {}),
+        **(
+            {
+                "outage_pauses": outage.epoch,
+                "outage_active": int(outage.probe_after is not None),
+                "outage_probes": outage.probes,
+            }
+            if outage.epoch
+            else {}
+        ),
     }
 
 
@@ -260,6 +276,18 @@ def _is_retryable_optum_continuation(response):
 
 
 async def fetch_partition_response(directory, request):
+    """Carry the partition identity and deadline through the shared request admission."""
+    identity = directory._uhc_partition_identity(
+        request.source_record, request.resource_type, request.partition_start_url
+    )
+    token = PARTITION_REQUEST.set((request, identity))
+    try:
+        return await _fetch_partition_with_cooldown(directory, request, identity)
+    finally:
+        PARTITION_REQUEST.reset(token)
+
+
+async def _fetch_partition_with_cooldown(directory, request, identity):
     """Retry a mandatory Optum continuation on its original cursor before deferring the leaf."""
     response = await directory._fetch_source_json(
         request.source_record, request.current_url, timeout=request.fetch_options.timeout
@@ -269,9 +297,7 @@ async def fetch_partition_response(directory, request):
         or request.current_url == request.partition_start_url
         or not _is_retryable_optum_continuation(response)
         or not directory._has_fhir_continuation_query(request.current_url)
-        or not directory._uhc_partition_identity(
-            request.source_record, request.resource_type, request.partition_start_url
-        )
+        or not identity
     ):
         return response
     cooldown = await directory._retry_rest_pagination_after_cooldown(
@@ -436,15 +462,12 @@ async def fetch_paced_source_response(directory, source_record, url, *, timeout)
         source_record,
         url,
         send=lambda: directory._fetch_source_json_unpaced(source_record, url, timeout=timeout),
+        probe_timeout=min(timeout, 10),
     )
 
 
-async def _fetch_admitted_source_response(directory, source_record, url, *, send, ready=None):
-    """Gate queued sends before pacing and publish cooldown before releasing a slot."""
-    if directory.current_version_census_contract(source_record) is not None:
-        return await send()
+def _source_response_slots(directory, source_record, url):
     pacing_state = source_record.get("_provider_directory_request_pacing_state")
-    pacing_options = {} if ready is None else {"ready": ready}
     request_slots = total_slots = nullcontext()
     if pacing_state is not None:
         slot_map = SOURCE_HTTP_REQUEST_SLOTS.get()
@@ -472,30 +495,86 @@ async def _fetch_admitted_source_response(directory, source_record, url, *, send
         request_slots = slot_map[slot_key]
         if isinstance(request_slots, _OptumRequestSlots):
             pacing_state["optum_request_slots"] = request_slots
+    return pacing_state, request_slots, total_slots
+
+
+async def _probe_optum_backend(directory, source_record, timeout):
+    """Send a bounded search through the same source admission and a separate probe cursor."""
+    url = f"{directory.UHC_PROVIDER_DIRECTORY_BASE}/InsurancePlan?_count=1"
+    partition = PARTITION_REQUEST.set(None)
+    proxy_cursor = directory.source_proxy.PARTITION_CURSOR_KEY.set("optum-outage-probe")
+    try:
+        async with asyncio.timeout(timeout):
+            return await _fetch_admitted_source_response(
+                directory,
+                source_record,
+                url,
+                send=lambda: directory._fetch_source_json_unpaced(source_record, url, timeout=timeout),
+            )
+    except TimeoutError:
+        return None, None, "TimeoutError", timeout * 1000
+    finally:
+        directory.source_proxy.PARTITION_CURSOR_KEY.reset(proxy_cursor)
+        PARTITION_REQUEST.reset(partition)
+
+
+async def _fetch_admitted_source_response(directory, source_record, url, *, send, ready=None, probe_timeout=None):
+    """Admit paced sends and hold Optum scans outside request slots during a backend outage."""
+    if directory.current_version_census_contract(source_record) is not None:
+        return await send()
+    pacing_state, request_slots, total_slots = _source_response_slots(directory, source_record, url)
+    pacing_options = {} if ready is None else {"ready": ready}
+    outage = (
+        request_slots.outage if probe_timeout is not None and isinstance(request_slots, _OptumRequestSlots) else None
+    )
+    can_retry_interrupted = True
     while True:
+        if outage is not None and not await outage.has_recovered_within_deadline(
+            directory, lambda: _probe_optum_backend(directory, source_record, probe_timeout)
+        ):
+            return None, None, "deadline_reached", 0
         async with request_slots, total_slots:
+            if outage is not None and outage.probe_after is not None:
+                continue
             try:
                 await directory._pace_source_request(source_record, allow_census_defer=True, **pacing_options)
             except directory.source_selection.CensusRequestDeferred:
                 return None, None, directory.source_selection.CENSUS_REQUEST_DEFERRED_ERROR, 0
+            if outage is not None and outage.probe_after is not None:
+                continue
             if isinstance(request_slots, AdaptiveRequestSlots) and request_slots.active > request_slots.limit:
                 continue
             if ready is not None and not ready():
                 return None
-            if isinstance(request_slots, AdaptiveRequestSlots):
-                response = await request_slots.send(directory, send, pacing_state)
-            else:
-                response = await send()
-            if response[0] in {429, 503, 504} and pacing_state is not None:
-                delay = directory._source_retry_after_seconds(
-                    response[1],
-                    max_delay_seconds=directory.source_selection.retry_after_limit(directory, source_record),
-                )
-                if delay is not None:
-                    pacing_state["retry_after_monotonic"] = max(
-                        pacing_state.get("retry_after_monotonic", 0.0), directory.time.monotonic() + delay
-                    )
-            return response
+            outage_epoch = outage.epoch if outage is not None else None
+            response = await _send_in_source_slot(directory, source_record, request_slots, pacing_state, send)
+        if (
+            can_retry_interrupted
+            and outage is not None
+            and outage_epoch != outage.epoch
+            and response[0] in HTTP_OUTAGE_STATUSES
+        ):
+            can_retry_interrupted = False
+            continue
+        return response
+
+
+async def _send_in_source_slot(directory, source_record, request_slots, pacing_state, send):
+    response = (
+        await request_slots.send(directory, send, pacing_state)
+        if isinstance(request_slots, AdaptiveRequestSlots)
+        else await send()
+    )
+    if response[0] in {429, 503, 504} and pacing_state is not None:
+        delay = directory._source_retry_after_seconds(
+            response[1],
+            max_delay_seconds=directory.source_selection.retry_after_limit(directory, source_record),
+        )
+        if delay is not None:
+            pacing_state["retry_after_monotonic"] = max(
+                pacing_state.get("retry_after_monotonic", 0.0), directory.time.monotonic() + delay
+            )
+    return response
 
 
 BULK_EXPORT_WAIT_CALLBACK: contextvars.ContextVar[Callable[[dict[str, Any] | None], Awaitable[None]] | None] = (
