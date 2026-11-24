@@ -12,7 +12,7 @@ from process.network_address_projection import _identifier
 from process.network_approved_source_bindings import APPROVED_NETWORK_BINDINGS_SQL
 from process.network_fhir_source_witness_contract import digest, source_origin
 from process.network_fhir_typed_contract import ADDRESS_FIELDS, PLAN_TIER_CONTRACT, POLICY, require
-from process.network_fhir_typed_sql import PLAN_TIER_PROVIDER_ONLY_SQL, PROVIDER_ONLY_SQL
+from process.network_fhir_typed_sql import PLAN_TIER_PROVIDER_ONLY_SQL, PROVIDER_ONLY_PAGE_SIZE, PROVIDER_ONLY_SQL
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.registry_fhir_catalog_sources import (
     fhir_catalog_source_generation,
@@ -24,6 +24,7 @@ from process.uhc_flex_practitioner_async_safety import drain_operation
 MEMBER_COLUMNS = ("network_id", "provider_system", "provider_id", "location_id", "evidence_id")
 BINDING_COLUMNS = ("provider_system", "provider_id", "location_id", "location_key", "entity_type", "entity_id")
 _PAIR_KEYS = ("resource_type", "resource_id", "network_source_key", "location_resource_id")
+_PAIR_PAGE_SIZE = 5000
 _OFFICE_PAGE_BYTES = 8 * 1024**2
 _MAPPING_DDL = {
     "provider_only": "network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,evidence_id text NOT NULL,PRIMARY KEY(network_id,provider_system,provider_id,evidence_id)",
@@ -118,41 +119,6 @@ def require_catalog_graph_scope(stage, coordinates, descriptor):
             "catalog_admission",
         )
     return fhir_catalog_source_generation(descriptor)
-
-
-async def _pair_ranges(connection, stage):
-    """One small boundary row per indexed 5,000-edge range; never hydrate edges in Python."""
-    after = ("", "", "", "")
-    keys = ",".join(_PAIR_KEYS)
-    while True:
-        row = await connection.fetchrow(
-            "SELECT "
-            + keys
-            + " FROM (SELECT "
-            + keys
-            + " FROM "
-            + stage.relation("pairs")
-            + " WHERE ("
-            + keys
-            + ")>($1,$2,$3,$4) ORDER BY "
-            + keys
-            + " LIMIT 5000) page ORDER BY "
-            + ",".join(key + " DESC" for key in _PAIR_KEYS)
-            + " LIMIT 1",
-            *after,
-        )
-        if row is None:
-            return
-        last_keys = tuple(row)
-        yield after, last_keys
-        after = last_keys
-
-
-def _range(prefix, start):
-    keys = ",".join(prefix + key for key in _PAIR_KEYS)
-    low = ",".join("$" + str(start + index) + "::text" for index in range(4))
-    high = ",".join("$" + str(start + 4 + index) + "::text" for index in range(4))
-    return "(" + keys + ")>(" + low + ") AND (" + keys + ")<=(" + high + ")"
 
 
 async def _office_inputs(connection, stage, mapping, approved):
@@ -314,6 +280,7 @@ async def _approved_graph_keys(connection, bindings, arguments, *, allow_empty=F
 @dataclass(frozen=True)
 class _PreparedBindingRows:
     relation: str
+    count: int
 
 
 def _mapping_binding_rows(bindings):
@@ -342,38 +309,41 @@ async def _prepare_mapping_bindings(connection, bindings, arguments, *, typed):
             + ", stored AS (INSERT INTO "
             + relation
             + " SELECT source_key,source_scope->>'source_generation',network_id FROM approved_network_bindings "
-            "WHERE NOT (SELECT invalid FROM binding_check)) SELECT invalid,(SELECT "
+            "WHERE NOT (SELECT invalid FROM binding_check)) SELECT (SELECT invalid FROM binding_check) AS invalid,"
             + _graph_scope_valid(True, False, typed=True)
-            + " FROM approved_network_bindings WHERE NOT (SELECT invalid FROM binding_check)) AS valid FROM binding_check",
+            + " AS valid,count(*) AS binding_count FROM approved_network_bindings "
+            "WHERE NOT (SELECT invalid FROM binding_check)",
             *arguments,
         )
         require_valid_catalog_bindings(selected["invalid"])
-        require(selected["valid"] is True, "approved_catalog_scope")
     else:
         from process.network_fhir_plan_tier_graph import validate_plan_tier_graph_bindings
 
         await validate_plan_tier_graph_bindings(connection, bindings, arguments)
-        require(
-            await connection.fetchval(
-                "WITH " + bindings + " SELECT " + _graph_scope_valid(True, True) + " FROM approved_network_bindings",
-                *arguments,
-            )
-            is True,
-            "approved_catalog_scope",
+        selected = await connection.fetchrow(
+            "WITH "
+            + bindings
+            + " SELECT "
+            + _graph_scope_valid(True, True)
+            + " AS valid,count(*) AS binding_count FROM approved_network_bindings",
+            *arguments,
         )
+    require(selected["valid"] is True, "approved_catalog_scope")
+    if not typed:
         await connection.execute(
             "CREATE TEMP TABLE " + relation + " ON COMMIT DROP AS SELECT * FROM " + _mapping_binding_rows(bindings),
             *arguments[:-1],
         )
     await connection.execute("CREATE INDEX ON " + relation + "(source_key,source_generation)")
     await connection.execute("ANALYZE " + relation)
-    return _PreparedBindingRows(relation), (arguments[-1],)
+    return _PreparedBindingRows(relation, selected["binding_count"]), (arguments[-1],)
 
 
 async def _map_pair_rows(connection, stage, mapping, bindings, arguments):
-    # Large approved maps must not be rescanned for every pair in each page.
-    # The savepoint restores the caller's planner setting after failure.
     async with connection.transaction():
+        if isinstance(bindings, _PreparedBindingRows):
+            return await _map_pair_pages(connection, stage, mapping, bindings, arguments)
+        # Inline approval queries benefit from a hash join. The savepoint restores this setting on failure.
         original = await connection.fetchval("SHOW enable_nestloop")
         await connection.execute("SET LOCAL enable_nestloop=off")
         totals = await _map_pair_pages(connection, stage, mapping, bindings, arguments)
@@ -381,60 +351,73 @@ async def _map_pair_rows(connection, stage, mapping, bindings, arguments):
         return totals
 
 
-async def _map_pair_pages(connection, stage, mapping, bindings, arguments):
-    generation_parameter = "$" + str(len(arguments)) + "::text"
-    joins = (
-        " FROM "
-        + stage.relation("pairs")
-        + " p LEFT JOIN "
+def _pair_binding_join(bindings, generation_parameter):
+    # A hash over a small approval map is bounded by the page size.
+    if isinstance(bindings, _PreparedBindingRows) and bindings.count > _PAIR_PAGE_SIZE:
+        return (
+            " LEFT JOIN LATERAL (SELECT network_id FROM "
+            + bindings.relation
+            + " WHERE source_key=p.network_source_key AND source_generation="
+            + generation_parameter
+            + " OFFSET 0) b ON true "
+        )
+    return (
+        " LEFT JOIN "
         + _mapping_binding_rows(bindings)
         + " b ON b.source_key=p.network_source_key AND b.source_generation="
         + generation_parameter
+    )
+
+
+def _pair_page_sql(stage, mapping, bindings, arguments):
+    generation_parameter = "$" + str(len(arguments)) + "::text"
+    keys = ",".join(_PAIR_KEYS)
+    descending = ",".join(key + " DESC" for key in _PAIR_KEYS)
+    lower = ",".join(f"${len(arguments) + offset}::text" for offset in range(1, len(_PAIR_KEYS) + 1))
+    evidence = (
+        "encode(sha256(convert_to(jsonb_build_array('fhir-direct-network-office-v3',"
+        + generation_parameter
+        + ",resource_type,resource_id,network_source_key,location_resource_id,evidence_basis)::text,'UTF8')),'hex')"
+    )
+    joins = (
+        " FROM page p"
+        + _pair_binding_join(bindings, generation_parameter)
         + " LEFT JOIN LATERAL (SELECT location_key FROM "
         + mapping.relation("offices")
-        + " o WHERE (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true "
+        + " o WHERE b.network_id IS NOT NULL AND (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true "
     )
-    totals = dict.fromkeys(
-        (
-            "mapped_pair_rows",
-            "mapped_reference_rows",
-            "unapproved_pair_rows",
-            "unapproved_reference_rows",
-            "unmatched_office_pair_rows",
-            "unmatched_office_reference_rows",
-        ),
-        0,
+    return (
+        f"WITH page AS MATERIALIZED (SELECT {keys},provider_system,provider_id,location_id,evidence_basis,reference_rows "
+        f"FROM {stage.relation('pairs')} WHERE ({keys})>({lower}) ORDER BY {keys} LIMIT {_PAIR_PAGE_SIZE}), "
+        "resolved AS MATERIALIZED (SELECT p.*,b.network_id,o.location_key"
+        + joins
+        + "), mapped AS (INSERT INTO "
+        + mapping.relation("memberships")
+        + " SELECT network_id,provider_system,provider_id,location_id,"
+        + evidence
+        + f""" FROM resolved WHERE network_id IS NOT NULL AND location_key IS NOT NULL)
+        SELECT (SELECT ARRAY[{keys}] FROM page ORDER BY {descending} LIMIT 1) AS last_keys,
+          count(*) FILTER(WHERE network_id IS NOT NULL AND location_key IS NOT NULL) mapped_pair_rows,
+          coalesce(sum(reference_rows) FILTER(WHERE network_id IS NOT NULL AND location_key IS NOT NULL),0)::bigint mapped_reference_rows,
+          count(*) FILTER(WHERE network_id IS NULL) unapproved_pair_rows,
+          coalesce(sum(reference_rows) FILTER(WHERE network_id IS NULL),0)::bigint unapproved_reference_rows,
+          count(*) FILTER(WHERE network_id IS NOT NULL AND location_key IS NULL) unmatched_office_pair_rows,
+          coalesce(sum(reference_rows) FILTER(WHERE network_id IS NOT NULL AND location_key IS NULL),0)::bigint unmatched_office_reference_rows
+        FROM resolved"""
     )
-    async for low, high in _pair_ranges(connection, stage):
-        scope = " WHERE " + _range("p.", len(arguments) + 1)
-        counts = await connection.fetchrow(
-            "SELECT count(*) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NOT NULL) mapped_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NOT NULL),0)::bigint mapped_reference_rows,count(*) FILTER(WHERE b.network_id IS NULL) unapproved_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NULL),0)::bigint unapproved_reference_rows,count(*) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NULL) unmatched_office_pair_rows,coalesce(sum(p.reference_rows) FILTER(WHERE b.network_id IS NOT NULL AND o.location_key IS NULL),0)::bigint unmatched_office_reference_rows"
-            + joins
-            + scope,
-            *arguments,
-            *low,
-            *high,
-        )
-        for key, count_value in counts.items():
-            totals[key] += count_value
-        evidence = (
-            "encode(sha256(convert_to(jsonb_build_array('fhir-direct-network-office-v3',"
-            + generation_parameter
-            + ",p.resource_type,p.resource_id,p.network_source_key,p.location_resource_id,p.evidence_basis)::text,'UTF8')),'hex')"
-        )
-        await connection.execute(
-            "INSERT INTO "
-            + mapping.relation("memberships")
-            + " SELECT b.network_id,p.provider_system,p.provider_id,p.location_id,"
-            + evidence
-            + joins
-            + scope
-            + " AND b.network_id IS NOT NULL AND o.location_key IS NOT NULL",
-            *arguments,
-            *low,
-            *high,
-        )
-    return totals
+
+
+async def _map_pair_pages(connection, stage, mapping, bindings, arguments):
+    page_sql = _pair_page_sql(stage, mapping, bindings, arguments)
+    after = ("", "", "", "")
+    totals_by_kind = {}
+    while True:
+        counts_by_kind = dict(await connection.fetchrow(page_sql, *arguments, *after))
+        after = counts_by_kind.pop("last_keys")
+        for key, count_value in counts_by_kind.items():
+            totals_by_kind[key] = totals_by_kind.get(key, 0) + count_value
+        if after is None:
+            return totals_by_kind
 
 
 async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
@@ -447,13 +430,14 @@ async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
     provider_sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + len(arguments)), provider_sql)
     for resource_type in ("OrganizationAffiliation", "PractitionerRole"):
         after = (resource_type, "")
-        while resource_rows := await connection.fetch(
-            "SELECT resource_type,resource_id FROM "
+        while upper := await connection.fetchrow(
+            "SELECT resource_type,resource_id FROM (SELECT resource_type,resource_id FROM "
             + stage.relation("cells")
-            + " WHERE resource_type=$1 AND resource_id>$2 ORDER BY resource_id LIMIT 128",
+            + f" WHERE resource_type=$1 AND resource_id>$2 ORDER BY resource_id LIMIT {PROVIDER_ONLY_PAGE_SIZE}) page "
+            "ORDER BY resource_id DESC LIMIT 1",
             *after,
         ):
-            last_keys = tuple(resource_rows[-1])
+            last_keys = tuple(upper)
             await connection.execute(
                 "INSERT INTO "
                 + mapping.relation("provider_only")

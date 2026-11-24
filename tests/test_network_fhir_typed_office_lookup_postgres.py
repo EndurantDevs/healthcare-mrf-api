@@ -336,7 +336,7 @@ async def _office_approval(connection, indexed, keys):
     await connection.execute("CREATE TEMP TABLE IF NOT EXISTS office_bound_keys(source_key text PRIMARY KEY)")
     await connection.execute("TRUNCATE pg_temp.office_bound_keys")
     await connection.execute("INSERT INTO pg_temp.office_bound_keys SELECT unnest($1::text[])", keys)
-    return mapping._PreparedBindingRows("pg_temp.office_bound_keys")
+    return mapping._PreparedBindingRows("pg_temp.office_bound_keys", len(keys))
 
 
 @pytest.mark.parametrize("indexed", [False, True])
