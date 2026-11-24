@@ -17,11 +17,12 @@ from api.network_address_scope import NetworkAddressReadScope
 
 
 class RecordingConnection:
-    def __init__(self):
+    def __init__(self, taxonomy_ids=()):
         self.calls = 0
         self.last_sql = None
         self.last_params = None
         self.sql_calls = []
+        self.taxonomy_ids = taxonomy_ids
 
     async def all(self, sql, **params):
         sql_text = str(sql)
@@ -29,6 +30,8 @@ class RecordingConnection:
         self.last_sql = sql_text
         self.last_params = params
         self.sql_calls.append((sql_text, dict(params)))
+        if sql_text.startswith("SELECT int_code FROM mrf.nucc_taxonomy"):
+            return [(taxonomy_id,) for taxonomy_id in self.taxonomy_ids]
         if "SELECT COUNT(DISTINCT" in sql_text:
             return [(5,)]
         return []
@@ -663,6 +666,7 @@ def test_name_taxonomy_projection_disabled_emits_legacy_schema_sql(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("taxonomy_ids", [[], [713]])
 @pytest.mark.parametrize(
     ("raw_primary_only", "expects_primary_predicate"),
     [(None, True), ("true", True), ("false", False)],
@@ -671,9 +675,11 @@ async def test_get_all_applies_primary_taxonomy_to_page_and_count(
     monkeypatch,
     raw_primary_only,
     expects_primary_predicate,
+    taxonomy_ids,
 ):
-    conn = RecordingConnection()
+    conn = RecordingConnection(taxonomy_ids)
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
     request_args_by_name = {
         "codes": "207Q00000X",
         "include_total": "true",
@@ -686,8 +692,13 @@ async def test_get_all_applies_primary_taxonomy_to_page_and_count(
     await get_all(types.SimpleNamespace(args=request_args_by_name))
 
     primary_predicate = "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
-    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    page_sql, page_params = next((sql, params) for sql, params in conn.sql_calls if "page_npis AS" in sql)
     count_sql = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
+    resolution_params = next(params for sql, params in conn.sql_calls if sql.startswith("SELECT int_code FROM"))
+    assert resolution_params == {"requested_taxonomy_code": "207Q00000X"}
+    assert page_sql.count("c.taxonomy_array && ARRAY[__[POSTCOMPILE_taxonomy_id]]::integer[]") == 2
+    assert page_params["taxonomy_id"] == next(iter(taxonomy_ids), None)
+    assert "c.taxonomy_array && q.int_codes" in count_sql
     assert (primary_predicate in page_sql) is expects_primary_predicate
     assert (primary_predicate in count_sql) is expects_primary_predicate
 

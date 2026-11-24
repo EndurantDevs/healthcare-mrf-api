@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import JSON as SQLAlchemyJSON
-from sqlalchemy import false, func, or_, select
+from sqlalchemy import Integer, bindparam, false, func, or_, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import literal_column, text, tuple_
@@ -172,6 +172,9 @@ from api.provider_search_sql import (
 )
 from api.provider_search_sql import (
     provider_page_npis_sql as _page_npis_sql,
+)
+from api.provider_search_sql import (
+    provider_taxonomy_clauses as _provider_taxonomy_clauses,
 )
 from api.provider_search_sql import (
     provider_taxonomy_code_parameters as _provider_taxonomy_code_parameters,
@@ -8443,17 +8446,7 @@ async def list_providers(
         is_unified_search = _is_unified_address_table(address_table_sql)
         provider_npi_sql = "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
 
-        taxonomy_filters = []
-        if classification:
-            taxonomy_filters.append("classification = :classification")
-        if specialization:
-            taxonomy_filters.append("specialization = :specialization")
-        if section:
-            taxonomy_filters.append("section = :section")
-        if display_name:
-            taxonomy_filters.append("display_name = :display_name")
-        if codes:
-            taxonomy_filters.append("code = ANY(:codes)")
+        taxonomy_filters = _provider_taxonomy_clauses(filters_by_name)
 
         npi_where, npi_params = _build_npi_where_clause(
             "b",
@@ -9047,7 +9040,7 @@ async def list_providers(
             organization_name,
             entity_type_code,
         )
-        taxonomy_clauses = []
+        taxonomy_clauses = _provider_taxonomy_clauses(filters_by_name)
         address_clauses = [
             _provider_list_address_type_clause("c", address_table_sql, include_service_locations=is_unified_search)
         ]
@@ -9059,16 +9052,6 @@ async def list_providers(
             address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
-        if classification:
-            taxonomy_clauses.append("classification = :classification")
-        if specialization:
-            taxonomy_clauses.append("specialization = :specialization")
-        if section:
-            taxonomy_clauses.append("section = :section")
-        if display_name:
-            taxonomy_clauses.append("display_name = :display_name")
-        if codes:
-            taxonomy_clauses.append("code = ANY(:codes)")
         use_taxonomy_filter = bool(taxonomy_clauses)
         taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
         use_location_first_taxonomy = _is_location_first_taxonomy_filter(
@@ -9084,8 +9067,16 @@ async def list_providers(
                 exact_npi,
             ),
         )
+        resolve_taxonomy_id = (
+            is_ordinary_provider_query
+            and is_unified_search
+            and not use_location_first_taxonomy
+            and len(codes or ()) == len(taxonomy_clauses) == 1
+        )
         if use_taxonomy_filter and not use_location_first_taxonomy:
-            address_clauses.insert(0, "c.taxonomy_array && q.int_codes")
+            # A typed catalog value lets even a generic plan estimate the requested taxonomy.
+            taxonomy_ids = "ARRAY[:taxonomy_id]::integer[]" if resolve_taxonomy_id else "q.int_codes"
+            address_clauses.insert(0, f"c.taxonomy_array && {taxonomy_ids}")
         if use_taxonomy_filter and is_ordinary_provider_query and not (codes and len(taxonomy_clauses) == 1):
             address_clauses.append(f"EXISTS (SELECT 1 FROM mrf.nucc_taxonomy WHERE {taxonomy_filter})")
         if plan_network_ids:
@@ -9405,6 +9396,15 @@ async def list_providers(
             native_npis=native_npis,
         )
         async with _provider_list_connection(db, page_import_context, request_session, native_npis=native_npis) as conn:
+            if resolve_taxonomy_id:
+                taxonomy_rows = await conn.all(
+                    text("SELECT int_code FROM mrf.nucc_taxonomy WHERE code = :requested_taxonomy_code"),
+                    requested_taxonomy_code=codes[0],
+                )
+                query_parameters_by_name["taxonomy_id"] = taxonomy_rows[0][0] if taxonomy_rows else None
+                provider_page_query = provider_page_query.bindparams(
+                    bindparam("taxonomy_id", type_=Integer(), literal_execute=True)
+                )
             rows_iter = await conn.all(
                 provider_page_query,
                 **query_parameters_by_name,

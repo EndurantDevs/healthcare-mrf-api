@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from textwrap import dedent
-from typing import Any, Iterable, NamedTuple, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 import sanic.exceptions
 
@@ -179,6 +179,19 @@ def _bounded_primary_taxonomy_page_sql(
     SELECT npi FROM ({staged_page}) AS staged_npis
      WHERE NOT (SELECT sufficient FROM prefix_complete)
     """
+
+
+def provider_taxonomy_clauses(filters: Mapping[str, Any]) -> list[str]:
+    """Keep the same taxonomy predicates in provider count and page queries."""
+
+    predicates = (
+        ("classification", "classification = :classification"),
+        ("specialization", "specialization = :specialization"),
+        ("section", "section = :section"),
+        ("display_name", "display_name = :display_name"),
+        ("codes", "code = ANY(:codes)"),
+    )
+    return [predicate for field, predicate in predicates if filters.get(field)]
 
 
 def taxonomy_codes_subquery(conditions: str) -> str:
