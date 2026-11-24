@@ -154,6 +154,8 @@ def _serving_plan(schema_name):
 
 
 async def _build_serving_indexes(connection, schema_name, index_plan):
+    from process.registry_network_import_progress import network_publication_step
+
     collisions = await connection.fetch(
         "SELECT relation.relname FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
         "WHERE namespace.nspname=$1 AND relation.relname=ANY($2::text[])",
@@ -162,8 +164,11 @@ async def _build_serving_indexes(connection, schema_name, index_plan):
     )
     if collisions:
         raise NetworkServingIndexesError("Planned serving index name already exists in candidate schema")
-    for _, statement in index_plan:
+    total = len(index_plan)
+    await network_publication_step("Building serving indexes", unit="index", total=total)
+    for done, (_, statement) in enumerate(index_plan, 1):
         await connection.execute(statement)
+        await network_publication_step("Building serving indexes", unit="index", done=done, total=total)
 
 
 _INDEX_SHAPE_SQL = """, jsonb_build_object(

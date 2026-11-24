@@ -12,6 +12,7 @@ from process.network_compact_readiness import COMPONENT, _require, compact_index
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_slices import PinnedMembershipSlices, _prepare_slices
 from process.network_membership_validation import _scope_report, _validated_candidate
+from process.registry_network_import_progress import network_publication_step
 
 
 async def _previous_slices(connection, candidate, control_schema):
@@ -54,6 +55,7 @@ async def _validated_slices(connection, copy_target, address_source, candidate, 
     async with _validated_candidate(
         connection, copy_target, address_source, control_schema=control_schema, office_sources=offices
     ) as (report, prepared_work):
+        await network_publication_step("Building serving slices")
         slices = await _prepare_slices(
             connection,
             copy_target,

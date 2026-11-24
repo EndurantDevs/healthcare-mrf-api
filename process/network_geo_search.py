@@ -273,6 +273,9 @@ async def _source_pass(connection, target_table, layout, source, *, is_base, ver
 
 
 async def _build_projection(connection, target, layout):
+    from process.registry_network_import_progress import network_publication_step
+
+    await network_publication_step("Preparing geographic search")
     table = compact_identifier(target.schema_name) + "." + compact_identifier(TABLE)
     columns = ",".join("a." + compact_identifier(name) for name in SEARCH_COLUMNS)
     await connection.execute(
@@ -295,11 +298,19 @@ async def _build_projection(connection, target, layout):
         ]
     )
     _require(inserted == verified == await connection.fetchval(f"SELECT count(*) FROM ONLY {table}"))
-    await connection.execute(
-        f"CREATE INDEX {TABLE}_gn ON {table} USING gist (geo,canonical_network_ids public.gist__intbig_ops) WHERE {_PREDICATE}"
-    )
-    await connection.execute(f"ANALYZE {table}")
+    await _build_geo_search_index(connection, table)
     return verified
+
+
+async def _build_geo_search_index(connection, qualified_table):
+    from process.registry_network_import_progress import network_publication_step
+
+    await network_publication_step("Building geographic search index", unit="index", total=1)
+    await connection.execute(
+        f"CREATE INDEX {TABLE}_gn ON {qualified_table} USING gist (geo,canonical_network_ids public.gist__intbig_ops) WHERE {_PREDICATE}"
+    )
+    await network_publication_step("Building geographic search index", unit="index", done=1, total=1)
+    await connection.execute(f"ANALYZE {qualified_table}")
 
 
 async def prepare_network_geo_search(connection, copy_target, layout):

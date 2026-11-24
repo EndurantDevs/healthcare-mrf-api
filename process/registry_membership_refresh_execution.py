@@ -25,6 +25,7 @@ from process.registry_membership_refresh_queue import (
     _require_address,
     validated_membership_refresh_request_record,
 )
+from process.registry_network_import_progress import network_publication_step
 from process.registry_publication_execution import (
     _locked_request_transaction,
     _request,
@@ -189,6 +190,7 @@ async def _complete_queued_membership_refresh(
 
 
 async def _finish_refresh(connection, request_scope, inputs, copy_target, writer_context, authority):
+    await network_publication_step("Publishing network generation")
     identity, lease, initial_request = request_scope
     envelope, original_sources, final_sources = inputs
     command = envelope["command"]

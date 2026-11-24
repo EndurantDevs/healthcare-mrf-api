@@ -380,6 +380,7 @@ async def validate_named_network_preparation(
 ):
     """Validate frozen payloads without holding publication controls or a preparation claim."""
     from process.network_membership_validation import validate_network_candidate_final
+    from process.registry_network_import_progress import network_publication_step
 
     if connection.is_in_transaction():
         raise NetworkPublicationError("Network preparation requires phase-owned transactions")
@@ -395,6 +396,7 @@ async def validate_named_network_preparation(
         return {"state": "published", "candidate_id": copy_target.candidate_id}
     if preparation_by_field["state"] == "validated":
         return {"state": "validated", "candidate_id": copy_target.candidate_id}
+    await network_publication_step("Validating final membership snapshot")
     async with AsyncExitStack() as validation_scope:
         validation_connection, office_authority = connection, None
         if validation_snapshot is None:
