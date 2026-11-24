@@ -18,7 +18,6 @@ from process.network_fhir_source_witness_contract import digest
 from process.registry_fhir_catalog_extraction import fhir_source_uri
 from process.registry_fhir_catalog_source_producer import open_source_owned_catalog_export
 from process.registry_fhir_catalog_sources import (
-    is_delta_positive_catalog_descriptor,
     parse_fhir_catalog_source_profile,
     validate_fhir_catalog_source_descriptor,
 )
@@ -60,12 +59,12 @@ def _edition_rank(descriptor):
 
 
 def preferred_fhir_editions(accepted, *, include_practitioner_enrichment=False):
-    """Select one edition per feed, with network editions ahead of practitioner enrichment."""
+    """Select one complete edition per feed, with network editions ahead of practitioner enrichment."""
     eligible_descriptors = [
         descriptor
         for descriptor in accepted
         if (include_practitioner_enrichment or not is_practitioner_enrichment(descriptor))
-        and (descriptor["complete"] or is_delta_positive_catalog_descriptor(descriptor))
+        and descriptor["complete"] is True
     ]
     by_feed = {}
     for descriptor in sorted(eligible_descriptors, key=_edition_rank):
@@ -337,7 +336,7 @@ async def _catalog_observations(connection, schema):
         descriptor = json.loads(row["descriptor"])
         admission = descriptor.get("admission")
         if (
-            (descriptor.get("complete") is True or is_delta_positive_catalog_descriptor(descriptor))
+            descriptor.get("complete") is True
             and type(admission) is dict
             and admission.get("kind") == "catalog_observation"
         ):

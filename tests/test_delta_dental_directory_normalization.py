@@ -255,7 +255,7 @@ def test_catalog_admits_only_exact_delta_positive_scope(tmp_path):
     from process.registry_imported_source_inventory import preferred_fhir_editions
 
     assert published["complete"] is False
-    assert preferred_fhir_editions([published]) == [published]
+    assert preferred_fhir_editions([published]) == []
     assert published["admission"][METADATA_KEY]["capped_windows"] == 1
     grant = SimpleNamespace(source_profiles=(profile,), observation_contract=CATALOG_OBSERVATION_CONTRACT)
     vector_entries = [{"source_generation": "delta-generation", "status": "current"}]

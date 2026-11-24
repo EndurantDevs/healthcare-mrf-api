@@ -185,7 +185,8 @@ def test_latest_complete_edition_wins_across_registrations_without_merging_disti
 
     observed = SimpleNamespace(fhir_descriptors=(new, other, without_url), carried_fhir_descriptors=())
     dispositions = [
-        SimpleNamespace(descriptor=descriptor) for descriptor in (old, new, same_date_smaller, other, without_url)
+        SimpleNamespace(descriptor=descriptor)
+        for descriptor in (old, new, same_date_smaller, other, without_url, unfinished_edition)
     ]
     selected = catalog_preparation.select_preparation_fhir_sources(observed, dispositions)
     assert {source.descriptor["endpoint_id"] for source in selected} == {
@@ -265,10 +266,12 @@ async def test_catalog_retains_one_copy_of_the_latest_complete_edition_if_unavai
     uri = "https://directory.example.test/tenant"
     old = edition("old", "endpoint-old", uri, 1, 10)
     latest = edition("latest", "endpoint-new", uri, 2, 20)
+    incomplete = edition("incomplete", "endpoint-incomplete", "https://directory.example.test/other", 3, 30)
+    incomplete["complete"] = False
     observed = SimpleNamespace(
         fhir_descriptors=(), carried_fhir_descriptors=(latest,), superseded_fhir_endpoints=("endpoint-old",)
     )
-    descriptor_by_generation = {"old": old, "duplicate": latest, "current": latest}
+    descriptor_by_generation = {"old": old, "duplicate": latest, "current": latest, "incomplete": incomplete}
     connection = SimpleNamespace(
         fetch=AsyncMock(
             return_value=[
@@ -286,6 +289,7 @@ async def test_catalog_retains_one_copy_of_the_latest_complete_edition_if_unavai
         assert set(await catalog_preparation.replaced_fhir_generations(connection, previous_by_field, ())) == {
             "old",
             "duplicate",
+            "incomplete",
         }
     finally:
         catalog_preparation._INVENTORY.reset(token)
