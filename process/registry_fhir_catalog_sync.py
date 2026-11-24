@@ -898,20 +898,27 @@ async def _build_source_catalog_candidate(
             loader_role=config.loader_role,
             source_generations=tuple(current_by_generation),
         )
-    await loader.execute(
-        f"UPDATE {storage_identifier(copy_target.schema_name)}.registry_fhir_catalog_binding "
-        "SET document_json=jsonb_set(document_json,'{status}',to_jsonb(CASE WHEN "
-        "NOT(document_json->'source_scope' ? 'insurance_plan_id') "
+    await _update_binding_statuses(loader, copy_target, current_by_generation)
+    accounting_by_phase["indexes"] = await create_fhir_catalog_indexes(loader, copy_target, **options_by_name)
+    return accounting_by_phase
+
+
+async def _update_binding_statuses(loader, copy_target, current_by_generation):
+    status = (
+        "to_jsonb(CASE WHEN NOT(document_json->'source_scope' ? 'insurance_plan_id') "
         "AND split_part(document_json->>'evidence_id',':',1)=ANY($1::text[]) "
-        "THEN 'current'::text ELSE 'last_good'::text END))",
+        "THEN 'current'::text ELSE 'last_good'::text END)"
+    )
+    return await loader.execute(
+        f"UPDATE {storage_identifier(copy_target.schema_name)}.registry_fhir_catalog_binding "
+        f"SET document_json=jsonb_set(document_json,'{{status}}',{status}) "
+        f"WHERE document_json->'status' IS DISTINCT FROM {status}",
         [
             key
             for key, disposition in current_by_generation.items()
             if disposition.descriptor["profile"] != "retained_normalized"
         ],
     )
-    accounting_by_phase["indexes"] = await create_fhir_catalog_indexes(loader, copy_target, **options_by_name)
-    return accounting_by_phase
 
 
 async def project_reviewed_fhir_catalog_products(

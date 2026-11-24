@@ -53,6 +53,47 @@ ACCEPTED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
+async def test_binding_status_refresh_updates_only_changed_documents(metadata_custody):
+    fixture = metadata_custody
+    active, retained = "a" * 64, "b" * 64
+    dispositions_by_generation = {
+        active: SimpleNamespace(descriptor={"profile": "published_normalized"}),
+        retained: SimpleNamespace(descriptor={"profile": "retained_normalized"}),
+    }
+    cases = (
+        ({"source_scope": {}, "status": "current"}, "current"),
+        ({"source_scope": {}, "evidence_id": retained + ":Organization/1", "status": "last_good"}, "last_good"),
+        ({"source_scope": {}, "status": "last_good"}, "current"),
+        ({"source_scope": {"insurance_plan_id": "plan"}, "status": "current"}, "last_good"),
+        ({"source_scope": {}}, "current"),
+        ({"source_scope": {}, "status": None}, "current"),
+        ({"source_scope": {}, "status": False}, "current"),
+        ({"status": "current"}, "last_good"),
+        ({"source_scope": None, "status": "last_good"}, "current"),
+    )
+    documents = [{"evidence_id": active + ":Organization/1", **fields} for fields, _ in cases]
+    relation = f'"{fixture.target.schema_name}".registry_fhir_catalog_binding'
+    await fixture.connection.executemany(
+        f"INSERT INTO {relation} (metadata_generation,network_id,binding_id,source_id,document_json) "
+        "VALUES ($1,$2,$3,$4,$5::jsonb)",
+        [("c" * 64, index, uuid4(), "example", json.dumps(doc)) for index, doc in enumerate(documents, 1)],
+    )
+
+    assert (
+        await sync._update_binding_statuses(fixture.connection, fixture.target, dispositions_by_generation)
+        == "UPDATE 7"
+    )
+    stored_documents = await fixture.connection.fetch(f"SELECT document_json FROM {relation} ORDER BY network_id")
+    assert [json.loads(stored["document_json"]) for stored in stored_documents] == [
+        {**document, "status": expected} for document, (_, expected) in zip(documents, cases, strict=True)
+    ]
+    assert (
+        await sync._update_binding_statuses(fixture.connection, fixture.target, dispositions_by_generation)
+        == "UPDATE 0"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source_kind", ["delta", "generic", "invalid_delta_receipt"])
 async def test_catalog_admits_incomplete_editions_only_with_verified_delta_observations(
     metadata_custody, delta_positive_descriptor, source_kind
