@@ -28,7 +28,7 @@ _PAIR_PAGE_SIZE = 5000
 _OFFICE_PAGE_BYTES = 8 * 1024**2
 _MAPPING_DDL = {
     "provider_only": "network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,evidence_id text NOT NULL,PRIMARY KEY(network_id,provider_system,provider_id,evidence_id)",
-    "offices": "provider_id text NOT NULL,location_id uuid NOT NULL,address_key uuid NOT NULL,canonical_identity text NOT NULL,location_key text,PRIMARY KEY(provider_id,location_id)",
+    "offices": "provider_id text NOT NULL,location_id uuid NOT NULL,address_key uuid NOT NULL,canonical_identity text NOT NULL,PRIMARY KEY(provider_id,location_id)",
     "memberships": "network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,evidence_id text NOT NULL",
     "bindings": "provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,location_key text NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,PRIMARY KEY(provider_system,provider_id,location_id)",
 }
@@ -56,7 +56,7 @@ class TypedGraphMapping:
             _identifier(name)
 
 
-async def create_typed_mapping_tables(connection, *, membership_table=None):
+async def create_typed_mapping_tables(connection, *, membership_table=None, lookup_companions=True):
     """Precreate scratch before a read-only custodian snapshot, or in the producer transaction."""
     from process.network_fhir_typed_office_lookup import create_office_lookup_tables
 
@@ -69,7 +69,8 @@ async def create_typed_mapping_tables(connection, *, membership_table=None):
         await connection.execute("CREATE TEMP TABLE " + _identifier(name) + "(" + _MAPPING_DDL[kind] + ")")
     if membership_table is not None:
         names_by_kind["memberships"] = membership_table
-    await create_office_lookup_tables(connection, names_by_kind["offices"])
+    if lookup_companions:
+        await create_office_lookup_tables(connection, names_by_kind["offices"])
     return names_by_kind
 
 
@@ -197,7 +198,7 @@ async def _match_offices(connection, mapping, address_source, matches):
         + f"<={_OFFICE_PAGE_BYTES} AS page_fits FROM page p) bounds LEFT JOIN page p ON bounds.page_fits "
         + "ORDER BY p.provider_id,p.location_id"
     )
-    after, limit = ("", UUID(int=0)), 1000
+    after, limit = ("", UUID(int=0)), 8192
     while True:
         # An oversized or empty page returns only the bounds row.
         office_rows = await connection.fetch(query, *after, limit)
@@ -219,34 +220,29 @@ async def _match_offices(connection, mapping, address_source, matches):
         )
         accepted_rows = _accepted_office_rows(matched_rows, canonical)
         if accepted_rows:
-            await connection.execute(
-                "UPDATE "
-                + mapping.relation("offices")
-                + " o SET location_key=v.location_key FROM unnest($1::text[],$2::uuid[],$3::text[]) v(provider_id,location_id,location_key) WHERE (o.provider_id,o.location_id)=(v.provider_id,v.location_id)",
-                [office_row[0] for office_row in accepted_rows],
-                [office_row[1] for office_row in accepted_rows],
-                [office_row[2] for office_row in accepted_rows],
+            await connection.copy_records_to_table(
+                mapping.table_names["bindings"],
+                schema_name="pg_temp",
+                records=[
+                    ("npi", provider_id, location_id, location_key, "npi", provider_id)
+                    for provider_id, location_id, location_key in accepted_rows
+                ],
             )
-    await connection.execute(
-        "INSERT INTO "
-        + mapping.relation("bindings")
-        + " SELECT 'npi',provider_id,location_id,location_key,'npi',provider_id FROM "
-        + mapping.relation("offices")
-        + " WHERE location_key IS NOT NULL"
-    )
 
 
-async def _mapping_workspace(connection, stage, table_names, *, membership_table=None):
+async def _mapping_workspace(connection, stage, table_names, *, membership_table=None, shared_office=None):
     from process.network_fhir_typed_office_lookup import office_lookup_names
 
     require(table_names is None or membership_table is None, "mapping_tables")
     names_by_kind = (
-        await create_typed_mapping_tables(connection, membership_table=membership_table)
+        await create_typed_mapping_tables(
+            connection, membership_table=membership_table, lookup_companions=shared_office is None
+        )
         if table_names is None
         else table_names
     )
     require(type(names_by_kind) is dict and set(names_by_kind) == set(_MAPPING_DDL), "mapping_tables")
-    names_by_kind = {**names_by_kind, **office_lookup_names(names_by_kind["offices"])}
+    names_by_kind = {**names_by_kind, **office_lookup_names(shared_office or names_by_kind["offices"])}
     for kind, name in names_by_kind.items():
         _identifier(name)
         require(
@@ -394,8 +390,9 @@ def _pair_page_sql(stage, mapping, bindings, arguments):
         " FROM page p"
         + _pair_binding_join(bindings, generation_parameter)
         + " LEFT JOIN LATERAL (SELECT location_key FROM "
-        + mapping.relation("offices")
-        + " o WHERE b.network_id IS NOT NULL AND (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true "
+        + mapping.relation("bindings")
+        + " o WHERE b.network_id IS NOT NULL AND o.provider_system='npi' "
+        + "AND (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true "
     )
     return (
         f"WITH page AS MATERIALIZED (SELECT {keys},provider_system,provider_id,location_id,evidence_basis,reference_rows "
@@ -470,8 +467,11 @@ async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
 
 async def _require_mapping_counts(connection, stage, mapping, totals):
     office_counts = await connection.fetchrow(
-        "SELECT count(*) FILTER(WHERE location_key IS NOT NULL) matched_offices,count(*) FILTER(WHERE location_key IS NULL) missing_offices FROM "
+        "SELECT matched_offices,(SELECT count(*) FROM "
         + mapping.relation("offices")
+        + ")-matched_offices AS missing_offices FROM (SELECT count(*) AS matched_offices FROM "
+        + mapping.relation("bindings")
+        + ") matched"
     )
     require(
         sum(totals[key] for key in ("mapped_pair_rows", "unapproved_pair_rows", "unmatched_office_pair_rows"))
@@ -542,7 +542,9 @@ async def prepare_typed_graph_mapping(
     return mappings[0]
 
 
-async def _prepare_mapping_offices(connection, stage, approval, table_names, control_schema, *, membership_table=None):
+async def _prepare_mapping_offices(
+    connection, stage, approval, table_names, control_schema, *, membership_table=None, shared_office=None
+):
     approved_source = approval.approved_source
     binding_coordinates, catalog_descriptor = approval.binding_coordinates, approval.catalog_descriptor
     stage.require_ready()
@@ -569,7 +571,9 @@ async def _prepare_mapping_offices(connection, stage, approval, table_names, con
         )
     else:
         bindings = await typed_graph_bindings(connection, approval, control_schema=control_schema)
-    mapping = await _mapping_workspace(connection, stage, table_names, membership_table=membership_table)
+    mapping = await _mapping_workspace(
+        connection, stage, table_names, membership_table=membership_table, shared_office=shared_office
+    )
     if approval.catalog_bindings is not None and table_names is None:
         bindings, arguments = await _prepare_mapping_bindings(connection, bindings, arguments, typed=use_typed_rows)
         approved = bindings
@@ -611,12 +615,22 @@ async def map_typed_graph_batch(
 
     require(bool(inputs), "mapping_inputs")
     async with connection.transaction():
-        prepared_mappings = [
-            await _prepare_mapping_offices(
-                connection, stage, approval, names, control_schema, membership_table=membership_table
+        prepared_mappings = []
+        for stage, approval, names in inputs:
+            shared_office = (
+                prepared_mappings[0][0].table_names["offices"] if names is None and prepared_mappings else None
             )
-            for stage, approval, names in inputs
-        ]
+            prepared_mappings.append(
+                await _prepare_mapping_offices(
+                    connection,
+                    stage,
+                    approval,
+                    names,
+                    control_schema,
+                    membership_table=membership_table,
+                    shared_office=shared_office,
+                )
+            )
         office_names = [selected[0].table_names["offices"] for selected in prepared_mappings]
         has_membership_stage = membership_table is not None
         async with typed_office_lookup(

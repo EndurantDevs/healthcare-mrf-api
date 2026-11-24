@@ -49,7 +49,7 @@ async def _fixture(connection):
         for site in sites:
             key_index = int(site == 4)
             await connection.execute(
-                "INSERT INTO " + selected.relation("offices") + " VALUES($1,$2,$3,$4,NULL)",
+                "INSERT INTO " + selected.relation("offices") + " VALUES($1,$2,$3,$4)",
                 "1000000004" if site == 2 else _PROVIDER,
                 UUID(int=site),
                 keys[key_index],
@@ -107,7 +107,11 @@ async def test_shared_lookup_pages_requested_keys_and_keeps_missing_offices(serv
             tuple(row)
             for selected in mappings
             for row in await connection.fetch(
-                "SELECT location_id,location_key FROM " + selected.relation("offices") + " ORDER BY location_id"
+                "SELECT location_id,location_key FROM "
+                + selected.relation("offices")
+                + " LEFT JOIN "
+                + selected.relation("bindings")
+                + " USING(provider_id,location_id) ORDER BY location_id"
             )
         ]
         assert actual_offices == [(UUID(int=1), "2"), (UUID(int=2), None), (UUID(int=3), "2"), (UUID(int=4), "4")]
@@ -145,7 +149,7 @@ async def _mixed_offices(connection, selected):
     canonical = native.canonicalize_batch(addresses)
     for site, normalized in enumerate(canonical, 5):
         await connection.execute(
-            "INSERT INTO " + selected.relation("offices") + " VALUES($1,$2,$3,$4,NULL)",
+            "INSERT INTO " + selected.relation("offices") + " VALUES($1,$2,$3,$4)",
             _PROVIDER,
             UUID(int=site),
             UUID(normalized["address_key"]),
@@ -156,6 +160,7 @@ async def _mixed_offices(connection, selected):
         ("uncanonicalizable", 1, (None, None, None, None, None, "US")),
         ("ambiguous-one", 2, addresses[2]),
         ("ambiguous-two", 2, addresses[2]),
+        ("ambiguous-three", 2, addresses[2]),
     ):
         await connection.execute(
             "INSERT INTO lookup_addresses VALUES($1,'npi',$2,$3,$4,'practice','street',NULL,$5,$6,$7,$8,$9,$10)",
@@ -214,6 +219,9 @@ async def test_mixed_lookup_omits_invalid_and_ambiguous_offices_with_exact_accou
         async with lookup.typed_office_lookup(
             connection, [selected.table_names["offices"] for selected in mappings], address
         ) as matches:
+            assert (
+                await connection.fetchval(f"SELECT count(*) FROM {matches} WHERE location_key LIKE 'ambiguous-%'") == 2
+            )
             for selected in mappings:
                 await mapping._match_offices(connection, selected, address, matches)
         assert batch_sizes == [1, 4]
@@ -238,7 +246,7 @@ async def test_mixed_lookup_omits_invalid_and_ambiguous_offices_with_exact_accou
             }
             assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("memberships")) == matched
         assert await _lookup_rows(connection) == 0
-        assert await connection.fetchval("SELECT count(*) FROM lookup_addresses") == 9
+        assert await connection.fetchval("SELECT count(*) FROM lookup_addresses") == 10
 
 
 async def test_office_acceptance_keeps_full_identity_and_native_result_shape_checks():
@@ -311,6 +319,16 @@ async def test_precreated_mapping_companions_work_in_read_only_snapshot(serving_
         assert await connection.fetchval("SHOW transaction_read_only") == "on"
         assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("bindings")) == 1
         assert await _lookup_rows(connection) == 0
+
+
+async def test_writable_mappings_share_one_lookup_pair(serving_schema):
+    connection, _, _ = serving_schema
+    first = await mapping._mapping_workspace(connection, None, None)
+    second = await mapping._mapping_workspace(connection, None, None, shared_office=first.table_names["offices"])
+    assert first.relation("offices") != second.relation("offices")
+    for kind, independent_name in lookup.office_lookup_names(second.table_names["offices"]).items():
+        assert first.relation(kind) == second.relation(kind)
+        assert await connection.fetchval("SELECT to_regclass($1)", "pg_temp." + independent_name) is None
 
 
 @pytest.fixture

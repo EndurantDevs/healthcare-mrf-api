@@ -277,9 +277,13 @@ async def _fixture(connection):
     await connection.execute(
         "INSERT INTO "
         + selected.relation("offices")
-        + " SELECT provider_id,location_id,address_key,canonical_identity,"
-        "CASE WHEN resource_id::integer%7=0 THEN NULL ELSE location_resource_id END FROM pair_plan_input "
-        "WHERE resource_id::integer%5<>0"
+        + " SELECT provider_id,location_id,address_key,canonical_identity FROM pair_plan_input WHERE resource_id::integer%5<>0"
+    )
+    await connection.execute(
+        "INSERT INTO "
+        + selected.relation("bindings")
+        + " SELECT 'npi',provider_id,location_id,location_resource_id,'npi',provider_id FROM pair_plan_input "
+        "WHERE resource_id::integer%5<>0 AND resource_id::integer%7<>0"
     )
     return stage, selected
 
@@ -395,9 +399,10 @@ async def test_shared_membership_workspace_keeps_graph_multiplicity_and_rolls_ba
             for _ in range(2)
         ]
         for graph in graphs:
-            await connection.execute(
-                "INSERT INTO " + graph.relation("offices") + " SELECT * FROM " + fixture.relation("offices")
-            )
+            for kind in ("offices", "bindings"):
+                await connection.execute(
+                    "INSERT INTO " + graph.relation(kind) + " SELECT * FROM " + fixture.relation(kind)
+                )
 
         assert await mapping._map_pair_rows(connection, stage, graphs[0], _BINDINGS, _ARGUMENTS) == totals
         with pytest.raises(TypedFHIRGraphError, match="mapping_counts"):
@@ -449,7 +454,7 @@ async def test_merged_office_bindings_reclaim_inputs_and_reject_conflicts(planne
 async def test_pair_plan_database_error_restores_scope(planner_connection, original):
     connection, _admin = planner_connection
     stage, selected = await _fixture(connection)
-    await connection.execute("DROP TABLE " + selected.relation("offices"))
+    await connection.execute("DROP TABLE " + selected.relation("bindings"))
     await connection.execute("SELECT set_config('enable_nestloop',$1,false)", original)
     async with connection.transaction():
         with pytest.raises(asyncpg.UndefinedTableError):

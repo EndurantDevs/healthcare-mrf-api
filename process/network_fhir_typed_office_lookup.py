@@ -7,7 +7,7 @@ from uuid import UUID
 from process.network_address_projection import _identifier
 from process.network_fhir_typed_contract import require
 
-_REQUEST_PAGE_ROWS = 5000
+_REQUEST_PAGE_ROWS = 20000
 
 
 def office_lookup_names(office_name):
@@ -37,7 +37,7 @@ async def _requested_keys(connection, offices, requested):
 
 
 async def _address_matches(connection, address, requested, matches):
-    """Probe only requested NPI/address pairs, retaining all candidates for ambiguity checks."""
+    """Keep at most two exact candidates per key, enough to distinguish a unique match."""
     after = "", UUID(int=0)
     while True:
         page = await connection.fetchrow(
@@ -52,12 +52,13 @@ async def _address_matches(connection, address, requested, matches):
                     WHERE a.address_key=page.address_key AND a.npi=page.provider_id::bigint
                         AND a.entity_type='npi' AND a.entity_id=page.provider_id
                         AND a.type='practice' AND a.address_precision='street' AND a.inferred_npi IS NULL
-                    OFFSET 0) a ON true
+                    LIMIT 2) a ON true
                 RETURNING 1
-            ) SELECT (SELECT count(*) FROM page) AS scanned,
-                (SELECT provider_id FROM page ORDER BY provider_id DESC,address_key DESC LIMIT 1) AS last_provider,
-                (SELECT address_key FROM page ORDER BY provider_id DESC,address_key DESC LIMIT 1) AS last_address,
-                (SELECT count(*) FROM inserted) AS matched""",
+            ) SELECT scanned,last.provider_id AS last_provider,last.address_key AS last_address,
+                (SELECT count(*) FROM inserted) AS matched
+            FROM (SELECT count(*) AS scanned FROM page) totals
+            LEFT JOIN LATERAL (SELECT provider_id,address_key FROM page
+                ORDER BY provider_id DESC,address_key DESC LIMIT 1) last ON true""",
             *after,
         )
         require(0 <= page["scanned"] <= _REQUEST_PAGE_ROWS and page["matched"] >= 0, "office_lookup_counts")
