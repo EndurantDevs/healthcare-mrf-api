@@ -205,13 +205,27 @@ def update_metrics(directory, metrics_by_field):
         metrics_by_field[scalar_key] = max(future_boundaries).isoformat() if future_boundaries else None
 
 
-def safe_error(result):
+def safe_error(fetch_result):
     """Publish fixed classes, never provider bodies, credentials or cursor text."""
-    if result is None or not result.error:
+    if fetch_result is None or not fetch_result.error:
         return None
-    if re.fullmatch(r"http_[0-9]{3}", result.error):
-        return result.error
-    if result.error in {
+    error_class = fetch_result.error
+    if fetch_result.fetch_mode == "partitioned_paged":
+        partition_error = re.fullmatch(r"partition_errors_[1-9][0-9]{0,8}_last_([A-Za-z0-9_]+)", error_class)
+        if partition_error:
+            error_class = partition_error[1]
+        if error_class in {
+            "pagination_cursor_repeated",
+            "pagination loop detected",
+            "untrusted_pagination_link",
+            "ClientConnectionResetError",
+            "ClientOSError",
+            "ServerDisconnectedError",
+        }:
+            return fetch_result.error
+    if re.fullmatch(r"http_[0-9]{3}", error_class):
+        return fetch_result.error
+    if error_class in {
         "TimeoutError",
         "ServerTimeoutError",
         "ClientPayloadError",
@@ -220,7 +234,7 @@ def safe_error(result):
         "non_bundle_payload",
         "deadline_reached",
     }:
-        return result.error
+        return fetch_result.error
     return "source_fetch_error"
 
 

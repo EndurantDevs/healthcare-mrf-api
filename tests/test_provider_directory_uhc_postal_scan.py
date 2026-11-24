@@ -112,7 +112,7 @@ async def test_named_role_retry_reuses_proved_numeric_splits(monkeypatch, parent
     assert state.resumed_partition_pages == 7 and state.resumed_partition_rows == 64
     assert state.completed_partition_identities == leaves
     if parent:
-        expect = [f"7103{digit}" for digit in range(1, 10)] + ["88000"]
+        expect = ["71031", "88000"] + [f"7103{digit}" for digit in range(2, 10)]
         expect += ["7100", "7101", "7104", "7105", "7106", "7107", "7108", "7109", "9", "Q"]
         assert urls == [_role_url(prefix) for prefix in expect]
     else:
@@ -791,6 +791,38 @@ async def test_uhc_split_guard_rereads_bare_total(monkeypatch):
     assert location_prefixes == ["77030", "77030-", "77030"]
     assert result.complete is False
     assert result.error.endswith(uhc_scan.BARE_ZIP_ERROR)
+
+
+@pytest.mark.asyncio
+async def test_retained_role_scans_guarded_zip4_children_before_broader_root(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", "1")
+    context = SimpleNamespace(retry_of_run_id="previous-run")
+    monkeypatch.setattr(postal_checkpoint, "isolated_context", lambda *_: context)
+    monkeypatch.setattr(postal_checkpoint, "completed_partitions", AsyncMock(return_value=({"77031"}, 1, 1)))
+    record_checkpoint = AsyncMock()
+    monkeypatch.setattr(postal_checkpoint, "record_partition", record_checkpoint)
+    delayed_child = _role_url("77030-4")
+    fetch, calls = _fake_role_server({"77030": 7, "77030-": 7}, fail_once={"77030-4"})
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch)
+
+    result = await importer._fetch_partitioned_resource_rows(
+        SOURCE,
+        "PractitionerRole",
+        ProviderDirectoryPractitionerRole,
+        [_role_url("77030"), _role_url("8")],
+        _options(run_id="retained-run"),
+    )
+
+    assert result.complete and result.error is None
+    assert calls[0] == _role_url("77030")
+    assert [_query(url)["address-postalcode"] for url in calls[1:4]] == ["77030", "77030-", "77030"]
+    child_urls = [_role_url(f"77030-{digit}") for digit in range(10)]
+    assert calls[4:] == child_urls + [_role_url("8"), delayed_child]
+    assert [call.args[4] for call in record_checkpoint.await_args_list] == [
+        *[url for url in child_urls if url != delayed_child],
+        _role_url("8"),
+        delayed_child,
+    ]
 
 
 @pytest.mark.asyncio

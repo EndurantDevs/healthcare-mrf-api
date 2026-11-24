@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+from itertools import zip_longest
 from typing import Any
 
 from db.plan_release_storage import storage_identifier, storage_relation
@@ -120,8 +121,11 @@ async def prepare_fetch(
             directory.db, directory._schema(), state.postal_checkpoint_context, checkpoint_type
         )
         if resource_type == "PractitionerRole" and state.postal_checkpoint_context.retry_of_run_id:
-            start_urls = _retained_role_starts(
-                directory, source_record, start_urls, state.completed_partition_identities
+            start_url_queue = asyncio.LifoQueue()
+            start_urls = list(
+                reversed(
+                    _retained_role_starts(directory, source_record, start_urls, state.completed_partition_identities)
+                )
             )
     for request_url in start_urls:
         partition_identity = directory._uhc_partition_identity(
@@ -135,7 +139,7 @@ async def prepare_fetch(
 
 
 def _retained_role_starts(directory, source_record, start_urls, completed):
-    """Reuse numeric ancestors established by completed leaves before ZIP+4 descent."""
+    """Reuse proved splits and interleave dense ZIP starts across three-digit areas."""
     split_prefixes = {
         leaf[:length]
         for leaf in completed
@@ -146,7 +150,8 @@ def _retained_role_starts(directory, source_record, start_urls, completed):
         return start_urls
     search_param = uhc_scan.POSTAL_SEARCH_PARAMS["PractitionerRole"]
     pending_urls = list(reversed(start_urls))
-    zip_starts, other_starts = [], []
+    zip_urls_by_area: dict[str, list[str]] = {}
+    other_starts = []
     while pending_urls:
         url = pending_urls.pop()
         prefix = directory._uhc_role_postal_prefix(source_record, "PractitionerRole", url)
@@ -158,9 +163,10 @@ def _retained_role_starts(directory, source_record, start_urls, completed):
                 for child in reversed(uhc_scan.postal_child_prefixes(prefix))
             )
         elif prefix and len(prefix) == 5 and prefix.isascii() and prefix.isdigit():
-            zip_starts.append(url)
+            zip_urls_by_area.setdefault(prefix[:3], []).append(url)
         else:
             other_starts.append(url)
+    zip_starts = [url for zip_round in zip_longest(*zip_urls_by_area.values()) for url in zip_round if url is not None]
     return zip_starts + other_starts
 
 

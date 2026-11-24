@@ -1137,19 +1137,7 @@ async def _verify_transition_run(
     is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error in _RETAINED_VSP_CAPTURE_ERRORS
     directory = import_module("process.provider_directory_fhir")
     is_highmark_companion_source = directory.highmark.is_companion_source(directory, source_ids)
-    failure_field = (
-        ",error::jsonb->>'message' AS error_message"
-        if has_changed_header_owner
-        or is_vsp_artifact_failure
-        or is_retained_vsp_failure
-        or is_highmark_companion_source
-        else ""
-    )
-    if is_highmark_companion_source:
-        failure_field += ",metrics::jsonb#>'{audit,pagination_resume_required}' AS pending_resources"
-    if expected_failure_error == _POSTAL_START_ERROR:
-        failure_field += ",error::jsonb->>'message' AS postal_error_message"
-    run_rows = await _read_transition_runs(connection, catalog_schema, root_run_id, failure_field)
+    run_rows = await _read_transition_runs(connection, catalog_schema, root_run_id)
     run_ids = {run_record["run_id"] for run_record in run_rows}
     _verify_transition_run_rows(run_rows, run_ids, root_run_id, failed_run_id, source_ids)
     is_postal_start_failure = _is_postal_start_failure(run_rows[0], expected_failure_error)
@@ -1173,27 +1161,27 @@ async def _verify_transition_run(
         "status": run_rows[0]["status"],
         "is_empty_vsp_failure": is_empty_vsp_failure,
         "is_postal_start_failure": is_postal_start_failure,
-        "is_interrupted_postal_scan": _is_interrupted_postal_scan(directory, run_rows, ancestor_run_ids),
-        "pending_highmark_resources": _transition_highmark_pending_resources(run_rows[0])
+        "is_stopped_postal_scan": _is_stopped_postal_scan(directory, run_rows, ancestor_run_ids),
+        "pending_highmark_resources": _transition_pending_resources(run_rows[0])
         if is_highmark_companion_source
         else (),
     }
 
 
-def _transition_highmark_pending_resources(run):
+def _transition_pending_resources(run):
     """Require the stopped result and the same durable audit to name the families."""
-    pending = _json(run["pending_resources"])
+    pending = _json(run.get("pending_resources"))
     if (
         run["status"] == "failed"
         and type(pending) is list
         and all(isinstance(entry, str) for entry in pending)
-        and run["error_message"] == "provider_directory_pagination_resume_required:" + ",".join(pending)
+        and run.get("error_message") == "provider_directory_pagination_resume_required:" + ",".join(pending)
     ):
         return pending
     return ()
 
 
-async def _read_transition_runs(connection, catalog_schema, root_run_id, failure_field):
+async def _read_transition_runs(connection, catalog_schema, root_run_id):
     """Read one ordered lineage with the failure details required by its transition."""
     return await connection.fetch(
         "SELECT run_id,status,finished_at,retry_of_run_id,created_at,"
@@ -1201,9 +1189,8 @@ async def _read_transition_runs(connection, catalog_schema, root_run_id, failure
         "params::jsonb->'source_ids' AS source_ids,"
         "params::jsonb->>'provider_directory_endpoint_scope' AS postal_endpoint_scope,"
         "params::jsonb->'allow_retained_pagination_reset' IS NOT DISTINCT FROM 'false'::jsonb AS postal_reset_disabled,"
-        "error::jsonb->>'code' AS postal_error_code"
-        + failure_field
-        + " FROM "
+        "error::jsonb->>'code' AS postal_error_code,error::jsonb->>'message' AS error_message,"
+        "metrics::jsonb#>'{audit,pagination_resume_required}' AS pending_resources FROM "
         + storage_relation(catalog_schema, "import_run")
         + " WHERE importer='provider-directory-fhir' AND "
         "(run_id=$1 OR params::jsonb->>'provider_directory_pagination_root_run_id'=$1) "
@@ -1218,16 +1205,29 @@ def _is_postal_start_failure(run, expected_failure_error):
     directory = import_module("process.provider_directory_fhir")
     if run["postal_endpoint_scope"] != directory.UHC_PROVIDER_DIRECTORY_BASE:
         return False
-    _require(run["postal_error_message"] == expected_failure_error, "transition_run_changed")
+    _require(run["error_message"] == expected_failure_error, "transition_run_changed")
     return True
 
 
-def _is_interrupted_postal_scan(directory, runs, ancestor_ids):
-    """Recognize only an interrupted, unbranched postal acquisition with resets disabled."""
+def _is_stopped_postal_scan(directory, runs, ancestor_ids):
+    """Recognize a retained interruption or reported incomplete postal scan."""
     leaf = runs[0]
     endpoint = directory.UHC_PROVIDER_DIRECTORY_BASE
-    if leaf.get("postal_endpoint_scope") != endpoint or leaf.get("postal_error_code") != "import_interrupted":
+    if leaf.get("postal_endpoint_scope") != endpoint:
         return False
+    if leaf.get("postal_error_code") != "import_interrupted":
+        source_ids = _json(leaf["source_ids"])
+        if leaf.get("postal_error_code") != "import_failed" or len(source_ids) != 1:
+            return False
+        pending_resources = _transition_pending_resources(leaf)
+        allowed_resources = {f"{source_ids[0]}:{resource}" for resource in directory.UHC_SUPPORTED_RESOURCES}
+        distinct_pending_resources = set(pending_resources)
+        if (
+            not distinct_pending_resources
+            or distinct_pending_resources - allowed_resources
+            or len(pending_resources) != len(distinct_pending_resources)
+        ):
+            return False
     _require(
         leaf["status"] == "failed"
         and len(runs) == len(ancestor_ids)
@@ -1613,9 +1613,9 @@ async def _verify_transition_checkpoints(
         _require(not bulk_checkpoints, "transition_checkpoint_changed")
         _require_postal_start_checkpoint(checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids)
         return [], []
-    if run_evidence.get("is_interrupted_postal_scan"):
+    if run_evidence.get("is_stopped_postal_scan"):
         _require(not bulk_checkpoints, "transition_checkpoint_changed")
-        await _verify_interrupted_postal_checkpoints(
+        await _verify_stopped_postal_checkpoints(
             connection, policy, checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids
         )
         return [], []
@@ -1743,7 +1743,7 @@ def _covered_postal_counts(directory, leaves, identity, source_record, expected_
     return counts_by_resource
 
 
-async def _verify_interrupted_postal_checkpoints(
+async def _verify_stopped_postal_checkpoints(
     connection, policy, checkpoints, identity, expected_counts, run_status, source_ids
 ):
     """Preserve finished leaves while allowing partitioned raw intake ahead of its first leaf."""

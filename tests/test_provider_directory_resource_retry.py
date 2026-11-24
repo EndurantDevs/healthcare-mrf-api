@@ -987,6 +987,25 @@ def test_known_error_classes_remain_fixed_and_unknown_details_are_redacted(error
     assert retry.safe_error(_result(error=error + ": response details")) == "source_fetch_error"
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("pagination_cursor_repeated", "pagination_cursor_repeated"),
+        ("pagination loop detected", "pagination loop detected"),
+        ("partition_errors_3_last_http_504", "partition_errors_3_last_http_504"),
+        ("partition_errors_2_last_untrusted_pagination_link", "partition_errors_2_last_untrusted_pagination_link"),
+        ("partition_errors_1_last_non_bundle_payload", "partition_errors_1_last_non_bundle_payload"),
+        ("partition_errors_2_last_ServerDisconnectedError", "partition_errors_2_last_ServerDisconnectedError"),
+        ("partition_errors_1_last_http_504: response details", "source_fetch_error"),
+        ("partition_errors_1_last_UnrecognizedError", "source_fetch_error"),
+        ("partition_errors_1234567890_last_http_504", "source_fetch_error"),
+    ],
+)
+def test_partition_progress_errors_expose_only_fixed_classes(error, expected):
+    assert retry.safe_error(_result(error=error, fetch_mode="partitioned_paged")) == expected
+    assert retry.safe_error(_result(error=error)) == "source_fetch_error"
+
+
 def test_resource_retry_requires_the_existing_no_reset_contract():
     runner = _scan()
     runner.source_record["_pagination_checkpoint_context"] = replace(

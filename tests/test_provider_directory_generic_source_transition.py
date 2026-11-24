@@ -323,7 +323,7 @@ async def test_postal_start_failure_retains_the_completed_plan_cursor(case, monk
         {
             **case.runs[-1],
             "source_ids": source_ids,
-            "postal_error_message": storage._POSTAL_START_ERROR,
+            "error_message": storage._POSTAL_START_ERROR,
             "postal_endpoint_scope": directory.UHC_PROVIDER_DIRECTORY_BASE,
         }
     ]
@@ -381,9 +381,24 @@ def _attach_interrupted_postal_scan(case):
     return dict.fromkeys(resources, 0) | {"InsurancePlan": 3, "Organization": 1, "PractitionerRole": 3}
 
 
+def _attach_incomplete_postal_scan(case):
+    directory = importlib.import_module("process.provider_directory_fhir")
+    leaf = case.runs[0]
+    entry = leaf["source_ids"][0] + ":Organization"
+    leaf.update(
+        postal_error_code="import_failed",
+        error_message=directory.PAGINATION_RESUME_REQUIRED_ERROR + ":" + entry,
+        pending_resources=[entry],
+    )
+
+
 @pytest.mark.asyncio
-async def test_interrupted_postal_scan_preserves_complete_cursors_leaves_and_uncovered_raw_rows(case):
+@pytest.mark.parametrize("reported_incomplete", [False, True])
+async def test_stopped_postal_scan_preserves_complete_cursors_leaves_and_uncovered_raw_rows(case, reported_incomplete):
     counts = _attach_interrupted_postal_scan(case)
+    if reported_incomplete:
+        _attach_incomplete_postal_scan(case)
+        case.header["status"] = "acquiring"
     counts["Practitioner"] = 2
     case.input_rows.append(dict(dataset_id=DATASET, resource_type="Practitioner", total=2, active=2))
     before = deepcopy((case.checkpoints, case.postal_leaves, case.input_rows, case.runs))
@@ -394,6 +409,30 @@ async def test_interrupted_postal_scan_preserves_complete_cursors_leaves_and_unc
     assert (await _transition(case, counts, manifest_replay=True))["already_applied"] is True
     assert (case.checkpoints, case.postal_leaves, case.input_rows, case.runs) == before
     assert all(sql.startswith('UPDATE "source_schema"."provider_directory_endpoint_dataset"') for sql, _ in case.writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["missing_audit", "message_mismatch", "other_source", "other_resource", "duplicate"])
+async def test_incomplete_postal_transition_requires_matching_scoped_pending_resources(case, drift):
+    counts = _attach_interrupted_postal_scan(case)
+    _attach_incomplete_postal_scan(case)
+    leaf = case.runs[0]
+    if drift == "missing_audit":
+        leaf["pending_resources"] = None
+    elif drift == "message_mismatch":
+        leaf["error_message"] = leaf["error_message"].replace(":Organization", ":Location")
+    else:
+        entries = {
+            "other_source": ["other:Organization"],
+            "other_resource": ["synthetic-postal-source:Endpoint"],
+            "duplicate": leaf["pending_resources"] * 2,
+        }[drift]
+        leaf["pending_resources"] = entries
+        leaf["error_message"] = leaf["error_message"].split(":", 1)[0] + ":" + ",".join(entries)
+
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await _transition(case, counts)
+    assert case.writes == []
 
 
 @pytest.mark.asyncio
