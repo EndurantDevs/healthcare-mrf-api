@@ -302,13 +302,14 @@ async def _stage_local_factors(session, binding, found, parameters_by_name, limi
 
     schema = native._quoted(found[0].schema_name)
     await session.execute(text("TRUNCATE plan_pricing_zip_first,plan_pricing_zip_priced"))
+    # Give PostgreSQL the bounded NPI batch as an index condition on the shared dictionary.
     await session.execute(
         text(f"""INSERT INTO plan_pricing_zip_first
-        SELECT wanted.npi,first.member_key
-          FROM plan_pricing_provider_npi_pending_stage wanted
-          JOIN {serving._ptg2_npi_scope_table(binding.serving_tables)} dictionary
-            ON dictionary.snapshot_key=:snapshot AND dictionary.npi=wanted.npi
+        SELECT dictionary.npi,first.member_key
+          FROM {serving._ptg2_npi_scope_table(binding.serving_tables)} dictionary
           JOIN {schema}.ptg_membership_first first ON first.owner_key=dictionary.npi_key
+         WHERE dictionary.snapshot_key=:snapshot
+           AND dictionary.npi=ANY(ARRAY(SELECT npi FROM plan_pricing_provider_npi_pending_stage))
          LIMIT :first_probe"""),
         parameters_by_name,
     )
