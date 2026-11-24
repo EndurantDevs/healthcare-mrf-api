@@ -145,6 +145,29 @@ async def test_native_capture_and_mapping_preserve_only_source_proven_providers(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_catalog_key_rejects_native_mapping_and_rolls_back_its_table(native_provider_case):
+    case = native_provider_case
+    relation = f'"{case.catalog.schema_name}".registry_fhir_catalog_binding'
+    tables = "SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND relname LIKE 'native_provider_mapped_%'"
+    async with case.writer.transaction():
+        before = await case.writer.fetchval(tables)
+        await case.writer.execute(
+            f"INSERT INTO {relation} SELECT metadata_generation,network_id,$1,source_id,"
+            f"document_json||jsonb_build_object('binding_id',$1::uuid) FROM {relation} LIMIT 1",
+            uuid4(),
+        )
+        with pytest.raises(ValueError, match="registry_imported_catalog_binding_conflict"):
+            await providers.rebuild_native_provider_stage(
+                case.writer,
+                case.recipe,
+                case.approved,
+                catalog_scope=case.catalog_scope,
+                control_schema=case.fixture.control,
+            )
+        assert await case.writer.fetchval(tables) == before
+
+
+@pytest.mark.asyncio
 async def test_native_codec_and_committed_recovery_keep_exact_capture(native_provider_case):
     case = native_provider_case
     from process.registry_source_recipe_store import canonical_registry_source_recipes, decode_registry_source_recipes

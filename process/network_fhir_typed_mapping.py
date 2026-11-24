@@ -154,22 +154,27 @@ def _range(prefix, start):
     return "(" + keys + ")>(" + low + ") AND (" + keys + ")<=(" + high + ")"
 
 
-async def _office_inputs(connection, stage, mapping, approved_keys):
+async def _office_inputs(connection, stage, mapping, approved):
     # The office primary key removes repeats without sorting the complete graph.
+    if isinstance(approved, _PreparedBindingRows):
+        selection = f"EXISTS (SELECT FROM {approved.relation} b WHERE b.source_key=p.network_source_key)"
+        parameters = ()
+    else:
+        selection = "p.network_source_key=ANY($1::text[])"
+        parameters = (approved,)
     column_sql = "provider_id,location_id,address_key,canonical_identity"
     await connection.execute(
-        f"INSERT INTO {mapping.relation('offices')} ({column_sql}) SELECT {column_sql} FROM {stage.relation('pairs')} "
-        "WHERE network_source_key=ANY($1::text[]) ON CONFLICT DO NOTHING",
-        approved_keys,
+        f"INSERT INTO {mapping.relation('offices')} ({column_sql}) SELECT {column_sql} FROM {stage.relation('pairs')} p "
+        f"WHERE {selection} ON CONFLICT DO NOTHING",
+        *parameters,
     )
     require(
         await connection.fetchval(
-            "SELECT NOT EXISTS(SELECT FROM "
-            + stage.relation("pairs")
-            + " p LEFT JOIN LATERAL (SELECT address_key,canonical_identity FROM "
-            + mapping.relation("offices")
-            + " o WHERE (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true WHERE p.network_source_key=ANY($1::text[]) AND (o.address_key IS DISTINCT FROM p.address_key OR o.canonical_identity IS DISTINCT FROM p.canonical_identity))",
-            approved_keys,
+            f"SELECT NOT EXISTS(SELECT FROM {stage.relation('pairs')} p LEFT JOIN LATERAL ("
+            f"SELECT address_key,canonical_identity FROM {mapping.relation('offices')} o "
+            "WHERE (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true "
+            f"WHERE {selection} AND (o.address_key IS DISTINCT FROM p.address_key OR o.canonical_identity IS DISTINCT FROM p.canonical_identity))",
+            *parameters,
         ),
         "office_collision",
     )
@@ -274,25 +279,31 @@ async def _mapping_workspace(connection, stage, table_names):
     return mapping
 
 
+def _graph_scope_valid(allow_empty, plan_tiers, *, typed=False):
+    source_key = "source_key" if typed else "record_json->>'source_key'"
+    source_scope = "source_scope" if typed else "record_json->'source_scope_json'"
+    tier_condition = (
+        f" OR ({source_scope}->>'kind'='uhc_plan_tier_v1' AND {source_scope}->>'source_generation'=$8::text)"
+        if plan_tiers
+        else ""
+    )
+    return (
+        ("" if allow_empty else "count(*)>0 AND ")
+        + f"coalesce(bool_and(coalesce({source_scope}=jsonb_build_object('organization_id',{source_key},'source_generation',$8::text)"
+        + tier_condition
+        + ",false)),true)"
+    )
+
+
 async def _approved_graph_keys(connection, bindings, arguments, *, allow_empty=False, plan_tiers=False):
-    tier_condition = ""
     if plan_tiers:
         from process.network_fhir_plan_tier_graph import validate_plan_tier_graph_bindings
 
         await validate_plan_tier_graph_bindings(connection, bindings, arguments)
-        tier_condition = (
-            " OR (record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1' "
-            "AND record_json->'source_scope_json'->>'source_generation'=$8::text)"
-        )
     selected = await connection.fetchrow(
-        "WITH "
-        + bindings
-        + (" SELECT " if allow_empty else " SELECT count(*)>0 AND ")
-        + "coalesce(bool_and(coalesce(record_json->'source_scope_json'=jsonb_build_object('organization_id',record_json->>'source_key','source_generation',$8::text)"
-        + tier_condition
-        + ",false)),true) AS valid, "
-        + "coalesce(array_agg(record_json->>'source_key' ORDER BY record_json->>'source_key') "
-        + "FILTER (WHERE $8::text IS NOT NULL),ARRAY[]::text[]) AS approved_keys FROM approved_network_bindings",
+        "WITH " + bindings + " SELECT " + _graph_scope_valid(allow_empty, plan_tiers) + " AS valid,"
+        "coalesce(array_agg(record_json->>'source_key' ORDER BY record_json->>'source_key') "
+        "FILTER (WHERE $8::text IS NOT NULL),ARRAY[]::text[]) AS approved_keys FROM approved_network_bindings",
         *arguments,
     )
     require(selected["valid"] is True, "approved_catalog_scope")
@@ -314,12 +325,45 @@ def _mapping_binding_rows(bindings):
     )
 
 
-async def _prepare_mapping_bindings(connection, bindings, arguments):
+async def _prepare_mapping_bindings(connection, bindings, arguments, *, typed):
+    from process.registry_imported_catalog_bindings import require_valid_catalog_bindings
+
     relation = "pg_temp." + _identifier("typed_network_bindings_" + uuid4().hex)
-    await connection.execute(
-        "CREATE TEMP TABLE " + relation + " ON COMMIT DROP AS SELECT * FROM " + _mapping_binding_rows(bindings),
-        *arguments[:-1],
-    )
+    if typed:
+        await connection.execute(
+            "CREATE TEMP TABLE "
+            + relation
+            + "(source_key text,source_generation text,network_id integer) ON COMMIT DROP"
+        )
+        selected = await connection.fetchrow(
+            "WITH "
+            + bindings
+            + ", stored AS (INSERT INTO "
+            + relation
+            + " SELECT source_key,source_scope->>'source_generation',network_id FROM approved_network_bindings "
+            "WHERE NOT (SELECT invalid FROM binding_check)) SELECT invalid,(SELECT "
+            + _graph_scope_valid(True, False, typed=True)
+            + " FROM approved_network_bindings WHERE NOT (SELECT invalid FROM binding_check)) AS valid FROM binding_check",
+            *arguments,
+        )
+        require_valid_catalog_bindings(selected["invalid"])
+        require(selected["valid"] is True, "approved_catalog_scope")
+    else:
+        from process.network_fhir_plan_tier_graph import validate_plan_tier_graph_bindings
+
+        await validate_plan_tier_graph_bindings(connection, bindings, arguments)
+        require(
+            await connection.fetchval(
+                "WITH " + bindings + " SELECT " + _graph_scope_valid(True, True) + " FROM approved_network_bindings",
+                *arguments,
+            )
+            is True,
+            "approved_catalog_scope",
+        )
+        await connection.execute(
+            "CREATE TEMP TABLE " + relation + " ON COMMIT DROP AS SELECT * FROM " + _mapping_binding_rows(bindings),
+            *arguments[:-1],
+        )
     await connection.execute("CREATE INDEX ON " + relation + "(source_key,source_generation)")
     await connection.execute("ANALYZE " + relation)
     return _PreparedBindingRows(relation), (arguments[-1],)
@@ -513,20 +557,31 @@ async def _prepare_mapping_offices(connection, stage, approval, table_names, con
             "catalog_generation",
         )
         generation = approval.catalog_generation
-    bindings = await typed_graph_bindings(connection, approval, control_schema=control_schema)
-    mapping = await _mapping_workspace(connection, stage, table_names)
     arguments = (approved_source.approved_revision, *binding_coordinates.sql_parameters, generation)
-    approved_keys = await _approved_graph_keys(
-        connection,
-        bindings,
-        arguments,
-        allow_empty=approval.catalog_bindings is not None,
-        plan_tiers=stage.document["contract"] == PLAN_TIER_CONTRACT,
-    )
+    is_plan_tier = stage.document["contract"] == PLAN_TIER_CONTRACT
+    use_typed_rows = approval.catalog_bindings is not None and table_names is None and not is_plan_tier
+    if use_typed_rows:
+        from process.registry_imported_catalog_bindings import published_catalog_binding_query
+
+        bindings = await published_catalog_binding_query(
+            connection,
+            approval.catalog_bindings,
+            approved_source,
+            binding_coordinates,
+            catalog_descriptor,
+            control_schema=control_schema,
+        )
+    else:
+        bindings = await typed_graph_bindings(connection, approval, control_schema=control_schema)
+    mapping = await _mapping_workspace(connection, stage, table_names)
     if approval.catalog_bindings is not None and table_names is None:
-        # The ordinary producer owns a writable transaction. Precreated workspaces can run read-only.
-        bindings, arguments = await _prepare_mapping_bindings(connection, bindings, arguments)
-    await _office_inputs(connection, stage, mapping, approved_keys)
+        bindings, arguments = await _prepare_mapping_bindings(connection, bindings, arguments, typed=use_typed_rows)
+        approved = bindings
+    else:
+        approved = await _approved_graph_keys(
+            connection, bindings, arguments, allow_empty=approval.catalog_bindings is not None, plan_tiers=is_plan_tier
+        )
+    await _office_inputs(connection, stage, mapping, approved)
     return mapping, approval, generation, arguments, bindings
 
 

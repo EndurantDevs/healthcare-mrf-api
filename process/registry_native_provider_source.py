@@ -12,7 +12,7 @@ from db.plan_release_storage import storage_identifier
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_source_witness_contract import digest
 from process.provider_directory_profile import valid_npi_sql
-from process.registry_imported_catalog_bindings import published_fhir_catalog_bindings_sql
+from process.registry_imported_catalog_bindings import published_catalog_binding_query, require_valid_catalog_bindings
 from process.registry_native_network_catalog import native_network_definitions, validate_native_catalog_descriptor
 
 PREFIX = "registry_native_provider_"
@@ -356,11 +356,11 @@ def _native_mapping_selection(descriptor):
     selected = (
         "SELECT wanted.source_key,approved.network_id FROM approved_network_bindings approved "
         "JOIN unnest($8::text[],$9::bigint[]) wanted(source_key,checksum) ON "
-        "(approved.record_json->'source_scope_json'->>'checksum_network')::bigint=wanted.checksum "
-        "WHERE approved.record_json->'source_scope_json'->>'source_generation'=$10"
+        "(approved.source_scope->>'checksum_network')::bigint=wanted.checksum "
+        "WHERE approved.source_scope->>'source_generation'=$10"
         if descriptor["coordinates"]["source_system"] == "aca"
         else "SELECT ($8::text[])[1] AS source_key,network_id FROM approved_network_bindings "
-        "WHERE record_json->'source_scope_json'->>'source_generation'=$10 AND $9::bigint[] IS NOT NULL"
+        "WHERE source_scope->>'source_generation'=$10 AND $9::bigint[] IS NOT NULL"
     )
     return keys, checksums, selected
 
@@ -418,6 +418,27 @@ async def _native_provider_inputs(
     return descriptor
 
 
+async def _map_native_provider_facts(connection, bindings, selected, name, capture, arguments, generation_id):
+    """Insert admitted facts and hash their selected networks from the same scoped binding result."""
+    result = await connection.fetchrow(
+        "WITH "
+        + bindings
+        + ", selected AS MATERIALIZED (SELECT * FROM ("
+        + selected
+        + ") candidates WHERE NOT (SELECT invalid FROM binding_check)), mapped AS (INSERT INTO "
+        + name
+        + " SELECT DISTINCT selected.network_id,'npi',fact.npi::text,encode(sha256(convert_to(jsonb_build_array($11::text,"
+        "fact.source_key,'npi',fact.npi::text,selected.network_id)::text,'UTF8')),'hex') "
+        f"FROM {capture} fact JOIN selected USING(source_key) WHERE {valid_npi_sql('fact.npi')}) "
+        "SELECT invalid,(SELECT encode(sha256(convert_to(coalesce(jsonb_agg(DISTINCT jsonb_build_array(source_key,network_id) "
+        "ORDER BY jsonb_build_array(source_key,network_id))::text,'[]'),'UTF8')),'hex') FROM selected) AS mapping FROM binding_check",
+        *arguments,
+        generation_id,
+    )
+    require_valid_catalog_bindings(result["invalid"])
+    return result["mapping"]
+
+
 async def rebuild_native_provider_stage(
     connection,
     recipe,
@@ -438,7 +459,7 @@ async def rebuild_native_provider_stage(
     descriptor = await _native_provider_inputs(
         connection, pin, catalog_scope, control_schema, source_manifest, retained_captures, verify_source
     )
-    bindings = await published_fhir_catalog_bindings_sql(
+    bindings = await published_catalog_binding_query(
         connection, catalog_scope, approved, recipe.binding_coordinates, descriptor, control_schema=control_schema
     )
     keys, checksums, selected = _native_mapping_selection(descriptor)
@@ -449,23 +470,8 @@ async def rebuild_native_provider_stage(
             f"CREATE TEMP TABLE {name}(network_id integer,provider_system text,provider_id text,evidence_id text)"
         )
         capture = storage_identifier(pin.capture["schema_name"]) + ".provider_fact"
-        await connection.execute(
-            "WITH "
-            + bindings
-            + ", selected AS ("
-            + selected
-            + ") INSERT INTO "
-            + name
-            + " SELECT DISTINCT selected.network_id,'npi',fact.npi::text,encode(sha256(convert_to(jsonb_build_array($11::text,"
-            "fact.source_key,'npi',fact.npi::text,selected.network_id)::text,'UTF8')),'hex') "
-            f"FROM {capture} fact JOIN selected USING(source_key) WHERE {valid_npi_sql('fact.npi')}",
-            *arguments,
-            pin.generation_id,
-        )
-        mapping = await connection.fetchval(
-            "WITH " + bindings + ", selected AS (" + selected + ") SELECT encode(sha256(convert_to(coalesce("
-            "jsonb_agg(DISTINCT jsonb_build_array(source_key,network_id) ORDER BY jsonb_build_array(source_key,network_id))::text,'[]'),'UTF8')),'hex') FROM selected",
-            *arguments,
+        mapping = await _map_native_provider_facts(
+            connection, bindings, selected, name, capture, arguments, pin.generation_id
         )
     recipe_hash = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
     return NativeProviderStage(

@@ -14,6 +14,12 @@ from process.registry_fhir_catalog_sources import (
     validate_fhir_catalog_source_descriptor,
 )
 
+_BINDING_CHECK = """, binding_check AS MATERIALIZED (
+      SELECT EXISTS(SELECT FROM effective_bindings WHERE conflicting
+        OR (overridden AND NOT excluded AND manual_network_key IS NULL))
+        OR EXISTS(SELECT FROM approved_network_bindings GROUP BY source_key HAVING count(*)>1) AS invalid
+    )"""
+
 
 @dataclass(frozen=True)
 class PublishedFHIRCatalogBindingScope:
@@ -37,7 +43,37 @@ def _document(encoded):
 
 
 async def published_fhir_catalog_bindings_sql(connection, scope, approved, coordinates, descriptor, *, control_schema):
-    """Resolve the exact published source before exposing its effective binding CTE."""
+    """Resolve the source and reject any conflicting effective binding before returning its query."""
+    control, catalog = await _published_catalog_scope(
+        connection, scope, approved, coordinates, descriptor, control_schema=control_schema
+    )
+    typed = _binding_sql(
+        control, catalog, scope.metadata_generation, source_system=coordinates.source_system, typed=True
+    )
+    invalid = await connection.fetchval(
+        "WITH " + typed + " SELECT invalid FROM binding_check", approved.approved_revision, *coordinates.sql_parameters
+    )
+    require_valid_catalog_bindings(invalid)
+    return _binding_sql(control, catalog, scope.metadata_generation, source_system=coordinates.source_system)
+
+
+def require_valid_catalog_bindings(invalid):
+    """Reject a conflicting or incomplete imported binding scope before its mapping can be used."""
+    if invalid is not False:
+        raise ValueError("registry_imported_catalog_binding_conflict")
+
+
+async def published_catalog_binding_query(connection, scope, approved, coordinates, descriptor, *, control_schema):
+    """Authenticate one exact source and revision for an integrated typed mapping query."""
+    control, catalog = await _published_catalog_scope(
+        connection, scope, approved, coordinates, descriptor, control_schema=control_schema
+    )
+    return _binding_sql(
+        control, catalog, scope.metadata_generation, source_system=coordinates.source_system, typed=True
+    )
+
+
+async def _published_catalog_scope(connection, scope, approved, coordinates, descriptor, *, control_schema):
     if (
         type(scope) is not PublishedFHIRCatalogBindingScope
         or type(approved) is not ApprovedMembershipSource
@@ -83,67 +119,89 @@ async def published_fhir_catalog_bindings_sql(connection, scope, approved, coord
     )
     if native is None or _document(native) != descriptor:
         raise ValueError("registry_imported_catalog_source_changed")
-    bindings = _binding_sql(control, catalog, scope.metadata_generation, source_system=coordinates.source_system)
-    invalid = await connection.fetchval(
-        "WITH " + bindings + " SELECT EXISTS(SELECT FROM effective_bindings WHERE conflicting "
-        "OR (overridden AND NOT excluded AND manual_network_key IS NULL)) OR EXISTS(SELECT FROM approved_network_bindings "
-        "GROUP BY record_json->>'source_key' HAVING count(*)>1)",
-        approved.approved_revision,
-        *coordinates.sql_parameters,
-    )
-    if invalid is not False:
-        raise ValueError("registry_imported_catalog_binding_conflict")
-    return bindings
+    return control, catalog
 
 
-def _binding_sql(control, catalog, metadata_generation, *, source_system=None):
+def _override_match(source_system):
     from process.registry_binding_override_sql import binding_override_identity_sql
 
     override_identity = binding_override_identity_sql("m.record_json", "c.document_json", "c.source_aliases")
     if source_system == "fhir":
         # FHIR exact and alias overrides both require the same key. Expose it as a hashable join condition.
         override_identity = "m.record_json->>'source_key'=c.document_json->>'source_key' AND " + override_identity
-    # The validated hex generation is a literal so existing bounded graph queries keep their eight parameters.
-    return f"""catalog_bindings AS MATERIALIZED (
-      SELECT b.*,coalesce(s.descriptor_json->'source_aliases',jsonb_build_array(s.descriptor_json->'coordinates'->'source_id')) AS source_aliases
+    return override_identity
+
+
+def _approved_fields(typed):
+    return (
+        "source_key,source_scope,effective_network_id AS network_id"
+        if typed
+        else """binding_id::text AS record_key,(document_json->>'revision')::bigint AS record_revision,
+        $1::bigint AS custom_revision,
+        (document_json-'source_scope')||jsonb_build_object('network_id',effective_network_id,
+          'source_scope_json',document_json->'source_scope','archived',false) AS record_json,
+        effective_network_id AS network_id,effective_network_id::text AS approved_network_key"""
+    )
+
+
+def _binding_sql(control, catalog, metadata_generation, *, source_system=None, typed=False):
+    """Resolve exact and alias overrides for one source, retaining full approved records for document readers."""
+    catalog_fields = "b.binding_id,b.network_id,b.document_json" if typed else "b.*"
+    manual_fields = (
+        "m.record_json->>'network_id' AS manual_id,m.record_json->>'archived' AS manual_archived"
+        if typed
+        else "m.record_json"
+    )
+    manual_id = "manual_id" if typed else "(record_json->>'network_id')"
+    manual_archived = "manual_archived" if typed else "(record_json->>'archived')"
+    manual_network = "n.record_json->>'archived' AS network_archived" if typed else "n.record_json AS manual_network"
+    network_archived = "network_archived" if typed else "(manual_network->>'archived')"
+    effective_fields = (
+        "c.document_json->>'source_key' AS source_key,c.document_json->'source_scope' AS source_scope"
+        if typed
+        else "c.*"
+    )
+    # Keep catalog lookups keyed by each selected binding when the JSON scope predicates underestimate its size.
+    override_identity = _override_match(source_system)
+    approved_fields = _approved_fields(typed)
+    bindings = f"""catalog_bindings AS MATERIALIZED (
+      SELECT {catalog_fields},coalesce(s.descriptor_json->'source_aliases',jsonb_build_array(s.descriptor_json->'coordinates'->'source_id')) AS source_aliases
       FROM {catalog}.registry_fhir_catalog_binding b
-      JOIN {catalog}.registry_fhir_catalog_network n USING(metadata_generation,network_id)
-      JOIN {catalog}.registry_fhir_catalog_source s
-        ON s.source_generation=b.document_json->'source_scope'->>'source_generation'
+      CROSS JOIN LATERAL (SELECT n.archived FROM {catalog}.registry_fhir_catalog_network n
+        WHERE n.metadata_generation=b.metadata_generation AND n.network_id=b.network_id OFFSET 0) n
+      CROSS JOIN LATERAL (SELECT s.descriptor_json FROM {catalog}.registry_fhir_catalog_source s
+        WHERE s.source_generation=b.document_json->'source_scope'->>'source_generation' OFFSET 0) s
       WHERE b.metadata_generation='{metadata_generation}' AND NOT n.archived
         AND b.document_json->>'source_system'=$2 AND b.source_id=$3
         AND b.document_json->>'dataset_schema'=$4 AND b.document_json->>'dataset_id'=$5
         AND b.document_json->>'producer_id'=$6 AND b.document_json->>'edition_id'=$7
     ), manual_bindings AS MATERIALIZED (
-      SELECT c.binding_id,m.record_json,m.custom_revision,
+      SELECT c.binding_id,{manual_fields},m.custom_revision,
         max(m.custom_revision) OVER(PARTITION BY c.binding_id) AS latest
       FROM catalog_bindings c JOIN {control}.registry_approved_record m
         ON m.approved_revision=$1 AND m.record_kind='network_binding'
         AND {override_identity}
     ), overrides AS MATERIALIZED (
-      SELECT binding_id,min((record_json->>'network_id')::integer) AS network_id,
-        bool_or((record_json->>'archived')::boolean) AS archived,
-        count(DISTINCT (record_json->>'network_id',record_json->>'archived'))>1 AS conflicting
+      SELECT binding_id,min({manual_id}::integer) AS network_id,
+        bool_or({manual_archived}::boolean) AS archived,
+        count(DISTINCT ({manual_id},{manual_archived}))>1 AS conflicting
       FROM manual_bindings WHERE custom_revision=latest GROUP BY binding_id
     ), effective_bindings AS MATERIALIZED (
-      SELECT c.*,coalesce(o.network_id,c.network_id) AS effective_network_id,
+      SELECT {effective_fields},coalesce(o.network_id,c.network_id) AS effective_network_id,
         coalesce(o.archived,false) AS excluded,coalesce(o.conflicting,false) AS conflicting,
         o.binding_id IS NOT NULL AS overridden,
-        n.record_key AS manual_network_key,n.record_json AS manual_network
+        n.record_key AS manual_network_key,{manual_network}
       FROM catalog_bindings c LEFT JOIN overrides o USING(binding_id)
       LEFT JOIN {control}.registry_approved_record n
         ON n.approved_revision=$1 AND n.record_kind='network'
         AND n.record_key=coalesce(o.network_id,c.network_id)::text
     ), approved_network_bindings AS MATERIALIZED (
-      SELECT binding_id::text AS record_key,(document_json->>'revision')::bigint AS record_revision,
-        $1::bigint AS custom_revision,
-        (document_json-'source_scope')||jsonb_build_object('network_id',effective_network_id,
-          'source_scope_json',document_json->'source_scope','archived',false) AS record_json,
-        effective_network_id AS network_id,effective_network_id::text AS approved_network_key
+      SELECT {approved_fields}
       FROM effective_bindings WHERE NOT excluded
-        AND NOT coalesce((manual_network->>'archived')::boolean,false)
+        AND NOT coalesce({network_archived}::boolean,false)
         AND NOT conflicting
     )"""
+    return bindings + _BINDING_CHECK if typed else bindings
 
 
 async def _catalog_snapshot(connection, scope, approved, control):

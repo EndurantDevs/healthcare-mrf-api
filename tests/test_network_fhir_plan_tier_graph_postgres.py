@@ -16,7 +16,7 @@ from process.network_fhir_plan_tier_graph import plan_tier_source_projection
 from process.network_fhir_retained_capture_contract import registry_location_id
 from process.network_fhir_source_witness_contract import SourceWitnessOrigin
 from process.network_fhir_typed_contract import ADDRESS_FIELDS, CELL_COLUMNS, KINDS, PAIR_COLUMNS
-from process.network_fhir_typed_mapping import _approved_graph_keys
+from process.network_fhir_typed_mapping import _approved_graph_keys, _prepare_mapping_bindings
 from process.network_fhir_typed_sql import PLAN_TIER_PROVIDER_ONLY_SQL
 from process.registry_fhir_plan_tier import source_key
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
@@ -272,6 +272,13 @@ async def test_changed_plan_or_tier_cannot_produce_graph(native_connection, dama
         assert await native_connection.fetchval("SELECT count(*) FROM " + stage.relation("pairs")) == 0
 
 
+async def _assert_prepared_tier(connection, bindings, arguments, expected_key):
+    prepared, parameters = await _prepare_mapping_bindings(connection, bindings, arguments, typed=False)
+    assert parameters == (arguments[-1],)
+    mapped = await connection.fetchrow("SELECT source_key,source_generation,network_id FROM " + prepared.relation)
+    assert tuple(mapped) == (expected_key, arguments[-1], 7)
+
+
 @pytest.mark.asyncio
 async def test_native_catalog_tier_scope_is_validated_before_mapping(native_connection):
     connection = native_connection
@@ -287,7 +294,11 @@ async def test_native_catalog_tier_scope_is_validated_before_mapping(native_conn
     await connection.execute(
         'INSERT INTO "' + table + '" VALUES($1,$2::jsonb)', str(uuid4()), json.dumps(binding_by_field)
     )
-    bindings = 'approved_network_bindings AS (SELECT * FROM pg_temp."' + table + '" WHERE $1::bigint>=0'
+    bindings = (
+        'approved_network_bindings AS (SELECT *, 7::integer AS network_id FROM pg_temp."'
+        + table
+        + '" WHERE $1::bigint>=0'
+    )
     bindings += "".join(" AND $" + str(index) + "::text IS NOT NULL" for index in range(2, 8)) + ")"
     arguments = (
         7,
@@ -300,6 +311,7 @@ async def test_native_catalog_tier_scope_is_validated_before_mapping(native_conn
         generation,
     )
     assert await _approved_graph_keys(connection, bindings, arguments, plan_tiers=True) == [source_key(tier)]
+    await _assert_prepared_tier(connection, bindings, arguments, source_key(tier))
     with pytest.raises(ValueError, match="approved_catalog_scope"):
         await _approved_graph_keys(connection, bindings, arguments)
     missing_scope_by_field = {
