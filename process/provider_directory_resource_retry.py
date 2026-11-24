@@ -218,6 +218,7 @@ def safe_error(fetch_result):
             "pagination_cursor_repeated",
             "pagination loop detected",
             "untrusted_pagination_link",
+            "optum_unreadable_search_slots",
             "ClientConnectionResetError",
             "ClientOSError",
             "ServerDisconnectedError",

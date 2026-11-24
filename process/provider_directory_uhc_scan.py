@@ -10,7 +10,9 @@ from functools import lru_cache, partial
 from itertools import batched, islice
 
 from db.plan_release_storage import storage_relation
+from process import provider_directory_optum_pages as optum_pages
 from process import provider_directory_source_proxy as source_proxy
+from process.provider_directory_resource_hash import RESOURCE_TRANSPORT_PAYLOAD_FIELDS
 
 POSTAL_SEARCH_PARAMS = {
     "PractitionerRole": "location.address-postalcode",
@@ -32,12 +34,74 @@ REFERENCE_PREFILL_DISCOVERY_SECONDS = 10.0
 _DIGITS = "0123456789"
 _ZIP5 = re.compile(r"[0-9]{5}")
 _PARTIAL_ZIP4 = re.compile(r"[0-9]{5}-[0-9]{1,3}")
+_OPTUM_RESOURCE_ID_TAG = "http://optum.com/fhir/wm/system/2021/07/resourceid"
 
 
 def is_source(directory, source_record):
     """Match the public Optum Flex base, which caps every search at 10,000 rows."""
     base = source_record.get("canonical_api_base") or source_record.get("api_base")
     return directory._canonical_base(base) == directory.UHC_PROVIDER_DIRECTORY_BASE
+
+
+def _resource_id_tag_index(tags):
+    """Identify one ordinary provider transport coding inside FHIR metadata."""
+    if not isinstance(tags, list):
+        return None
+    matches = [
+        index for index, tag in enumerate(tags) if isinstance(tag, dict) and tag.get("system") == _OPTUM_RESOURCE_ID_TAG
+    ]
+    if len(matches) != 1:
+        return None
+    tag = tags[matches[0]]
+    code = tag.get("code")
+    if tag.keys() == {"system", "code"} and isinstance(code, str) and code:
+        return matches[0]
+    return None
+
+
+def _is_optum_resource_observation(payload, api_base, resource_url):
+    """Require the importer-recorded fetch location as well as the supplied full URL."""
+    fetch_url = payload.get("fhir_fetch_url")
+    return (
+        payload.get("resource_url") == resource_url
+        and isinstance(fetch_url, str)
+        and (fetch_url == api_base or fetch_url.startswith(f"{api_base}/"))
+    )
+
+
+def align_replayed_resource_id_tag(directory, resource_type, previous, incoming):
+    """Keep the complete incoming provenance while comparing Optum replayed content."""
+    previous_meta = previous.get("fhir_meta")
+    incoming_meta = incoming.get("fhir_meta")
+    if not isinstance(previous_meta, dict) or not isinstance(incoming_meta, dict):
+        return previous
+    previous_tags = previous_meta.get("tag")
+    incoming_tags = incoming_meta.get("tag")
+    previous_index = _resource_id_tag_index(previous_tags)
+    incoming_index = _resource_id_tag_index(incoming_tags)
+    if previous_index is None or incoming_index is None:
+        return previous
+    api_base = directory.UHC_PROVIDER_DIRECTORY_BASE
+    resource_url = f"{api_base}/{resource_type}/{incoming.get('resource_id')}"
+    if not all(
+        _is_optum_resource_observation(observation, api_base, resource_url) for observation in (previous, incoming)
+    ):
+        return previous
+    if previous_tags[previous_index] == incoming_tags[incoming_index]:
+        return previous
+    aligned_tags = previous_tags.copy()
+    aligned_tags[previous_index] = incoming_tags[incoming_index]
+    metadata_by_field = {field: field_value for field, field_value in previous_meta.items() if field != "lastUpdated"}
+    metadata_by_field["tag"] = aligned_tags
+    if "lastUpdated" in incoming_meta:
+        metadata_by_field["lastUpdated"] = incoming_meta["lastUpdated"]
+    payload_by_field = {
+        field: field_value for field, field_value in previous.items() if field not in RESOURCE_TRANSPORT_PAYLOAD_FIELDS
+    }
+    payload_by_field.update(
+        {field: incoming[field] for field in RESOURCE_TRANSPORT_PAYLOAD_FIELDS if field in incoming}
+    )
+    return {**payload_by_field, "fhir_meta": metadata_by_field}
 
 
 def postal_child_prefixes(prefix):
@@ -405,13 +469,16 @@ class _ReferenceReader:
         return resource_keys
 
 
-def _scans_complete(directory, diagnostics_by_type):
+def _scans_ready_for_reference_closure(directory, diagnostics_by_type):
     return all(
-        directory._is_resource_diagnostic_acquisition_complete(diagnostic)
-        and not diagnostic.get("error")
-        and not diagnostic.get("bounded")
+        not diagnostic.get("bounded")
+        and (_is_scan_complete(directory, diagnostic) or optum_pages.has_only_unreadable_slots(diagnostic))
         for diagnostic in diagnostics_by_type.values()
     )
+
+
+def _is_scan_complete(directory, diagnostic):
+    return directory._is_resource_diagnostic_acquisition_complete(diagnostic) and not diagnostic.get("error")
 
 
 async def hydrate_saved_role_links(
@@ -534,7 +601,7 @@ async def hydrate_after_scan(directory, runner, resource_type, role_done):
     if resource_type not in ROLE_LINK_FIELDS or role_done.is_set():
         return
     diagnostic = runner.diagnostic_by_resource.get(resource_type)
-    if not diagnostic or not _scans_complete(directory, {resource_type: diagnostic}):
+    if not diagnostic or diagnostic.get("bounded") or not _is_scan_complete(directory, diagnostic):
         return
     written = await hydrate_saved_role_links(
         directory,
@@ -555,7 +622,7 @@ async def close_references(directory, source_record, persist, diagnostics_by_typ
     if (
         not is_source(directory, source_record)
         or not directory._is_uhc_role_postal_partition_enabled(source_record)
-        or not _scans_complete(directory, diagnostics_by_type)
+        or not _scans_ready_for_reference_closure(directory, diagnostics_by_type)
     ):
         return
     target_types = [resource_type for resource_type in REFERENCE_TARGET_TYPES if resource_type in diagnostics_by_type]

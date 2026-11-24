@@ -53,6 +53,13 @@ _RETAINED_VSP_CAPTURE_ERRORS = (
     OFFICE_CENSUS_UNRESOLVED,
 )
 _POSTAL_START_ERROR = "provider_directory_generic_source_isolated_transaction_required"
+_POSTAL_REDUCTION_CONFLICTS = frozenset(
+    {
+        "provider_directory_resource_payload_conflict",
+        "provider_directory_organization_identity_payload_conflict",
+        "provider_directory_practitioner_identity_payload_conflict",
+    }
+)
 
 HEADER = "provider_directory_endpoint_dataset"
 RESOURCE = "provider_directory_dataset_resource"
@@ -1210,24 +1217,13 @@ def _is_postal_start_failure(run, expected_failure_error):
 
 
 def _is_stopped_postal_scan(directory, runs, ancestor_ids):
-    """Recognize a retained interruption or reported incomplete postal scan."""
+    """Recognize a stopped postal intake that can retain its unmodified rows."""
     leaf = runs[0]
     endpoint = directory.UHC_PROVIDER_DIRECTORY_BASE
     if leaf.get("postal_endpoint_scope") != endpoint:
         return False
-    if leaf.get("postal_error_code") != "import_interrupted":
-        source_ids = _json(leaf["source_ids"])
-        if leaf.get("postal_error_code") != "import_failed" or len(source_ids) != 1:
-            return False
-        pending_resources = _transition_pending_resources(leaf)
-        allowed_resources = {f"{source_ids[0]}:{resource}" for resource in directory.UHC_SUPPORTED_RESOURCES}
-        distinct_pending_resources = set(pending_resources)
-        if (
-            not distinct_pending_resources
-            or distinct_pending_resources - allowed_resources
-            or len(pending_resources) != len(distinct_pending_resources)
-        ):
-            return False
+    if not _has_postal_stop_result(directory, leaf):
+        return False
     _require(
         leaf["status"] == "failed"
         and len(runs) == len(ancestor_ids)
@@ -1241,6 +1237,25 @@ def _is_stopped_postal_scan(directory, runs, ancestor_ids):
         "transition_run_changed",
     )
     return True
+
+
+def _has_postal_stop_result(directory, leaf):
+    """Permit an exact merge failure for transfer while still verifying all inputs."""
+    if leaf.get("postal_error_code") == "import_interrupted":
+        return True
+    source_ids = _json(leaf["source_ids"])
+    if leaf.get("postal_error_code") != "import_failed" or len(source_ids) != 1:
+        return False
+    if leaf.get("error_message") in _POSTAL_REDUCTION_CONFLICTS:
+        return True
+    pending_resources = _transition_pending_resources(leaf)
+    allowed_resources = {f"{source_ids[0]}:{resource}" for resource in directory.UHC_SUPPORTED_RESOURCES}
+    distinct_pending_resources = set(pending_resources)
+    return (
+        bool(distinct_pending_resources)
+        and distinct_pending_resources <= allowed_resources
+        and len(pending_resources) == len(distinct_pending_resources)
+    )
 
 
 def _verify_vsp_pre_capture_lineage(run_rows, root_run_id, ancestor_run_ids, expected_failure_error):

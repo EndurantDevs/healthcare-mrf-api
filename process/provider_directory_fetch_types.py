@@ -152,6 +152,9 @@ class PartitionFetchState:
     resumed_partition_pages: int = 0
     resumed_partition_rows: int = 0
     retry_leaf_urls: dict[str, str] = field(default_factory=dict)
+    unreadable_optum_slot_count: int = 0
+    unreadable_optum_page_count: int = 0
+    unreadable_optum_pages: list[dict[str, Any]] = field(default_factory=list)
     active_chain_count: int = 0
     pending_partition_checkpoint_rows: list[dict[str, Any]] = field(default_factory=list)
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -178,6 +181,7 @@ class PartitionPageFetchResult:
     next_url: str | None
     outcome: str
     rows_fetched: int = 0
+    reported_total: int | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +198,7 @@ class PartitionPageRequest:
     pending_resource_rows: list[dict[str, Any]]
     fetch_options: PartitionFetchOptions
     page_identities: list[str] = field(default_factory=list)
+    expected_total: int | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +212,22 @@ class PartitionChainRequest:
     request_url: str
     fetch_options: PartitionFetchOptions
     page_identities: list[str] = field(default_factory=list)
+
+    def page_request(self, current_url, is_residual_only, pending_resource_rows, expected_total):
+        """Bind a page to the current chain, write buffer, and first-page total."""
+        return PartitionPageRequest(
+            source_record=self.source_record,
+            resource_type=self.resource_type,
+            start_url_queue=self.start_url_queue,
+            state=self.state,
+            partition_start_url=self.request_url,
+            current_url=current_url,
+            is_residual_only=is_residual_only,
+            pending_resource_rows=pending_resource_rows,
+            fetch_options=self.fetch_options,
+            page_identities=self.page_identities,
+            expected_total=expected_total,
+        )
 
 
 @dataclass(frozen=True)

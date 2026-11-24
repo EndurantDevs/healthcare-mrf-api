@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_compact_source_migration as compact_migration
 from process import provider_directory_generic_source_storage as storage
+from process import provider_directory_uhc_scan as uhc_scan
 from process.provider_directory_generic_candidate import (
     COPY_FRAME_BYTES,
     COPY_MAX_BYTES,
@@ -96,9 +97,14 @@ def _resource_callbacks(directory, candidate):
         """Apply the existing pure family union or ordered last-observation rule."""
         if not is_semantic:
             return incoming
+        previous_payload = previous["payload_json"]
+        if previous["payload_hash"] != incoming["payload_hash"]:
+            previous_payload = uhc_scan.align_replayed_resource_id_tag(
+                directory, incoming["resource_type"], previous_payload, incoming["payload_json"]
+            )
         merged = directory._merged_semantic_dataset_payload(
             incoming["resource_type"],
-            previous["payload_json"],
+            previous_payload,
             incoming["payload_json"],
             contract,
         )

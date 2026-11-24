@@ -14,7 +14,12 @@ from contextlib import asynccontextmanager, nullcontext
 from typing import Any, Awaitable, Callable, Mapping
 
 from process.provider_directory_fetch_types import ResourceFetchResult
-from process.provider_directory_optum_outage import HTTP_OUTAGE_STATUSES, PARTITION_REQUEST, OptumOutage
+from process.provider_directory_optum_outage import (
+    PARTITION_REQUEST,
+    OptumOutage,
+    is_backend_outage_response,
+    is_page_error,
+)
 
 SOURCE_HTTP_REQUEST_SLOTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "provider_directory_http_request_slots", default=None
@@ -148,7 +153,7 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
             previous = self.limit
             self._adjust(epoch, send_limit, response, now, pacing_state)
             if response is not None:
-                self.outage.observe(response[0], now, outage_epoch)
+                self.outage.observe(response, now, outage_epoch)
             self._log_limit_change(directory, previous)
 
     def _adjust(self, epoch, send_limit, response, now, pacing_state):
@@ -273,6 +278,12 @@ def _optum_request_outcome(response):
 
 def _is_retryable_optum_continuation(response):
     return response[0] == 429 or _optum_request_outcome(response).startswith("transient_")
+
+
+def is_optum_partition_page_error(response):
+    """Match only the current Optum partition and its exact paging failure."""
+    context = PARTITION_REQUEST.get()
+    return context is not None and bool(context[1]) and is_page_error(response)
 
 
 async def fetch_partition_response(directory, request):
@@ -552,7 +563,7 @@ async def _fetch_admitted_source_response(directory, source_record, url, *, send
             can_retry_interrupted
             and outage is not None
             and outage_epoch != outage.epoch
-            and response[0] in HTTP_OUTAGE_STATUSES
+            and is_backend_outage_response(response)
         ):
             can_retry_interrupted = False
             continue

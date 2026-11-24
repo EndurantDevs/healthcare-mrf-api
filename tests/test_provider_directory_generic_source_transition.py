@@ -394,12 +394,23 @@ def _attach_incomplete_postal_scan(case):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reported_incomplete", [False, True])
-async def test_stopped_postal_scan_preserves_complete_cursors_leaves_and_uncovered_raw_rows(case, reported_incomplete):
+@pytest.mark.parametrize(
+    "terminal_result",
+    [
+        "interrupted",
+        "incomplete",
+        "provider_directory_resource_payload_conflict",
+        "provider_directory_organization_identity_payload_conflict",
+        "provider_directory_practitioner_identity_payload_conflict",
+    ],
+)
+async def test_stopped_postal_scan_preserves_complete_cursors_leaves_and_uncovered_raw_rows(case, terminal_result):
     counts = _attach_interrupted_postal_scan(case)
-    if reported_incomplete:
+    if terminal_result == "incomplete":
         _attach_incomplete_postal_scan(case)
         case.header["status"] = "acquiring"
+    elif terminal_result != "interrupted":
+        case.runs[0].update(postal_error_code="import_failed", error_message=terminal_result)
     counts["Practitioner"] = 2
     case.input_rows.append(dict(dataset_id=DATASET, resource_type="Practitioner", total=2, active=2))
     before = deepcopy((case.checkpoints, case.postal_leaves, case.input_rows, case.runs))
@@ -410,6 +421,20 @@ async def test_stopped_postal_scan_preserves_complete_cursors_leaves_and_uncover
     assert (await _transition(case, counts, manifest_replay=True))["already_applied"] is True
     assert (case.checkpoints, case.postal_leaves, case.input_rows, case.runs) == before
     assert all(sql.startswith('UPDATE "source_schema"."provider_directory_endpoint_dataset"') for sql, _ in case.writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_message",
+    ["provider_directory_generic_source_payload_hash_changed", "prefix:provider_directory_resource_payload_conflict"],
+)
+async def test_postal_transfer_cannot_classify_a_different_failure_as_reduction_conflict(case, error_message):
+    counts = _attach_interrupted_postal_scan(case)
+    case.runs[0].update(postal_error_code="import_failed", error_message=error_message)
+
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await _transition(case, counts)
+    assert case.writes == []
 
 
 @pytest.mark.asyncio
