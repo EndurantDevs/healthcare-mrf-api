@@ -558,9 +558,10 @@ async def test_proxy_retry_requires_root_observed_binding(monkeypatch, damage):
     else:
         with pytest.raises(ValueError, match="route_changed"):
             await source.require_fhir_source_route_ancestry(connection, launch)
-    assert "metrics->'audit'->'source_http_proxy'->'binding' AS source_http_proxy_binding" in str(
-        connection.all.await_args.args[0]
-    )
+    query = str(connection.all.await_args.args[0])
+    transport_audit = "COALESCE(metrics->'audit',metrics)->'source_http_proxy'"
+    assert f"{transport_audit}->'binding' AS source_http_proxy_binding" in query
+    assert f"{transport_audit}->'cooldowns' AS source_http_proxy_cooldowns" in query
 
 
 @pytest.mark.usefixtures("enabled_proxy")
