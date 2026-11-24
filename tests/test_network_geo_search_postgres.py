@@ -38,10 +38,7 @@ async def test_search_keyset_reuses_direct_range_shape_after_first_batch():
         )
     )
     assert (
-        await search._source_pass(
-            connection, '"candidate".network_geo_search', layout, layout.base, is_base=True, verify=True
-        )
-        == 3
+        await search._source_pass(connection, '"candidate".network_geo_search', layout, layout.base, is_base=True) == 3
     )
     first, second, final = connection.fetchrow.await_args_list
     assert "WHERE $1::text IS NULL" in first.args[0]
@@ -203,13 +200,20 @@ async def test_search_parity_failure_rolls_back_only_its_new_projection(search_d
     original = search._source_pass
     mutation_events = []
 
-    async def corrupt_before_verify(connection, table, layout, source, *, is_base, verify):
-        if verify and not mutation_events:
-            await connection.execute(f"UPDATE {table} SET state_name='changed'")
-            mutation_events.append("changed")
-        return await original(connection, table, layout, source, is_base=is_base, verify=verify)
+    async def corrupt_insert(connection, table, layout, source, *, is_base):
+        async def fetchrow(statement, *args):
+            columns = ",".join(search.compact_identifier(name) for name in search._COLUMNS)
+            expected = f"SELECT {columns} FROM expected"
+            corrupted = expected.replace('"state_name"', "'ZZ'")
+            assert expected in statement
+            output = await connection.fetchrow(statement.replace(expected, corrupted, 1), *args)
+            if output["row_count"]:
+                mutation_events.append("changed")
+            return output
 
-    monkeypatch.setattr(search, "_source_pass", corrupt_before_verify)
+        return await original(SimpleNamespace(fetchrow=fetchrow), table, layout, source, is_base=is_base)
+
+    monkeypatch.setattr(search, "_source_pass", corrupt_insert)
     with pytest.raises(search.NetworkGeoSearchError):
         await search.prepare_network_geo_search(db.connection, db.search_target, db.second_layout)
     assert mutation_events == ["changed"]
