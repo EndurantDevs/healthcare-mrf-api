@@ -11,6 +11,7 @@ from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
 from process.network_fhir_source_witness_contract import digest
 from process.registry_fhir_catalog_sources import (
     fhir_catalog_source_generation,
+    is_delta_positive_catalog_descriptor,
     validate_fhir_catalog_source_descriptor,
 )
 from process.registry_imported_source_inventory import (
@@ -97,7 +98,7 @@ async def replaced_fhir_generations(connection, previous, accepted):
     generations = []
     for prior_source in sorted(prior_sources, key=lambda prior: prior["source_generation"] not in current_generations):
         descriptor = json.loads(prior_source["descriptor"])
-        if descriptor.get("complete") is not True:
+        if descriptor.get("complete") is not True and not is_delta_positive_catalog_descriptor(descriptor):
             generations.append(prior_source["source_generation"])
             continue
         feed = fhir_feed(descriptor)
@@ -189,7 +190,8 @@ def select_preparation_fhir_sources(inventory, accepted):
     published_sources = [
         source
         for source in accepted
-        if source.descriptor["profile"] == "published_normalized" and source.descriptor["complete"] is True
+        if source.descriptor["profile"] == "published_normalized"
+        and (source.descriptor["complete"] is True or is_delta_positive_catalog_descriptor(source.descriptor))
     ]
     preferred, _ = select_fhir_editions(
         [source.descriptor for source in published_sources],

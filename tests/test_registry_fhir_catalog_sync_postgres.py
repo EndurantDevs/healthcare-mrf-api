@@ -18,7 +18,12 @@ from process.registry_fhir_catalog_custody import FHIRCatalogTarget
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
 from process.registry_fhir_catalog_grant import FHIRCatalogStandingGrant
-from process.registry_fhir_catalog_sources import FHIRCatalogSourceDisposition, fhir_catalog_source_generation
+from process.registry_fhir_catalog_sources import (
+    FHIRCatalogSourceDisposition,
+    fhir_catalog_source_digest,
+    fhir_catalog_source_generation,
+    validate_fhir_catalog_source_descriptor,
+)
 from process.registry_fhir_catalog_store import (
     copy_fhir_catalog_snapshot,
     create_fhir_catalog_candidate,
@@ -30,6 +35,9 @@ from process.registry_fhir_catalog_sync import (
     refresh_carried_fhir_catalog_relationships,
 )
 from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
+from process.registry_imported_catalog_preparation import select_preparation_fhir_sources
+from process.registry_imported_source_inventory import _catalog_observations, preferred_fhir_editions
+from tests.test_delta_dental_directory_normalization import delta_positive_descriptor as delta_positive_descriptor
 from tests.test_registry_fhir_catalog_custody_postgres import (
     expected_snapshot,
     freeze_metadata,
@@ -42,6 +50,60 @@ from tests.test_registry_fhir_catalog_grant import descriptor
 from tests.test_registry_fhir_catalog_sources import read_profile
 
 ACCEPTED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_kind", ["delta", "generic", "invalid_delta_receipt"])
+async def test_catalog_admits_incomplete_editions_only_with_verified_delta_observations(
+    metadata_custody, delta_positive_descriptor, source_kind
+):
+    fixture = metadata_custody
+    selected = delta_positive_descriptor
+    if source_kind == "generic":
+        selected = descriptor()
+        selected["complete"] = False
+        selected["admission"]["selected_resources"] = selected["admission"]["resource_types"] = ["Organization"]
+        selected["admission"]["resource_counts"] = {"Organization": 1}
+        assert validate_fhir_catalog_source_descriptor(selected) == selected
+    elif source_kind == "invalid_delta_receipt":
+        selected["accepted_receipt_sha256"] = "f" * 64
+
+    generation = fhir_catalog_source_digest(selected)
+    source_id = selected["coordinates"]["source_id"]
+    schema = fixture.target.schema_name
+    admission = selected["admission"]
+    source_rows = 1 if source_kind == "generic" else admission["publication"]["claimed_resource_count"]
+    await fixture.connection.execute(
+        f'INSERT INTO "{schema}".registry_fhir_catalog_source '
+        "(source_generation,source_id,descriptor_json,profile,source_rows,observation_rows,accepted_at) "
+        "VALUES($1,$2,$3::jsonb,'published_normalized',$4,0,now())",
+        generation,
+        source_id,
+        json.dumps(selected),
+        source_rows,
+    )
+    snapshot = expected_snapshot(fixture)
+    snapshot["source_vector_json"] = [{"source_generation": generation, "source_id": source_id, "status": "current"}]
+    snapshot["metadata_generation"] = metadata_generation(snapshot)
+    if source_kind == "invalid_delta_receipt":
+        with pytest.raises(ValueError, match="observation_invalid"):
+            await freeze_metadata(fixture, snapshot=snapshot)
+        return
+
+    disposition = SimpleNamespace(descriptor=selected)
+    preferred = preferred_fhir_editions([selected])
+    inventory = SimpleNamespace(fhir_descriptors=preferred, carried_fhir_descriptors=())
+    if source_kind == "generic":
+        assert preferred == []
+        assert await _catalog_observations(fixture.connection, schema) == ()
+        assert select_preparation_fhir_sources(inventory, [disposition]) == []
+        with pytest.raises(ValueError, match="source_invalid"):
+            await freeze_metadata(fixture, snapshot=snapshot)
+    else:
+        assert await _catalog_observations(fixture.connection, schema) == (selected,)
+        assert select_preparation_fhir_sources(inventory, [disposition]) == [disposition]
+        sealed = await freeze_metadata(fixture, snapshot=snapshot)
+        assert sealed["accounting_json"]["registry_fhir_catalog_source"]["rows"] == 1
 
 
 async def _named_replacement_rows(fixture, *, is_typed):

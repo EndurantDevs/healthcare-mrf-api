@@ -20,6 +20,7 @@ from process import registry_native_network_catalog as native
 from process.registry_fhir_catalog_observation import catalog_observation_descriptor_digest
 from process.registry_fhir_catalog_validation import metadata_generation, snapshot_inputs
 from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
+from tests.test_delta_dental_directory_normalization import delta_positive_descriptor as delta_positive_descriptor
 from tests.test_registry_fhir_catalog_grant import standing_grant
 from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor
 from tests.test_registry_fhir_catalog_validation import snapshot
@@ -262,10 +263,13 @@ async def test_practitioner_enrichment_preserves_legacy_network_on_same_feed(is_
 
 
 @pytest.mark.asyncio
-async def test_catalog_retains_one_copy_of_the_latest_complete_edition_if_unavailable():
+@pytest.mark.parametrize("is_delta", [False, True])
+async def test_catalog_retains_one_copy_of_the_latest_eligible_edition_if_unavailable(
+    delta_positive_descriptor, is_delta
+):
     uri = "https://directory.example.test/tenant"
     old = edition("old", "endpoint-old", uri, 1, 10)
-    latest = edition("latest", "endpoint-new", uri, 2, 20)
+    latest = delta_positive_descriptor if is_delta else edition("latest", "endpoint-new", uri, 2, 20)
     incomplete = edition("incomplete", "endpoint-incomplete", "https://directory.example.test/other", 3, 30)
     incomplete["complete"] = False
     observed = SimpleNamespace(

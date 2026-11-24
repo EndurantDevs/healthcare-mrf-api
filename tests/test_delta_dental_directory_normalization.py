@@ -214,7 +214,7 @@ def test_cumulative_lineages_keep_positive_roles_and_deduplicate_windows(tmp_pat
         assert "delta-role-19" in expanded_ids
 
 
-def test_catalog_admits_only_exact_delta_positive_scope(tmp_path):
+def _delta_catalog_observation_args(tmp_path):
     from process.delta_dental_directory_json import SOURCE_ENDPOINT
     from process.delta_dental_directory_producer import (
         DELTA_OBSERVED_ENDPOINT_ID,
@@ -222,10 +222,7 @@ def test_catalog_admits_only_exact_delta_positive_scope(tmp_path):
         DeltaObservedSourceScope,
         _receipt_for_capture,
     )
-    from process.registry_fhir_catalog_grant import fhir_catalog_admitted_current_sources
-    from process.registry_fhir_catalog_observation import CATALOG_OBSERVATION_CONTRACT, FHIRCatalogObservationDigests
-    from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
-    from process.registry_fhir_catalog_sources import validate_fhir_catalog_source_descriptor
+    from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
     from tests.test_registry_fhir_catalog_sources import descriptor, published_row, read_profile
 
     database = _capture(tmp_path)
@@ -246,16 +243,30 @@ def test_catalog_admits_only_exact_delta_positive_scope(tmp_path):
         endpoint_id=DELTA_OBSERVED_ENDPOINT_ID,
         **{METADATA_KEY: json.dumps(coverage_by_field)},
     )
-    profile = read_profile()
-    tables_by_name = descriptor()["tables"]
-    published = build_fhir_catalog_observation_descriptor(
-        profile, header_by_field, tables_by_name, (SOURCE_ENDPOINT, [SOURCE_ID]), families_by_name
-    )
-    assert validate_fhir_catalog_source_descriptor(published) == published
+    return read_profile(), header_by_field, descriptor()["tables"], (SOURCE_ENDPOINT, [SOURCE_ID]), families_by_name
+
+
+@pytest.fixture
+def delta_positive_descriptor(tmp_path):
+    from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
+
+    return build_fhir_catalog_observation_descriptor(*_delta_catalog_observation_args(tmp_path))
+
+
+def test_catalog_admits_only_exact_delta_positive_scope(tmp_path):
+    from process.delta_dental_directory_producer import METADATA_KEY
+    from process.registry_fhir_catalog_grant import fhir_catalog_admitted_current_sources
+    from process.registry_fhir_catalog_observation import CATALOG_OBSERVATION_CONTRACT
+    from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
+    from process.registry_fhir_catalog_sources import validate_fhir_catalog_source_descriptor
     from process.registry_imported_source_inventory import preferred_fhir_editions
 
+    args = _delta_catalog_observation_args(tmp_path)
+    profile, _, _, _, families_by_name = args
+    published = build_fhir_catalog_observation_descriptor(*args)
+    assert validate_fhir_catalog_source_descriptor(published) == published
     assert published["complete"] is False
-    assert preferred_fhir_editions([published]) == []
+    assert preferred_fhir_editions([published]) == [published]
     assert published["admission"][METADATA_KEY]["capped_windows"] == 1
     grant = SimpleNamespace(source_profiles=(profile,), observation_contract=CATALOG_OBSERVATION_CONTRACT)
     vector_entries = [{"source_generation": "delta-generation", "status": "current"}]
@@ -264,9 +275,7 @@ def test_catalog_admits_only_exact_delta_positive_scope(tmp_path):
         validate_fhir_catalog_source_descriptor({**published, "complete": True})
     families_by_name["PractitionerRole"]["rows"] += 1
     with pytest.raises(ValueError):
-        build_fhir_catalog_observation_descriptor(
-            profile, header_by_field, tables_by_name, (SOURCE_ENDPOINT, [SOURCE_ID]), families_by_name
-        )
+        build_fhir_catalog_observation_descriptor(*args)
 
 
 def _retained_source_state(directory, endpoint_id, run_id, metadata_key, receipt_by_field):

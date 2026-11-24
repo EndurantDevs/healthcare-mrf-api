@@ -13,6 +13,10 @@ from process.registry_fhir_catalog_extraction import (
 )
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
 from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_companies
+from process.registry_fhir_catalog_sources import (
+    is_delta_positive_catalog_descriptor,
+    validate_fhir_catalog_source_descriptor,
+)
 from process.registry_fhir_plan_tier import (
     SUPPORTED_TRANSFORMS,
     TRANSFORM_VERSION,
@@ -347,7 +351,8 @@ OR EXISTS(SELECT FROM source_bindings b
 OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_source s
  LEFT JOIN vector v USING(source_generation)
  WHERE s.source_id IS DISTINCT FROM v.source_id OR v.source_generation IS NULL
-   OR (v.status='current' AND s.descriptor_json->'complete'<>'true'::jsonb))
+   OR (v.status='current' AND s.descriptor_json->'complete'<>'true'::jsonb
+     AND NOT(s.source_generation=ANY($5::text[]))))
 OR EXISTS(SELECT FROM vector v LEFT JOIN {namespace}.registry_fhir_catalog_source s USING(source_generation)
  WHERE s.source_generation IS NULL) AS invalid,
  (SELECT coalesce(jsonb_object_agg(source_generation,jsonb_build_array(observation_rows,source_rows)),'{{}}'::jsonb)
@@ -414,7 +419,7 @@ _PRODUCTS_SQL = """SELECT EXISTS(SELECT FROM {control}.registry_approved_record 
      AND b.binding_id=CASE WHEN pg_input_is_valid(a.record_key,'uuid') THEN a.record_key::uuid END))"""
 
 
-async def _validate_sets(connection, namespace, generation, inputs, control_schema):
+async def _validate_sets(connection, namespace, generation, inputs, control_schema, delta_positive_generations=()):
     control = storage_identifier(control_schema)
     result = await connection.fetchrow(
         _SET_SQL.format(namespace=namespace, control=control),
@@ -422,6 +427,7 @@ async def _validate_sets(connection, namespace, generation, inputs, control_sche
         inputs["metadata_approved_revision"],
         canonical_json(inputs["source_vector_json"]),
         inputs["mapping_sha256"],
+        delta_positive_generations,
     )
     if result["invalid"] or await connection.fetchval(
         _PRODUCTS_SQL.format(namespace=namespace, control=control), generation, inputs["metadata_approved_revision"]
@@ -461,12 +467,21 @@ async def _account_tables(connection, namespace):
 
 
 async def _validate_sources(connection, namespace):
-    """Check the small source table's descriptors against their own columns."""
+    """Check stored descriptors and identify verified positive-observation exceptions."""
     source_rows = await connection.fetch(
         f"SELECT to_jsonb(stored)::text AS document FROM {namespace}.registry_fhir_catalog_source stored"
     )
+    delta_positive_generations = []
     for source in source_rows:
-        _source_document(json.loads(source["document"]))
+        document = json.loads(source["document"])
+        _source_document(document)
+        descriptor = document["descriptor_json"]
+        if descriptor["profile"] == "published_normalized" and descriptor["complete"] is False:
+            validated = validate_fhir_catalog_source_descriptor(descriptor)
+            if not is_delta_positive_catalog_descriptor(validated):
+                _invalid("source_invalid")
+            delta_positive_generations.append(document["source_generation"])
+    return delta_positive_generations
 
 
 async def _validate_prior_networks(connection, namespace, control, inputs):
@@ -513,9 +528,9 @@ async def validate_fhir_catalog_candidate(connection, copy_target, snapshot, *, 
         "membership": inputs["membership_mapping_sha256"],
     }:
         _invalid("inputs_changed")
-    await _validate_sources(connection, namespace)
+    delta_positive_generations = await _validate_sources(connection, namespace)
     accounting_by_table = await _account_tables(connection, namespace)
-    await _validate_sets(connection, namespace, generation, inputs, control_schema)
+    await _validate_sets(connection, namespace, generation, inputs, control_schema, delta_positive_generations)
     await _validate_prior_networks(connection, namespace, storage_identifier(control_schema), inputs)
     return {
         "metadata_generation": generation,
