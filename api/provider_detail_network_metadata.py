@@ -19,6 +19,7 @@ from api.network_address_scope import (
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.network_serving_read import PinnedNetworkServingManifest
+from process.registry_effective_network_catalog import current_catalog_networks_sql
 from process.registry_network_catalog_read import RegistryNetworkCatalogError, _closed_json
 
 MAX_METADATA_BYTES = 32 * 1024 * 1024
@@ -44,6 +45,13 @@ _LEGACY_ASSOCIATIONS = {
     "network_memberships",
 }
 _FACT_FIELDS = {"npi", "address_key", "network_id", "provider_system", "provider_id", "location_id", "evidence_id"}
+_APPROVED_NETWORK_JOIN = """JOIN {control}.registry_approved_record network ON network.approved_revision=:metadata_revision
+ AND network.record_kind='network' AND network.record_key=member.network_id::text
+ AND network.record_json->'archived'='false'::jsonb
+ AND jsonb_typeof(network.record_json->'network_id')='number'
+ AND network.record_json->>'network_id'=member.network_id::text"""
+_PINNED_NETWORK_JOIN = """JOIN {networks} network ON network.approved_revision=:metadata_revision
+ AND network.network_id=member.network_id AND NOT network.archived"""
 _READ_SQL = """WITH requested_offices AS MATERIALIZED (
  SELECT * FROM unnest(CAST(:metadata_npis AS bigint[]),CAST(:metadata_address_keys AS uuid[]))
  AS requested(npi,address_key)
@@ -60,11 +68,7 @@ _READ_SQL = """WITH requested_offices AS MATERIALIZED (
  FROM offices office JOIN {candidate}.network_membership member
  ON (member.provider_system,member.provider_id,member.location_id)=
     (office.provider_system,office.provider_id,office.location_id)
- JOIN {control}.registry_approved_record network ON network.approved_revision=:metadata_revision
- AND network.record_kind='network' AND network.record_key=member.network_id::text
- AND network.record_json->'archived'='false'::jsonb
- AND jsonb_typeof(network.record_json->'network_id')='number'
- AND network.record_json->>'network_id'=member.network_id::text
+ {network_join}
  WHERE NOT member.network_id=ANY(CAST(:metadata_excluded AS integer[]))
  AND (CAST(:metadata_selected AS integer[]) IS NULL OR member.network_id=ANY(CAST(:metadata_selected AS integer[])))
  LIMIT :metadata_fact_limit
@@ -213,10 +217,16 @@ async def _read_memberships(session, manifest, copies_by_office, scope, include_
                 "metadata_max_bytes": MAX_METADATA_BYTES,
             }
         )
+        networks = current_catalog_networks_sql()
+        network_join = (
+            _PINNED_NETWORK_JOIN.format(networks=networks)
+            if networks is not None
+            else _APPROVED_NETWORK_JOIN.format(control=_identifier(registry_schema()))
+        )
         statement = _READ_SQL.format(
             addresses=scoped_address_relation_sql("mrf.entity_address_unified"),
             candidate=_identifier(manifest.schema_name),
-            control=_identifier(registry_schema()),
+            network_join=network_join,
         )
         summary_by_field = (await session.execute(text(statement), parameters_by_name)).mappings().one_or_none()
         if summary_by_field is None or summary_by_field["bounded"] is not True:

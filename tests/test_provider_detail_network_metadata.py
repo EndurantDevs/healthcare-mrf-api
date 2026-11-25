@@ -25,6 +25,7 @@ from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi as provider
 from api.network_address_scope import network_address_read_scope
 from db import connection as db_connection
+from process.registry_effective_network_catalog import effective_catalog_read_scope
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
 from tests.network_read_execution_support import (
     mock_approved_control_metadata,
@@ -149,6 +150,22 @@ async def test_premise_members_preserve_exact_location_and_hide_opt_in_evidence(
     assert member["location_id"] == _SITE and "evidence_ids" not in member
     parameters = session.execute.await_args.args[1]
     assert parameters["metadata_selected"] == [42] and parameters["_canonical_network_ids"] == [42]
+
+
+@pytest.mark.asyncio
+async def test_membership_joins_the_effective_networks_of_the_pinned_catalog():
+    session = _session([_fact()])
+    detail_by_field = {"npi": int(_NPI), "address_list": [{"address_key": _ADDRESS}]}
+    with effective_catalog_read_scope("test_catalog_records", "test_catalog_networks"):
+        projected = await _project(session, detail_by_field, selected=(42,))
+
+    statement, parameters = session.execute.await_args.args
+    sql = str(statement)
+    assert "JOIN test_catalog_networks network ON network.approved_revision=:metadata_revision" in sql
+    assert "network.network_id=member.network_id AND NOT network.archived" in sql
+    assert "registry_approved_record" not in sql
+    assert parameters["metadata_selected"] == [42]
+    assert projected["address_list"][0]["network_memberships"][0]["location_id"] == _SITE
 
 
 @pytest.mark.asyncio
