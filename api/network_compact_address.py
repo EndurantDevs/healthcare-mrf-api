@@ -126,7 +126,12 @@ def compact_selected_offices(layout, network_ids):
 
 def compact_city_page(layout, network_ids, address_type):
     """Intersect selected offices and state before fetching each matching city's first providers."""
-    _validate_address_selection(layout, network_ids, None, False)
+    search = compact_city_search_relation(layout, network_ids)
+    if search is not None:
+        page = f"""SELECT DISTINCT coalesce(c.npi,c.inferred_npi) AS npi FROM {search} c
+          WHERE c.state_name=:state AND c.city_name=:city AND {address_type}
+          ORDER BY npi LIMIT :limit OFFSET :start"""
+        return None, page, "FALSE"
     selected = _membership_arms(layout, selected=True) or "SELECT NULL::text AS location_key WHERE FALSE"
     offices = _office_rows(layout, "location_key,npi,inferred_npi,state_name,type")
     cities = _office_rows(layout, "location_key,city_name")
@@ -148,6 +153,17 @@ def compact_city_page(layout, network_ids, address_type):
         AND address.city_name=:city LIMIT 1) city ON true
       ORDER BY office.npi LIMIT :limit OFFSET :start"""
     return keys, page, f"NOT {small_selection}"
+
+
+def compact_city_search_relation(layout, network_ids):
+    """Read the complete effective office projection for the pinned network selection."""
+    _validate_address_selection(layout, network_ids, None, False)
+    if layout.city_search is None or network_ids is None:
+        return None
+    return (
+        f"(SELECT npi,inferred_npi,state_name,city_name,type FROM ONLY {_relation(layout.city_search)} "
+        "WHERE canonical_network_ids && CAST(:_canonical_network_ids AS integer[]))"
+    )
 
 
 def _address_query(layout, network_ids, visible_membership_sql, location_lookup, columns=None):

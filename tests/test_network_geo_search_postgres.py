@@ -10,11 +10,18 @@ from uuid import UUID
 
 import asyncpg
 import pytest
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 
-from api.network_compact_address import compact_address_native_sql
+from api.network_compact_address import compact_address_native_sql, compact_city_page, compact_city_search_relation
 from db.models import EntityAddressUnified
 from process import network_geo_search as search
-from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
+from process.network_compact_layout import (
+    CompactAddressRelation,
+    CompactEdgeArtifact,
+    CompactNetworkLayout,
+    bind_compact_geo_search_candidate,
+)
 from process.network_membership_copy import MembershipCopyTarget
 from tests.test_network_compact_address_postgres import compact_db as compact_db
 from tests.test_network_membership_slices_postgres import slice_db as slice_db
@@ -142,7 +149,7 @@ async def test_bounded_search_matches_full_compact_rows_and_custom_precedence(se
     db = search_db
     monkeypatch.setattr(search, "_BATCH_ROWS", 1)
     descriptor = await search.prepare_network_geo_search(db.connection, db.search_target, db.second_layout)
-    columns = ",".join("a." + column for column in search.SEARCH_COLUMNS)
+    columns = ",".join("a." + column for column in search._LOCATION_COLUMNS)
     relation, arguments = compact_address_native_sql(db.second_layout, first_parameter=1, visible_membership_sql="TRUE")
     expected = await db.connection.fetch(
         f"SELECT {columns},{search._GEO} AS geo,a.canonical_network_ids FROM {relation} a WHERE cardinality(a.canonical_network_ids)>0 ORDER BY a.location_key",
@@ -154,12 +161,69 @@ async def test_bounded_search_matches_full_compact_rows_and_custom_precedence(se
     assert actual == expected and descriptor["row_count"] == len(expected) == 2
     assert actual[0]["lat"] == 70 and actual[0]["state_name"] == "BB"
     assert actual[0]["canonical_network_ids"] == [7, 42]
-    assert len(actual[0]) == len(search.SEARCH_COLUMNS) + 2
+    assert len(actual[0]) == len(search._LOCATION_COLUMNS) + 2
     candidate = _candidate(db.search_target, db.second_layout, descriptor)
     assert search.geo_search_receipt(candidate) == descriptor
     assert search.geo_search_relation(candidate) == CompactAddressRelation(db.search_target.schema_name, search.TABLE)
     assert await db.connection.fetchval("SHOW work_mem") == "64MB"
     assert await db.connection.fetchval("SHOW temp_file_limit") == "256MB"
+
+
+@pytest.mark.asyncio
+async def test_published_city_search_preserves_inferred_and_non_geocoded_offices(search_db):
+    db, layout = search_db, search_db.second_layout
+    await db.connection.execute(f"UPDATE {search._qualified(layout.base)} SET city_name='EXAMPLE CITY'")
+    await db.connection.execute(
+        f"""UPDATE {search._qualified(layout.custom)}
+        SET city_name='EXAMPLE CITY',npi=NULL,inferred_npi=2222222222,lat=NULL,long=NULL,type='secondary'
+        WHERE location_key=$1""",
+        db.keys[2],
+    )
+    descriptor = await search.prepare_network_geo_search(db.connection, db.search_target, layout)
+    candidate = _candidate(db.search_target, layout, descriptor)
+    assert bind_compact_geo_search_candidate(layout, candidate).city_search is None
+    candidate["validation_json"]["serving_readiness"]["city_search"] = True
+    projected = bind_compact_geo_search_candidate(layout, candidate)
+    relation_name = search._qualified(projected.city_search)
+    index_names = {index["name"] for index in await search._index_records(db.connection, relation_name)}
+    assert search._CITY_INDEX in index_names
+    assert search._CITY_INDEX not in {index["name"] for index in descriptor["indexes"]}
+
+    for network_ids, expected_npis in (((42,), []), ((42, 99), [2222222222]), ((99,), [2222222222]), ((88,), [])):
+        await _assert_published_city_search(db.connection, projected, network_ids, expected_npis)
+
+
+async def _assert_published_city_search(connection, layout, network_ids, expected_npis):
+    address_type = "c.type IN ('primary','secondary','practice','site')"
+    ordinary_sql, ordinary_binds = compact_address_native_sql(layout, first_parameter=1, network_ids=network_ids)
+    reference_rows = await connection.fetch(
+        f"SELECT DISTINCT coalesce(c.npi,c.inferred_npi) npi FROM {ordinary_sql} c "
+        f"WHERE city_name='EXAMPLE CITY' AND state_name='AA' AND {address_type} ORDER BY npi",
+        *ordinary_binds,
+    )
+    assert [reference_row["npi"] for reference_row in reference_rows] == expected_npis
+    key_ctes, page_sql, fallback_filter = compact_city_page(layout, network_ids, address_type)
+    assert key_ctes is None and fallback_filter == "FALSE"
+    relation_sql = compact_city_search_relation(layout, network_ids)
+    count_sql = (
+        f"SELECT count(DISTINCT coalesce(c.npi,c.inferred_npi)) FROM {relation_sql} c "
+        f"WHERE city_name=:city AND state_name=:state AND {address_type}"
+    )
+    for statement, offset, expected_values in (
+        (count_sql, 0, [len(expected_npis)]),
+        (page_sql, 0, expected_npis),
+        (page_sql, 1, []),
+    ):
+        compiled = text(statement).compile(dialect=PGDialect_asyncpg())
+        binds_by_name = {
+            "_canonical_network_ids": list(network_ids),
+            "city": "EXAMPLE CITY",
+            "state": "AA",
+            "limit": 1,
+            "start": offset,
+        }
+        observed_rows = await connection.fetch(str(compiled), *(binds_by_name[name] for name in compiled.positiontup))
+        assert [observed_row[0] for observed_row in observed_rows] == expected_values
 
 
 @pytest.mark.asyncio
@@ -185,6 +249,7 @@ async def test_search_rejects_changed_index_identity_and_receipt_scope(search_db
     descriptor["indexes"] = [
         {field: index[field] for field in ("name", *search._INDEX_FIELDS)}
         for index in await search._index_records(db.connection, relation)
+        if index["name"] != search._CITY_INDEX
     ]
     descriptor["sha256"] = search._digest({key: entry for key, entry in descriptor.items() if key != "sha256"})
     with pytest.raises(search.NetworkGeoSearchError):

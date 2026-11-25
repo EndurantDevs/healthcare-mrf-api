@@ -35,7 +35,9 @@ SEARCH_COLUMNS = (
     "ptg_source_array",
     "group_plan_array",
 )
-_COLUMNS = (*SEARCH_COLUMNS, "geo", "canonical_network_ids")
+_LOCATION_COLUMNS = (*SEARCH_COLUMNS, "city_name", "inferred_npi")
+_COLUMNS = (*_LOCATION_COLUMNS, "geo", "canonical_network_ids")
+_CITY_INDEX = TABLE + "_city_page"
 _BATCH_ROWS = 2000
 _SCOPE_FIELDS = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
 _FIELDS = {"contract", "scope", "table_name", "row_count", "sources", "indexes", "sha256"}
@@ -184,10 +186,10 @@ async def _has_compatible_sources(connection, layout):
             FROM pg_attribute WHERE attrelid=to_regclass($1::text)
               AND attnum>0 AND NOT attisdropped AND attname=ANY($2::text[])""",
             _qualified(relation),
-            SEARCH_COLUMNS,
+            _LOCATION_COLUMNS,
         )
         columns_by_name = {entry["attname"]: entry["type_name"] for entry in attributes}
-        if set(columns_by_name) != set(SEARCH_COLUMNS):
+        if set(columns_by_name) != set(_LOCATION_COLUMNS):
             return False
         profiles.append(columns_by_name)
     _require(all(columns_by_name == profiles[0] for columns_by_name in profiles))
@@ -196,7 +198,7 @@ async def _has_compatible_sources(connection, layout):
 
 def _batch_ctes(layout, *, has_after=False):
     """Read one ordered key range across the selected edge artifacts."""
-    columns = ",".join("a." + compact_identifier(name) for name in SEARCH_COLUMNS)
+    columns = ",".join("a." + compact_identifier(name) for name in _LOCATION_COLUMNS)
     keyset_predicate = "edge.location_key>$1::text" if has_after else "$1::text IS NULL"
     key_pages, memberships = [], []
     for index, artifact in enumerate(layout.artifacts, 2):
@@ -257,7 +259,7 @@ async def _build_projection(connection, target, layout):
 
     await network_publication_step("Preparing geographic search")
     table = compact_identifier(target.schema_name) + "." + compact_identifier(TABLE)
-    columns = ",".join("a." + compact_identifier(name) for name in SEARCH_COLUMNS)
+    columns = ",".join("a." + compact_identifier(name) for name in _LOCATION_COLUMNS)
     await connection.execute(
         f"CREATE TABLE {table} AS SELECT {columns},{_GEO} AS geo,ARRAY[]::integer[] AS canonical_network_ids FROM ONLY {_qualified(layout.base)} a WITH NO DATA"
     )
@@ -276,6 +278,10 @@ async def _build_geo_search_index(connection, qualified_table):
     await network_publication_step("Building geographic search index", unit="index", total=1)
     await connection.execute(
         f"CREATE INDEX {TABLE}_gn ON {qualified_table} USING gist (geo,canonical_network_ids public.gist__intbig_ops) WHERE {_PREDICATE}"
+    )
+    await connection.execute(
+        f"CREATE INDEX {_CITY_INDEX} ON {qualified_table} (state_name,city_name,(coalesce(npi,inferred_npi)))"
+        " WHERE type IN ('primary','secondary','practice','site')"
     )
     await network_publication_step("Building geographic search index", unit="index", done=1, total=1)
     await connection.execute(f"ANALYZE {qualified_table}")
@@ -303,7 +309,12 @@ async def prepare_network_geo_search(connection, copy_target, layout):
             "table_name": TABLE,
             "row_count": count,
             "sources": json.loads(json.dumps(asdict(layout))),
-            "indexes": [{field: index_record[field] for field in ("name", *_INDEX_FIELDS)} for index_record in indexes],
+            # Keep the spatial receipt readable by readers that predate city pages.
+            "indexes": [
+                {field: index_record[field] for field in ("name", *_INDEX_FIELDS)}
+                for index_record in indexes
+                if index_record["name"] != _CITY_INDEX
+            ],
         }
         descriptor_by_field["sha256"] = _digest(descriptor_by_field)
         require_geo_search_index_records(indexes, descriptor_by_field)
