@@ -234,6 +234,7 @@ async def test_native_child_candidates_keep_current_period_and_missing_projectio
     native_npis = (native._A, native._C, child_native._ABSENT)
     native_rows = values(column("npi", Text)).data([(npi,) for npi in native_npis]).cte("native_episode_sample")
     native_scope = select(native_rows.c.npi)
+    entity = projected.model(read_core.CustomImportEntityBinding)
     order_terms = (read_core.ReadOrderTerm("output_child", "asc", "last"),)
     for selector, expected in (
         (_KEY, [(native._A, Decimal("2"))]),
@@ -244,8 +245,14 @@ async def test_native_child_candidates_keep_current_period_and_missing_projectio
         original = _prepare(legacy, entity_values=native_npis, **options_by_name)
         scoped = _prepare(projected, native_entity_scope=native_scope, **options_by_name)
         assert "native_child_candidate_bindings AS MATERIALIZED" in str(scoped.statement)
-        assert [tuple(row) for row in (await session.execute(original.statement)).all()] == expected
-        assert [tuple(row) for row in (await session.execute(scoped.statement)).all()] == expected
+        plan = grouped_read.normalize_plan(projected, fixture.query(**options_by_name), _SCOPE)
+        candidates = grouped_query._native_child_candidate_ids(projected, native_scope, plan.context_filters[0])
+        candidate_npis = select(entity.canonical_value).join_from(
+            candidates, entity, candidates.c.entity_binding_id == entity.entity_binding_id
+        )
+        assert (await session.scalars(candidate_npis)).all() == [npi for npi, _ in expected]
+        assert [tuple(result_row) for result_row in (await session.execute(original.statement)).all()] == expected
+        assert [tuple(result_row) for result_row in (await session.execute(scoped.statement)).all()] == expected
     incomplete = await _projected_context(session, projected, omit_scope="child")
     scoped = _prepare(
         incomplete,
