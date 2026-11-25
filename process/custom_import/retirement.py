@@ -37,6 +37,7 @@ from db.models.custom_import import (
     CustomImportCurrentGeneration,
     CustomImportDataset,
     CustomImportExecution,
+    CustomImportGenerationSeal,
     CustomImportLease,
     CustomImportNoChangeSeal,
     CustomImportPublicationEvent,
@@ -179,7 +180,30 @@ async def _retained_pointers(session, family):
     )
 
 
-async def _eligibility(session, family, current, rollback):
+async def _require_discardable_generation(session, family, execution, lease):
+    """Keep unpublished candidates unless the owner selects a completed, sealed generation."""
+    now = await session.scalar(select(func.clock_timestamp()))
+    if (
+        family.frozen_at is None
+        or execution.state != "completed"
+        or lease.expires_at is None
+        or lease.expires_at > now
+        or not await session.scalar(
+            select(
+                exists().where(
+                    CustomImportGenerationSeal.generation_id == family.generation_id,
+                    CustomImportGenerationSeal.execution_id == family.execution_id,
+                    CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
+                )
+            )
+        )
+        or await _previously_published(session, family)
+    ):
+        raise SnapshotRetirementRefused("discard requires a completed, unpublished snapshot without a live lease")
+
+
+async def _eligibility(session, family, current, rollback, *, discard_generation_id=None):
+    """Classify retirement while holding the producer and its lease."""
     execution = await session.scalar(
         select(CustomImportExecution)
         .where(
@@ -201,6 +225,9 @@ async def _eligibility(session, family, current, rollback):
         raise SnapshotRetirementRefused("snapshot retirement producer identity is missing")
     if family.generation_id is not None and family.generation_id in (current, rollback):
         raise SnapshotRetirementRefused("snapshot retirement target is current or retained for rollback")
+    if discard_generation_id is not None:
+        await _require_discardable_generation(session, family, execution, lease)
+        return "abandoned"
     if family.frozen_at is None and lease.fence > family.producing_fence:
         return "replaced_fence"
     if family.generation_id is None:
@@ -589,7 +616,7 @@ async def _retire_verified_family(session, quoted, family, engine_id, reason):
     return SnapshotRetirementReceipt(family_id, reason, retained_bytes, False)
 
 
-async def _retire_snapshot(session, family_id, engine_id, assert_external_unreferenced):
+async def _retire_snapshot(session, family_id, engine_id, assert_external_unreferenced, *, discard_generation_id):
     """Retire one exact family atomically; caller must roll back any refusal/error.
 
     The required external check runs under the common lifecycle lock on this
@@ -603,10 +630,20 @@ async def _retire_snapshot(session, family_id, engine_id, assert_external_unrefe
     _schema, quoted = await _owner_schema(session)
     family, tombstone = await _locked_family(session, family_id, engine_id)
     identity = family or tombstone
+    if discard_generation_id is not None and (
+        type(discard_generation_id) is not int
+        or discard_generation_id <= 0
+        or identity.generation_id != discard_generation_id
+    ):
+        raise SnapshotRetirementRefused("discard generation does not match the exact snapshot")
     current, rollback = await _retained_pointers(session, identity)
     if identity.generation_id is not None and identity.generation_id in (current, rollback):
         raise SnapshotRetirementRefused("snapshot retirement target is current or retained for rollback")
-    reason = None if tombstone is not None else await _eligibility(session, family, current, rollback)
+    reason = (
+        None
+        if tombstone is not None
+        else await _eligibility(session, family, current, rollback, discard_generation_id=discard_generation_id)
+    )
     await assert_external_unreferenced(session, identity, current, rollback)
     if session.new or session.dirty or session.deleted:
         raise SnapshotRetirementRefused("snapshot retirement external check changed pending state")
@@ -636,7 +673,11 @@ async def _retire_snapshot(session, family_id, engine_id, assert_external_unrefe
     )
 
 
-async def retire_snapshot_family(session, family_id, *, engine_id, assert_external_unreferenced):
-    """Bound the complete owner operation; the caller rolls back all refusals/errors."""
+async def retire_snapshot_family(
+    session, family_id, *, engine_id, assert_external_unreferenced, discard_generation_id=None
+):
+    """Bound the owner operation; an explicit generation permits discarding an unpublished candidate."""
     async with asyncio.timeout(MAX_RETIREMENT_SECONDS):
-        return await _retire_snapshot(session, family_id, engine_id, assert_external_unreferenced)
+        return await _retire_snapshot(
+            session, family_id, engine_id, assert_external_unreferenced, discard_generation_id=discard_generation_id
+        )
