@@ -265,6 +265,7 @@ async def run_segmented_snowflake_candidate(
     *,
     processing_policy,
     writer_transports=None,
+    direct_compact: bool = False,
 ):
     """Carry one source claim through bounded replay, verified sealing and activation."""
 
@@ -277,12 +278,25 @@ async def run_segmented_snowflake_candidate(
         request = replace(request, lease_token=bytes(request.lease_token))
     captured = await _capture_for_build(session_factory, connector, request, policy)
     return await build_segmented_capture(
-        session_factory, request, captured, policy, writer_transports=writer_transports
+        session_factory,
+        request,
+        captured,
+        policy,
+        writer_transports=writer_transports,
+        direct_compact=direct_compact,
     )
 
 
-async def _build_captured_output(session_factory, request, build_id, counts, *, compact_limits, writer_transports):
+async def _build_captured_output(
+    session_factory, request, build_id, counts, *, compact_limits, writer_transports, staged_phase=None
+):
     """Dispatch owned snapshots after SOURCE and leave existing builds on the legacy path."""
+    if staged_phase == "verified":
+        from process.custom_import.build_output import _replay
+
+        replay = await _replay(session_factory, request, build_id)
+        if replay is not None:
+            return replay
     with failure_phase(FailurePhase.GRAPH):
         if compact_limits is not None:
             from process.custom_import.family_block_finalize import try_build_block_output
@@ -302,6 +316,107 @@ async def _build_captured_output(session_factory, request, build_id, counts, *, 
         )
 
 
+async def _load_sealed_direct_request(session_factory, request, captured, policy):
+    """Load the retained build request and id for an already-verified direct build."""
+    from sqlalchemy import text
+
+    async with session_factory() as session, session.begin():
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        await _set_timeout(session, policy.build.statement_timeout_ms)
+        bundle = (
+            await session.scalars(
+                select(CustomImportCaptureBundle)
+                .join(
+                    CustomImportExecution,
+                    CustomImportExecution.capture_bundle_id == CustomImportCaptureBundle.capture_bundle_id,
+                )
+                .where(
+                    CustomImportCaptureBundle.capture_bundle_id == captured.capture_bundle_id,
+                    CustomImportExecution.execution_id == captured.execution_id,
+                )
+                .options(load_only(CustomImportCaptureBundle.sealed_at, *_capture_columns()))
+            )
+        ).one_or_none()
+        if bundle is None:
+            return None
+        _require_capture(request, captured, policy, bundle)
+        build = (
+            await session.scalars(
+                select(CustomImportBuildAttempt).where(
+                    CustomImportBuildAttempt.execution_id == captured.execution_id,
+                    CustomImportBuildAttempt.producing_fence == captured.fence,
+                )
+            )
+        ).one_or_none()
+        if build is None or build.phase != "verified" or build.generation_id is None:
+            return None
+        bounds = policy.build.to_mapping()
+        bounds.pop("build_deadline_seconds")
+        build_request = SourceBuildRequest(
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+            execution_id=captured.execution_id,
+            lease_token=request.lease_token,
+            fence=captured.fence,
+            definition=request.definition,
+            expected_base_generation_id=build.base_generation_id,
+            expected_pointer_version=build.base_pointer_version,
+            complete_scope=True,
+            build_deadline_at=build.build_deadline_at,
+            **bounds,
+        )
+        return build_request, build.build_id
+
+
+async def _replay_sealed_direct_capture(session_factory, request, captured, policy, retained_base):
+    """Recover a committed direct terminal seal on a same-fence retry after lease expiry."""
+    if not callable(session_factory):
+        return None
+    from process.custom_import.build_output import _replay
+
+    loaded = await _load_sealed_direct_request(session_factory, request, captured, policy)
+    if loaded is None:
+        return None
+    build_request, build_id = loaded
+    if (
+        retained_base is not None
+        and (build_request.expected_base_generation_id, build_request.expected_pointer_version) != retained_base
+    ):
+        raise CandidateRunnerError("retained replay base has changed")
+    output = await _replay(session_factory, build_request, build_id)
+    if output is None:
+        return None
+    counts = await count_source_outcomes(session_factory, build_request, build_id)
+    return build_request, counts, output
+
+
+async def _finalize_captured_output(session_factory, build_request, captured, counts, output, retained_base):
+    if output.no_change is not None:
+        return _result("no_change", captured, counts, output, output.no_change)
+    if retained_base is not None:
+        return _result("sealed_unpublished", captured, counts, output)
+    with failure_phase(FailurePhase.ACTIVATE):
+        publication = await _activate(session_factory, build_request, output)
+    return _result("sealed_unpublished" if publication is None else "activated", captured, counts, output, publication)
+
+
+async def _begin_or_replay_build(session_factory, request, captured, policy, *, handoff, retained_base):
+    try:
+        build_request = await _build_request(session_factory, request, captured, policy, **handoff)
+    except LeaseAuthorityLost:
+        replayed = await _replay_sealed_direct_capture(session_factory, request, captured, policy, retained_base)
+        if replayed is not None:
+            return None, replayed
+        raise
+    if (
+        retained_base is not None
+        and (build_request.expected_base_generation_id, build_request.expected_pointer_version) != retained_base
+    ):
+        raise CandidateRunnerError("retained replay base has changed")
+    return build_request, None
+
+
 async def build_segmented_capture(
     session_factory,
     request,
@@ -311,24 +426,28 @@ async def build_segmented_capture(
     writer_transports=None,
     retained_base=None,
     compact_limits=None,
+    direct_compact: bool = False,
 ):
     """Build a bound capture. Replays require the original base and explicit activation."""
     if compact_limits is not None and (writer_transports is not None or retained_base is None):
         raise CandidateRunnerError("compact retained builds require the local owner and explicit base")
-
+    if direct_compact and writer_transports is not None:
+        raise CandidateRunnerError("direct compact option cannot be combined with writer transports")
     counts = SourceOutcomeCounts(0, 0)
     if captured.status not in {"capture_sealed", "capture_bound"}:
         return _result(captured.status, captured, counts)
     handoff = {} if writer_transports is None else {"writer_transports": writer_transports}
+    stage_options = handoff if not direct_compact else {"direct_compact": True}
     try:
         with failure_phase(FailurePhase.BEGIN_BUILD):
-            build_request = await _build_request(session_factory, request, captured, policy, **handoff)
-            if (
-                retained_base is not None
-                and (build_request.expected_base_generation_id, build_request.expected_pointer_version) != retained_base
-            ):
-                raise CandidateRunnerError("retained replay base has changed")
-        staged_source = await stage_segmented_source(session_factory, build_request, **handoff)
+            build_request, replayed = await _begin_or_replay_build(
+                session_factory, request, captured, policy, handoff=handoff, retained_base=retained_base
+            )
+            if replayed is not None:
+                return await _finalize_captured_output(
+                    session_factory, replayed[0], captured, replayed[1], replayed[2], retained_base
+                )
+        staged_source = await stage_segmented_source(session_factory, build_request, **stage_options)
         with failure_phase(FailurePhase.COUNTS):
             failure_identifiers(build_id=staged_source.build_id)
             counts = await count_source_outcomes(session_factory, build_request, staged_source.build_id)
@@ -339,13 +458,13 @@ async def build_segmented_capture(
             counts,
             compact_limits=compact_limits,
             writer_transports=writer_transports,
+            staged_phase=getattr(staged_source, "phase", None),
         )
         if output is None:
             status = await _finish(session_factory, request, captured, policy, "failed")
             return _result(status, captured, counts)
     except CancellationRequested:
-        status = await _finish(session_factory, request, captured, policy, "canceled")
-        return _result(status, captured, counts)
+        return _result(await _finish(session_factory, request, captured, policy, "canceled"), captured, counts)
     except LeaseAuthorityLost:
         return _result("lease_lost", captured, counts)
     except CandidateRunnerError:
@@ -353,10 +472,4 @@ async def build_segmented_capture(
             session_factory, request, captured, policy, "failed", failure_reason="segmented_build_failed"
         )
         return _result(status, captured, counts)
-    if output.no_change is not None:
-        return _result("no_change", captured, counts, output, output.no_change)
-    if retained_base is not None:
-        return _result("sealed_unpublished", captured, counts, output)
-    with failure_phase(FailurePhase.ACTIVATE):
-        publication = await _activate(session_factory, build_request, output)
-    return _result("sealed_unpublished" if publication is None else "activated", captured, counts, output, publication)
+    return await _finalize_captured_output(session_factory, build_request, captured, counts, output, retained_base)

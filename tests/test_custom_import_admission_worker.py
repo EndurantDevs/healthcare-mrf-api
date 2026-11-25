@@ -305,7 +305,8 @@ def test_response_transport_metadata_is_closed_and_bounded(headers):
         _canonical(RECEIPT | {"after_occurrence_id": 5}),
         _canonical(RECEIPT | {"candidate_error_count": 2**63}),
         _canonical(RECEIPT | {"candidate_error_count": 0.0}),
-        _canonical(RECEIPT | {"phase": "verified"}),
+        _canonical(RECEIPT | {"phase": "output"}),
+        _canonical(RECEIPT | {"phase": "verifying"}),
         _canonical(RECEIPT | {"phase": []}),
         json.dumps(RECEIPT | {"candidate_error_count": float("nan")}).encode(),
         json.dumps(RECEIPT | {"candidate_error_count": float("inf")}).encode(),
@@ -320,7 +321,7 @@ def test_receipt_rejects_duplicate_unknown_wrong_run_or_unsafe_values(raw):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("phase", ["graph", "rejected"])
+@pytest.mark.parametrize("phase", ["graph", "rejected", "verified"])
 def test_empty_eof_receipt_is_valid_without_advancing_cursor(phase):
     async def run():
         document = RECEIPT | {"phase": phase, "rows_processed": 0, "after_occurrence_id": 5}
