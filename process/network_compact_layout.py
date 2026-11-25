@@ -56,6 +56,11 @@ class CompactNetworkLayout:
         """Return an optional verified search pin without changing historical serialization."""
         return getattr(self, "_geo_search", None)
 
+    @property
+    def city_search(self):
+        """Use the location columns only when the candidate published them."""
+        return self.geo_search if getattr(self, "_city_search", False) else None
+
     def __post_init__(self):
         if (
             type(self.ref_map) is not CompactAddressRelation
@@ -104,6 +109,12 @@ def bind_compact_geo_search_candidate(layout, candidate):
     from process.network_geo_search import geo_search_receipt, geo_search_relation
 
     search = geo_search_receipt(candidate)
-    return bind_compact_geo_search(
+    bound = bind_compact_geo_search(
         layout, geo_search_relation(candidate), sources=search["sources"] if search is not None else None
     )
+    if search is not None:
+        validation = candidate["validation_json"]
+        if isinstance(validation, str):
+            validation = json.loads(validation)
+        object.__setattr__(bound, "_city_search", validation["serving_readiness"].get("city_search") is True)
+    return bound

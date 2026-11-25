@@ -137,7 +137,7 @@ async def prepare_compact_network_readiness(
             connection, copy_target.schema_name, include_reuse_keys=has_typed_memberships
         ),
         **({"slice_ref_revision": 2} if has_typed_memberships else {}),
-        **({"geo_search": geo_search} if geo_search is not None else {}),
+        **({"geo_search": geo_search, "city_search": True} if geo_search is not None else {}),
     }
     await connection.execute(
         f"UPDATE {_identifier(control_schema)}.network_membership_candidate "

@@ -387,17 +387,46 @@ _OTHER_ZIP_PAGE_FILTERS = (
 )
 
 
-def _provider_page_access(scope, filters, address_source, taxonomy_source, *, plain_sort, ordinary, native_only):
+def _provider_indexed_location_address(scope, address_sql, schema, location):
+    """Select indexed membership only on a qualified compact location search."""
+    if (
+        scope is not None
+        and scope.is_compact_network_selection
+        and scope.manifest.supports_location_lookup
+        and location
+    ):
+        return True, scoped_address_relation_sql(f"{schema}.{EntityAddressUnified.__tablename__}", location_lookup=True)
+    return False, address_sql
+
+
+def _provider_city_count_address(scope, address_sql, *, city, state, address_clauses):
+    """Reuse the city page projection for the same complete native count scope."""
+    if not city or not state or len(address_clauses) != 3:
+        return address_sql
+    from api.network_compact_address import compact_city_search_relation
+
+    return compact_city_search_relation(scope.manifest.compact_layout, scope.network_ids) or address_sql
+
+
+def _provider_page_access(
+    scope, filters, address_source, taxonomy_source, *, npi_sort, ordinary, native_only, bare_location
+):
     """Choose NPI ordering and the office source for page discovery."""
     compact = scope is not None and scope.is_compact_network_selection
     network_count = len(scope.network_ids) if compact else 0
+    location_lookup = compact and scope.manifest.supports_location_lookup
     is_nationwide_page = network_count in (4, 5)
     zip_code = filters.get("zip_code")
     location = zip_code or filters.get("city") or filters.get("state")
-    computed = bool(filters.get("plan_network")) or (
-        plain_sort and ((ordinary and zip_code) or (compact and (location or is_nationwide_page)))
+    plain_sort = npi_sort and bool(taxonomy_source)
+    # Sort ZIP matches after location lookup instead of scanning the nationwide NPI index.
+    indexed_zip_order = npi_sort and native_only and bare_location and bool(zip_code) and location_lookup
+    computed = (
+        indexed_zip_order
+        or bool(filters.get("plan_network"))
+        or (plain_sort and ((ordinary and zip_code) or (compact and (location or is_nationwide_page))))
     )
-    is_bounded_page = network_count == 3 and scope.manifest.supports_location_lookup
+    is_bounded_page = network_count == 3 and location_lookup
     if not ((is_nationwide_page or is_bounded_page) and plain_sort and native_only and not location):
         return computed, None, ProviderPageSource(address_source)
     if not filters["primary_only"] or len(filters["codes"] or ()) != 1:

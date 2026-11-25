@@ -123,11 +123,13 @@ from api.provider_list_sql import (
     _is_unified_address_table,
     _npi_count_read,
     _primary_address_order_clause,
+    _provider_city_count_address,
     _provider_import_count_page,
     _provider_import_match_clause,
     _provider_import_membership_clause,
     _provider_import_order_clause,
     _provider_import_relation_cte,
+    _provider_indexed_location_address,
     _provider_list_address_type_clause,
     _provider_list_connection,
     _provider_list_count,
@@ -8336,18 +8338,8 @@ async def list_providers(
 
     address_required_columns = _public_address_serving_column_keys()
     address_table_sql = await _address_serving_table_sql(address_required_columns, session=request_session)
-    use_indexed_offices = (
-        network_scope is not None
-        and network_scope.is_compact_network_selection
-        and network_scope.manifest.supports_location_lookup
-        and bool(zip_code or (city and state))
-    )
-    indexed_address_sql = (
-        scoped_address_relation_sql(
-            f"{_runtime_db_schema()}.{EntityAddressUnified.__tablename__}", location_lookup=True
-        )
-        if use_indexed_offices
-        else address_table_sql
+    use_indexed_offices, indexed_address_sql = _provider_indexed_location_address(
+        network_scope, address_table_sql, _runtime_db_schema(), zip_code or (city and state)
     )
     ordinary_address_sql = address_table_sql
     plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
@@ -8373,6 +8365,7 @@ async def list_providers(
         city = filters_by_name.get("city")
         state = filters_by_name.get("state")
         zip_code = filters_by_name.get("zip_code")
+        address_table_sql = indexed_address_sql if zip_code else ordinary_address_sql
         phone_digits = filters_by_name.get("phone_digits")
         address_key = filters_by_name.get("address_key")
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
@@ -8471,6 +8464,12 @@ async def list_providers(
         )
         if import_membership_clause is not None:
             address_clauses.append(import_membership_clause)
+
+        if use_indexed_offices and import_context is None and native_npis is None:
+            if not (zip_code or npi_where or use_taxonomy_filter):
+                address_table_sql = _provider_city_count_address(
+                    network_scope, address_table_sql, city=city, state=state, address_clauses=address_clauses
+                )
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         if use_taxonomy_filter and is_ordinary_provider_query and not (codes and len(taxonomy_filters) == 1):
@@ -9190,10 +9189,11 @@ async def list_providers(
             network_scope if page_import_context is None else None,
             filters_by_name,
             address_source,
-            taxonomy_source,
-            plain_sort=use_taxonomy_filter and not npi_where and order_by == "npi",
+            taxonomy_source if use_taxonomy_filter else "",
+            npi_sort=not npi_where and order_by == "npi",
             ordinary=is_ordinary_provider_query,
             native_only=is_unified_search and native_npis is None and native_scope_preparer is None,
+            bare_location=len(eligible_address_clauses) == 2,
         )
         city_page = None
         hydration_source = address_source

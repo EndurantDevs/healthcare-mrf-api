@@ -68,7 +68,7 @@ async def test_sparse_selected_edges_match_full_rows_with_missing_and_manual_add
         + [(UUID(int=999), db.keys[1])],
     )
     descriptor = await search.prepare_network_geo_search(db.connection, db.search_target, layout)
-    columns = ",".join("a." + column for column in search.SEARCH_COLUMNS)
+    columns = ",".join("a." + column for column in search._LOCATION_COLUMNS)
     relation, arguments = compact_address_native_sql(layout, first_parameter=1, visible_membership_sql="TRUE")
     expected = await db.connection.fetch(
         f"SELECT {columns},{search._GEO} AS geo,a.canonical_network_ids FROM {relation} a WHERE cardinality(a.canonical_network_ids)>0 ORDER BY a.location_key",

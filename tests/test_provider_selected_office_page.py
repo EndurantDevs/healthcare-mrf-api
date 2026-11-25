@@ -27,6 +27,8 @@ from tests.test_npi_all_names_like import FakeAcquire, RecordingConnection
         (4, {"primary_only": "false"}, False, True),
         (3, {"state": "NY"}, False, True),
         (3, {"zip_code": "60601"}, False, True),
+        (3, {"zip_code": "60601", "codes": ""}, False, False),
+        (3, {"zip_code": "60601", "state": "IL", "codes": ""}, False, False),
         (3, {"city": "Chicago", "state": "IL"}, False, True),
         (3, {"codes": "207Q00000X,208D00000X"}, False, False),
         (5, {"codes": "207Q00000X,208D00000X"}, False, True),
@@ -54,9 +56,10 @@ async def test_selected_office_page(monkeypatch, size, extra, staged, computed, 
     assert "selected_office_keys" not in count
     selection, hydration = page.split("sub_s AS (", 1)
     assert location_source in hydration and "selected_office_keys" not in hydration
-    if exact_place and supports_location_lookup:
-        assert location_source in selection and ordinary in count
-    assert ("ORDER BY npi + 0" in selection) == computed
+    if exact_place:
+        assert location_source in selection and location_source in count
+    bare_indexed_zip = supports_location_lookup and set(extra) == {"zip_code", "codes"} and extra["codes"] == ""
+    assert ("ORDER BY npi + 0" in selection) == (computed or bare_indexed_zip)
     assert ("taxonomy_prefix AS MATERIALIZED" in selection) == bounded
     if bounded:
         assert "bucket_members OFFSET 0" in selection
