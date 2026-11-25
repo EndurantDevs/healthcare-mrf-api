@@ -335,3 +335,32 @@ async def test_query_local_continuation_500_is_returned_without_replaying_cursor
     async with importer._source_http_session_scope(force=True, request_concurrency=32):
         assert await fetch_partition(search_request(source_by_field, 1, current_url=CURSOR)) == PAGE_ERROR
     send.assert_awaited_once_with(source_by_field, CURSOR, timeout=14)
+
+
+def test_paging_request_failure_and_http_200_page_error_classification():
+    paging_failure = (
+        500,
+        {
+            "resourceType": "OperationOutcome",
+            "issue": [
+                {
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": "Paging Request Failure. (fhirResourceTypeName=&quot;Practitioner&quot;)",
+                },
+                {"severity": "information", "code": "processing", "diagnostics": "TrackingUuid = synthetic"},
+            ],
+        },
+        None,
+        1,
+    )
+    assert outage.is_paging_failure(paging_failure)
+    assert not outage.is_page_error(paging_failure)
+    assert response._optum_request_outcome(paging_failure) == "transient_http_500_paging"
+    assert response._is_retryable_optum_continuation(paging_failure)
+
+    http_200_page_error = (200, PAGE_ERROR[1], importer.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR, 1)
+    assert outage.is_page_error(http_200_page_error)
+    assert not outage.is_backend_outage_response(http_200_page_error)
+    other_200_outcome = (200, ERROR[1], importer.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR, 1)
+    assert not outage.is_page_error(other_200_outcome)

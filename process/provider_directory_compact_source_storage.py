@@ -16,6 +16,7 @@ TABLE_SUFFIXES = {
     "resource_body_blocks": "rb",
 }
 SHARED_BODY_ROOT = "resource_shared_bodies"
+REFERENCE_TOKENS_ROOT = "resource_reference_tokens"
 
 
 def require_source_identity(identity, *, payload_format=compact_payload.FORMAT):
@@ -75,7 +76,9 @@ def validate_tables(binding):
 
 
 def _input_suffixes(payload_format):
-    return TABLE_SUFFIXES | ({SHARED_BODY_ROOT: "sb"} if payload_format == compact_payload.SHARED_BODY_FORMAT else {})
+    if payload_format == compact_payload.SHARED_BODY_FORMAT:
+        return TABLE_SUFFIXES | {SHARED_BODY_ROOT: "sb", REFERENCE_TOKENS_ROOT: "rt"}
+    return dict(TABLE_SUFFIXES)
 
 
 def payload_tables(policy, tables):
@@ -86,10 +89,11 @@ def payload_tables(policy, tables):
         tables["resource_reference_sets"]["name"],
         tables["resource_body_blocks"]["name"],
         tables.get(SHARED_BODY_ROOT, {}).get("name"),
+        tables.get(REFERENCE_TOKENS_ROOT, {}).get("name"),
     )
 
 
-async def create_inputs(connection, policy, *, payload_format=compact_payload.FORMAT):
+async def create_inputs(connection, policy, *, payload_format=compact_payload.FORMAT, defer_secondary_indexes=False):
     """Create one logical input view and its isolated compact backing relations."""
     from process import provider_directory_generic_source_storage as storage
 
@@ -99,9 +103,16 @@ async def create_inputs(connection, policy, *, payload_format=compact_payload.FO
         for root, suffix in _input_suffixes(payload_format).items()
     }
     compact = payload_tables(policy, tables_by_root)
-    for statement in compact_payload.compact_payload_ddl(compact):
+    ddl_statements = (
+        compact_payload.compact_payload_ddl(compact, defer_secondary_indexes=True)
+        if defer_secondary_indexes
+        else compact_payload.compact_payload_ddl(compact)
+    )
+    for statement in ddl_statements:
         await connection.execute(statement)
     roots = ("aliases", "reference_sets", "body_blocks")
+    if compact.reference_tokens is not None:
+        roots += ("reference_tokens",)
     if compact.shared_bodies is not None:
         roots += ("shared_bodies",)
     for root in roots:

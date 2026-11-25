@@ -19,6 +19,7 @@ from process.provider_directory_optum_outage import (
     OptumOutage,
     is_backend_outage_response,
     is_page_error,
+    is_paging_failure,
 )
 
 SOURCE_HTTP_REQUEST_SLOTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
@@ -265,6 +266,8 @@ def _optum_request_outcome(response):
         return f"transient_http_{status}"
     if status == 500 and is_optum_partition_page_error(response):
         return "page_error"
+    if status == 500 and is_paging_failure(response):
+        return "transient_http_500_paging"
     if _request_timed_out(error):
         return "transient_timeout"
     if error in {"ClientConnectionResetError", "ClientOSError", "ConnectionResetError", "ServerDisconnectedError"}:

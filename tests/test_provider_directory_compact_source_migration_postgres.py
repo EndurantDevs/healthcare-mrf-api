@@ -426,8 +426,7 @@ async def test_successor_preserves_reset_census(intake_case, monkeypatch, payloa
     assert len(checkpoints) == 7
 
 
-@pytest.mark.parametrize("payload_format", [compact.FORMAT, compact.SHARED_BODY_FORMAT])
-async def test_successful_release_rolls_back_with_handoff(intake_case, monkeypatch, payload_format):
+async def test_successful_release_rolls_back_with_handoff(intake_case):
     from tests.test_provider_directory_compact_completion_postgres import _append, _candidate, _complete, _payloads
 
     case = await _candidate(intake_case, "release")
@@ -438,11 +437,7 @@ async def test_successful_release_rolls_back_with_handoff(intake_case, monkeypat
     )
     original = await _prepare(case)
     await _append(case, _payloads())
-    if payload_format == compact.SHARED_BODY_FORMAT:
-        monkeypatch.setattr(
-            case.factory, "storage_binding", SharedBodyFHIRSourceStorage(**asdict(case.factory.storage_binding))
-        )
-    converted = await _migrate(case, payload_format=payload_format)
+    converted = await _migrate(case, payload_format=compact.FORMAT)
     with pytest.raises(ValueError):
         async with source.source_transaction(case.database):
             publisher = source.bound_publisher()
@@ -473,6 +468,62 @@ async def test_successful_release_rolls_back_with_handoff(intake_case, monkeypat
         assert not await case.connection.fetchval(
             "SELECT to_regclass($1)::text IS NOT NULL", storage_relation("source_schema", table["name"])
         )
+
+
+async def test_shared_body_conversion_atomically_reclaims_legacy_tables_on_finish(intake_case, monkeypatch):
+    from tests.test_provider_directory_compact_completion_postgres import _append, _candidate, _complete, _payloads
+
+    case = await _candidate(intake_case, "shared_release")
+    case.directory.anthem = directory.anthem
+    case.directory._stable_source_id = directory._stable_source_id
+    case.directory._last_updated_partition_fingerprint_resource_type = (
+        directory._last_updated_partition_fingerprint_resource_type
+    )
+    original = await _prepare(case)
+    await _append(case, _payloads())
+    observed_before = await _observations(case, original)
+    monkeypatch.setattr(
+        case.factory, "storage_binding", SharedBodyFHIRSourceStorage(**asdict(case.factory.storage_binding))
+    )
+    original_store = storage._store
+    failure_by_stage = {"should_fail": True}
+
+    async def fail_finish_store(connection, policy, identity, previous, binding_by_field, **kwargs):
+        if failure_by_stage["should_fail"] and binding_by_field["contract"] == storage.NAMED_COMPACT_CONTRACT:
+            failure_by_stage["should_fail"] = False
+            raise RuntimeError("synthetic finish commit failure")
+        return await original_store(connection, policy, identity, previous, binding_by_field, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "_store", fail_finish_store)
+        with pytest.raises(RuntimeError, match="synthetic finish commit failure"):
+            await _migrate(case, payload_format=compact.SHARED_BODY_FORMAT)
+    pending = await _binding_for(case)
+    assert pending["contract"] == storage.NAMED_ISOLATED_CONTRACT and pending[migration.KEY]["state"] == "copying"
+    for table in original["tables"].values():
+        assert await case.connection.fetchval(
+            "SELECT to_regclass($1)::text IS NOT NULL", storage_relation("source_schema", table["name"])
+        )
+    converted = await _migrate(case, payload_format=compact.SHARED_BODY_FORMAT)
+    assert converted["contract"] == storage.NAMED_COMPACT_CONTRACT and migration.KEY not in converted
+    assert await _binding_for(case) == converted
+    for table in original["tables"].values():
+        assert not await case.connection.fetchval(
+            "SELECT to_regclass($1)::text IS NOT NULL", storage_relation("source_schema", table["name"])
+        )
+    assert await _observations(case, converted) == observed_before
+    tokens_table = storage_relation("source_schema", converted["tables"]["resource_reference_tokens"]["name"])
+    assert await case.connection.fetchval(f"SELECT count(*) FROM {tokens_table}") == 1
+    aliases_name = converted["tables"]["resource_aliases"]["name"]
+    index_count = await case.connection.fetchval(
+        "SELECT count(*) FROM pg_indexes WHERE schemaname='source_schema' AND tablename=$1", aliases_name
+    )
+    assert index_count == 3
+    prepared = await _complete(case)
+    assert await _observations(case, prepared) == observed_before
+    await case.connection.execute(f"UPDATE {tokens_table} SET reference_text='Organization/tampered'")
+    with pytest.raises(ValueError, match="compact_shared_body_changed"):
+        await _complete(case)
 
 
 async def _binding_for(case):
