@@ -54,6 +54,7 @@ _NEW = {
     "query_record": (108, "custom_import_block_query_record"),
 }
 ROLE_SPECS = MappingProxyType(_COMMON | _NEW)
+COMPACT_TABLE_NAMES = tuple(name for _, name in _NEW.values())
 # An aggregate row must not disclose columns unavailable through its old sources.
 READ_CAPABILITIES = MappingProxyType(
     {

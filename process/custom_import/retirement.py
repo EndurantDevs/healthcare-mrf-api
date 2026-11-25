@@ -48,6 +48,7 @@ from db.models.custom_import_storage import (
     CustomImportSnapshotRelation,
     CustomImportSnapshotRetirement,
 )
+from process.custom_import.family_block_layout import COMPACT_TABLE_NAMES
 from process.custom_import.retirement_history import (
     assert_closed_continuations,
     lock_historical_projection,
@@ -338,10 +339,13 @@ async def _optional_relation_names(session, family_id):
             text("""
         SELECT c.relname FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname=:namespace AND c.relname IN ('source_bulk_landing','legacy_copy_origin')
+        WHERE n.nspname=:namespace AND c.relname=ANY(CAST(:names AS text[]))
         ORDER BY c.relname
     """),
-            {"namespace": snapshot_schema(family_id)},
+            {
+                "namespace": snapshot_schema(family_id),
+                "names": ["source_bulk_landing", "legacy_copy_origin", *COMPACT_TABLE_NAMES],
+            },
         )
     )
 
