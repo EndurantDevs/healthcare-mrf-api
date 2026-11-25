@@ -75,8 +75,7 @@ async def _catalog_coordinates(connection, manifest, control_schema):
     return control, catalog, generation, manifest.approved_custom_revision
 
 
-async def effective_catalog_sql(connection, manifest, control_schema, *, selected_networks=None):
-    """Read imported metadata with exact retained manual overrides and source bindings."""
+async def _checked_catalog_coordinates(connection, manifest, control_schema):
     coordinates = await _catalog_coordinates(connection, manifest, control_schema)
     if coordinates is None:
         return None
@@ -87,9 +86,31 @@ async def effective_catalog_sql(connection, manifest, control_schema, *, selecte
         is not False
     ):
         raise ValueError("registry_effective_catalog_binding_conflict")
+    return coordinates
+
+
+async def effective_catalog_sql(connection, manifest, control_schema, *, selected_networks=None):
+    """Read imported metadata with exact retained manual overrides and source bindings."""
+    coordinates = await _checked_catalog_coordinates(connection, manifest, control_schema)
+    if coordinates is None:
+        return None
+    control, catalog, generation, revision = coordinates
     ctes = _catalog_ctes(control, catalog, generation, revision, selected_networks=selected_networks)
     records = _record_ctes(catalog, generation, revision, selected_networks=selected_networks)
     return f"(WITH {ctes},{records} SELECT * FROM effective_records)"
+
+
+async def effective_catalog_organizations_sql(connection, manifest, control_schema):
+    """Resolve organizations using indexed evidence for each source company."""
+    coordinates = await _checked_catalog_coordinates(connection, manifest, control_schema)
+    if coordinates is None:
+        return None
+    control, catalog, generation, revision = coordinates
+    organizations = _source_organization_ctes(catalog, revision, _scoped_company_visibility(catalog, generation), None)
+    return (
+        f"(WITH {_manual_catalog_cte(control, revision)},{_manual_binding_keys_cte()},"
+        f"{organizations} SELECT * FROM organization_records)"
+    )
 
 
 def _legacy_aca_match_key(document):
@@ -156,8 +177,7 @@ async def effective_catalog_networks_sql(connection, manifest, control_schema):
           AND m.record_kind='network' AND m.record_key=n.network_id::text))"""
 
 
-def _requested_binding_ctes(catalog, generation, selected_networks):
-    """Read requested binding keys, including overrides moved into the selection."""
+def _manual_binding_keys_cte():
     return f"""manual_keys AS MATERIALIZED (
       SELECT record_json,custom_revision,record_json->>'source_key' AS match_key
       FROM manual WHERE record_kind='network_binding'
@@ -165,7 +185,12 @@ def _requested_binding_ctes(catalog, generation, selected_networks):
       SELECT selection.record_json,selection.custom_revision,selection.match_key
       FROM (SELECT record_json,custom_revision,{_legacy_aca_match_key("record_json")} AS match_key
         FROM manual WHERE record_kind='network_binding') selection WHERE selection.match_key IS NOT NULL
-    ), incoming_keys AS MATERIALIZED (
+    )"""
+
+
+def _requested_binding_ctes(catalog, generation, selected_networks):
+    """Read requested binding keys, including overrides moved into the selection."""
+    return f"""{_manual_binding_keys_cte()}, incoming_keys AS MATERIALIZED (
       SELECT DISTINCT match_key,record_json->>'source_id' AS source_id,
         (record_json->>'source_system'='fhir' AND match_key ~ '^[A-Za-z0-9.-]{{1,64}}$') IS TRUE AS fhir_org
       FROM manual_keys
@@ -186,9 +211,16 @@ def _requested_binding_ctes(catalog, generation, selected_networks):
     ), """
 
 
-def _catalog_ctes(control, catalog, generation, revision, *, selected_networks=None):
+def _manual_catalog_cte(control, revision):
     if type(revision) is not int or not 0 <= revision < 2**63:
         raise ValueError("registry_effective_catalog_revision_invalid")
+    return f"""manual AS MATERIALIZED (
+      SELECT approved_revision,record_kind,record_key,record_revision,custom_revision,record_json
+      FROM ONLY {control}.registry_approved_record WHERE approved_revision={revision}
+    )"""
+
+
+def _catalog_ctes(control, catalog, generation, revision, *, selected_networks=None):
     override_identity = binding_override_identity_sql("m.record_json", "b.document_json", "b.source_aliases")
     keys, network_filter, effective_filter = "", "", ""
     manual_match = "manual m ON m.record_kind='network_binding'"
@@ -201,10 +233,7 @@ def _catalog_ctes(control, catalog, generation, revision, *, selected_networks=N
         manual_match = "manual_keys m ON m.match_key=b.document_json->>'source_key'"
         network_filter = f"AND n.network_id=ANY({selected_networks})"
         effective_filter = f"AND coalesce(o.network_id,b.network_id)=ANY({selected_networks})"
-    return f"""manual AS MATERIALIZED (
-      SELECT approved_revision,record_kind,record_key,record_revision,custom_revision,record_json
-      FROM ONLY {control}.registry_approved_record WHERE approved_revision={revision}
-    ), {keys}imported AS MATERIALIZED (
+    return f"""{_manual_catalog_cte(control, revision)}, {keys}imported AS MATERIALIZED (
       SELECT b.*,s.descriptor_json->'source_aliases' AS source_aliases
       FROM {imported_bindings}
       LEFT JOIN ONLY {catalog}.registry_fhir_catalog_source s
