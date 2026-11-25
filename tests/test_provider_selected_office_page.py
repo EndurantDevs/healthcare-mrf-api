@@ -91,3 +91,31 @@ async def test_plain_city_page_stages_state_offices_and_keeps_large_selection_fa
     assert "NOT (SELECT total <= 500000 FROM selected_office_bound)" in selection
     assert ordinary in selection and ordinary in count
     assert indexed in hydration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lookup", "extra", "indexed_page"),
+    [
+        (True, {}, True),
+        (True, {"start": "1"}, True),
+        (True, {"start": "64"}, False),
+        (True, {"phone": "3125550100"}, False),
+        (False, {}, False),
+    ],
+)
+async def test_small_network_provider_page_uses_ordered_office_lookup(monkeypatch, lookup, extra, indexed_page):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi, "_provider_list_connection", lambda *args, **kwargs: FakeAcquire(conn))
+    manifest = _lookup_manifest(_layout()) if lookup else _manifest(_layout())
+    with network_address_read_scope(manifest, (42,)):
+        ordinary = scoped_address_relation_sql("mrf.entity_address_unified")
+        indexed = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
+        response = await npi.get_all(SimpleNamespace(args={"limit": "2", "include_total": "0", **extra}))
+    assert response.status == 200
+    assert not any("SELECT COUNT(DISTINCT" in sql for sql, _ in conn.sql_calls)
+    page = next(sql for sql, _ in conn.sql_calls if "page_npis AS" in sql)
+    selection, hydration = page.split("sub_s AS (", 1)
+    assert ordinary in selection
+    assert (indexed if indexed_page else ordinary) in hydration
+    assert ("prefix_page AS MATERIALIZED" in selection) is indexed_page

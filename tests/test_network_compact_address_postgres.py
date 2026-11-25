@@ -25,6 +25,7 @@ from api.network_compact_address import (
     compact_address_relation_sql,
     compact_address_selectable,
     compact_city_page,
+    compact_npi_page,
     compact_selected_offices,
 )
 from api.network_read_execution import qualified_relation_sql
@@ -120,6 +121,38 @@ async def test_staged_offices_match_scoped_rows(compact_db):
         assert rows == [
             {key: value for key, value in row.items() if key != "canonical_network_ids"} for row in ordinary
         ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact_db", [((42, 1),)], indirect=True)
+async def test_compact_npi_page_falls_back_for_matches_beyond_the_prefix(compact_db):
+    db, layout = compact_db, compact_db.second_layout
+    base = qualified_relation_sql(layout.base.schema_name, layout.base.table_name)
+    custom = qualified_relation_sql(layout.custom.schema_name, layout.custom.table_name)
+    await db.connection.execute(f"UPDATE {base} SET npi=1000000001 WHERE location_key=$1", db.keys[0])
+    await db.connection.execute(f"UPDATE {custom} SET inferred_npi=npi,npi=NULL WHERE location_key=$1", db.keys[2])
+    await db.connection.execute(f"""INSERT INTO {base}
+        (location_key,entity_type,entity_id,npi,row_origin,checksum,type)
+        SELECT 'prefix-' || i,'npi','synthetic',1500000000+i,'base',i,'practice'
+        FROM generate_series(1,32768) i""")
+    network_ids = (42, 99)
+    addresses = compact_address_relation_sql(layout, network_ids=network_ids)
+    location_type = "c.type='practice'"
+    ordinary = f"""SELECT DISTINCT COALESCE(c.npi,c.inferred_npi) AS npi FROM {addresses} c
+        WHERE {location_type} ORDER BY npi LIMIT :limit OFFSET :start"""
+    optimized = compact_npi_page(layout, network_ids, location_type, ordinary)
+    params = compact_address_parameters(layout) | {"_canonical_network_ids": list(network_ids)}
+    async with db.engine.connect() as connection:
+        for start, limit, expected in (
+            (0, 1, [1111111111]),
+            (0, 2, [1111111111, 2222222222]),
+            (1, 1, [2222222222]),
+            (2, 1, []),
+        ):
+            page_params = params | {"start": start, "limit": limit}
+            for query in (optimized, ordinary):
+                result = await connection.execute(text(f"SELECT * FROM ({query}) page ORDER BY npi"), page_params)
+                assert result.scalars().all() == expected
 
 
 @pytest.mark.asyncio

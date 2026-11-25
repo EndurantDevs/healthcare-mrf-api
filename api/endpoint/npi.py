@@ -139,6 +139,7 @@ from api.provider_list_sql import (
     _provider_list_total_statement,
     _provider_native_entity_scope,
     _provider_page_access,
+    _provider_plain_network_page,
     _provider_registry_page_cte,
     _sql_with_ctes,
     _sql_with_prefix_ctes,
@@ -9185,40 +9186,34 @@ async def list_providers(
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}\n    {taxonomy_source}"
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
+        is_npi_order = not npi_where and order_by == "npi"
+        is_native_only = is_unified_search and native_npis is None and native_scope_preparer is None
         use_computed_page_order, selected_keys, page_source = _provider_page_access(
             network_scope if page_import_context is None else None,
             filters_by_name,
             address_source,
             taxonomy_source if use_taxonomy_filter else "",
-            npi_sort=not npi_where and order_by == "npi",
+            npi_sort=is_npi_order,
             ordinary=is_ordinary_provider_query,
-            native_only=is_unified_search and native_npis is None and native_scope_preparer is None,
+            native_only=is_native_only,
             bare_location=len(eligible_address_clauses) == 2,
         )
-        city_page = None
-        hydration_source = address_source
-        if (
-            use_indexed_offices
-            and city
-            and state
-            and not zip_code
-            and not phone_digits
-            and order_by == "npi"
-            and not npi_where
-            and not use_taxonomy_filter
+        network_page = _provider_plain_network_page(
+            network_scope,
+            filters_by_name,
+            eligible_address_clauses,
+            _runtime_db_schema(),
+            start + limit,
+            is_plain=is_npi_order
+            and is_native_only
             and page_import_context is None
-            and native_npis is None
-            and native_scope_preparer is None
-            and len(eligible_address_clauses) == 3
-            and len(address_clauses) == 3
-        ):
-            from api.network_compact_address import compact_city_page
-
-            selected_keys, city_page, ordinary_selection = compact_city_page(
-                network_scope.manifest.compact_layout, network_scope.network_ids, address_clauses[0]
-            )
-            eligible_address_clauses.append(ordinary_selection)
-            hydration_source = f"{indexed_address_sql} as c"
+            and not (phone_digits or use_taxonomy_filter),
+        )
+        hydration_source = address_source
+        if network_page is not None:
+            selected_keys, fallback_predicate, wrap_page, hydration_source = network_page
+            if fallback_predicate is not None:
+                eligible_address_clauses.append(fallback_predicate)
         if order_by == "relevance":
             eligible_npis_sql = _relevance_page_sql(
                 address_source, provider_npi_sql, eligible_address_clauses, name_only=use_name_relevance_exists
@@ -9251,8 +9246,8 @@ async def list_providers(
             )
             page_npis_sql = f"SELECT {page_projection} FROM ({eligible_npis_sql}) AS eligible_npi"
         page_npis_sql += f"\n{page_order_sql}\nLIMIT :limit OFFSET :start"
-        if city_page is not None:
-            page_npis_sql = f"({city_page}) UNION ALL ({page_npis_sql})"
+        if network_page is not None:
+            page_npis_sql = wrap_page(page_npis_sql)
         sub_s_total_projection = ", pn.provider_total AS _provider_total" if inline_name_taxonomy_total else ""
         sub_s_page_position_projection = ""
         imported_count_ctes = None
