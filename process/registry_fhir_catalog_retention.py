@@ -7,13 +7,15 @@ this sweep drops them. Staging runs in one transaction, so a run killed while st
 A kill just after the staging commit and before the checkpoint, or between the checkpoint and the
 admission, leaves a schema or a snapshot row without a preparation record; the sweep skips those.
 
-The sweep holds the catalog run lock, so no run is building or validating meanwhile. Stale
-unabandoned candidates are also kept while a publication request is queued or running under a live
-lease, since a network import publishes its prepared catalog with the memberships it is still
-building. A schema named by a published snapshot or by the serving pointer is never selected; the
-rollback generation is a published snapshot too. The sweeping login needs the privileges of the
-candidate schema owners, SELECT and DELETE on the snapshot ledger and the preparation, claim and
-relation tables, and SELECT on the serving control and publication request tables.
+The sweep holds the catalog run lock, so no run is building or validating meanwhile. Unabandoned
+candidates stay while a publication request is queued or running under a live lease, since a network
+import publishes its prepared catalog with the memberships it is still building. A candidate whose
+snapshot is published, selected by the serving pointer, referenced by a non-rejected network
+membership candidate or named as an unpublished child's predecessor is never selected. The sweeping
+login needs the privileges of the candidate schema owners, SELECT and DELETE on the snapshot ledger
+and the preparation, claim and relation tables, SELECT (schema_name) on hp_snapshot_retention.relation,
+SELECT (state, source_generations) on network_membership_candidate, and SELECT on the serving control
+and publication request tables.
 
 Without ``--execute`` the sweep only lists what an executing run would drop.
 """
@@ -33,6 +35,10 @@ LOCK_TIMEOUT = "5s"
 _DEFERRED = (asyncpg.LockNotAvailableError, asyncpg.QueryCanceledError, asyncpg.DependentObjectsStillExistError)
 
 
+class _CandidateChangedError(Exception):
+    """Roll back child-record deletes when the preparation row is no longer eligible."""
+
+
 def _eligible(control):
     """Unpublished catalog preparations of one control schema that no run or reader can still use."""
     schema = "'fhir_catalog_'||replace(p.preparation_id::text,'-','')"
@@ -43,7 +49,12 @@ def _eligible(control):
    WHERE q.state='queued' OR q.state='running' AND q.lease_expires_at>clock_timestamp())))
  AND NOT EXISTS(SELECT FROM {control}.registry_fhir_catalog_snapshot s WHERE s.schema_name={schema}
   AND (s.published_at IS NOT NULL
-   OR s.metadata_generation=(SELECT c.metadata_generation FROM {control}.network_serving_control c WHERE c.id=1)))
+   OR s.metadata_generation=(SELECT c.metadata_generation FROM {control}.network_serving_control c WHERE c.id=1)
+   OR EXISTS(SELECT FROM {control}.network_membership_candidate m
+    WHERE m.state<>'rejected' AND m.source_generations->>'fhir_catalog'=s.metadata_generation)
+   OR EXISTS(SELECT FROM {control}.registry_fhir_catalog_snapshot child
+    WHERE child.published_at IS NULL
+     AND child.custody_json#>>'{{preparation,previous_metadata_generation}}'=s.metadata_generation)))
  AND NOT EXISTS(SELECT FROM hp_snapshot_retention.relation r WHERE r.schema_name={schema})"""
 
 
@@ -51,34 +62,42 @@ async def _has_retired(connection, control_schema, stale_after, preparation_id):
     """Drop one candidate's tables, schema and records together, rechecking eligibility under the row lock."""
     control = storage_identifier(control_schema)
     schema = "fhir_catalog_" + preparation_id.hex
-    async with connection.transaction():
-        await connection.execute(f"SET LOCAL lock_timeout='{LOCK_TIMEOUT}'")
-        retired = await connection.fetchval(
-            "DELETE FROM hp_snapshot_retention.preparation p "
-            f"WHERE p.preparation_id=$3 AND {_eligible(control)} RETURNING true",
-            control_schema,
-            stale_after,
-            preparation_id,
-        )
-        if not retired:
-            return False
-        tables = await connection.fetch(
-            "SELECT format('%I.%I',n.nspname,c.relname) AS name FROM pg_class c "
-            "JOIN pg_namespace n ON n.oid=c.relnamespace "
-            "WHERE n.nspname=$1 AND c.relkind IN ('r','p') AND NOT c.relispartition",
-            schema,
-        )
-        if tables:
-            await connection.execute("DROP TABLE " + ",".join(table["name"] for table in tables))
-        await connection.execute(f"DROP SCHEMA IF EXISTS {storage_identifier(schema)}")
-        await connection.execute(
-            f"DELETE FROM {control}.registry_fhir_catalog_snapshot WHERE schema_name=$1 AND published_at IS NULL",
-            schema,
-        )
-        for table in ("preparation_relation", "preparation_claim"):
-            await connection.execute(
-                f"DELETE FROM hp_snapshot_retention.{table} WHERE preparation_id=$1", preparation_id
+    try:
+        async with connection.transaction():
+            await connection.execute(f"SET LOCAL lock_timeout='{LOCK_TIMEOUT}'")
+            for table in ("preparation_relation", "preparation_claim"):
+                await connection.execute(
+                    f"DELETE FROM hp_snapshot_retention.{table} WHERE preparation_id=$3 "
+                    f"AND EXISTS(SELECT FROM hp_snapshot_retention.preparation p "
+                    f"WHERE p.preparation_id=$3 AND {_eligible(control)})",
+                    control_schema,
+                    stale_after,
+                    preparation_id,
+                )
+            retired = await connection.fetchval(
+                "DELETE FROM hp_snapshot_retention.preparation p "
+                f"WHERE p.preparation_id=$3 AND {_eligible(control)} RETURNING true",
+                control_schema,
+                stale_after,
+                preparation_id,
             )
+            if not retired:
+                raise _CandidateChangedError
+            tables = await connection.fetch(
+                "SELECT format('%I.%I',n.nspname,c.relname) AS name FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=$1 AND c.relkind IN ('r','p') AND NOT c.relispartition",
+                schema,
+            )
+            if tables:
+                await connection.execute("DROP TABLE " + ",".join(table["name"] for table in tables))
+            await connection.execute(f"DROP SCHEMA IF EXISTS {storage_identifier(schema)}")
+            await connection.execute(
+                f"DELETE FROM {control}.registry_fhir_catalog_snapshot WHERE schema_name=$1 AND published_at IS NULL",
+                schema,
+            )
+    except _CandidateChangedError:
+        return False
     return True
 
 

@@ -19,6 +19,7 @@ class _Connection:
     def __init__(self, *, locked=True, candidates=(), busy=(), gone=()):
         self.locked, self.candidates, self.busy, self.gone = locked, list(candidates), set(busy), set(gone)
         self.statements = []
+        self.rolled_back = 0
 
     async def fetchval(self, sql, *args):
         self.statements.append(sql)
@@ -39,7 +40,11 @@ class _Connection:
 
     @asynccontextmanager
     async def transaction(self):
-        yield
+        try:
+            yield
+        except BaseException:
+            self.rolled_back += 1
+            raise
 
 
 def _drops(connection):
@@ -79,7 +84,9 @@ async def test_busy_candidate_is_deferred_and_the_rest_retired():
         "deferred": ["fhir_catalog_" + busy.hex],
     }
     drops = _drops(connection)
-    assert drops[0].startswith("DELETE FROM hp_snapshot_retention.preparation p")
+    assert drops[0].startswith("DELETE FROM hp_snapshot_retention.preparation_relation")
+    assert drops[1].startswith("DELETE FROM hp_snapshot_retention.preparation_claim")
+    assert drops[2].startswith("DELETE FROM hp_snapshot_retention.preparation p")
     assert 'DROP TABLE "candidate"."registry_fhir_catalog_network"' in drops
     assert f'DROP SCHEMA IF EXISTS "fhir_catalog_{idle.hex}"' in drops
     assert "pg_advisory_unlock" in connection.statements[-1]
@@ -93,9 +100,8 @@ async def test_candidate_no_longer_eligible_is_left_untouched():
         connection, control_schema="registry", execute=True
     )
     assert report == {"state": "retired", "schemas": [], "deferred": ["fhir_catalog_" + candidate.hex]}
-    assert [
-        sql for sql in _drops(connection) if not sql.startswith("DELETE FROM hp_snapshot_retention.preparation p")
-    ] == []
+    assert connection.rolled_back == 1
+    assert [sql for sql in _drops(connection) if not sql.startswith("DELETE FROM hp_snapshot_retention")] == []
 
 
 def test_command_sweeps_the_configured_registry_schema(monkeypatch, capsys):
