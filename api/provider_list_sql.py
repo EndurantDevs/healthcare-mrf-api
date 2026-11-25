@@ -10,6 +10,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
+from functools import partial
 from typing import Any
 
 from sqlalchemy import BigInteger, bindparam, column, func, literal_column, select, table, text
@@ -407,6 +408,28 @@ def _provider_city_count_address(scope, address_sql, *, city, state, address_cla
     from api.network_compact_address import compact_city_search_relation
 
     return compact_city_search_relation(scope.manifest.compact_layout, scope.network_ids) or address_sql
+
+
+def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, is_plain):
+    """Plan a compact city page or a bounded NPI page for native provider reads."""
+    if not (
+        is_plain
+        and scope is not None
+        and scope.is_compact_network_selection
+        and scope.manifest.supports_location_lookup
+    ):
+        return None
+    from api.network_compact_address import compact_city_page, compact_npi_page
+
+    layout = scope.manifest.compact_layout
+    is_city_page = len(clauses) == 3 and filters.get("city") and filters.get("state") and not filters.get("zip_code")
+    if not is_city_page and (len(clauses) != 1 or page_end > 64):
+        return None
+    indexed = scoped_address_relation_sql(f"{schema}.{EntityAddressUnified.__tablename__}", location_lookup=True)
+    if is_city_page:
+        keys, city_page, fallback = compact_city_page(layout, scope.network_ids, clauses[0])
+        return keys, fallback, lambda page_sql: f"({city_page}) UNION ALL ({page_sql})", f"{indexed} as c"
+    return None, None, partial(compact_npi_page, layout, scope.network_ids, clauses[0]), f"{indexed} as c"
 
 
 def _provider_page_access(

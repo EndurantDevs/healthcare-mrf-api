@@ -64,6 +64,17 @@ def _membership_arms(layout, *, selected, location_lookup=False):
     return memberships
 
 
+def _selected_office_predicate(layout, *, location_lookup):
+    selected = _membership_arms(layout, selected=True, location_lookup=location_lookup)
+    if not selected:
+        return "FALSE"
+    membership = f"office.location_key IN ({selected})"
+    if location_lookup:
+        # Keep the correlated probe after the office filters instead of flattening it into a join.
+        return f"({membership}) IS TRUE"
+    return f"EXISTS ({selected}) AND {membership}"
+
+
 def _validate_address_selection(layout, network_ids, visible_membership_sql, location_lookup):
     compact_address_parameters(layout)
     if type(location_lookup) is not bool:
@@ -166,6 +177,32 @@ def compact_city_search_relation(layout, network_ids):
     )
 
 
+def compact_npi_page(layout, network_ids, address_type, full_page):
+    """Fill a small page from the indexed office prefix, or run the full selection."""
+    _validate_address_selection(layout, network_ids, None, True)
+    offices = _office_rows(layout, "location_key,npi,inferred_npi,type")
+    membership = _selected_office_predicate(layout, location_lookup=True)
+    # A full page is exact: every office with a lower NPI was in the prefix.
+    return f"""
+    WITH prefix_page AS MATERIALIZED (
+        SELECT DISTINCT office.effective_npi AS npi
+          FROM (
+              SELECT c.location_key, COALESCE(c.npi, c.inferred_npi) AS effective_npi
+                FROM ({offices}) c
+               WHERE {address_type} AND COALESCE(c.npi, c.inferred_npi) IS NOT NULL
+               ORDER BY effective_npi
+               LIMIT 32768
+          ) office
+         WHERE {membership}
+         ORDER BY npi
+         LIMIT :limit OFFSET :start
+    ), prefix_filled AS (SELECT COUNT(*) = :limit AS filled FROM prefix_page)
+    SELECT npi FROM prefix_page WHERE (SELECT filled FROM prefix_filled)
+    UNION ALL
+    SELECT npi FROM ({full_page}) full_page WHERE NOT (SELECT filled FROM prefix_filled)
+    """
+
+
 def _address_query(layout, network_ids, visible_membership_sql, location_lookup, columns=None, *, zip_lookup=False):
     _validate_address_selection(layout, network_ids, visible_membership_sql, location_lookup)
     requested_columns = _projection_column_names(columns)
@@ -201,14 +238,7 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup,
              OFFSET 0)"""
         )
     elif network_ids is not None:
-        selected = _membership_arms(layout, selected=True, location_lookup=location_lookup)
-        membership = f"office.location_key IN ({selected})"
-        if location_lookup:
-            # Keep the correlated probe after the office filters instead of flattening it into a join.
-            membership = f"({membership}) IS TRUE"
-        else:
-            membership = f"EXISTS ({selected}) AND {membership}"
-        scoped = query + (f" WHERE {membership}" if selected else " WHERE FALSE")
+        scoped = query + " WHERE " + _selected_office_predicate(layout, location_lookup=location_lookup)
     else:
         visibility = "row_origin IN ('base','ptg_overlay')"
         if visible_membership_sql is not None:
