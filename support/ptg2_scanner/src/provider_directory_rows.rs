@@ -91,7 +91,7 @@ fn sha256_hex(text: &str) -> String {
     hex
 }
 
-fn is_sha256_hex(text: &str) -> bool {
+pub(crate) fn is_sha256_hex(text: &str) -> bool {
     text.len() == 64
         && text
             .bytes()
@@ -413,6 +413,22 @@ fn contract_hash(payload: &Fields, contract: &str) -> Result<String, Unsupported
     hash_entries(entries(payload))
 }
 
+/// Compute the publisher's hash for a stored full merged role.
+pub(crate) fn stored_merged_role_hash(id: &str, json: &str) -> Result<Option<String>, Unsupported> {
+    let Value::Object(payload) = value::decode_json(json)? else {
+        return Ok(None);
+    };
+    if payload.iter().any(|(name, _)| name == "merged_role_repeat") {
+        return Err(unsupported("merged_role_repeat"));
+    }
+    if !matches!(get(&payload, "resource_id"), Value::Str(role_id) if role_id == id)
+        || merged_role_id(&payload)? != id
+    {
+        return Ok(None);
+    }
+    Ok(Some(merged_role_components(&payload)?.1))
+}
+
 /// Validate stored merged roles, leaving ambiguous rows to the reference validator.
 /// The identity bytes have the same order and framing as the Python content proof.
 #[cfg(feature = "python")]
@@ -430,18 +446,7 @@ pub(crate) fn verify_merged_role_page(
     let verified: Vec<_> = rows
         .par_iter()
         .map(|(id, hash, json)| {
-            fn verify(id: &str, hash: &str, json: &str) -> Result<bool, Unsupported> {
-                let Value::Object(payload) = value::decode_json(json)? else {
-                    return Ok(false);
-                };
-                Ok(
-                    matches!(get(&payload, "resource_id"), Value::Str(role_id) if role_id == id)
-                        && !payload.iter().any(|(name, _)| name == "merged_role_repeat")
-                        && merged_role_id(&payload)? == id
-                        && merged_role_components(&payload)?.1 == hash,
-                )
-            }
-            verify(id, hash, json).unwrap_or(false)
+            stored_merged_role_hash(id, json).ok().flatten().as_deref() == Some(hash.as_str())
         })
         .collect();
     let mut identities = String::new();

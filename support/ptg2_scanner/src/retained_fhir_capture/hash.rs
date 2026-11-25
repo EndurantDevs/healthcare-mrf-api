@@ -1,6 +1,7 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 use super::python_whitespace;
+use crate::provider_directory_rows::{is_sha256_hex, stored_merged_role_hash};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,10 +26,22 @@ fn sha256(value: &Value) -> String {
 
 pub(super) fn payload_hash(
     payload: &Map<String, Value>,
+    raw_payload: &str,
     contract: &str,
     resource_type: &str,
     completion_v3: bool,
 ) -> std::result::Result<String, &'static str> {
+    if matches!(contract, "semantic_content_v3" | "semantic_content_v4")
+        && resource_type == "PractitionerRole"
+        && let Some(id) = payload
+            .get("resource_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_sha256_hex(id))
+        && let Some(hash) =
+            stored_merged_role_hash(id, raw_payload).map_err(|_| "python_semantics_required")?
+    {
+        return Ok(hash);
+    }
     if contract == "transport_bound_v1" {
         return Ok(digest(&object_json_bytes(payload, true, true)));
     }

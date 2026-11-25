@@ -1,5 +1,6 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+use ptg2_scanner::provider_directory_rows::{prepare, Context};
 use ptg2_scanner::retained_fhir_capture::{encode_retained_fhir_capture_batch as encode, *};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -7,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 fn context(rows: Vec<Value>, contract: &str, derive: bool) -> Value {
     json!({"source_id":"source-a", "release_id":"release-1", "observed_at_pg_micros":1234,
-        "hash_contract":contract, "resource_types":["Organization", "Location", "InsurancePlan", "Practitioner"], "derive":derive, "rows":rows})
+        "hash_contract":contract, "resource_types":["Organization", "Location", "InsurancePlan", "Practitioner", "PractitionerRole"], "derive":derive, "rows":rows})
 }
 fn input(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
@@ -109,6 +110,70 @@ fn legacy_row(kind: &str, payload: Value) -> Value {
             .collect::<String>(),
     )
 }
+
+#[test]
+fn published_merged_roles_keep_their_hash_in_mixed_capture_pages() {
+    let observations: [&[u8]; 2] = [
+        br#"{"resourceType":"PractitionerRole","id":"role-1","network":[{"reference":"Organization/n1"}],"identifier":[{"system":"http://hl7.org/fhir/sid/us-npi","value":"1234567893"}]}"#,
+        br#"{"resourceType":"PractitionerRole","id":"role-2","network":[{"reference":"Organization/n2"}],"identifier":[{"system":"http://hl7.org/fhir/sid/us-npi","value":"1234567893"}]}"#,
+    ];
+    for contract in ["semantic_content_v3", "semantic_content_v4"] {
+        let prepared = prepare(
+            &observations,
+            &Context {
+                source_id: "source-a",
+                resource_type: "PractitionerRole",
+                resource_url: None,
+                self_url: None,
+                fetch_url: None,
+                fetch_mode: None,
+                dataset_id: Some("dataset-1"),
+                resource_hash_contract: contract,
+                merge_roles: true,
+                payload_text: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.rows.len(), 1);
+        let published = &prepared.rows[0];
+        let payload: Value =
+            serde_json::from_str(published.payload_text.as_deref().unwrap()).unwrap();
+        let merged = row("PractitionerRole", payload.clone(), &published.payload_hash);
+        let mut ordinary_payload = payload;
+        for field in [
+            "resource_url",
+            "fhir_self_url",
+            "fhir_fetch_url",
+            "fhir_fetch_mode",
+        ] {
+            ordinary_payload.as_object_mut().unwrap().remove(field);
+        }
+        let ordinary_hash =
+            legacy_row("PractitionerRole", ordinary_payload)["payload_hash"].clone();
+        assert_ne!(ordinary_hash, merged["payload_hash"]);
+        let practitioner = legacy_row("Practitioner", json!({"resource_id":"pr-1"}));
+        let ordinary = legacy_row("PractitionerRole", json!({"resource_id":"a".repeat(64)}));
+        let rows = [practitioner, merged, ordinary];
+        for derive in [false, true] {
+            let mut document = context(rows.to_vec(), contract, derive);
+            let batch = encode(&input(&document)).unwrap();
+            let expected: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    json!([r["resource_type"], r["resource_id"], r["payload_hash"]]).to_string()
+                })
+                .collect();
+            assert_eq!(batch.root_bytes, expected.join("\n").as_bytes());
+            assert!(batch.fallback_rows.is_empty());
+
+            document["rows"][1]["payload_hash"] = ordinary_hash.clone();
+            let error = encode(&input(&document)).unwrap_err();
+            assert_eq!(error.code, "payload_hash");
+            assert_eq!(error.row_index, Some(1));
+        }
+    }
+}
+
 fn copy_rows(bytes: &[u8]) -> Vec<Vec<Option<&[u8]>>> {
     assert_eq!(&bytes[..19], b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0");
     let mut offset = 19;
