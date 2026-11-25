@@ -128,6 +128,26 @@ def _plan_nodes(raw_plan):
         pending_nodes.extend(plan_node.get("Plans", ()))
 
 
+def _scan_blocks(resource_nodes):
+    return sum(
+        plan_node.get(block_kind, 0)
+        for plan_node in resource_nodes
+        for block_kind in ("Shared Hit Blocks", "Shared Read Blocks")
+    )
+
+
+async def _generic_page_plan(connection, query, params_by_name, execute_arguments):
+    for index, name in enumerate(params_by_name, start=1):
+        query = query.replace(f":{name}", f"${index}")
+    await connection.status("SET LOCAL plan_cache_mode = force_generic_plan;")
+    await connection.status(f"PREPARE keyset_probe AS {query}")
+    raw_plan = await connection.scalar(
+        f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE keyset_probe({execute_arguments})"
+    )
+    await connection.status("DEALLOCATE keyset_probe;")
+    return list(_plan_nodes(raw_plan))
+
+
 async def _content_page_and_plan(database: Database):
     query = (
         importer._endpoint_dataset_hash_page_sql(
@@ -144,13 +164,11 @@ async def _content_page_and_plan(database: Database):
         "batch_size": BATCH_SIZE,
     }
     async with database.acquire() as connection:
-        await connection.status("SET plan_cache_mode = force_generic_plan;")
         page_rows = await connection.all(query, **params_by_name)
-        raw_plan = await connection.scalar(
-            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + query,
-            **params_by_name,
+        plan_nodes = await _generic_page_plan(
+            connection, query, params_by_name, f"'{DATASET_ID}', '{RESOURCE_TYPE}', '{CURSOR_ID}', {BATCH_SIZE}"
         )
-    return page_rows, list(_plan_nodes(raw_plan))
+    return page_rows, plan_nodes
 
 
 async def _acquired_page_and_plan(database: Database):
@@ -163,13 +181,14 @@ async def _acquired_page_and_plan(database: Database):
         "batch_size": BATCH_SIZE,
     }
     async with database.acquire() as connection:
-        await connection.status("SET plan_cache_mode = force_generic_plan;")
         page_rows = await connection.all(query, **params_by_name)
-        raw_plan = await connection.scalar(
-            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + query,
-            **params_by_name,
+        plan_nodes = await _generic_page_plan(
+            connection,
+            query,
+            params_by_name,
+            f"'{DATASET_ID}', ARRAY['{RESOURCE_TYPE}'], '{RESOURCE_TYPE}', '{CURSOR_ID}', {BATCH_SIZE}",
         )
-    return page_rows, list(_plan_nodes(raw_plan))
+    return page_rows, plan_nodes
 
 
 async def _seed_overlapping_proof_rows(
@@ -277,11 +296,14 @@ async def test_postgres_content_proof_cursor_is_a_bounded_index_range(
     assert resource_nodes
     assert all(plan_node.get("Node Type") != "Seq Scan" for plan_node in resource_nodes)
     index_conditions = " ".join(str(plan_node.get("Index Cond", "")) for plan_node in resource_nodes)
+    assert "$1" in index_conditions and "ROW($2, $3)" in index_conditions
     rows_inspected = sum(
         int(plan_node.get("Actual Rows", 0)) + int(plan_node.get("Rows Removed by Filter", 0))
         for plan_node in resource_nodes
     )
     assert rows_inspected < 100
+    scan_blocks = _scan_blocks(resource_nodes)
+    assert scan_blocks < 64
     index_names = {str(plan_node.get("Index Name", "")) for plan_node in resource_nodes}
     assert _cursor_migration().INDEX_NAME in index_names
     assert all(
@@ -289,6 +311,7 @@ async def test_postgres_content_proof_cursor_is_a_bounded_index_range(
     )
     assert not any("resource_id" in str(plan_node.get("Filter", "")) for plan_node in resource_nodes)
     record_testsuite_property("content_cursor_rows_inspected", rows_inspected)
+    record_testsuite_property("content_cursor_scan_blocks", scan_blocks)
     record_testsuite_property("content_cursor_index", _cursor_migration().INDEX_NAME)
     record_testsuite_property("content_cursor_index_conditions", index_conditions)
 
@@ -311,16 +334,20 @@ async def test_postgres_subset_acquired_cursor_is_a_bounded_index_range(
     assert resource_nodes
     assert all(plan_node.get("Node Type") != "Seq Scan" for plan_node in resource_nodes)
     index_conditions = " ".join(str(plan_node.get("Index Cond", "")) for plan_node in resource_nodes)
+    assert "$1" in index_conditions and "ROW($3, $4)" in index_conditions
     rows_inspected = sum(
         int(plan_node.get("Actual Rows", 0)) + int(plan_node.get("Rows Removed by Filter", 0))
         for plan_node in resource_nodes
     )
     assert rows_inspected < 100
+    scan_blocks = _scan_blocks(resource_nodes)
+    assert scan_blocks < 64
     assert any(str(plan_node.get("Index Name", "")) == _cursor_migration().INDEX_NAME for plan_node in resource_nodes)
     assert all(
         identity_column in index_conditions for identity_column in ("dataset_id", "resource_type", "resource_id")
     )
     record_testsuite_property("acquired_cursor_rows_inspected", rows_inspected)
+    record_testsuite_property("acquired_cursor_scan_blocks", scan_blocks)
     record_testsuite_property("acquired_cursor_index", _cursor_migration().INDEX_NAME)
     record_testsuite_property("acquired_cursor_index_conditions", index_conditions)
 
