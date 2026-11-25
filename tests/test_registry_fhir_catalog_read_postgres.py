@@ -648,6 +648,8 @@ async def test_unattached_continuations_pin_metadata_scope_and_fresh_visibility(
     assert {network["network_id"] for network in first["items"]}.isdisjoint(
         network["network_id"] for network in second["items"]
     )
+    end = await _read(fixture, replace(query, offset=2_147_483_647))
+    assert end["total"] == first["total"] and end["items"] == () and end["next_offset"] is None
     for changed in (
         replace(query, continuation_scope_sha256="f" * 64),
         replace(query, plan_search="Gold"),

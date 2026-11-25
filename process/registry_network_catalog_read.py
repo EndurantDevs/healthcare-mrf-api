@@ -42,7 +42,7 @@ from process.registry_fhir_plan_tier import (
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 MAX_PAGE = 100
-MAX_OFFSET = 1_000_000
+MAX_OFFSET = 2_147_483_647  # At most one catalog entry per positive int32 network ID.
 MAX_EXCLUSIONS = 50_000
 MAX_RESPONSE_BYTES = 1_048_576
 _BENEFIT_CODES = ("medical", "dental", "vision")

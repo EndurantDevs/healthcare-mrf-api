@@ -366,10 +366,12 @@ async def test_native_exclusions_precede_counts_offsets_and_details(catalog_db):
     first = await _page(fixture, RegistryNetworkCatalogQuery(limit=1), excluded)
     second = await _page(fixture, RegistryNetworkCatalogQuery(limit=1, offset=1), excluded)
     end = await _page(fixture, RegistryNetworkCatalogQuery(limit=1, offset=2), excluded)
+    far_end = await _page(fixture, RegistryNetworkCatalogQuery(limit=1, offset=2_147_483_647), excluded)
     assert first["total"] == second["total"] == end["total"] == 2
     assert first["items"][0]["network_id"] == fixture.records.beta["record_id"]
     assert second["items"][0]["network_id"] == fixture.records.gamma["record_id"]
     assert end["items"] == ()
+    assert far_end == {**end, "offset": 2_147_483_647}
     async with _reader(fixture) as connection:
         with pytest.raises(RegistryNetworkCatalogError, match="detail_denied"):
             await read_registry_network_catalog_detail(
