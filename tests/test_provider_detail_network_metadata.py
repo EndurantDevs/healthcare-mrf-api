@@ -25,6 +25,7 @@ from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi as provider
 from api.network_address_scope import network_address_read_scope
 from db import connection as db_connection
+from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
 from process.registry_effective_network_catalog import effective_catalog_read_scope
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
 from tests.network_read_execution_support import (
@@ -150,6 +151,39 @@ async def test_premise_members_preserve_exact_location_and_hide_opt_in_evidence(
     assert member["location_id"] == _SITE and "evidence_ids" not in member
     parameters = session.execute.await_args.args[1]
     assert parameters["metadata_selected"] == [42] and parameters["_canonical_network_ids"] == [42]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("indexed_offices", [False, True])
+async def test_selected_compact_metadata_uses_indexed_offices_when_available(indexed_offices):
+    manifest = address_manifest()
+    layout = CompactNetworkLayout(
+        CompactAddressRelation(manifest.schema_name, "network_slice_ref"),
+        manifest.address_relation,
+        (CompactEdgeArtifact(manifest.candidate_id, manifest.schema_name),),
+    )
+    object.__setattr__(manifest, "_compact_layout", layout)
+    object.__setattr__(manifest, "_supports_location_lookup", indexed_offices)
+    session = _session([_fact(evidence_id="b" * 64), _fact()])
+    rows = [{"npi": int(_NPI), "address_list": [{"address_key": _ADDRESS}]}]
+
+    with network_address_read_scope(manifest, (42,), access_scope_sha256="d" * 64):
+        projected = await metadata.project_managed_collection_metadata(
+            session, manifest, rows, include_sources=False, include_evidence=True
+        )
+
+    statement, parameters = session.execute.await_args.args
+    assert ("bucket_members OFFSET 0" in str(statement)) is indexed_offices
+    assert parameters["metadata_selected"] == [42] and parameters["metadata_address_keys"] == [_ADDRESS]
+    assert projected[0]["address_list"][0]["network_memberships"] == [
+        {
+            "network_id": 42,
+            "provider_system": "npi",
+            "provider_id": _NPI,
+            "location_id": _SITE,
+            "evidence_ids": ["a" * 64, "b" * 64],
+        }
+    ]
 
 
 @pytest.mark.asyncio

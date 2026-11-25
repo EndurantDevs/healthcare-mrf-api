@@ -224,7 +224,7 @@ async def _read_memberships(session, manifest, copies_by_office, scope, include_
             else _APPROVED_NETWORK_JOIN.format(control=_identifier(registry_schema()))
         )
         statement = _READ_SQL.format(
-            addresses=scoped_address_relation_sql("mrf.entity_address_unified"),
+            addresses=scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True),
             candidate=_identifier(manifest.schema_name),
             network_join=network_join,
         )
