@@ -48,6 +48,46 @@ async def test_imported_network_visible_without_any_manual_approval(effective_ca
     assert await db.connection.fetchval(f'SELECT count(*) FROM "{db.control}".registry_approved_record') == 0
 
 
+async def test_native_catalog_list_pages_match_full_catalog(effective_catalog_db, monkeypatch):
+    fixture = effective_catalog_db
+    await manual_record(
+        fixture, "network", 8, {"network_id": 8, "display_name": "A Manual", "aliases": ["PPO%"], "archived": False}
+    )
+    await manual_record(
+        fixture, "network", 10, {"network_id": 10, "display_name": "PPO% Archived", "aliases": [], "archived": True}
+    )
+    await fixture.connection.execute(
+        f"""INSERT INTO "{fixture.catalog}".registry_fhir_catalog_network
+            VALUES($1,8,'Z Shadowed','[]',false,1,ARRAY['medical'],'z shadowed'),
+                  ($1,9,'PPO% Native','[]',false,1,ARRAY['medical'],'ppo% native'),
+                  ($1,10,'PPO% Shadowed','[]',false,1,ARRAY['medical'],'ppo% shadowed')""",
+        GENERATION,
+    )
+    policy = RegistryOrganizationVisibility()
+    scenarios = (
+        (catalog.RegistryNetworkCatalogQuery(search="PPO%", limit=1), (), 2, (8,)),
+        (catalog.RegistryNetworkCatalogQuery(search="PPO%", limit=1, offset=1), (), 2, (9,)),
+        (catalog.RegistryNetworkCatalogQuery(search="PPO%", limit=1, offset=2), (), 2, ()),
+        (catalog.RegistryNetworkCatalogQuery(search="PPO%"), (8,), 1, (9,)),
+        (catalog.RegistryNetworkCatalogQuery(search="PPO%", archived=True), (), 1, (10,)),
+        (catalog.RegistryNetworkCatalogQuery(search="PPO_"), (), 0, ()),
+        (catalog.RegistryNetworkCatalogQuery(search="Shadowed"), (), 0, ()),
+        (catalog.RegistryNetworkCatalogQuery(), (), 3, (8, 7, 9)),
+    )
+
+    async def unscoped(*_args):
+        return None
+
+    for query, exclusions, total, expected_ids in scenarios:
+        inputs = (fixture.connection, fixture.manifest, query, exclusions, fixture.control)
+        actual = await catalog._page(*inputs, organization_policy=policy)
+        with monkeypatch.context() as patch:
+            patch.setattr(catalog, "_list_page_keys", unscoped)
+            assert actual == await catalog._page(*inputs, organization_policy=policy)
+        assert actual["total"] == total
+        assert tuple(network["network_id"] for network in actual["items"]) == expected_ids
+
+
 async def test_manual_name_archive_and_binding_override_remain_authoritative(effective_catalog_db, monkeypatch):
     db = effective_catalog_db
     await manual_record(
