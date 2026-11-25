@@ -551,11 +551,16 @@ def _child_candidate_ids(context, selectors, *, owned_members=None):
 
 
 def _native_child_candidate_ids(context, entity_values, selector):
-    """Narrow required child searches to native providers that could supply the selected key."""
+    """Probe each native provider's selected period for its complete child key."""
+
+    from process.custom_import.grouped_read import _join_root_scalar
+
     pinned_target = context.target
     binding = context.model(core.CustomImportEntityBinding)
     winner = context.model(core.CustomImportWinner)
+    family = context.model(core.CustomImportFamilyRevision)
     member = context.model(CustomImportFamilyChild)
+    selection_field = context.definition.fields_by_id[context.definition.query.entity_selection.field_id]
     keys = _keyed_children(context, (selector,), name="native_complete_score_keys")
     native_bindings = (
         select(binding.entity_binding_id)
@@ -567,10 +572,19 @@ def _native_child_candidate_ids(context, entity_values, selector):
         .subquery("native_child_bindings")
     )
     bindings = _bindings_with_default_value(context, native_bindings)
-    could_match = (
+    candidates = (
         select(1)
         .select_from(winner)
         .join(
+            family,
+            (family.family_revision_id == winner.family_revision_id)
+            & (family.dataset_id == winner.dataset_id)
+            & (family.schema_revision_id == winner.schema_revision_id),
+        )
+    )
+    candidates, period_value = _join_root_scalar(candidates, context, selection_field, prefix="candidate_period")
+    could_match = (
+        candidates.join(
             member,
             and_(
                 member.family_revision_id == winner.family_revision_id,
@@ -580,6 +594,7 @@ def _native_child_candidate_ids(context, entity_values, selector):
         )
         .join(keys, and_(*(getattr(member, name) == getattr(keys.c, name) for name in _CHILD_OWNER_KEYS)))
         .where(
+            period_value == bindings.c.selected_value,
             winner.entity_binding_id == bindings.c.entity_binding_id,
             winner.dataset_id == pinned_target.dataset_id,
             winner.generation_id == pinned_target.generation_id,
