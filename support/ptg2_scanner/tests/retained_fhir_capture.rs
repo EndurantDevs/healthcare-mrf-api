@@ -139,7 +139,7 @@ fn published_merged_roles_keep_their_hash_in_mixed_capture_pages() {
         let payload: Value =
             serde_json::from_str(published.payload_text.as_deref().unwrap()).unwrap();
         let merged = row("PractitionerRole", payload.clone(), &published.payload_hash);
-        let mut ordinary_payload = payload;
+        let mut ordinary_payload = payload.clone();
         for field in [
             "resource_url",
             "fhir_self_url",
@@ -166,6 +166,22 @@ fn published_merged_roles_keep_their_hash_in_mixed_capture_pages() {
             assert_eq!(batch.root_bytes, expected.join("\n").as_bytes());
             assert!(batch.fallback_rows.is_empty());
 
+            let repeat = json!({
+                "resource_id": published.resource_id,
+                "merged_role_repeat": true,
+                "network_refs": payload["network_refs"],
+                "identifiers": payload["identifiers"],
+            });
+            let mut malformed = payload.clone();
+            malformed["network_refs"] = json!("Organization/n1");
+            for candidate in [repeat, malformed] {
+                document["rows"][1] = row("PractitionerRole", candidate, &published.payload_hash);
+                let fallback = encode(&input(&document)).unwrap();
+                assert_eq!(fallback.fallback_rows, [1]);
+                assert_eq!(fallback.root_bytes, batch.root_bytes);
+            }
+
+            document["rows"][1] = rows[1].clone();
             document["rows"][1]["payload_hash"] = ordinary_hash.clone();
             let error = encode(&input(&document)).unwrap_err();
             assert_eq!(error.code, "payload_hash");

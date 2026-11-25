@@ -788,6 +788,36 @@ mod tests {
         assert!(text.ends_with(r#""specialty_codes":[],"telecom":[],"telehealth":[]}"#));
     }
 
+    #[cfg(feature = "python")]
+    #[test]
+    fn stored_merged_role_pages_defer_unverifiable_payloads() {
+        let merged = prepare(&LINES, &context("semantic_content_v4", true)).unwrap();
+        let role = &merged.rows[0];
+        let stored = |body| (role.resource_id.clone(), role.payload_hash.clone(), body);
+        let text = role.payload_text.as_deref().unwrap();
+        let fields = [
+            ("fhir_meta", serde_json::json!({"weight": 1.25})),
+            (
+                "accepting_patients",
+                serde_json::json!([{"from_network_ref": 1.25}]),
+            ),
+            ("network_refs", serde_json::json!(1.25)),
+            ("network_refs", serde_json::json!([1.25])),
+        ];
+        let mut rows = vec![stored(text.to_owned()), stored("{".to_owned())];
+        for (field, value) in fields {
+            let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+            payload[field] = value;
+            rows.push(stored(payload.to_string()));
+        }
+
+        let (_, fallback) = verify_merged_role_page(&rows).unwrap();
+        assert_eq!(fallback, [1, 2, 3, 4, 5]);
+
+        rows[0].1 = "g".repeat(64);
+        assert!(verify_merged_role_page(&rows).is_none());
+    }
+
     #[test]
     fn refusals_name_their_reason() {
         let refuse = |lines: &[&[u8]], contract: &str| {
