@@ -192,3 +192,38 @@ def test_derived_child_uses_both_dictionary_ids_without_new_ordering_or_hashes()
         ctx.family_block_binding.tables_by_role["query_child"],
         ctx.family_block_binding.tables_by_role["key_dictionary"],
     }
+
+
+def test_cached_read_models_scalar_models_and_projection_views_isolate_scopes():
+    from process.custom_import.family_block_read_models import read_models
+
+    read_context = context(derived_definition())
+    pinned_target = SimpleNamespace(dataset_id=11, definition_revision_id=5, schema_revision_id=31)
+    first_models = read_models(read_context.family_block_binding, pinned_target)
+    assert read_models(read_context.family_block_binding, pinned_target) is first_models
+    other_models = read_models(
+        read_context.family_block_binding,
+        SimpleNamespace(dataset_id=12, definition_revision_id=5, schema_revision_id=31),
+    )
+    assert other_models is not first_models
+    with pytest.raises(FamilyBlockUnavailable, match="bounded integer"):
+        read_models(
+            read_context.family_block_binding,
+            SimpleNamespace(dataset_id=True, definition_revision_id=5, schema_revision_id=31),
+        )
+
+    first_views = query_projection_views(read_context.family_block_binding)
+    assert query_projection_views(read_context.family_block_binding) is first_views
+
+    base_context = context()
+    score = base_context.definition.fields_by_id["score"]
+    first_scalar = field_scalar_model(base_context, score)
+    assert field_scalar_model(base_context, score) is first_scalar
+    base_context.target = SimpleNamespace(dataset_id=12, schema_revision_id=31)
+    assert field_scalar_model(base_context, score) is not first_scalar
+    base_context.target = SimpleNamespace(dataset_id=1, schema_revision_id=31)
+    one_scalar = field_scalar_model(base_context, score)
+    assert one_scalar is not first_scalar
+    base_context.target = SimpleNamespace(dataset_id=True, schema_revision_id=31)
+    with pytest.raises(FamilyBlockUnavailable, match="bounded integer"):
+        field_scalar_model(base_context, score)

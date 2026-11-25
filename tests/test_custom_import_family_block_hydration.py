@@ -201,7 +201,7 @@ def _damage_membership(stored, damage):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("families", [1, 3, 50])
-async def test_small_families_share_six_queries_and_preserve_exact_order(families):
+async def test_small_families_share_two_queries_and_preserve_exact_order(families):
     stored = _PageRows(families)
     selected = stored.selected()[::-1]
     actual = await reader.hydrate_families(stored, stored.context(), selected, "scope")
@@ -214,7 +214,7 @@ async def test_small_families_share_six_queries_and_preserve_exact_order(familie
         for detail in actual
     )
     assert all(detail.authorization_scope_sha256 == "scope" for detail in actual)
-    assert len(stored.statements) == 6
+    assert len(stored.statements) == 2
     assert max(stored.blob_sizes) <= reader.FamilyBlockReadLimits().bytes
     assert all(result.closed for result in stored.results)
 
@@ -244,7 +244,7 @@ async def test_repeated_family_keeps_each_original_winner_and_result_order():
     actual = await reader.hydrate_families(stored, stored.context(), selected, "scope")
     assert [detail.winner.context_key_sha256 for detail in actual] == [b"0" * 32, b"0" * 32, b"1" * 32]
     assert actual[1].children == actual[2].children
-    assert len(stored.statements) == 6
+    assert len(stored.statements) == 2
 
 
 @pytest.mark.asyncio
@@ -253,15 +253,11 @@ async def test_repeated_family_keeps_each_original_winner_and_result_order():
     [
         "family_missing",
         "family_identity",
-        "membership_missing",
-        "membership_overlap",
-        "membership_collection",
-        "membership_drift",
+        "family_raw_bytes",
+        "family_stored_bytes",
         "fragment_missing",
         "fragment_crc",
         "fragment_drift",
-        "start_missing",
-        "start_family",
     ],
 )
 async def test_cross_family_damage_refuses_without_partial_details(damage):
@@ -272,10 +268,10 @@ async def test_cross_family_damage_refuses_without_partial_details(damage):
         stored.families.pop()
     if damage == "family_identity":
         stored.families[-1]["root_record_id"] += 1
-    if damage == "membership_missing":
-        stored.members.pop()
-    if damage in ("membership_overlap", "membership_collection"):
-        _damage_membership(stored, damage)
+    if damage == "family_raw_bytes":
+        stored.families[-1]["raw_bytes"] += 1
+    if damage == "family_stored_bytes":
+        stored.families[-1]["stored_bytes"] += 1
     if damage == "fragment_missing":
         stored.fragments.pop()
     if damage == "fragment_crc":
@@ -293,7 +289,7 @@ async def test_many_families_use_bounded_parameter_chunks_without_an_input_cap(m
     monkeypatch.setattr(hydration, "_NATIVE_IDS", 128)
     actual = await reader.hydrate_families(stored, stored.context(), stored.selected(), "scope")
     assert len(actual) == 1025
-    assert len(stored.statements) == 6 * 9
+    assert len(stored.statements) == 2 * 9
     assert (
         max(
             len(statement.compile(compile_kwargs={"render_postcompile": True}).params)
@@ -304,12 +300,11 @@ async def test_many_families_use_bounded_parameter_chunks_without_an_input_cap(m
 
 
 @pytest.mark.asyncio
-async def test_coordinate_groups_bound_parameters_without_limiting_families():
+async def test_large_child_families_stream_within_parameter_bounds():
     stored = _PageRows(5, children=1000)
     actual = await reader.hydrate_families(stored, stored.context(), stored.selected(), "scope")
-    starts = [statement for statement in stored.statements if "record_ordinal" in statement.selected_columns]
     assert len(actual) == 5 and all(len(detail.children) == 1000 for detail in actual)
-    assert [len(statement.get_final_froms()[0].left.element._data[0]) for statement in starts] == [4004, 1001]
+    assert len(stored.statements) == 2
     assert (
         max(
             len(statement.compile(compile_kwargs={"render_postcompile": True}).params)
@@ -350,6 +345,7 @@ async def test_blob_singleton_exhaustion_refuses_before_fetch(monkeypatch):
     stored = _PageRows(3, children=2)
     limits = reader.FamilyBlockReadLimits(bytes=1024)
     monkeypatch.setattr(reader, "FamilyBlockReadLimits", lambda: limits)
+    stored.families[-1]["stored_bytes"] = limits.bytes + 1
     stored.fragments[-1]["size"] = limits.bytes + 1
     with pytest.raises(reader.FamilyBlockError, match="exceeds the admitted read budget"):
         await reader.hydrate_families(stored, stored.context(), stored.selected(), "scope")
