@@ -161,6 +161,36 @@ async def test_retirement_removes_only_replaced_storage_and_replays_exactly():
                 await _call(session, case, attempt, "create_custom_import_snapshot_family")
 
 
+async def test_explicit_discard_retires_only_the_named_unpublished_snapshot():
+    async with isolated_publication_case() as case:
+        _, attempt, family_id = await _sealed_current_snapshot(case)
+        options_by_name = {
+            "engine_id": "synthetic",
+            "assert_external_unreferenced": _external_fixture_check,
+        }
+        for generation_id, reason in (
+            (None, "no publication history"),
+            (attempt.generation_id + 1, "does not match"),
+        ):
+            with pytest.raises(retirement.SnapshotRetirementRefused, match=reason):
+                async with case.sessions() as session, session.begin():
+                    await _bounded(session)
+                    await retirement.retire_snapshot_family(
+                        session, family_id, discard_generation_id=generation_id, **options_by_name
+                    )
+        async with case.sessions() as session, session.begin():
+            await _bounded(session)
+            result = await retirement.retire_snapshot_family(
+                session, family_id, discard_generation_id=attempt.generation_id, **options_by_name
+            )
+            assert result.reason == "abandoned"
+            assert (
+                await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": f"ci_snapshot_{family_id}"})
+                is None
+            )
+            assert await session.get(CustomImportSnapshotRetirement, family_id) is not None
+
+
 async def test_retirement_rolls_back_native_drops_and_tombstone_on_interruption(monkeypatch):
     async with isolated_publication_case() as case:
         _, family_id = await _replaced_fence(case)

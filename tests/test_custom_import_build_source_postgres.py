@@ -399,6 +399,14 @@ async def test_retirement_removes_only_replaced_storage_and_replays_exactly():
     await verify()
 
 
+async def test_explicit_discard_retires_only_the_named_unpublished_snapshot():
+    from tests.custom_import_retirement_postgres import (
+        test_explicit_discard_retires_only_the_named_unpublished_snapshot as verify,
+    )
+
+    await verify()
+
+
 async def test_retirement_rolls_back_native_drops_and_tombstone_on_interruption(monkeypatch):
     from tests.custom_import_retirement_postgres import (
         test_retirement_rolls_back_native_drops_and_tombstone_on_interruption as verify,

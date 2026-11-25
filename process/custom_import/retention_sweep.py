@@ -21,6 +21,7 @@ import asyncio
 import importlib
 import json
 from dataclasses import asdict
+from functools import partial
 
 from sqlalchemy import exists, select, text
 from sqlalchemy.exc import DBAPIError
@@ -134,17 +135,20 @@ async def sweep(sessions, retire, refusals, *, engine_id, execute, emit=print):
     return outcomes
 
 
-def control_plane_retire(engine_id, control_module):
+def control_plane_retire(engine_id, control_module, *, discard_generation_id=None):
     """Bind the control plane's reference check from the module the scheduled job supplies."""
     control = importlib.import_module(control_module)
     namespace = str(CustomImportSnapshotFamily.__table__.schema)
+    operation = retirement.retire_snapshot_family
+    if discard_generation_id is not None:
+        operation = partial(operation, discard_generation_id=discard_generation_id)
 
     async def retire(session, family_id):
         """Retire one family through the control-plane wrapper on this session."""
         return await control.retire_exact_snapshot_family(
             session,
             family_id,
-            retire_snapshot_family=retirement.retire_snapshot_family,
+            retire_snapshot_family=operation,
             context=control.SnapshotRetirementOwnerContext(
                 engine_id=engine_id,
                 engine_namespace=namespace,
@@ -159,11 +163,18 @@ async def _amain(arguments):
 
     from db.connection import db
 
-    retire, refusals = control_plane_retire(arguments.engine_id, arguments.control_module)
+    family_id, generation_id = arguments.discard_unpublished or (None, None)
+    retire, refusals = control_plane_retire(
+        arguments.engine_id, arguments.control_module, discard_generation_id=generation_id
+    )
     await db.connect()
     try:
         sessions = async_sessionmaker(db.engine, expire_on_commit=False, autoflush=False)
-        await sweep(sessions, retire, refusals, engine_id=arguments.engine_id, execute=arguments.execute)
+        if family_id is None:
+            await sweep(sessions, retire, refusals, engine_id=arguments.engine_id, execute=arguments.execute)
+        else:
+            outcome = await retire_one(sessions, family_id, retire, refusals, execute=arguments.execute)
+            print(json.dumps(outcome, sort_keys=True))
     finally:
         await db.disconnect()
 
@@ -177,6 +188,13 @@ def main(argv=None):
     )
     parser.add_argument(
         "--execute", action="store_true", help="commit retirements and cleanups instead of rolling back"
+    )
+    parser.add_argument(
+        "--discard-unpublished",
+        nargs=2,
+        type=int,
+        metavar=("FAMILY", "GENERATION"),
+        help="check or retire only the named completed, unpublished snapshot",
     )
     asyncio.run(_amain(parser.parse_args(argv)))
 
