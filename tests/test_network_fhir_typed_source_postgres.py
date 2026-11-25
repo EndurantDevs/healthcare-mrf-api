@@ -966,7 +966,7 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
         manifest = await publication._publish_once(context)
         assert manifest.compact_layout is not None and manifest.generation_id > 0
         assert checked_captures == []
-        assert len(built_work) == 2 and len({work for _, work in built_work}) == 2
+        assert len(built_work) == 1  # Final validation uses the retained accounting.
         await _assert_typed_candidate_counts(context)
         if not is_legacy:
             # A newer, unselected Source publication must not invalidate the last-good closed contribution.
