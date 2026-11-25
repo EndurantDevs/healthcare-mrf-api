@@ -8,30 +8,38 @@ from db.models.custom_import import CustomImportChildRevision, CustomImportFamil
 from process.custom_import import read_core as core
 from process.custom_import.derived_query import reduce_expression
 
+_CHILD_OWNER_KEYS = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
+
+
+def _bindings_with_default_value(context, bindings, entity_values=None):
+    """Resolve the guarded default once per binding before expanding families."""
+    from process.custom_import.grouped_read import _selected_value_relation
+
+    latest = _selected_value_relation(context, entity_values)
+    selected_value = (
+        select(latest.c.selected_value)
+        .where(latest.c.entity_binding_id == bindings.c.entity_binding_id)
+        .correlate(bindings)
+        .scalar_subquery()
+    )
+    return (
+        select(bindings.c.entity_binding_id, selected_value.label("selected_value"))
+        .cte("candidate_selected_values")
+        .prefix_with("MATERIALIZED")
+    )
+
 
 def selected_identities(context, plan, entity_values=None, *, entity_binding_ids=None, include_binding=False):
     """Pin all selected family identities before evaluating score predicates."""
-
-    from process.custom_import.grouped_read import _selected_value_relation, selected_family_statement
+    from process.custom_import.grouped_read import selected_family_statement
 
     family = context.model(core.CustomImportFamilyRevision)
     winner = context.model(core.CustomImportWinner)
     entity = context.model(core.CustomImportEntityBinding)
     default_selected_value = None
     if entity_binding_ids is not None and plan.selected_value is None:
-        latest = _selected_value_relation(context, entity_values)
-        selected_value = (
-            select(latest.c.selected_value)
-            .where(latest.c.entity_binding_id == entity_binding_ids.c.entity_binding_id)
-            .correlate(entity_binding_ids)
-            .scalar_subquery()
-        )
-        # Resolve the guarded helper once before expanding each candidate's families.
-        entity_binding_ids = (
-            select(entity_binding_ids.c.entity_binding_id, selected_value.label("selected_value"))
-            .cte("candidate_selected_values")
-            .prefix_with("MATERIALIZED")
-        )
+        if "selected_value" not in entity_binding_ids.c:
+            entity_binding_ids = _bindings_with_default_value(context, entity_binding_ids, entity_values)
         default_selected_value = entity_binding_ids.c.selected_value
     statement = selected_family_statement(
         context,
@@ -500,12 +508,11 @@ def _child_candidate_members(context, selectors):
     family = context.model(core.CustomImportFamilyRevision)
     member = context.model(CustomImportFamilyChild)
     revision = context.model(CustomImportChildRevision)
-    identities = ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot")
     return (
         select(
             family.entity_binding_id,
             member.family_revision_id,
-            *(getattr(member, name) for name in identities),
+            *(getattr(member, name) for name in _CHILD_OWNER_KEYS),
             keys.c.selected_key_value,
         )
         .select_from(keys)
@@ -521,10 +528,10 @@ def _child_candidate_members(context, selectors):
             member,
             and_(
                 member.family_revision_id == family.family_revision_id,
-                *(getattr(member, name) == getattr(keys.c, name) for name in identities),
+                *(getattr(member, name) == getattr(keys.c, name) for name in _CHILD_OWNER_KEYS),
             ),
         )
-        .join(revision, and_(*(getattr(revision, name) == getattr(keys.c, name) for name in identities)))
+        .join(revision, and_(*(getattr(revision, name) == getattr(keys.c, name) for name in _CHILD_OWNER_KEYS)))
         .cte("candidate_complete_score_members")
         .prefix_with("MATERIALIZED")
     )
@@ -541,6 +548,53 @@ def _child_candidate_ids(context, selectors, *, owned_members=None):
         .cte("child_candidate_score_entities")
         .prefix_with("MATERIALIZED")
     )
+
+
+def _native_child_candidate_ids(context, entity_values, selector):
+    """Narrow required child searches to native providers that could supply the selected key."""
+    pinned_target = context.target
+    binding = context.model(core.CustomImportEntityBinding)
+    winner = context.model(core.CustomImportWinner)
+    member = context.model(CustomImportFamilyChild)
+    keys = _keyed_children(context, (selector,), name="native_complete_score_keys")
+    native_bindings = (
+        select(binding.entity_binding_id)
+        .where(
+            binding.dataset_id == pinned_target.dataset_id,
+            binding.adapter_id == "npi",
+            binding.canonical_value.in_(entity_values),
+        )
+        .subquery("native_child_bindings")
+    )
+    bindings = _bindings_with_default_value(context, native_bindings)
+    could_match = (
+        select(1)
+        .select_from(winner)
+        .join(
+            member,
+            and_(
+                member.family_revision_id == winner.family_revision_id,
+                member.dataset_id == winner.dataset_id,
+                member.schema_revision_id == winner.schema_revision_id,
+            ),
+        )
+        .join(keys, and_(*(getattr(member, name) == getattr(keys.c, name) for name in _CHILD_OWNER_KEYS)))
+        .where(
+            winner.entity_binding_id == bindings.c.entity_binding_id,
+            winner.dataset_id == pinned_target.dataset_id,
+            winner.generation_id == pinned_target.generation_id,
+            winner.definition_revision_id == pinned_target.definition_revision_id,
+            winner.schema_revision_id == pinned_target.schema_revision_id,
+            winner.profile_slot == context.profile_slot,
+            winner.context_collection_slot == 0,
+            winner.context_child_revision_id.is_(None),
+            member.collection_slot == context.collection_slots_by_name[selector.field.collection],
+        )
+        .correlate(bindings)
+        .offset(0)
+        .exists()
+    )
+    return select(bindings).where(could_match).cte("native_child_candidate_bindings").prefix_with("MATERIALIZED")
 
 
 def _retained_root_columns(roots, root_values, root_states, include_binding):

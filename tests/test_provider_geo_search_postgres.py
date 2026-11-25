@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import os
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -210,6 +211,28 @@ async def test_projection_answers_exactly_like_the_address_table(geo_db):
             projected_answers = await _answers(read, search, parameters_by_name, **options)
             assert projected_answers == live_answers, (parameters_by_name, options)
             assert live_answers[0] > 0 or "General Practice" in str(parameters_by_name)
+
+
+@pytest.mark.asyncio
+async def test_network_projection_groups_offices_and_requires_current_providers(geo_db):
+    """Preserve distinct offices, missing NPIs, empty results and live provider filters."""
+    await geo_db.connection.execute("""
+        INSERT INTO mrf.entity_address_unified (location_key, npi, address_key, lat, long, state_name, type)
+        VALUES ('second-office', 8, '00000000-0000-0000-0000-000000000101', 41.88, -87.63, 'IL', 'primary')
+    """)
+    live = _query(None)
+    projection = """(SELECT *,Geography(ST_MakePoint(long::double precision,lat::double precision)) AS geo
+      FROM mrf.entity_address_unified)"""
+    async with geo_db.engine.connect() as connection:
+        for extra_clause, expected in (("", 41), ("AND d.npi = 8", 2), ("AND a.state_name = 'CA'", 0)):
+            address_query = replace(live, extra_clause=extra_clause)
+            search_query = replace(address_query, search_table_sql=projection)
+            direct = text(build_native_nearby_count_sql(address_query))
+            search = build_native_nearby_count_sql(search_query)
+            assert ("GROUP BY a.npi" in search) == ("d.npi" not in extra_clause)
+            parameters_by_name = {**_CHICAGO, "radius": 25.0}
+            assert await connection.scalar(direct, parameters_by_name) == expected
+            assert await connection.scalar(text(search), parameters_by_name) == expected
 
 
 @pytest.mark.asyncio

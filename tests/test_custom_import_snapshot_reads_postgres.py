@@ -57,9 +57,6 @@ from tests.custom_import_grouped_projection_postgres import (
     projection_case as projection_case,
 )
 from tests.custom_import_grouped_projection_postgres import (
-    projection_helper as projection_helper,
-)
-from tests.custom_import_grouped_projection_postgres import (
     test_duplicate_members_fail_before_metric as test_duplicate_members_fail_before_metric,
 )
 from tests.custom_import_grouped_projection_postgres import (
@@ -67,6 +64,9 @@ from tests.custom_import_grouped_projection_postgres import (
 )
 from tests.custom_import_grouped_projection_postgres import (
     test_mixed_filters_keep_exact_context as test_mixed_filters_keep_exact_context,
+)
+from tests.custom_import_grouped_projection_postgres import (
+    test_native_child_candidates_keep_current_period_and_missing_projection_error as test_native_child_candidates_keep_current_period_and_missing_projection_error,
 )
 from tests.custom_import_grouped_projection_postgres import (
     test_native_count_order_page_parity as test_native_count_order_page_parity,
