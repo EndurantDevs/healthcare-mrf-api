@@ -161,7 +161,7 @@ def test_provider_network_binding_openapi_contract():
     binding = schemas["CustomImportProviderNetworkBinding"]
     assert binding["additionalProperties"] is False
     assert set(binding["required"]) == network._BINDING_FIELDS
-    assert binding["properties"]["network_ids"]["maxItems"] == 50
+    assert binding["properties"]["network_ids"]["maxItems"] == 60
     assert binding["properties"]["legacy_checksums"]["maxItems"] == 50
     assert "legacy_checksums" not in binding["required"]
     for name in ("CustomImportProviderRequest", "CustomImportProviderBatchRequest"):
@@ -193,7 +193,6 @@ def test_provider_network_binding_openapi_contract():
         ("network_ids", [42, 42]),
         ("network_ids", [True]),
         ("network_ids", [-1]),
-        ("network_ids", list(range(1, 52))),
         ("selector", {"namespace": "legacy_checksum", "values": [42, 88]}),
         ("selector", {"namespace": "canonical", "values": [42, 99]}),
         ("selector", {"namespace": "canonical", "values": [42, 88], "extra": True}),
@@ -204,6 +203,26 @@ def test_binding_rejects_noncanonical_or_unbound_authority(field, value):
     document["network_binding"][field] = value
     with pytest.raises(CustomImportReadRequestError, match="binding"):
         providers._parse_provider_request(_body(document), allow_network_binding=True)
+
+
+@pytest.mark.parametrize(
+    "size,legacy,accepted",
+    [(53, False, True), (60, False, True), (61, False, False), (50, True, True), (51, True, False)],
+)
+def test_signed_provider_list_binding_network_limit(size, legacy, accepted):
+    document = _bound_document(native_query={"zip_code": "60601", "page": "2"})
+    binding = document["network_binding"]
+    identities = list(range(1, size + 1))
+    binding["network_ids"] = identities
+    binding["selector"]["values"] = identities
+    if legacy:
+        binding["legacy_checksums"] = [42]
+    if accepted:
+        parsed = providers._parse_provider_request(_body(document), allow_network_binding=True)
+        assert parsed.network_binding.network_ids == tuple(identities)
+    else:
+        with pytest.raises(CustomImportReadRequestError, match="binding"):
+            providers._parse_provider_request(_body(document), allow_network_binding=True)
 
 
 @pytest.mark.parametrize("legacy", ["plan_network", "plan_release_id"])

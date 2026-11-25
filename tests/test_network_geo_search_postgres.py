@@ -13,7 +13,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 
+from api.network_address_scope import network_address_read_scope, scoped_address_parameters, scoped_address_relation_sql
 from api.network_compact_address import compact_address_native_sql, compact_city_page, compact_city_search_relation
+from api.provider_list_sql import _address_zip5_filter
 from db.models import EntityAddressUnified
 from process import network_geo_search as search
 from process.network_compact_layout import (
@@ -23,6 +25,7 @@ from process.network_compact_layout import (
     bind_compact_geo_search_candidate,
 )
 from process.network_membership_copy import MembershipCopyTarget
+from tests.network_compact_address_postgres_support import _lookup_manifest
 from tests.test_network_compact_address_postgres import compact_db as compact_db
 from tests.test_network_membership_slices_postgres import slice_db as slice_db
 
@@ -191,6 +194,51 @@ async def test_published_city_search_preserves_inferred_and_non_geocoded_offices
 
     for network_ids, expected_npis in (((42,), []), ((42, 99), [2222222222]), ((99,), [2222222222]), ((88,), [])):
         await _assert_published_city_search(db.connection, projected, network_ids, expected_npis)
+
+
+@pytest.mark.asyncio
+async def test_zip_search_uses_projection_for_exact_office_membership(search_db):
+    db, layout = search_db, search_db.second_layout
+    for relation in (layout.base, layout.custom):
+        await db.connection.execute(f"UPDATE {search._qualified(relation)} SET zip5=NULL,postal_code='60601-1234'")
+    await db.connection.execute(
+        f"UPDATE {search._qualified(layout.custom)} SET zip5='60601',postal_code='' WHERE location_key=$1",
+        db.keys[0],
+    )
+    await db.connection.execute(
+        f"""UPDATE {search._qualified(layout.custom)}
+        SET npi=NULL,inferred_npi=2222222222,lat=NULL,long=NULL,type='secondary'
+        WHERE location_key=$1""",
+        db.keys[2],
+    )
+    descriptor = await search.prepare_network_geo_search(db.connection, db.search_target, layout)
+    bind_compact_geo_search_candidate(layout, _candidate(db.search_target, layout, descriptor))
+    assert layout.city_search is None
+    manifest = _lookup_manifest(layout)
+
+    for network_ids, expected_keys in (((42, 99, *range(500, 551)), {db.keys[0], db.keys[2]}), ((88,), set())):
+        with network_address_read_scope(manifest, network_ids):
+            paired_rows = []
+            for lookup in ({"location_lookup": True}, {"zip_lookup": True}):
+                relation = scoped_address_relation_sql("mrf.entity_address_unified", **lookup)
+                zip_filter = _address_zip5_filter("c", relation)
+                statement = text(f"""SELECT c.location_key, coalesce(c.npi,c.inferred_npi) npi,
+                      c.entity_name, c.canonical_network_ids, c.lat
+                 FROM {relation} c WHERE {zip_filter} ORDER BY c.location_key""")
+                compiled = statement.compile(dialect=PGDialect_asyncpg())
+                params = scoped_address_parameters({"zip_code": "60601"})
+                paired_rows.append(
+                    await db.connection.fetch(str(compiled), *(params[name] for name in compiled.positiontup))
+                )
+        reference, actual = paired_rows
+        assert actual == reference
+        assert {office["location_key"] for office in actual} == expected_keys
+        if actual:
+            by_key = {office["location_key"]: office for office in actual}
+            assert by_key[db.keys[0]]["entity_name"] == "manual override"
+            assert by_key[db.keys[0]]["canonical_network_ids"] == [7, 42]
+            assert by_key[db.keys[2]]["npi"] == 2222222222
+            assert by_key[db.keys[2]]["lat"] is None
 
 
 async def _assert_published_city_search(connection, layout, network_ids, expected_npis):

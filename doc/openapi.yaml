@@ -12083,9 +12083,9 @@ components:
         network_ids:
           type: array
           minItems: 1
-          maxItems: 50
+          maxItems: 60
           uniqueItems: true
-          description: Sorted positive canonical IDs, exactly equal to selector.values.
+          description: Sorted positive canonical IDs, exactly equal to selector.values. A legacy checksum binding can contain up to 50 canonical IDs.
           items: {type: integer, minimum: 1, maximum: 2147483647}
         legacy_checksums:
           type: array

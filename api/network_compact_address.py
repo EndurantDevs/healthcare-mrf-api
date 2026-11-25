@@ -166,7 +166,7 @@ def compact_city_search_relation(layout, network_ids):
     )
 
 
-def _address_query(layout, network_ids, visible_membership_sql, location_lookup, columns=None):
+def _address_query(layout, network_ids, visible_membership_sql, location_lookup, columns=None, *, zip_lookup=False):
     _validate_address_selection(layout, network_ids, visible_membership_sql, location_lookup)
     requested_columns = _projection_column_names(columns)
     hidden_columns = (
@@ -190,7 +190,17 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup,
         for name in working_columns
     )
     query = f"SELECT {output_columns} FROM ({base}) office"
-    if network_ids is not None:
+    if network_ids is not None and zip_lookup and layout.geo_search is not None:
+        # Probe membership by office key after ZIP filtering, including offices without coordinates.
+        scoped = (
+            query
+            + f""" WHERE EXISTS (
+            SELECT FROM ONLY {_relation(layout.geo_search)} projected
+             WHERE projected.location_key=office.location_key
+               AND projected.canonical_network_ids OPERATOR(public.&&) CAST(:_canonical_network_ids AS integer[])
+             OFFSET 0)"""
+        )
+    elif network_ids is not None:
         selected = _membership_arms(layout, selected=True, location_lookup=location_lookup)
         membership = f"office.location_key IN ({selected})"
         if location_lookup:
@@ -210,14 +220,18 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup,
     return scoped
 
 
-def compact_address_relation_sql(layout, *, network_ids=None, visible_membership_sql=None, location_lookup=False):
+def compact_address_relation_sql(
+    layout, *, network_ids=None, visible_membership_sql=None, location_lookup=False, zip_lookup=False
+):
     """Return a parenthesized relation; selector/visibility binds belong to the caller.
 
     Layout and visibility SQL come only from trusted manifest/policy integration.
     Neither this query builder nor its DTOs establish custody or authorize reads.
     Location lookups require an independently bounded outer address query.
     """
-    return "(" + _address_query(layout, network_ids, visible_membership_sql, location_lookup) + ")"
+    return (
+        "(" + _address_query(layout, network_ids, visible_membership_sql, location_lookup, zip_lookup=zip_lookup) + ")"
+    )
 
 
 def _bound_address_query(layout, network_ids, visible_membership_sql, *, location_lookup=False, columns=None):

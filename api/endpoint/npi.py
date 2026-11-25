@@ -8339,7 +8339,7 @@ async def list_providers(
     address_required_columns = _public_address_serving_column_keys()
     address_table_sql = await _address_serving_table_sql(address_required_columns, session=request_session)
     use_indexed_offices, indexed_address_sql = _provider_indexed_location_address(
-        network_scope, address_table_sql, _runtime_db_schema(), zip_code or (city and state)
+        network_scope, address_table_sql, _runtime_db_schema(), zip_code, city and state
     )
     ordinary_address_sql = address_table_sql
     plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(

@@ -102,13 +102,14 @@ def _binding_network_ids(binding):
 
     selector = binding["selector"]
     identities = binding["network_ids"]
+    max_network_ids = 50 if "legacy_checksums" in binding else 60
     if (
         type(selector) is not dict
         or set(selector) != {"namespace", "values"}
         or selector["namespace"] != "canonical"
         or type(selector["values"]) is not list
         or type(identities) is not list
-        or not 1 <= len(identities) <= 50
+        or not 1 <= len(identities) <= max_network_ids
         or any(type(identity) is not int or not 0 < identity <= 2147483647 for identity in identities)
         or identities != sorted(set(identities))
         or selector["values"] != identities
