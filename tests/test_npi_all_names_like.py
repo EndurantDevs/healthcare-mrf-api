@@ -14,6 +14,7 @@ from api import provider_profile_snapshot, provider_search_sql
 from api.endpoint import npi as npi_module
 from api.endpoint.npi import get_all
 from api.network_address_scope import NetworkAddressReadScope, network_address_read_scope, scoped_address_relation_sql
+from process.network_compact_layout import CompactAddressRelation, bind_compact_geo_search
 from tests.network_compact_address_postgres_support import _layout, _lookup_manifest
 
 
@@ -1486,7 +1487,8 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count_only", [False, True])
-async def test_get_all_compact_zip_exact_count_uses_indexed_office_scope(monkeypatch, count_only):
+@pytest.mark.parametrize("has_projection", [False, True])
+async def test_get_all_compact_zip_exact_count_uses_indexed_office_scope(monkeypatch, count_only, has_projection):
     conn = RecordingConnection()
 
     @asynccontextmanager
@@ -1494,7 +1496,10 @@ async def test_get_all_compact_zip_exact_count_uses_indexed_office_scope(monkeyp
         yield conn
 
     monkeypatch.setattr(npi_module, "_provider_list_connection", record_sql)
-    manifest = _lookup_manifest(_layout())
+    layout = _layout()
+    if has_projection:
+        bind_compact_geo_search(layout, CompactAddressRelation(layout.ref_map.schema_name, "network_geo_search"))
+    manifest = _lookup_manifest(layout)
     query_by_name = {
         "zip_code": "60601",
         "codes": "TESTCODE",
@@ -1506,18 +1511,21 @@ async def test_get_all_compact_zip_exact_count_uses_indexed_office_scope(monkeyp
         query_by_name["count_only"] = "1"
     with network_address_read_scope(manifest, (7, 42)):
         ordinary = scoped_address_relation_sql("mrf.entity_address_unified")
-        indexed = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
+        sliced = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
+        indexed = scoped_address_relation_sql("mrf.entity_address_unified", zip_lookup=True)
         monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value=ordinary))
         reply = await get_all(types.SimpleNamespace(args=query_by_name))
 
     assert reply.status == 200
+    assert (indexed != sliced) is has_projection
     count_sql, params = next((sql, params) for sql, params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
     assert indexed != ordinary and indexed in count_sql
+    assert "COALESCE(c.zip5, LEFT(COALESCE(c.postal_code, ''), 5)) = :zip_code" in count_sql
     assert params["_canonical_network_ids"] == [7, 42]
     assert params["zip_code"] == "60601"
     if not count_only:
         page_sql = next(sql for sql, _ in conn.sql_calls if "page_npis AS" in sql)
-        assert indexed in page_sql
+        assert page_sql.count(indexed) == 2
         assert json.loads(reply.body)["total"] == 5
 
 

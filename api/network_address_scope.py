@@ -459,9 +459,9 @@ async def _require_legacy_mapping(driver, approved_relation, manifest, network_i
         )
 
 
-def scoped_address_relation_sql(table_ref, *, location_lookup=False):
+def scoped_address_relation_sql(table_ref, *, location_lookup=False, zip_lookup=False):
     """Return a parameterized filtered relation only for the unified table."""
-    if type(location_lookup) is not bool:
+    if type(location_lookup) is not bool or type(zip_lookup) is not bool:
         raise ValueError("network_address_lookup_invalid")
     scope = _SCOPE.get()
     if scope is None or not table_ref.endswith(".entity_address_unified"):
@@ -475,7 +475,8 @@ def scoped_address_relation_sql(table_ref, *, location_lookup=False):
             visible_membership_sql="TRUE"
             if scope.legacy_checksums is not None
             else (_visible_membership_predicate() if scope.network_ids is None else None),
-            location_lookup=location_lookup and scope.manifest.supports_location_lookup,
+            location_lookup=(location_lookup or zip_lookup) and scope.manifest.supports_location_lookup,
+            zip_lookup=zip_lookup and scope.is_compact_network_selection and scope.manifest.supports_location_lookup,
         )
         if scope.legacy_checksums is not None:
             relation = (
@@ -498,8 +499,8 @@ def is_scoped_address_relation(table_ref):
     """Recognize exactly the filtered relation bound in this request."""
     scope = _SCOPE.get()
     return scope is not None and any(
-        table_ref == scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=lookup)
-        for lookup in (False, True)
+        table_ref == scoped_address_relation_sql("mrf.entity_address_unified", **lookup)
+        for lookup in ({}, {"location_lookup": True}, {"zip_lookup": True})
     )
 
 

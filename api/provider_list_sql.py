@@ -387,15 +387,16 @@ _OTHER_ZIP_PAGE_FILTERS = (
 )
 
 
-def _provider_indexed_location_address(scope, address_sql, schema, location):
+def _provider_indexed_location_address(scope, address_sql, schema, zip_code, city_state):
     """Select indexed membership only on a qualified compact location search."""
     if (
         scope is not None
         and scope.is_compact_network_selection
         and scope.manifest.supports_location_lookup
-        and location
+        and (zip_code or city_state)
     ):
-        return True, scoped_address_relation_sql(f"{schema}.{EntityAddressUnified.__tablename__}", location_lookup=True)
+        lookup_by_name = {"zip_lookup": True} if zip_code else {"location_lookup": True}
+        return True, scoped_address_relation_sql(f"{schema}.{EntityAddressUnified.__tablename__}", **lookup_by_name)
     return False, address_sql
 
 
