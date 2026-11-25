@@ -46,7 +46,13 @@ async def initialize_source_candidate(directory, candidate, partition_initializa
 
 async def prepare_retained_prefix(directory, candidate, cancellation):
     """Convert only the selected intake before its first REST acquisition."""
-    return await migrate_source_candidate(directory.db, directory, candidate, check_cancelled=cancellation.check)
+    return await migrate_source_candidate(
+        directory.db,
+        directory,
+        candidate,
+        check_cancelled=cancellation.check,
+        payload_format=policy_scope.source_payload_format(),
+    )
 
 
 def validate_conversion(binding):
@@ -58,7 +64,7 @@ def validate_conversion(binding):
         and set(progress_by_field) == _FIELDS,
         "payload_conversion_changed",
     )
-    layout.require_source_identity(binding["identity"])
+    layout.require_source_identity(binding["identity"], payload_format=progress_by_field["format"])
     _validate_progress(binding, progress_by_field)
     _validate_conversion_tables(binding, progress_by_field)
     if progress_by_field["state"] == "copying":
@@ -73,6 +79,7 @@ def validate_conversion(binding):
     else:
         storage._require(
             binding["contract"] == storage.NAMED_COMPACT_CONTRACT
+            and binding["payload_format"] == progress_by_field["format"]
             and progress_by_field["rows"] == progress_by_field["total_rows"]
             and all(
                 binding["tables"].get(root) == table for root, table in progress_by_field["compact_tables"].items()
@@ -84,7 +91,7 @@ def validate_conversion(binding):
 def _validate_progress(binding, progress_by_field):
     """Require bounded committed coordinates and the original allocation high-water."""
     storage._require(
-        progress_by_field["format"] == compact.FORMAT
+        progress_by_field["format"] in (compact.FORMAT, compact.SHARED_BODY_FORMAT)
         and type(progress_by_field["state"]) is str
         and progress_by_field["state"] in {"copying", "retained"}
         and type(progress_by_field["ordinal"]) is int
@@ -141,7 +148,14 @@ def _validate_conversion_tables(binding, progress_by_field):
     storage._require(
         legacy["resource_input"]["name"][:-3] == legacy["witness_input"]["name"][:-3], "payload_conversion_tables"
     )
-    layout.validate_tables({**binding, "phase": "loading", "tables": progress_by_field["compact_tables"]})
+    layout.validate_tables(
+        {
+            **binding,
+            "phase": "loading",
+            "payload_format": progress_by_field["format"],
+            "tables": progress_by_field["compact_tables"],
+        }
+    )
     storage._require(
         not (
             {table["name"] for table in legacy.values()}
@@ -167,7 +181,7 @@ async def _sequence(connection, schema, relation):
     return name, [values["last_value"], values["is_called"]]
 
 
-async def _begin(connection, policy, previous, directory):
+async def _begin(connection, policy, previous, directory, payload_format):
     """Persist target names before the first separately committed payload segment."""
     relation = storage_relation(policy.schema, previous["tables"]["resource_input"]["name"])
     witness = storage_relation(policy.schema, previous["tables"]["witness_input"]["name"])
@@ -195,10 +209,10 @@ async def _begin(connection, policy, previous, directory):
     await connection.execute(f"CREATE UNIQUE INDEX {storage_identifier(name)} ON {relation}(batch_ordinal,row_ordinal)")
     _, sequence = await _sequence(connection, policy.schema, relation)
     progress_by_field = {
-        "format": compact.FORMAT,
+        "format": payload_format,
         "state": "copying",
         "legacy_tables": previous["tables"],
-        "compact_tables": await layout.create_inputs(connection, policy),
+        "compact_tables": await layout.create_inputs(connection, policy, payload_format=payload_format),
         "ordinal": previous["ordinal"],
         "resets": previous["resets"],
         "after": [0, -1],
@@ -346,7 +360,7 @@ async def _finish(connection, policy, binding):
     current_binding_by_field = {
         **binding,
         "contract": storage.NAMED_COMPACT_CONTRACT,
-        "payload_format": compact.FORMAT,
+        "payload_format": progress_by_field["format"],
         "tables": progress_by_field["compact_tables"],
         KEY: {**progress_by_field, "state": "retained"},
     }
@@ -360,13 +374,15 @@ async def _finish(connection, policy, binding):
     return current_binding_by_field
 
 
-async def migrate_source_candidate(database, directory, candidate, *, check_cancelled=None):
-    """Convert only the registered named source through independently committed segments."""
+async def migrate_source_candidate(database, directory, candidate, *, check_cancelled=None, payload_format=None):
+    """Convert an explicitly selected layout in independently committed segments."""
     if candidate is None:
         return None
     identity = storage.candidate_identity(directory, candidate)
-    if identity["metadata"].get("source_ids") != [directory._stable_source_id(directory.anthem.seed_rows()[0])]:
-        return None
+    if payload_format is None:
+        if identity["metadata"].get("source_ids") != [directory._stable_source_id(directory.anthem.seed_rows()[0])]:
+            return None
+        payload_format = compact.FORMAT
     storage._require(policy_scope._PUBLISHER.get() is None, "payload_conversion_outer_transaction")
     while True:
         if check_cancelled is not None:
@@ -375,16 +391,19 @@ async def migrate_source_candidate(database, directory, candidate, *, check_canc
             publisher = policy_scope.bound_publisher()
             if not isinstance(publisher.storage_binding, NamedFHIRSourceStorage):
                 return None
+            storage._require_shared_payload_format(publisher, payload_format)
             connection, policy = publisher.connection, publisher.policy
             storage._require_candidate_storage(publisher, directory, identity)
             binding = await storage._locked(connection, policy, identity, allow_conversion=True)
             storage._require(binding is not None, "preparation_required")
-            layout.require_source_identity(identity)
+            layout.require_source_identity(identity, payload_format=payload_format)
             if binding["contract"] == storage.NAMED_COMPACT_CONTRACT:
+                storage._require(binding["payload_format"] == payload_format, "payload_format_changed")
                 return binding
             if KEY not in binding:
-                binding = await _begin(connection, policy, binding, directory)
+                binding = await _begin(connection, policy, binding, directory, payload_format)
             else:
+                storage._require(binding[KEY]["format"] == payload_format, "payload_format_changed")
                 keys = await _keys(connection, policy, binding)
                 binding = (
                     await _copy_segment(connection, policy, binding, keys)

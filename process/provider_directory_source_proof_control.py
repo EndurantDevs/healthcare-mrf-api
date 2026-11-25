@@ -9,7 +9,7 @@ from process.provider_directory_generic_source_storage import (
     _require,
     _validate_binding,
 )
-from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
+from process.provider_directory_source_storage_binding import is_named_source_storage
 
 PROOF_ROOT = "provider_directory_dataset_proof_shard"
 _COLUMNS = (
@@ -78,16 +78,15 @@ async def require_proof_executor(executor, schema):
     """Select the bound writer transaction; caller objects grant no SQL authority."""
     publisher = bound_publisher()
     binding = getattr(publisher, "storage_binding", None)
-    _require(binding is None or type(binding) is NamedFHIRSourceStorage, "storage_changed")
+    _require(binding is None or is_named_source_storage(binding), "storage_changed")
     expected_schema = publisher.policy.schema if binding is None else binding.catalog_schema
     _require(
         publisher.connection.is_in_transaction() is True and schema == expected_schema,
         "proof_transaction_changed",
     )
-    if isinstance(binding, NamedFHIRSourceStorage):
+    if binding is not None:
         _require(publisher.policy.schema == binding.storage_schema, "storage_changed")
         return publisher
-    _require(binding is None, "storage_changed")
     await verify_proof_control(publisher.connection, publisher.policy)
     return publisher
 
@@ -97,7 +96,7 @@ async def verify_proof_control(connection, policy, *, storage_binding=None):
     _require(connection.is_in_transaction() is True, "proof_transaction_changed")
     if storage_binding is not None:
         _require(
-            type(storage_binding) is NamedFHIRSourceStorage and storage_binding.storage_schema == policy.schema,
+            is_named_source_storage(storage_binding) and storage_binding.storage_schema == policy.schema,
             "storage_changed",
         )
     relation = storage_relation(policy.schema, PROOF_ROOT)

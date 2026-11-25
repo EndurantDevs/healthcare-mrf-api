@@ -22,7 +22,11 @@ _LOGGER = logging.getLogger(__name__)
 def _output_tables(policy, binding):
     tables = layout.payload_tables(policy, binding["tables"])
     return compact.CompactPayloadTables(
-        policy.schema, binding["tables"]["resource_output_aliases"]["name"], tables.reference_sets, tables.body_blocks
+        policy.schema,
+        binding["tables"]["resource_output_aliases"]["name"],
+        tables.reference_sets,
+        tables.body_blocks,
+        tables.shared_bodies,
     )
 
 
@@ -179,9 +183,13 @@ async def _write_overrides(connection, policy, binding, resource_rows, *, sessio
     )
 
 
-def _expected_bodies(rows, dataset_id):
+def _expected_bodies(rows, dataset_id, tables):
     aliases, blocks, _ = compact.prepare_compact_payload_batch(
-        rows, dataset_id=dataset_id, batch_ordinal=1, format_id=compact.FORMAT
+        rows,
+        dataset_id=dataset_id,
+        batch_ordinal=1,
+        format_id=tables.format,
+        shared_bodies={} if tables.shared_bodies is not None else None,
     )
     bodies_by_block = {block[2]: json.loads(block[3]) for block in blocks}
     for alias in aliases:
@@ -202,7 +210,8 @@ async def _reusable_aliases(connection, policy, binding, rows):
     tables = layout.payload_tables(policy, binding["tables"])
     matched_rows = []
     fields = ",".join("a." + name for name in (*compact._ALIAS_COLUMNS, "npi_text"))
-    for batch in candidate_rows.copy_record_batches(_expected_bodies(rows, binding["identity"]["dataset_id"])):
+    expected_bodies = _expected_bodies(rows, binding["identity"]["dataset_id"], tables)
+    for batch in candidate_rows.copy_record_batches(expected_bodies):
         records = await connection.fetch(
             "WITH expected AS (SELECT * FROM unnest($3::text[],$4::text[],$5::text[],$6::text[],$7::jsonb[],"
             "$8::smallint[],$9::bytea[],$10::boolean[]) e(type,id,hash,acquired,body,state,refs,restore)) "
@@ -257,13 +266,16 @@ async def _finish_indexes(connection, policy, binding):
         connection,
         policy.schema,
         [
-            binding["tables"][root]["name"]
-            for root in (
+            table["name"]
+            for root, table in binding["tables"].items()
+            if root
+            in {
                 "resource_aliases",
                 "resource_output_aliases",
                 "resource_reference_sets",
                 "resource_body_blocks",
-            )
+                layout.SHARED_BODY_ROOT,
+            }
         ],
     )
 
@@ -278,18 +290,23 @@ def _all_aliases_sql(policy, binding):
 
 
 async def _validate_aliases(connection, tables, alias_sql, dataset_id):
+    shared_join, _ = compact._body_read_sql(tables)
+    if shared_join:
+        shared_join = "LEFT " + shared_join
+    shared_invalid = " OR d.body_hash IS NULL" if tables.shared_bodies is not None else ""
     invalid = await connection.fetchval(
         f"WITH aliases AS ({alias_sql}) SELECT EXISTS(SELECT FROM aliases a "
         f"LEFT JOIN {tables.relation('body_blocks')} b "
         "ON (b.dataset_id,b.batch_ordinal,b.block_ordinal)=(a.dataset_id,a.batch_ordinal,a.block_ordinal) "
         f"LEFT JOIN {tables.relation('reference_sets')} s ON (s.dataset_id,s.set_hash)=(a.dataset_id,a.service_set_hash) "
+        f"{shared_join} "
         "WHERE a.dataset_id<>$1 OR a.resource_type='' OR a.resource_id='' "
         "OR a.payload_hash!~'^[0-9a-f]{64}$' "
         "OR (a.acquired_resource_sha256 IS NOT NULL AND a.acquired_resource_sha256!~'^[0-9a-f]{64}$') "
         "OR b.dataset_id IS NULL OR a.body_ordinal>=jsonb_array_length(b.bodies) "
         "OR jsonb_typeof(b.bodies->a.body_ordinal) NOT IN('object','string') "
         "OR (a.service_field_state=2 AND s.set_hash IS NULL) "
-        f"OR a.npi_text IS DISTINCT FROM {compact._npi_expression_sql()})",
+        f"OR a.npi_text IS DISTINCT FROM {compact._npi_expression_sql(tables)}{shared_invalid})",
         dataset_id,
     )
     storage._require(not invalid, "compact_alias_changed")
@@ -335,6 +352,13 @@ async def validate_storage(connection, policy, binding):
     await _validate_aliases(connection, tables, alias_sql, dataset_id)
     await _validate_blocks(connection, tables, alias_sql, dataset_id)
     await _validate_reference_sets(connection, tables, alias_sql, dataset_id)
+    if tables.shared_bodies is not None:
+        invalid_body = await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {tables.relation('shared_bodies')} WHERE dataset_id<>$1 "
+            "OR body_hash<>sha256(convert_to(payload::text,'UTF8')))",
+            dataset_id,
+        )
+        storage._require(not invalid_body, "compact_shared_body_changed")
     invalid = await connection.fetchval(
         f"SELECT coalesce(max(batch_ordinal),0)<>$1 OR EXISTS(SELECT FROM {tables.relation('aliases')} "
         "GROUP BY batch_ordinal HAVING min(row_ordinal)<>0 OR max(row_ordinal)<>count(*)-1) "

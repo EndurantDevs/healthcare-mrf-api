@@ -15,9 +15,13 @@ from uuid import UUID
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_candidate as candidate
+from process.provider_directory_resource_hash import RESOURCE_TRANSPORT_PAYLOAD_FIELDS
+from process.provider_directory_source_storage_binding import SHARED_BODY_FORMAT as SHARED_BODY_FORMAT
 
 FORMAT = "provider-directory-uuid-body-blocks-v1"
 BLOCK_ROWS = 64
+_OBSERVATION_FIELDS = RESOURCE_TRANSPORT_PAYLOAD_FIELDS | {"fhir_meta"}
+_SHARED_BODY_MATCH = "d.dataset_id=a.dataset_id AND d.body_hash=decode((b.bodies->a.body_ordinal)->>'body_hash','hex')"
 _CANONICAL_REFERENCE = re.compile(r"HealthcareService/[0-9a-f]{32}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _ALIAS_COLUMNS = (
@@ -43,11 +47,21 @@ class CompactPayloadTables:
     aliases: str
     reference_sets: str
     body_blocks: str
+    shared_bodies: str | None = None
 
     def __post_init__(self):
-        for name in (self.schema_name, self.aliases, self.reference_sets, self.body_blocks):
+        names = (self.aliases, self.reference_sets, self.body_blocks)
+        if self.shared_bodies is not None:
+            names += (self.shared_bodies,)
+        storage_identifier(self.schema_name)
+        for name in names:
             storage_identifier(name)
-        _require(len({self.aliases, self.reference_sets, self.body_blocks}) == 3, "relation_names")
+        _require(len(set(names)) == len(names), "relation_names")
+
+    @property
+    def format(self):
+        """Return the layout selected by the backing table inventory."""
+        return SHARED_BODY_FORMAT if self.shared_bodies is not None else FORMAT
 
     def relation(self, name):
         """Quote a relation in the caller-selected logical schema."""
@@ -80,7 +94,7 @@ def _rendered_json_bytes(document):
 def compact_payload_ddl(tables):
     """Create candidate-local storage only; application grants stay caller-owned."""
     aliases, sets, blocks = (tables.relation(name) for name in ("aliases", "reference_sets", "body_blocks"))
-    return (
+    statements = (
         f"CREATE TABLE {sets}(dataset_id varchar(96) NOT NULL,set_hash bytea NOT NULL,canonical_refs uuid[],"
         "fallback_refs text[],PRIMARY KEY(dataset_id,set_hash),CHECK(octet_length(set_hash)=32),"
         "CHECK((canonical_refs IS NULL)<>(fallback_refs IS NULL)))",
@@ -102,12 +116,37 @@ def compact_payload_ddl(tables):
         f"CREATE INDEX {storage_identifier(tables.aliases + '_npi')} ON {aliases}"
         "(npi_text,dataset_id,resource_type) WHERE resource_type IN('Practitioner','PractitionerRole')",
     )
+    if tables.shared_bodies is not None:
+        statements += (
+            f"CREATE TABLE {tables.relation('shared_bodies')}(dataset_id varchar(96) NOT NULL,body_hash bytea NOT NULL,"
+            "payload json NOT NULL,PRIMARY KEY(dataset_id,body_hash),"
+            "CHECK(octet_length(body_hash)=32),CHECK(json_typeof(payload)='object'))",
+        )
+    return statements
+
+
+def _body_read_sql(tables):
+    """Keep both halves as JSON text so replay preserves exact numeric values."""
+    if tables.shared_bodies is None:
+        return (
+            "",
+            "CASE WHEN jsonb_typeof(b.bodies->a.body_ordinal)='string' "
+            "THEN b.bodies->>a.body_ordinal ELSE (b.bodies->a.body_ordinal)::text END",
+        )
+    provenance = "(b.bodies->a.body_ordinal)->>'provenance_json'"
+    body = "d.payload::text"
+    return (
+        f"JOIN {tables.relation('shared_bodies')} d ON {_SHARED_BODY_MATCH}",
+        f"CASE WHEN ({provenance})='{{}}' THEN {body} ELSE left({body},-1) || "
+        f"CASE WHEN {body}='{{}}' THEN '' ELSE ',' END || substring(({provenance}) FROM 2) END",
+    )
 
 
 def compact_resource_sql(tables, *, observations=False, alias_cte=None):
     """Expose exact six columns without normalizing float sign or representation."""
     extra = ",a.batch_ordinal,a.row_ordinal" if observations else ""
     aliases = tables.relation("aliases") if alias_cte is None else storage_identifier(alias_cte)
+    shared_join, body_sql = _body_read_sql(tables)
     return f"""SELECT a.dataset_id,a.resource_type,a.resource_id,a.payload_hash,
       (CASE WHEN additions.text='{{}}' THEN body.text ELSE left(body.text,-1) ||
        CASE WHEN body.text='{{}}' THEN '' ELSE ',' END || substring(additions.text FROM 2) END)::json
@@ -116,8 +155,8 @@ def compact_resource_sql(tables, *, observations=False, alias_cte=None):
        ON (b.dataset_id,b.batch_ordinal,b.block_ordinal)=(a.dataset_id,a.batch_ordinal,a.block_ordinal)
       LEFT JOIN {tables.relation("reference_sets")} s
        ON (s.dataset_id,s.set_hash)=(a.dataset_id,a.service_set_hash)
-      CROSS JOIN LATERAL (SELECT CASE WHEN jsonb_typeof(b.bodies->a.body_ordinal)='string'
-       THEN b.bodies->>a.body_ordinal ELSE (b.bodies->a.body_ordinal)::text END AS text) body
+      {shared_join}
+      CROSS JOIN LATERAL (SELECT {body_sql} AS text) body
       CROSS JOIN LATERAL (SELECT (CASE WHEN a.restore_resource_id
        THEN jsonb_build_object('resource_id',a.resource_id) ELSE '{{}}'::jsonb END ||
        CASE a.service_field_state WHEN 0 THEN '{{}}'::jsonb
@@ -157,6 +196,15 @@ def _split_payload(resource):
         body_by_field.pop("healthcare_service_refs")
         return body_by_field, 2, references
     return body_by_field, 0, None
+
+
+def _prepare_observation_body(resource_row, shared_bodies):
+    body, state, references = _split_payload(resource_row["payload_json"])
+    should_restore_id = body.get("resource_id") == resource_row["resource_id"]
+    if should_restore_id:
+        body.pop("resource_id")
+    body = _body_value(body) if shared_bodies is None else _shared_observation(body, shared_bodies)
+    return body, state, references, should_restore_id
 
 
 def _normalized_rows(resource_rows, dataset_id):
@@ -199,9 +247,16 @@ def _normalized_rows(resource_rows, dataset_id):
     return normalized_rows
 
 
-def prepare_compact_payload_batch(resource_rows, *, dataset_id, batch_ordinal, format_id, row_start=0):
+def prepare_compact_payload_batch(
+    resource_rows, *, dataset_id, batch_ordinal, format_id, row_start=0, shared_bodies=None
+):
     """Encode observations without deduplicating identities or changing stored hashes."""
-    _require(format_id == FORMAT and type(batch_ordinal) is int and 0 < batch_ordinal < 2**63, "format_or_ordinal")
+    _require(
+        format_id == (FORMAT if shared_bodies is None else SHARED_BODY_FORMAT)
+        and type(batch_ordinal) is int
+        and 0 < batch_ordinal < 2**63,
+        "format_or_ordinal",
+    )
     _require(
         type(row_start) is int and 0 <= row_start < 2**31 - len(resource_rows),
         "segment_ordinal",
@@ -209,26 +264,20 @@ def prepare_compact_payload_batch(resource_rows, *, dataset_id, batch_ordinal, f
     aliases, blocks, sets, bodies = [], [], {}, []
     body_bytes, rendered_bytes, block_ordinal = 2, 2, row_start
     for ordinal, (resource_row, charge) in enumerate(_normalized_rows(resource_rows, dataset_id), start=row_start):
-        body, state, references = _split_payload(resource_row["payload_json"])
-        should_restore_id = body.get("resource_id") == resource_row["resource_id"]
-        if should_restore_id:
-            body.pop("resource_id")
-        body = _body_value(body)
-        text = _json(body)
-        next_bytes = body_bytes + len(text.encode()) + bool(bodies)
+        body, state, references, should_restore_id = _prepare_observation_body(resource_row, shared_bodies)
+        encoded_bytes = len(_json(body).encode())
         next_rendered_bytes = rendered_bytes + _rendered_json_bytes(body) + 2
         if bodies and (
             len(bodies) == BLOCK_ROWS
             or candidate.copy_record_bytes((0, dataset_id, batch_ordinal, block_ordinal, ""))
-            + max(next_bytes, next_rendered_bytes)
+            + max(body_bytes + encoded_bytes + 1, next_rendered_bytes)
             + candidate.COPY_FRAME_BYTES
             > candidate.COPY_MAX_BYTES
         ):
             blocks.append((dataset_id, batch_ordinal, block_ordinal, _json(bodies)))
             bodies, body_bytes, rendered_bytes, block_ordinal = [], 2, 2, block_ordinal + 1
-        body_ordinal = len(bodies)
         bodies.append(body)
-        body_bytes += len(text.encode()) + (len(bodies) > 1)
+        body_bytes += encoded_bytes + (len(bodies) > 1)
         rendered_bytes += _rendered_json_bytes(body) + 2
         digest = _reference_digest(references) if state == 2 else None
         if digest is not None:
@@ -239,12 +288,12 @@ def prepare_compact_payload_batch(resource_rows, *, dataset_id, batch_ordinal, f
                 dataset_id,
                 batch_ordinal,
                 ordinal,
-                resource_row["resource_type"],
-                resource_row["resource_id"],
-                resource_row["payload_hash"],
-                resource_row["acquired_resource_sha256"],
+                *(
+                    resource_row[field]
+                    for field in ("resource_type", "resource_id", "payload_hash", "acquired_resource_sha256")
+                ),
                 block_ordinal,
-                body_ordinal,
+                len(bodies) - 1,
                 digest,
                 state,
                 should_restore_id,
@@ -272,6 +321,35 @@ async def _copy(connection, tables, root, columns, records):
             getattr(tables, root), schema_name=tables.schema_name, columns=columns, records=copied_rows
         )
         _require(status == f"COPY {len(copied_rows)}", "copy_count")
+
+
+def _shared_observation(body, body_by_hash):
+    """Keep complete observation provenance separately from identical canonical bodies."""
+    provenance_by_field = {name: body.pop(name) for name in _OBSERVATION_FIELDS if name in body}
+    payload = _json(body)
+    digest = hashlib.sha256(payload.encode()).digest()
+    _require(body_by_hash.setdefault(digest, payload) == payload, "body_hash_collision")
+    return {"body_hash": digest.hex(), "provenance_json": _json(provenance_by_field)}
+
+
+async def _new_shared_bodies(connection, tables, dataset_id, body_by_hash):
+    """Prove equality for matching keys in bounded PostgreSQL batches before sharing a body."""
+    new_bodies = []
+    for batch in candidate.copy_record_batches(
+        (dataset_id, key, payload) for key, payload in (body_by_hash or {}).items()
+    ):
+        existing = await connection.fetch(
+            "SELECT known.body_hash,known.payload::text IS NOT DISTINCT FROM expected.payload AS same "
+            "FROM unnest($2::bytea[],$3::text[]) expected(body_hash,payload) "
+            f"JOIN {tables.relation('shared_bodies')} known ON (known.dataset_id,known.body_hash)=($1,expected.body_hash)",
+            dataset_id,
+            [row[1] for row in batch],
+            [row[2] for row in batch],
+        )
+        _require(all(row["same"] is True for row in existing), "body_hash_collision")
+        existing_keys = {bytes(row["body_hash"]) for row in existing}
+        new_bodies.extend(row for row in batch if row[1] not in existing_keys)
+    return new_bodies
 
 
 async def _new_reference_sets(connection, tables, dataset_id, desired):
@@ -347,7 +425,9 @@ async def _is_replayed_batch(connection, tables, dataset_id, batch_ordinal, alia
     return True
 
 
-def _npi_expression_sql():
+def _npi_expression_sql(tables=None):
+    if tables is not None and tables.shared_bodies is not None:
+        return "d.payload->>'npi'"
     return (
         "(CASE WHEN jsonb_typeof(b.bodies->a.body_ordinal)='string' "
         "THEN (b.bodies->>a.body_ordinal)::jsonb ELSE b.bodies->a.body_ordinal END)->>'npi'"
@@ -371,8 +451,9 @@ async def _require_replay_payloads(connection, tables, dataset_id, batch_ordinal
     changed = await connection.fetchval(
         f"SELECT EXISTS(SELECT FROM {tables.relation('aliases')} a JOIN {tables.relation('body_blocks')} b "
         "ON (b.dataset_id,b.batch_ordinal,b.block_ordinal)=(a.dataset_id,a.batch_ordinal,a.block_ordinal) "
+        f"{_body_read_sql(tables)[0]} "
         "WHERE a.dataset_id=$1 AND a.batch_ordinal=$2 "
-        f"AND a.npi_text IS DISTINCT FROM {_npi_expression_sql()})",
+        f"AND a.npi_text IS DISTINCT FROM {_npi_expression_sql(tables)})",
         dataset_id,
         batch_ordinal,
     )
@@ -387,14 +468,16 @@ async def append_compact_payload_batch(connection, tables, rows, *, dataset_id, 
     Reusing an observation ordinal requires byte-equivalent normalized payloads.
     """
     _require(connection.is_in_transaction(), "transaction_required")
+    body_by_hash = {} if tables.shared_bodies is not None else None
     aliases, blocks, desired = prepare_compact_payload_batch(
-        rows, dataset_id=dataset_id, batch_ordinal=batch_ordinal, format_id=format_id
+        rows, dataset_id=dataset_id, batch_ordinal=batch_ordinal, format_id=format_id, shared_bodies=body_by_hash
     )
     references = await _new_reference_sets(connection, tables, dataset_id, desired)
+    shared_bodies = await _new_shared_bodies(connection, tables, dataset_id, body_by_hash)
     if await _is_replayed_batch(connection, tables, dataset_id, batch_ordinal, aliases, blocks):
-        _require(not references, "replay_reference_missing")
+        _require(not references and not shared_bodies, "replay_reference_missing")
         return {"rows": len(rows), "is_replay": True}
-    await _append_prepared(connection, tables, dataset_id, batch_ordinal, aliases, blocks, references)
+    await _append_prepared(connection, tables, dataset_id, batch_ordinal, aliases, blocks, references, shared_bodies)
     return {"rows": len(rows), "is_replay": False}
 
 
@@ -407,29 +490,36 @@ async def append_compact_payload_segment(connection, tables, rows, *, dataset_id
     segments fail native keys rather than changing whole-batch replay semantics.
     """
     _require(connection.is_in_transaction(), "transaction_required")
+    body_by_hash = {} if tables.shared_bodies is not None else None
     aliases, blocks, desired = prepare_compact_payload_batch(
         rows,
         dataset_id=dataset_id,
         batch_ordinal=batch_ordinal,
-        format_id=FORMAT,
+        format_id=tables.format,
         row_start=row_start,
+        shared_bodies=body_by_hash,
     )
     references = await _new_reference_sets(connection, tables, dataset_id, desired)
-    await _append_prepared(connection, tables, dataset_id, batch_ordinal, aliases, blocks, references)
+    shared_bodies = await _new_shared_bodies(connection, tables, dataset_id, body_by_hash)
+    await _append_prepared(connection, tables, dataset_id, batch_ordinal, aliases, blocks, references, shared_bodies)
 
 
-async def _append_prepared(connection, tables, dataset_id, batch_ordinal, aliases, blocks, references):
+async def _append_prepared(connection, tables, dataset_id, batch_ordinal, aliases, blocks, references, shared_bodies):
     """Share bounded COPY and scalar derivation across batches and migration segments."""
     await _copy(
         connection, tables, "reference_sets", ("dataset_id", "set_hash", "canonical_refs", "fallback_refs"), references
     )
+    if shared_bodies:
+        await _copy(connection, tables, "shared_bodies", ("dataset_id", "body_hash", "payload"), shared_bodies)
     await _copy(connection, tables, "body_blocks", ("dataset_id", "batch_ordinal", "block_ordinal", "bodies"), blocks)
     await _copy(connection, tables, "aliases", _ALIAS_COLUMNS, aliases)
+    shared_from = f", {tables.relation('shared_bodies')} d" if tables.shared_bodies is not None else ""
+    shared_match = f" AND {_SHARED_BODY_MATCH}" if tables.shared_bodies is not None else ""
     await connection.execute(
-        f"UPDATE {tables.relation('aliases')} a SET npi_text={_npi_expression_sql()} "
-        f"FROM {tables.relation('body_blocks')} b WHERE (b.dataset_id,b.batch_ordinal,b.block_ordinal)="
+        f"UPDATE {tables.relation('aliases')} a SET npi_text={_npi_expression_sql(tables)} "
+        f"FROM {tables.relation('body_blocks')} b{shared_from} WHERE (b.dataset_id,b.batch_ordinal,b.block_ordinal)="
         "(a.dataset_id,a.batch_ordinal,a.block_ordinal) AND a.dataset_id=$1 AND a.batch_ordinal=$2 "
-        f"AND a.npi_text IS DISTINCT FROM {_npi_expression_sql()}",
+        f"AND a.npi_text IS DISTINCT FROM {_npi_expression_sql(tables)}{shared_match}",
         dataset_id,
         batch_ordinal,
     )

@@ -6,7 +6,9 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from dataclasses import asdict
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.exc import DBAPIError
@@ -19,6 +21,7 @@ from process import provider_directory_generic_source_completion as completion
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_partition_successor as partition_successor
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage, SharedBodyFHIRSourceStorage
 from tests.test_provider_directory_compact_intake_postgres import (
     _append_checkpoint,
     _binding,
@@ -232,9 +235,16 @@ async def test_segmented_prefix_preserves_history(intake_case, monkeypatch):
     assert await _migrate(case) == await _binding(case)
 
 
-async def test_cancelled_conversion_preserves_prefix(intake_case, monkeypatch):
+@pytest.mark.parametrize("payload_format", [compact.FORMAT, compact.SHARED_BODY_FORMAT])
+async def test_cancelled_conversion_preserves_prefix(intake_case, monkeypatch, payload_format):
     case = intake_case
     before, observations, checkpoints = await _legacy(case)
+    if payload_format == compact.SHARED_BODY_FORMAT:
+        with pytest.raises(ValueError, match="payload_format_changed"):
+            await _migrate(case, payload_format=payload_format)
+        monkeypatch.setattr(
+            case.factory, "storage_binding", SharedBodyFHIRSourceStorage(**asdict(case.factory.storage_binding))
+        )
     original = compact.append_compact_payload_segment
 
     async def interrupted(*args, **kwargs):
@@ -244,14 +254,28 @@ async def test_cancelled_conversion_preserves_prefix(intake_case, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(compact, "append_compact_payload_segment", interrupted)
         with pytest.raises(asyncio.CancelledError):
-            await _migrate(case)
+            await migration.prepare_retained_prefix(case.directory, case.candidate, SimpleNamespace(check=AsyncMock()))
     pending = await _binding(case)
     assert pending["tables"] == before["tables"] and pending[migration.KEY]["rows"] == 0
-    target = storage_relation("source_schema", pending[migration.KEY]["compact_tables"]["resource_aliases"]["name"])
-    assert await case.connection.fetchval(f"SELECT count(*) FROM {target}") == 0
+    compact_aliases = storage_relation(
+        "source_schema", pending[migration.KEY]["compact_tables"]["resource_aliases"]["name"]
+    )
+    assert await case.connection.fetchval(f"SELECT count(*) FROM {compact_aliases}") == 0
     assert await _observations(case, before) == observations and await _checkpoints(case) == checkpoints
-    after = await _migrate(case)
+    after = await migration.prepare_retained_prefix(case.directory, case.candidate, SimpleNamespace(check=AsyncMock()))
+    assert after["payload_format"] == payload_format
     assert await _observations(case, after) == observations
+    assert await _checkpoints(case) == checkpoints
+    if payload_format == compact.SHARED_BODY_FORMAT:
+        with monkeypatch.context() as unconfigured:
+            unconfigured.setattr(
+                case.factory, "storage_binding", NamedFHIRSourceStorage(**asdict(case.factory.storage_binding))
+            )
+            with pytest.raises(ValueError, match="payload_format_changed"):
+                await _append_checkpoint(case, "PractitionerRole", _rows(case, "PractitionerRole"))
+        assert await _checkpoints(case) == checkpoints
+    await _append_checkpoint(case, "PractitionerRole", _rows(case, "PractitionerRole"))
+    assert (await _binding(case))["ordinal"] > after["ordinal"]
 
 
 async def test_ambiguous_commit_resumes_conversion(intake_case, monkeypatch):
@@ -355,10 +379,19 @@ async def _transition_census(case, current):
     return counts_by_resource, identity_by_field
 
 
-async def test_successor_preserves_reset_census(intake_case):
+@pytest.mark.parametrize("payload_format", [compact.FORMAT, compact.SHARED_BODY_FORMAT])
+async def test_successor_preserves_reset_census(intake_case, monkeypatch, payload_format):
     case = intake_case
     _before, _observed, checkpoints = await _legacy(case)
-    current = await _migrate(case)
+    if payload_format == compact.SHARED_BODY_FORMAT:
+        monkeypatch.setattr(
+            case.factory, "storage_binding", SharedBodyFHIRSourceStorage(**asdict(case.factory.storage_binding))
+        )
+    current = await _migrate(case, payload_format=payload_format)
+    old_storage_by_field = {**current["storage"], "producer": ["a" * 40, "sha256:" + "b" * 64]}
+    new_storage_by_field = {**current["storage"], "producer": ["c" * 40, "sha256:" + "d" * 64]}
+    _raw, transitioned = storage._transition_candidate_document(current, old_storage_by_field, new_storage_by_field)
+    assert transitioned == current
     counts_by_resource, identity_by_field = await _transition_census(case, current)
     stopped_run_by_field = {"status": "failed", "ancestor_run_ids": ["root"]}
     async with source.source_transaction(case.database):
@@ -393,7 +426,8 @@ async def test_successor_preserves_reset_census(intake_case):
     assert len(checkpoints) == 7
 
 
-async def test_successful_release_rolls_back_with_handoff(intake_case):
+@pytest.mark.parametrize("payload_format", [compact.FORMAT, compact.SHARED_BODY_FORMAT])
+async def test_successful_release_rolls_back_with_handoff(intake_case, monkeypatch, payload_format):
     from tests.test_provider_directory_compact_completion_postgres import _append, _candidate, _complete, _payloads
 
     case = await _candidate(intake_case, "release")
@@ -404,7 +438,11 @@ async def test_successful_release_rolls_back_with_handoff(intake_case):
     )
     original = await _prepare(case)
     await _append(case, _payloads())
-    converted = await _migrate(case)
+    if payload_format == compact.SHARED_BODY_FORMAT:
+        monkeypatch.setattr(
+            case.factory, "storage_binding", SharedBodyFHIRSourceStorage(**asdict(case.factory.storage_binding))
+        )
+    converted = await _migrate(case, payload_format=payload_format)
     with pytest.raises(ValueError):
         async with source.source_transaction(case.database):
             publisher = source.bound_publisher()
