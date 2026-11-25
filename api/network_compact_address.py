@@ -124,6 +124,32 @@ def compact_selected_offices(layout, network_ids):
     return keys, offices
 
 
+def compact_city_page(layout, network_ids, address_type):
+    """Intersect selected offices and state before fetching each matching city's first providers."""
+    _validate_address_selection(layout, network_ids, None, False)
+    selected = _membership_arms(layout, selected=True) or "SELECT NULL::text AS location_key WHERE FALSE"
+    offices = _office_rows(layout, "location_key,npi,inferred_npi,state_name,type")
+    cities = _office_rows(layout, "location_key,city_name")
+    refs = _relation(layout.ref_map)
+    # Cap nationwide key enumeration. The ordinary provider page handles larger selections.
+    small_selection = "(SELECT total <= 500000 FROM selected_office_bound)"
+    keys = f"""selected_office_bound AS MATERIALIZED (
+      SELECT coalesce(sum(row_count),0) AS total FROM ONLY {refs}
+      WHERE network_id=ANY(CAST(:_canonical_network_ids AS integer[]))
+    ), selected_city_keys AS MATERIALIZED (
+      SELECT DISTINCT location_key FROM ({selected}) keys WHERE {small_selection}
+    ), selected_state_offices AS MATERIALIZED (
+      SELECT c.location_key,coalesce(c.npi,c.inferred_npi) AS npi
+      FROM selected_city_keys k JOIN ({offices}) c USING(location_key)
+      WHERE c.state_name=:state AND {address_type} ORDER BY npi
+    )"""
+    page = f"""SELECT DISTINCT ON (office.npi) office.npi FROM selected_state_offices office
+      JOIN LATERAL (SELECT FROM ({cities}) address WHERE address.location_key=office.location_key
+        AND address.city_name=:city LIMIT 1) city ON true
+      ORDER BY office.npi LIMIT :limit OFFSET :start"""
+    return keys, page, f"NOT {small_selection}"
+
+
 def _address_query(layout, network_ids, visible_membership_sql, location_lookup, columns=None):
     _validate_address_selection(layout, network_ids, visible_membership_sql, location_lookup)
     requested_columns = _projection_column_names(columns)
@@ -150,11 +176,13 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup,
     query = f"SELECT {output_columns} FROM ({base}) office"
     if network_ids is not None:
         selected = _membership_arms(layout, selected=True, location_lookup=location_lookup)
-        # Avoid a national office scan when the selected memberships are empty.
-        membership_prefix = f"EXISTS ({selected}) AND " if not location_lookup else ""
-        scoped = query + (
-            f" WHERE {membership_prefix}office.location_key IN ({selected})" if selected else " WHERE FALSE"
-        )
+        membership = f"office.location_key IN ({selected})"
+        if location_lookup:
+            # Keep the correlated probe after the office filters instead of flattening it into a join.
+            membership = f"({membership}) IS TRUE"
+        else:
+            membership = f"EXISTS ({selected}) AND {membership}"
+        scoped = query + (f" WHERE {membership}" if selected else " WHERE FALSE")
     else:
         visibility = "row_origin IN ('base','ptg_overlay')"
         if visible_membership_sql is not None:

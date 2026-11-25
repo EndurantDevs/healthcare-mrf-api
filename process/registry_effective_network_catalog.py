@@ -75,19 +75,31 @@ async def _catalog_coordinates(connection, manifest, control_schema):
     return control, catalog, generation, manifest.approved_custom_revision
 
 
-async def effective_catalog_sql(connection, manifest, control_schema):
+async def effective_catalog_sql(connection, manifest, control_schema, *, selected_networks=None):
     """Read imported metadata with exact retained manual overrides and source bindings."""
     coordinates = await _catalog_coordinates(connection, manifest, control_schema)
     if coordinates is None:
         return None
     control, catalog, generation, revision = coordinates
-    ctes = _catalog_ctes(control, catalog, generation, revision)
     if (
         await connection.fetchval(_manual_bindings_may_conflict_sql(control, revision)) is not False
-        and await connection.fetchval(_catalog_conflict_sql(ctes)) is not False
+        and await connection.fetchval(_catalog_conflict_sql(_catalog_ctes(control, catalog, generation, revision)))
+        is not False
     ):
         raise ValueError("registry_effective_catalog_binding_conflict")
-    return "(WITH " + ctes + "," + _record_ctes(catalog, generation, revision) + " SELECT * FROM effective_records)"
+    ctes = _catalog_ctes(control, catalog, generation, revision, selected_networks=selected_networks)
+    records = _record_ctes(catalog, generation, revision, selected_networks=selected_networks)
+    return f"(WITH {ctes},{records} SELECT * FROM effective_records)"
+
+
+def _legacy_aca_match_key(document):
+    return f"""CASE WHEN {document}->>'source_system'='aca'
+      AND {document}->>'producer_id'<>'registry-native-network-source-v1'
+      AND (NOT {document} ? 'source_key_kind' OR {document}->>'source_key_kind'='hios_plan_id')
+      AND {document}->>'source_key' ~ '^[1-9][0-9]{{4}}[A-Z]{{2}}[0-9]{{7}}(-[0-9]{{2}})?$'
+      AND jsonb_typeof({document}#>'{{source_scope_json,checksum_network}}')='number'
+      THEN 'ACAPlan/'||({document}->>'source_key')||'/'||
+        trim_scale(({document}#>'{{source_scope_json,checksum_network}}')::numeric)::text END"""
 
 
 def _manual_bindings_may_conflict_sql(control, revision):
@@ -96,13 +108,7 @@ def _manual_bindings_may_conflict_sql(control, revision):
       SELECT custom_revision,record_json->>'source_system' AS source_system,
         record_json->>'source_key' AS source_key,record_json->>'network_id' AS target,
         record_json->>'archived' AS archived,
-        CASE WHEN record_json->>'source_system'='aca'
-          AND record_json->>'producer_id'<>'registry-native-network-source-v1'
-          AND (NOT record_json ? 'source_key_kind' OR record_json->>'source_key_kind'='hios_plan_id')
-          AND record_json->>'source_key' ~ '^[1-9][0-9]{{4}}[A-Z]{{2}}[0-9]{{7}}(-[0-9]{{2}})?$'
-          AND jsonb_typeof(record_json#>'{{source_scope_json,checksum_network}}')='number'
-          THEN 'ACAPlan/'||(record_json->>'source_key')||'/'||
-            trim_scale((record_json#>'{{source_scope_json,checksum_network}}')::numeric)::text END AS native_aca_key
+        {_legacy_aca_match_key("record_json")} AS native_aca_key
       FROM ONLY {control}.registry_approved_record
       WHERE approved_revision={revision} AND record_kind='network_binding'
     ) SELECT EXISTS (
@@ -147,23 +153,64 @@ async def effective_catalog_networks_sql(connection, manifest, control_schema):
           AND m.record_kind='network' AND m.record_key=n.network_id::text))"""
 
 
-def _catalog_ctes(control, catalog, generation, revision):
+def _requested_binding_ctes(catalog, generation, selected_networks):
+    """Read requested binding keys, including overrides moved into the selection."""
+    return f"""manual_keys AS MATERIALIZED (
+      SELECT record_json,custom_revision,record_json->>'source_key' AS match_key
+      FROM manual WHERE record_kind='network_binding'
+      UNION ALL
+      SELECT selection.record_json,selection.custom_revision,selection.match_key
+      FROM (SELECT record_json,custom_revision,{_legacy_aca_match_key("record_json")} AS match_key
+        FROM manual WHERE record_kind='network_binding') selection WHERE selection.match_key IS NOT NULL
+    ), incoming_keys AS MATERIALIZED (
+      SELECT DISTINCT match_key,record_json->>'source_id' AS source_id,
+        (record_json->>'source_system'='fhir' AND match_key ~ '^[A-Za-z0-9.-]{{1,64}}$') IS TRUE AS fhir_org
+      FROM manual_keys
+      WHERE CASE WHEN pg_input_is_valid(record_json->>'network_id','integer')
+        THEN (record_json->>'network_id')::integer END=ANY({selected_networks})
+    ), other_keys AS MATERIALIZED (SELECT match_key FROM incoming_keys WHERE NOT fhir_org),
+    requested_bindings AS MATERIALIZED (
+      SELECT binding_id FROM ONLY {catalog}.registry_fhir_catalog_binding
+      WHERE metadata_generation='{generation}' AND network_id=ANY({selected_networks})
+      UNION SELECT b.binding_id FROM incoming_keys k JOIN ONLY {catalog}.registry_fhir_catalog_source s
+        ON s.source_id=k.source_id OR s.descriptor_json->'source_aliases' ? k.source_id
+      CROSS JOIN LATERAL (SELECT b.binding_id FROM ONLY {catalog}.registry_fhir_catalog_binding b
+        WHERE b.metadata_generation='{generation}' AND (b.document_json->>'evidence_id') COLLATE "C"=
+          s.source_generation||':Organization/'||k.match_key OFFSET 0) b WHERE k.fhir_org
+      UNION SELECT b.binding_id FROM ONLY {catalog}.registry_fhir_catalog_binding b
+      WHERE EXISTS(SELECT FROM other_keys) AND b.metadata_generation='{generation}'
+        AND b.document_json->>'source_key' IN (SELECT match_key FROM other_keys)
+    ), """
+
+
+def _catalog_ctes(control, catalog, generation, revision, *, selected_networks=None):
     if type(revision) is not int or not 0 <= revision < 2**63:
         raise ValueError("registry_effective_catalog_revision_invalid")
     override_identity = binding_override_identity_sql("m.record_json", "b.document_json", "b.source_aliases")
+    keys, network_filter, effective_filter = "", "", ""
+    manual_match = "manual m ON m.record_kind='network_binding'"
+    imported_bindings = f"ONLY {catalog}.registry_fhir_catalog_binding b"
+    if selected_networks is not None:
+        keys = _requested_binding_ctes(catalog, generation, selected_networks)
+        imported_bindings = f"""requested_bindings selected CROSS JOIN LATERAL (
+          SELECT b.* FROM ONLY {catalog}.registry_fhir_catalog_binding b
+          WHERE b.metadata_generation='{generation}' AND b.binding_id=selected.binding_id OFFSET 0) b"""
+        manual_match = "manual_keys m ON m.match_key=b.document_json->>'source_key'"
+        network_filter = f"AND n.network_id=ANY({selected_networks})"
+        effective_filter = f"AND coalesce(o.network_id,b.network_id)=ANY({selected_networks})"
     return f"""manual AS MATERIALIZED (
       SELECT approved_revision,record_kind,record_key,record_revision,custom_revision,record_json
       FROM ONLY {control}.registry_approved_record WHERE approved_revision={revision}
-    ), imported AS MATERIALIZED (
+    ), {keys}imported AS MATERIALIZED (
       SELECT b.*,s.descriptor_json->'source_aliases' AS source_aliases
-      FROM ONLY {catalog}.registry_fhir_catalog_binding b
+      FROM {imported_bindings}
       LEFT JOIN ONLY {catalog}.registry_fhir_catalog_source s
         ON s.source_generation=split_part(b.document_json->>'evidence_id',':',1)
       WHERE b.metadata_generation='{generation}'
     ), manual_matches AS MATERIALIZED (
       SELECT b.binding_id,m.record_json,m.custom_revision,
         max(m.custom_revision) OVER(PARTITION BY b.binding_id) AS latest
-      FROM imported b JOIN manual m ON m.record_kind='network_binding' AND {override_identity}
+      FROM imported b JOIN {manual_match} AND {override_identity}
     ), overrides AS MATERIALIZED (
       SELECT binding_id,min((record_json->>'network_id')::integer) AS network_id,
         bool_or((record_json->>'archived')::boolean) AS archived,
@@ -171,29 +218,57 @@ def _catalog_ctes(control, catalog, generation, revision):
       FROM manual_matches WHERE custom_revision=latest GROUP BY binding_id
     ), effective_bindings AS MATERIALIZED (
       SELECT b.*,coalesce(o.network_id,b.network_id) AS effective_network_id
-      FROM imported b LEFT JOIN overrides o USING(binding_id)
-      WHERE NOT coalesce(o.archived,false) AND NOT coalesce(o.conflicting,false)
+      FROM imported b LEFT JOIN overrides o ON o.binding_id=b.binding_id
+      WHERE NOT coalesce(o.archived,false) AND NOT coalesce(o.conflicting,false) {effective_filter}
         AND NOT EXISTS(SELECT FROM manual n WHERE n.record_kind='network'
           AND n.record_key=coalesce(o.network_id,b.network_id)::text AND n.record_json->'archived'='true'::jsonb)
     ), catalogue_networks AS MATERIALIZED (
-      SELECT n.* FROM ONLY {catalog}.registry_fhir_catalog_network n WHERE metadata_generation='{generation}'
+      SELECT n.* FROM ONLY {catalog}.registry_fhir_catalog_network n
+      WHERE metadata_generation='{generation}' {network_filter}
     )"""
 
 
-def _source_organization_ctes(catalog, revision):
+def _scoped_aca_sources(selected_networks):
+    """Include selected companies and any company that supplies one of their groups."""
+    return f"""selected_company_links AS MATERIALIZED (
+      SELECT l.record_key AS company_id,l.record_json->>'group_id' AS group_id
+      FROM manual l CROSS JOIN unnest({selected_networks}) selected(network_id)
+      WHERE l.record_kind='company_links' AND l.record_json->'archived'='false'::jsonb
+        AND l.record_json->'network_ids' @> jsonb_build_array(selected.network_id)
+    ), selected_companies AS MATERIALIZED (
+      SELECT company_id FROM native_company_networks UNION SELECT company_id FROM selected_company_links
+    ), selected_groups AS MATERIALIZED (
+      SELECT group_id FROM selected_company_links WHERE group_id IS NOT NULL
+      UNION SELECT source.group_id FROM aca_metadata_sources source
+      JOIN selected_companies USING(company_id) WHERE source.group_id IS NOT NULL
+    ), selected_aca_sources AS MATERIALIZED (
+      SELECT source.* FROM aca_metadata_sources source WHERE source.company_id IN (
+        SELECT company_id FROM selected_companies UNION
+        SELECT company_id FROM aca_metadata_sources JOIN selected_groups USING(group_id))
+    ), """
+
+
+def _source_organization_ctes(catalog, revision, company_visibility, selected_networks):
     """Read pinned source-period organizations without creating manual approval records."""
+    if selected_networks is None:
+        scope, source_table, lookup_columns = "", "aca_metadata_sources", ""
+    else:
+        scope, source_table = _scoped_aca_sources(selected_networks), "selected_aca_sources"
+        lookup_columns = """,
+          descriptor_json#>>'{input,company_catalog,company_record,company_id}' AS company_id,
+          descriptor_json#>>'{input,company_catalog,group_record,group_id}' AS group_id"""
     return f"""aca_metadata_sources AS MATERIALIZED (
-      SELECT source_generation,descriptor_json FROM ONLY {catalog}.registry_fhir_catalog_source
+      SELECT source_generation,descriptor_json{lookup_columns} FROM ONLY {catalog}.registry_fhir_catalog_source
       WHERE source_id LIKE 'aca:%'
-    ), native_organization_inputs AS MATERIALIZED (
+    ), {scope}native_organization_inputs AS MATERIALIZED (
       SELECT company,metadata->'group_record' AS company_group,company->>'company_id' AS company_id,
         (metadata->'resolution'->>'reporting_year')::integer AS reporting_year,source.source_generation
-      FROM aca_metadata_sources source
+      FROM {source_table} source
       CROSS JOIN LATERAL (SELECT source.descriptor_json->'input'->'company_catalog' AS metadata) selected
       CROSS JOIN LATERAL (SELECT metadata->'company_record' AS company) named
       WHERE metadata->>'contract'='aca-issuer-company-catalog-v1'
         AND jsonb_typeof(company)='object'
-        AND EXISTS(SELECT FROM native_company_networks n WHERE n.company_id=company->>'company_id')
+        AND {company_visibility}
     ), native_company_group_choices AS MATERIALIZED (
       SELECT company_id,CASE WHEN count(DISTINCT coalesce(company_group->>'group_id',''))=1
         THEN min(company_group->>'group_id') END AS group_id FROM native_organization_inputs GROUP BY company_id
@@ -221,13 +296,43 @@ def _source_organization_ctes(catalog, revision):
     )"""
 
 
-def _record_ctes(catalog, generation, revision):
+def _scoped_company_visibility(catalog, generation):
+    """Resolve imported evidence even for companies linked to a different network."""
+    identity = binding_override_identity_sql(
+        "m.record_json", "b.document_json", "(s.descriptor_json->'source_aliases')"
+    )
+    return f"""EXISTS(SELECT FROM ONLY {catalog}.registry_fhir_catalog_relationship r
+      JOIN ONLY {catalog}.registry_fhir_catalog_binding b
+        ON b.metadata_generation=r.metadata_generation AND b.network_id=r.network_id AND b.binding_id=r.binding_id
+      LEFT JOIN ONLY {catalog}.registry_fhir_catalog_source s
+        ON s.source_generation=split_part(b.document_json->>'evidence_id',':',1)
+      LEFT JOIN LATERAL (
+        SELECT (m.record_json->>'network_id')::integer AS network_id,
+          (m.record_json->>'archived')::boolean AS archived
+        FROM manual_keys m WHERE m.match_key=b.document_json->>'source_key'
+          AND m.custom_revision IS NOT NULL AND {identity}
+        ORDER BY m.custom_revision DESC LIMIT 1
+      ) o ON true
+      WHERE r.metadata_generation='{generation}' AND r.company_id=CASE
+        WHEN company->>'company_id' ~ '^[0-9a-f]{{8}}(-[0-9a-f]{{4}}){{3}}-[0-9a-f]{{12}}$'
+        THEN (company->>'company_id')::uuid END
+        AND NOT coalesce(o.archived,false)
+        AND NOT EXISTS(SELECT FROM manual a WHERE a.record_kind='network' AND a.record_json->'archived'='true'::jsonb
+          AND a.record_key=coalesce(o.network_id,r.network_id)::text))"""
+
+
+def _record_ctes(catalog, generation, revision, *, selected_networks=None):
+    relationship_join = "USING(binding_id)"
+    company_visibility = "EXISTS(SELECT FROM native_company_networks n WHERE n.company_id=company->>'company_id')"
+    if selected_networks is not None:
+        relationship_join = "ON b.network_id=r.network_id AND b.binding_id=r.binding_id"
+        company_visibility = _scoped_company_visibility(catalog, generation)
     return f"""native_company_networks AS MATERIALIZED (
       SELECT DISTINCT r.company_id::text AS company_id,b.effective_network_id AS network_id
       FROM ONLY {catalog}.registry_fhir_catalog_relationship r
-      JOIN effective_bindings b USING(binding_id)
+      JOIN effective_bindings b {relationship_join}
       WHERE r.metadata_generation='{generation}' AND r.company_id IS NOT NULL
-    ), {_source_organization_ctes(catalog, revision)}, company_links AS MATERIALIZED (
+    ), {_source_organization_ctes(catalog, revision, company_visibility, selected_networks)}, company_links AS MATERIALIZED (
       SELECT m.approved_revision,m.record_kind,m.record_key,m.record_revision,m.custom_revision,
         CASE WHEN m.record_json->'archived'='false'::jsonb THEN m.record_json||jsonb_build_object('network_ids',
           coalesce((SELECT jsonb_agg(network_id ORDER BY network_id) FROM (

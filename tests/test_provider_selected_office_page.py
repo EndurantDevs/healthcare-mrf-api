@@ -26,6 +26,8 @@ from tests.test_npi_all_names_like import FakeAcquire, RecordingConnection
         (3, {"primary_only": "false"}, False, False),
         (4, {"primary_only": "false"}, False, True),
         (3, {"state": "NY"}, False, True),
+        (3, {"zip_code": "60601"}, False, True),
+        (3, {"city": "Chicago", "state": "IL"}, False, True),
         (3, {"codes": "207Q00000X,208D00000X"}, False, False),
         (5, {"codes": "207Q00000X,208D00000X"}, False, True),
         (3, {"q": "clinic"}, False, False),
@@ -41,6 +43,8 @@ async def test_selected_office_page(monkeypatch, size, extra, staged, computed, 
     manifest = _lookup_manifest(_layout()) if supports_location_lookup else _manifest(_layout())
     with network_address_read_scope(manifest, tuple(range(1, size + 1))):
         ordinary = scoped_address_relation_sql("mrf.entity_address_unified")
+        exact_place = bool(extra.get("zip_code"))
+        location_source = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=exact_place)
         monkeypatch.setattr(npi, "_address_serving_table_sql", AsyncMock(return_value=ordinary))
         await npi.get_all(SimpleNamespace(args={"codes": "207Q00000X", "include_total": "1", **extra}))
     page = next(sql for sql, _ in conn.sql_calls if "page_npis AS" in sql)
@@ -49,7 +53,9 @@ async def test_selected_office_page(monkeypatch, size, extra, staged, computed, 
     assert ("selected_office_keys AS MATERIALIZED" in page) == (bounded or staged and size != 3)
     assert "selected_office_keys" not in count
     selection, hydration = page.split("sub_s AS (", 1)
-    assert ordinary in hydration and "selected_office_keys" not in hydration
+    assert location_source in hydration and "selected_office_keys" not in hydration
+    if exact_place and supports_location_lookup:
+        assert location_source in selection and ordinary in count
     assert ("ORDER BY npi + 0" in selection) == computed
     assert ("taxonomy_prefix AS MATERIALIZED" in selection) == bounded
     if bounded:
@@ -65,3 +71,20 @@ async def test_selected_office_page(monkeypatch, size, extra, staged, computed, 
         assert "native.location_key=key.location_key OFFSET 0" in selection
         assert "custom.location_key=base.location_key" in selection
         assert "c.taxonomy_array && q.int_codes" in selection
+
+
+@pytest.mark.asyncio
+async def test_plain_city_page_stages_state_offices_and_keeps_large_selection_fallback(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi, "_provider_list_connection", lambda *args, **kwargs: FakeAcquire(conn))
+    with network_address_read_scope(_lookup_manifest(_layout()), (42,)):
+        ordinary = scoped_address_relation_sql("mrf.entity_address_unified")
+        indexed = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
+        await npi.get_all(SimpleNamespace(args={"city": "Chicago", "state": "IL", "include_total": "1"}))
+    page = next(sql for sql, _ in conn.sql_calls if "page_npis AS" in sql)
+    count = next(sql for sql, _ in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
+    selection, hydration = page.split("sub_s AS (", 1)
+    assert "selected_state_offices AS MATERIALIZED" in selection
+    assert "NOT (SELECT total <= 500000 FROM selected_office_bound)" in selection
+    assert ordinary in selection and ordinary in count
+    assert indexed in hydration

@@ -117,6 +117,7 @@ from api.provider_list_sql import (
     _address_phone_digits_filter,
     _address_site_key_filter,
     _address_zip5_filter,
+    _append_array_filters,
     _bounded_provider_list_count,
     _extract_name_filters,
     _is_unified_address_table,
@@ -8333,88 +8334,22 @@ async def list_providers(
         )
     )
 
-    def _append_available_filter(
-        address_clauses: list[str],
-        array_clause: str,
-        exists_clause: str,
-        *,
-        is_array_available: bool,
-        is_table_available: bool,
-    ) -> None:
-        if is_array_available and is_table_available:
-            address_clauses.append(f"({array_clause} OR {exists_clause})")
-        elif is_array_available:
-            address_clauses.append(array_clause)
-        elif is_table_available:
-            address_clauses.append(exists_clause)
-        else:
-            address_clauses.append("1=0")
-
-    def _append_array_filters(
-        address_clauses: list[str],
-        filters_by_name: dict[str, Any],
-    ) -> dict[str, int]:
-        """Append supported procedure and medication predicates and parameters."""
-        parameters_by_name: dict[str, int] = {}
-        provider_npi_sql = (
-            "COALESCE(c.npi, c.inferred_npi)" if _is_unified_address_table(address_table_sql) else "c.npi"
-        )
-        filter_year = filters_by_name.get("filter_year")
-        procedure_internal_codes = filters_by_name.get("procedure_internal_codes") or []
-        medication_internal_codes = filters_by_name.get("medication_internal_codes") or []
-        procedures_array_available = bool(filters_by_name.get("npi_procedures_array_available", True))
-        medications_array_available = bool(filters_by_name.get("npi_medications_array_available", True))
-        procedure_table_available = bool(filters_by_name.get("pricing_provider_procedure_available", False))
-        medication_table_available = bool(filters_by_name.get("pricing_provider_prescription_available", False))
-        if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
-            parameters_by_name["filter_year"] = int(filter_year)
-        for idx, code in enumerate(procedure_internal_codes):
-            parameter_name = f"procedure_code_{idx}"
-            parameters_by_name[parameter_name] = int(code)
-            array_clause = f"c.procedures_array @> ARRAY[:{parameter_name}]::INTEGER[]"
-            claims_pp_relation = "mrf.pricing_provider_procedure"
-            exists_clause = (
-                "EXISTS ("
-                f"SELECT 1 FROM {claims_pp_relation} AS pp "
-                f"WHERE pp.npi = {provider_npi_sql} AND pp.procedure_code = :{parameter_name}"
-                + (" AND pp.year = :filter_year" if filter_year is not None else "")
-                + ")"
-            )
-            _append_available_filter(
-                address_clauses,
-                array_clause,
-                exists_clause,
-                is_array_available=procedures_array_available,
-                is_table_available=procedure_table_available,
-            )
-        for idx, code in enumerate(medication_internal_codes):
-            parameter_name = f"medication_code_{idx}"
-            parameters_by_name[parameter_name] = int(code)
-            array_clause = f"c.medications_array @> ARRAY[:{parameter_name}]::INTEGER[]"
-            claims_pr_relation = "mrf.pricing_provider_prescription"
-            exists_clause = (
-                "EXISTS ("
-                f"SELECT 1 FROM {claims_pr_relation} AS pr "
-                f"WHERE pr.npi = {provider_npi_sql} "
-                "AND pr.rx_code_system = 'HP_RX_CODE' "
-                + ("AND pr.year = :filter_year " if filter_year is not None else "")
-                + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{parameter_name} "
-                ")"
-            )
-            _append_available_filter(
-                address_clauses,
-                array_clause,
-                exists_clause,
-                is_array_available=medications_array_available,
-                is_table_available=medication_table_available,
-            )
-        return parameters_by_name
-
     address_required_columns = _public_address_serving_column_keys()
-    address_table_sql = await _address_serving_table_sql(
-        address_required_columns,
-        session=request_session,
+    address_table_sql = await _address_serving_table_sql(address_required_columns, session=request_session)
+    use_indexed_offices = (
+        network_scope is not None
+        and network_scope.is_compact_network_selection
+        and network_scope.manifest.supports_location_lookup
+        and bool(zip_code or (city and state))
     )
+    indexed_address_sql = (
+        scoped_address_relation_sql(
+            f"{_runtime_db_schema()}.{EntityAddressUnified.__tablename__}", location_lookup=True
+        )
+        if use_indexed_offices
+        else address_table_sql
+    )
+    ordinary_address_sql = address_table_sql
     plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
         request_session,
         plan_release_id_raw,
@@ -8527,7 +8462,7 @@ async def list_providers(
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
-        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name, provider_npi_sql)
         import_relation_cte = _provider_import_relation_cte(import_context)
         import_membership_clause = _provider_import_membership_clause(
             import_context,
@@ -8801,7 +8736,7 @@ async def list_providers(
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
-        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name, provider_npi_sql)
         import_relation_cte = _provider_import_relation_cte(import_context)
         import_membership_clause = _provider_import_membership_clause(
             import_context, provider_npi_sql, native_npis=native_npis
@@ -9025,6 +8960,7 @@ async def list_providers(
         has_insurance = filters_by_name.get("has_insurance")
         codes = filters_by_name.get("codes")
         zip_code = filters_by_name.get("zip_code")
+        address_table_sql = indexed_address_sql if zip_code else ordinary_address_sql
         phone_digits = filters_by_name.get("phone_digits")
         address_key = filters_by_name.get("address_key")
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
@@ -9116,7 +9052,7 @@ async def list_providers(
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
-        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name, provider_npi_sql)
         import_relation_cte = _provider_import_relation_cte(page_import_context)
         scope_native_query = native_scope_preparer is not None and bool(
             simple_filter_present or city or state or has_insurance or native_npis is not None
@@ -9259,6 +9195,30 @@ async def list_providers(
             ordinary=is_ordinary_provider_query,
             native_only=is_unified_search and native_npis is None and native_scope_preparer is None,
         )
+        city_page = None
+        hydration_source = address_source
+        if (
+            use_indexed_offices
+            and city
+            and state
+            and not zip_code
+            and not phone_digits
+            and order_by == "npi"
+            and not npi_where
+            and not use_taxonomy_filter
+            and page_import_context is None
+            and native_npis is None
+            and native_scope_preparer is None
+            and len(eligible_address_clauses) == 3
+            and len(address_clauses) == 3
+        ):
+            from api.network_compact_address import compact_city_page
+
+            selected_keys, city_page, ordinary_selection = compact_city_page(
+                network_scope.manifest.compact_layout, network_scope.network_ids, address_clauses[0]
+            )
+            eligible_address_clauses.append(ordinary_selection)
+            hydration_source = f"{indexed_address_sql} as c"
         if order_by == "relevance":
             eligible_npis_sql = _relevance_page_sql(
                 address_source, provider_npi_sql, eligible_address_clauses, name_only=use_name_relevance_exists
@@ -9291,6 +9251,8 @@ async def list_providers(
             )
             page_npis_sql = f"SELECT {page_projection} FROM ({eligible_npis_sql}) AS eligible_npi"
         page_npis_sql += f"\n{page_order_sql}\nLIMIT :limit OFFSET :start"
+        if city_page is not None:
+            page_npis_sql = f"({city_page}) UNION ALL ({page_npis_sql})"
         sub_s_total_projection = ", pn.provider_total AS _provider_total" if inline_name_taxonomy_total else ""
         sub_s_page_position_projection = ""
         imported_count_ctes = None
@@ -9317,7 +9279,7 @@ async def list_providers(
               JOIN LATERAL (
                   SELECT {candidate_projection},
                          COUNT(*) OVER () AS provider_address_total
-                    FROM {address_source}
+                    FROM {hydration_source}
                    WHERE {" and ".join(address_clauses)}
                      AND {provider_npi_sql} = pn.npi
                    ORDER BY {_primary_address_order_clause("c", address_table_sql)}

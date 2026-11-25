@@ -2,7 +2,8 @@
 """Native HIOS evidence and company-aware catalogue reads without manual approvals."""
 
 import json
-from uuid import UUID
+from copy import deepcopy
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -147,6 +148,77 @@ async def test_aca_company_network_search_and_exclusions_work_without_approved_c
         fixture.control,
     )
     assert renamed["items"][0]["companies"][0]["display_name"] == "Approved company name"
+
+
+async def test_scoped_catalog_keeps_company_and_group_from_off_network_bindings(serving_schema, effective_catalog_db):
+    connection, schema, _engine = serving_schema
+    aca_source, company_id, group_id = await source_company(connection, schema)
+    fixture = effective_catalog_db
+    await seed_projection(fixture, aca_source)
+    group_supplier = uuid4()
+    unrelated_company = uuid4()
+    await _add_catalog_company(fixture, aca_source, group_supplier, group_id, 10002)
+    await _add_catalog_company(fixture, aca_source, unrelated_company, uuid4(), 10003)
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.catalog}".registry_fhir_catalog_source '
+        "SET descriptor_json=descriptor_json #- '{input,company_catalog,group_record}' WHERE source_id=$1",
+        aca_source["source_id"],
+    )
+    await manual_record(
+        fixture, "network", 8, {"network_id": 8, "display_name": "Linked network", "aliases": [], "archived": False}
+    )
+    await manual_record(
+        fixture, "company_links", company_id, {"network_ids": [8], "group_id": str(group_id), "archived": False}
+    )
+    for policy in (
+        RegistryOrganizationVisibility(),
+        RegistryOrganizationVisibility(excluded_group_ids=(str(group_id),)),
+    ):
+        query = (fixture.connection, fixture.manifest, RegistryNetworkCatalogQuery(), (), fixture.control)
+        unscoped = await _page(*query, organization_policy=policy)
+        scoped = await _page(*query, (8,), organization_policy=policy)
+        assert scoped["items"] == tuple(network for network in unscoped["items"] if network["network_id"] == 8)
+        [company] = scoped["items"][0]["companies"]
+        assert company["company_id"] == str(company_id)
+        assert company["group_id"] == (None if policy.excluded_group_ids else str(group_id))
+    unscoped_sql = await effective_catalog_sql(fixture.connection, fixture.manifest, fixture.control)
+    scoped_sql = await effective_catalog_sql(
+        fixture.connection, fixture.manifest, fixture.control, selected_networks="$1::integer[]"
+    )
+    select_companies = "SELECT record_key FROM {} records WHERE record_kind='company'"
+    unscoped_companies = await fixture.connection.fetch(select_companies.format(unscoped_sql))
+    scoped_companies = await fixture.connection.fetch(select_companies.format(scoped_sql), [8])
+    assert {company["record_key"] for company in unscoped_companies} == {
+        str(company_id),
+        str(group_supplier),
+        str(unrelated_company),
+    }
+    assert {company["record_key"] for company in scoped_companies} == {str(company_id), str(group_supplier)}
+
+
+async def _add_catalog_company(fixture, source, company_id, group_id, issuer):
+    descriptor = deepcopy(native_catalog_descriptor(source))
+    metadata = descriptor["input"]["company_catalog"]
+    original_company = UUID(metadata["company_record"]["company_id"])
+    metadata["company_record"]["company_id"] = str(company_id)
+    metadata["group_record"]["group_id"] = str(group_id)
+    namespace = f'"{fixture.catalog}"'
+    await fixture.connection.execute(
+        f"INSERT INTO {namespace}.registry_fhir_catalog_source VALUES($1,$2,$3::jsonb,'published_normalized',1,1,now(),now())",
+        digest(descriptor),
+        f"aca:{issuer}:2027",
+        json.dumps(descriptor),
+    )
+    await fixture.connection.execute(
+        f"""INSERT INTO {namespace}.registry_fhir_catalog_relationship
+        SELECT metadata_generation,$1,network_id,source_id,source_generation,binding_id,$2,$3,
+          company_search,plan_search,document_json
+        FROM {namespace}.registry_fhir_catalog_relationship WHERE company_id=$4 LIMIT 1""",
+        digest(str(company_id)),
+        company_id,
+        group_id,
+        original_company,
+    )
 
 
 @pytest.mark.parametrize(("kind", "label"), [("company", "Source legal company"), ("group", "Source reported group")])

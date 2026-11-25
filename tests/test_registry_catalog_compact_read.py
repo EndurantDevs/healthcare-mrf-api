@@ -107,7 +107,7 @@ def _guarded_page(monkeypatch, connection, manifest, *, failure=None):
     async def fetchrow(sql, *parameters):
         if " AS rows_json" in sql:
             assert events == []
-            assert manifest.schema_name in sql and "network_membership" in sql
+            assert manifest.schema_name in sql and "network_slice_ref" in sql
             events.append("query")
             if failure is not None:
                 raise failure
@@ -198,14 +198,14 @@ async def test_legacy_binds_and_filter_positions_survive_compact_projection(requ
         catalog.MAX_RESPONSE_BYTES,
         "medical",
     )
-    first = 13 if policy_enabled else 11
     if policy_enabled:
         assert parameters[10:12] == ((COMPANY,), (GROUP,))
         assert "NOT company.record_key=ANY($11::text[])" in sql and "ANY($12::text[])" in sql
-    assert parameters[first - 1 :] == tuple(artifact.candidate_id for artifact in manifest.compact_layout.artifacts)
-    assert f"${first}" in sql and f"${first + 1}" in sql
+    assert len(parameters) == (12 if policy_enabled else 10)
     assert sql.index("NOT record_key::integer=ANY") < sql.index("filtered AS") < sql.index("OFFSET $7")
-    _directory_shape(sql, manifest)
+    assert f'FROM ONLY "{manifest.schema_name}"."network_slice_ref" ref' in sql
+    assert "ref.network_id=page.network_id AND ref.row_count>0" in sql
+    assert "network_membership" not in sql
 
 
 async def test_fhir_filters_and_exclusions_keep_their_original_positions(request, monkeypatch):
