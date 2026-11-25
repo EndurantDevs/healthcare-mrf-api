@@ -122,7 +122,7 @@ def legacy_selector():
         {"limit": 101},
         {"limit": True},
         {"offset": -1},
-        {"offset": 1000001},
+        {"offset": 2147483648},
         {"generation_id": 0},
         {"generation_id": "9"},
         {"archived": 0},
@@ -143,7 +143,7 @@ def test_trusted_exclusions_require_bounded_sorted_unique_int4(network_ids):
 
 
 def test_maximum_request_boundaries_and_closed_legacy_namespaces():
-    catalog.RegistryNetworkCatalogQuery(limit=100, offset=1000000, generation_id=9223372036854775807)
+    catalog.RegistryNetworkCatalogQuery(limit=100, offset=2147483647, generation_id=9223372036854775807)
     assert catalog._exclusions(tuple(range(1, 50001)))[-1] == 50000
     selector = legacy_selector()
     with pytest.raises(catalog.RegistryNetworkCatalogError):

@@ -430,7 +430,7 @@ _INVALID_ENVELOPES = [
             {"limit": 0},
             {"limit": 101},
             {"offset": -1},
-            {"offset": 1000001},
+            {"offset": 2147483648},
             {"network_generation": 9},
             {"network_generation": "0"},
             {"network_generation": "09"},
@@ -575,7 +575,7 @@ def test_wire_generation_and_client_limits_preserve_gateway_scalar_count():
     request = SimpleNamespace(
         body=json.dumps(
             envelope(
-                {"network_generation": "9223372036854775807", "limit": 100, "offset": 1000000},
+                {"network_generation": "9223372036854775807", "limit": 100, "offset": 2147483647},
                 client_id="é" * 64,
             )
         ).encode(),
@@ -584,7 +584,7 @@ def test_wire_generation_and_client_limits_preserve_gateway_scalar_count():
     policy_by_field, excluded_ids, selector, generation, scope = endpoint._parameters(request, "list")
     assert len(policy_by_field["client_id"]) == 64 and len(policy_by_field["client_id"].encode()) == 128
     assert excluded_ids == () and selector.generation_id == generation == 9223372036854775807
-    assert selector.limit == 100 and selector.offset == 1000000 and len(scope) == 64
+    assert selector.limit == 100 and selector.offset == 2147483647 and len(scope) == 64
 
 
 @pytest.mark.asyncio

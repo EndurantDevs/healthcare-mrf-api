@@ -19,7 +19,6 @@ from process.network_approved_source_bindings import RegistryNetworkSourceCoordi
 from process.network_published_api_pin import read_published_api_pin
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import (
-    MAX_OFFSET,
     RegistryNetworkCatalogError,
     RegistryNetworkCatalogQuery,
     catalog_binding_document,
@@ -34,6 +33,7 @@ from process.registry_network_catalog_read import (
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _FHIR_ID = re.compile(r"[A-Za-z0-9.-]{1,64}\Z")
+_MAX_NESTED_OFFSET = 1_000_000
 _RELATIONSHIP_FIELDS = {
     "relationship_id",
     "source_id",
@@ -116,7 +116,7 @@ class FHIRCatalogQuery:
             if getattr(self, field) is not None:
                 object.__setattr__(self, field, _search_text(getattr(self, field)))
         for offset in (self.relationship_offset, self.binding_offset):
-            catalog_integer(offset, MAX_OFFSET, minimum=0)
+            catalog_integer(offset, _MAX_NESTED_OFFSET, minimum=0)
         if any((self.offset, self.relationship_offset, self.binding_offset)) and (
             self.metadata_generation is None or self.continuation_scope_sha256 is None
         ):
@@ -302,7 +302,7 @@ def _fhir_binding_fields(binding):
 def _nested_document(document, validator, offset):
     _object(document, {"total", "offset", "limit", "items", "next_offset"})
     total = catalog_integer(document["total"], 9223372036854775807, minimum=0)
-    catalog_integer(document["offset"], MAX_OFFSET, minimum=0)
+    catalog_integer(document["offset"], _MAX_NESTED_OFFSET, minimum=0)
     catalog_integer(document["limit"], NESTED_LIMIT)
     if document["offset"] != offset or document["limit"] != NESTED_LIMIT or type(document["items"]) is not list:
         _invalid()
@@ -310,7 +310,7 @@ def _nested_document(document, validator, offset):
         _invalid()
     expected_next = offset + len(document["items"]) if offset + len(document["items"]) < total else None
     if document["next_offset"] is not None:
-        catalog_integer(document["next_offset"], MAX_OFFSET + NESTED_LIMIT, minimum=0)
+        catalog_integer(document["next_offset"], _MAX_NESTED_OFFSET + NESTED_LIMIT, minimum=0)
     if document["next_offset"] != expected_next:
         _invalid()
     for entry in document["items"]:
