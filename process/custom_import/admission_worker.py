@@ -150,13 +150,13 @@ def _receipt(body, pins):
     if (
         any(parsed[name] != getattr(pins, name) for name in ("execution_id", "build_id", "fence"))
         or type(parsed["phase"]) is not str
-        or parsed["phase"] not in {"admission", "graph", "rejected"}
+        or parsed["phase"] not in {"admission", "graph", "rejected", "verified"}
         or parsed["after_occurrence_id"] < pins.expected_after_occurrence_id
         or parsed["rows_processed"] > 0
         and parsed["after_occurrence_id"] <= pins.expected_after_occurrence_id
         or parsed["rows_processed"] == 0
         and (
-            parsed["phase"] not in {"graph", "rejected"}
+            parsed["phase"] not in {"graph", "rejected", "verified"}
             or parsed["after_occurrence_id"] != pins.expected_after_occurrence_id
         )
     ):
@@ -335,19 +335,75 @@ class AdmissionBatchTransport:
         raise failure
 
 
+async def _completed_verified_progress(session_factory, request, build_id):
+    """Observe a terminal verified direct-compact seal after execution completion."""
+    import hmac
+
+    from sqlalchemy import select, text
+
+    from db.models.custom_import import CustomImportBuildAttempt, CustomImportExecution, CustomImportGenerationSeal
+    from process.custom_import.build_source import _assert_build_identity, _set_timeout
+    from process.custom_import.continuation_runtime import producer_token_sha256
+
+    if not callable(session_factory):
+        return None
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(text("SET TRANSACTION READ ONLY"))
+            await _set_timeout(session, request.statement_timeout_ms)
+            execution = await session.get(CustomImportExecution, request.execution_id)
+            build = await session.get(CustomImportBuildAttempt, build_id)
+            if execution is None or build is None:
+                return None
+            if execution.state not in {"completed", "no_change"} or build.phase != "verified":
+                return None
+            _assert_build_identity(build, request, execution)
+            if build.generation_id is None:
+                return None
+            seal = (
+                await session.scalars(
+                    select(CustomImportGenerationSeal).where(
+                        CustomImportGenerationSeal.generation_id == build.generation_id,
+                        CustomImportGenerationSeal.dataset_id == request.dataset_id,
+                        CustomImportGenerationSeal.execution_id == request.execution_id,
+                        CustomImportGenerationSeal.sealing_fence == request.fence,
+                    )
+                )
+            ).one_or_none()
+            if seal is None or not hmac.compare_digest(
+                bytes(seal.sealing_token_sha256), producer_token_sha256(request)
+            ):
+                return None
+            return RetainedAdmissionProgress(
+                request.execution_id,
+                build_id,
+                request.fence,
+                build.phase,
+                build.admission_after_occurrence_id,
+                build.source_occurrence_count,
+                build.candidate_error_count,
+            )
+
+
 async def _retained_progress(session_factory, request, build_id):
-    async with _page_session(session_factory, request, build_id) as (_session, build):
-        if build.phase not in _POST_ADMISSION_PHASES | {"admission"}:
-            raise _unavailable()
-        return RetainedAdmissionProgress(
-            request.execution_id,
-            build_id,
-            request.fence,
-            build.phase,
-            build.admission_after_occurrence_id,
-            build.source_occurrence_count,
-            build.candidate_error_count,
-        )
+    try:
+        async with _page_session(session_factory, request, build_id) as (_session, build):
+            if build.phase not in _POST_ADMISSION_PHASES | {"admission"}:
+                raise _unavailable()
+            return RetainedAdmissionProgress(
+                request.execution_id,
+                build_id,
+                request.fence,
+                build.phase,
+                build.admission_after_occurrence_id,
+                build.source_occurrence_count,
+                build.candidate_error_count,
+            )
+    except LeaseAuthorityLost:
+        sealed_progress = await _completed_verified_progress(session_factory, request, build_id)
+        if sealed_progress is not None:
+            return sealed_progress
+        raise
 
 
 async def admit_next_batch(session_factory, request, build_id, transport):

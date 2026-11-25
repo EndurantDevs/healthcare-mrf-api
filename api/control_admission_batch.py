@@ -184,7 +184,7 @@ async def _retained_request(session_factory, verified: VerifiedAdmission) -> Sou
 def _receipt(verified, admission_result):
     """Encode only the committed result for the exact attempted cursor."""
 
-    if admission_result.phase not in {"admission", "graph", "rejected"}:
+    if admission_result.phase not in {"admission", "graph", "rejected", "verified"}:
         raise _unavailable()
     for name, maximum in (
         ("after_occurrence_id", 2**63 - 1),
@@ -201,7 +201,7 @@ def _receipt(verified, admission_result):
         and admission_result.after_occurrence_id <= verified.pins.expected_after_occurrence_id
         or admission_result.rows_processed == 0
         and (
-            admission_result.phase not in {"graph", "rejected"}
+            admission_result.phase not in {"graph", "rejected", "verified"}
             or admission_result.after_occurrence_id != verified.pins.expected_after_occurrence_id
         )
     ):

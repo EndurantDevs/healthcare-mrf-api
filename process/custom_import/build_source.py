@@ -574,6 +574,7 @@ class _StreamContext:
     registry: CandidateRegistry
     build_id: int
     stream: SourceStream
+    direct_stage_info: tuple[int, int] | None = None
 
     @property
     def stream_slot(self):
@@ -1237,6 +1238,7 @@ async def stage_segmented_source(
     request: SourceBuildRequest,
     *,
     writer_transports=None,
+    direct_compact: bool = False,
 ) -> SourceBuildResult:
     """Replay immutable bytes, then globally admit families; never publish or finish execution.
 
@@ -1253,11 +1255,21 @@ async def stage_segmented_source(
         request = writer_transports.source.bind_request(writer_transports.admission.bind_request(request))
     with failure_phase(FailurePhase.BEGIN_BUILD):
         failure_identifiers(execution_id=request.execution_id)
-        build_id, registry = await _begin_build(session_factory, request)
+        try:
+            build_id, registry = await _begin_build(session_factory, request)
+        except LeaseAuthorityLost:
+            from process.custom_import.family_block_direct_stage import replay_verified_direct_stage
+
+            replayed = await replay_verified_direct_stage(session_factory, request)
+            if replayed is not None:
+                return replayed
+            raise
         failure_identifiers(build_id=build_id)
     with failure_phase(FailurePhase.SOURCE):
         if writer_transports is not None:
             await _stage_source_handoff(session_factory, request, build_id, registry, writer_transports.source)
+        elif direct_compact:
+            await _stage_local_source(session_factory, request, build_id, registry, direct_compact=True)
         else:
             await _stage_local_source(session_factory, request, build_id, registry)
     with failure_phase(FailurePhase.ADMISSION_INDEX):
@@ -1268,8 +1280,9 @@ async def stage_segmented_source(
         return await _admit_local_pages(session_factory, request, build_id)
 
 
-async def _stage_local_source(session_factory, request, build_id, registry):
+async def _stage_local_source(session_factory, request, build_id, registry, *, direct_compact: bool = False):
     """Preserve standalone replay from the retained capture and stream cursors."""
+    from process.custom_import import family_block_direct_stage as direct_stage
 
     async with _page_session(session_factory, request, build_id) as (session, build):
         phase, bundle_id = build.phase, build.capture_bundle_id
@@ -1278,6 +1291,11 @@ async def _stage_local_source(session_factory, request, build_id, registry):
         policy = SegmentedCapturePolicy.from_mapping(json.loads(bundle.canonical_policy))
         if policy.canonical != bundle.canonical_policy or bytes.fromhex(policy.digest) != bytes(bundle.policy_sha256):
             raise CandidateRunnerError("sealed capture policy differs from its retained digest")
+        direct_info = (
+            await direct_stage.ensure_direct_stage(session, build, request.definition, registry, enable=direct_compact)
+            if phase == "source"
+            else None
+        )
         await _prepare_statement(session)
         cursor_by_slot = {
             cursor.stream_slot: (cursor.next_part_ordinal, cursor.next_part_row_ordinal)
@@ -1288,40 +1306,87 @@ async def _stage_local_source(session_factory, request, build_id, registry):
             ).all()
         }
     if phase == "source":
-        await _replay_source(session_factory, request, registry, build_id, bundle_id, policy, cursor_by_slot)
+        if direct_info is not None:
+            await direct_stage.replay_direct_source(
+                session_factory, request, registry, build_id, bundle_id, policy, cursor_by_slot, direct_info
+            )
+        else:
+            await _replay_source(session_factory, request, registry, build_id, bundle_id, policy, cursor_by_slot)
+
+
+async def _resolve_direct_stage_family(session, build) -> int | None:
+    from process.custom_import.family_block_direct_stage import has_direct_stage
+
+    if getattr(session, "scalar", None) is None:
+        return None
+    await session.execute(text("SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)"))
+    family_id = await _resolve_build_snapshot(session, build.build_id)
+    return family_id if await has_direct_stage(session, family_id) else None
+
+
+async def _step_local_admission_page(session, request, build):
+    from process.custom_import import admission_sql as admission
+    from process.custom_import.family_block_direct_finalize import run_direct_admission_locked
+
+    if build.phase in ("graph", "rejected", "output", "verifying", "verified"):
+        return (
+            SourceBuildResult(
+                build.build_id,
+                request.execution_id,
+                build.phase,
+                build.source_occurrence_count,
+                build.candidate_error_count,
+            ),
+            None,
+        )
+    if build.phase != "admission":
+        raise CandidateRunnerError("source build is not ready for global admission")
+    family_id = await _resolve_direct_stage_family(session, build)
+    if family_id is not None:
+        step_result = await run_direct_admission_locked(
+            session, request, build, build.admission_after_occurrence_id, family_id
+        )
+        if step_result is None:
+            return None, (family_id, build.source_occurrence_count)
+        return None, None
+    direct, _ = await _try_ordinary_write(
+        session,
+        admission._admit_locked,
+        build,
+        build.admission_after_occurrence_id,
+        prefer_fenced_writes=request.prefer_fenced_writes,
+    )
+    if not direct:
+        # Restricted connections keep the existing fenced dispatcher.
+        await _call(
+            session,
+            "admit_custom_import_build_page",
+            (("bigint", build.build_id), ("bigint", build.admission_after_occurrence_id)),
+        )
+    return None, None
 
 
 async def _admit_local_pages(session_factory, request, build_id):
     """Select ordinary writes or the retained dispatcher in each fenced page."""
-
     from process.custom_import import admission_sql as admission
+    from process.custom_import.family_block_direct_finalize import run_direct_seal_step
 
     while True:
+        seal_info = None
         try:
             async with _page_session(session_factory, request, build_id) as (session, build):
-                if build.phase in ("graph", "rejected", "output", "verifying", "verified"):
-                    return SourceBuildResult(
-                        build_id,
-                        request.execution_id,
-                        build.phase,
-                        build.source_occurrence_count,
-                        build.candidate_error_count,
-                    )
-                if build.phase != "admission":
-                    raise CandidateRunnerError("source build is not ready for global admission")
-                direct, _ = await _try_ordinary_write(
-                    session,
-                    admission._admit_locked,
-                    build,
-                    build.admission_after_occurrence_id,
-                    prefer_fenced_writes=request.prefer_fenced_writes,
-                )
-                if not direct:
-                    # Restricted connections keep the existing fenced dispatcher.
-                    await _call(
-                        session,
-                        "admit_custom_import_build_page",
-                        (("bigint", build_id), ("bigint", build.admission_after_occurrence_id)),
-                    )
+                finished, seal_info = await _step_local_admission_page(session, request, build)
+                if finished is not None:
+                    return finished
         except DBAPIError as error:
             await admission._retry_admission_timeout(session_factory, request, build_id, error, allow_dispatcher=True)
+        if seal_info is not None:
+            seal_family_id, source_occurrence_count = seal_info
+            seal_result = await run_direct_seal_step(session_factory, request, build_id, seal_family_id)
+            return SourceBuildResult(
+                build_id,
+                request.execution_id,
+                seal_result.phase,
+                source_occurrence_count,
+                seal_result.candidate_error_count,
+            )

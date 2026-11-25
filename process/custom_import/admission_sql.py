@@ -123,14 +123,17 @@ async def _execute(session, statement, parameter_by_name):
     return (await session.execute(statement, parameter_by_name)).mappings().one()
 
 
-async def _admit_locked(session, build, expected_after_id, *, physical_row_cap: int = 100_000):
+async def _admit_locked(
+    session, build, expected_after_id, *, physical_row_cap: int = 100_000, family_id: int | None = None
+):
     """Internal only: the enclosing page context owns rollback on every failure."""
 
     _integer(physical_row_cap, "physical_row_cap", build.page_row_limit, 100_000)
-    # The page context already bounded this statement; establish trusted resolution
-    # before even its next (unqualified) timeout helper, as the old leaf did.
-    await session.execute(text("SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)"))
-    family_id = await _resolve_build_snapshot(session, build.build_id)
+    if family_id is None:
+        # The page context already bounded this statement; establish trusted resolution
+        # before even its next (unqualified) timeout helper, as the old leaf did.
+        await session.execute(text("SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)"))
+        family_id = await _resolve_build_snapshot(session, build.build_id)
     # Retain the dispatcher's immutable retained-base check as well as its writable binding.
     await _call(session, "resolve_custom_import_build_base_snapshot", (("bigint", build.build_id),))
     statements, relation_by_name = await _statements(session, family_id)
@@ -242,6 +245,23 @@ async def _retry_admission_timeout(
         return await _admit_locked(session, build, cursor, physical_row_cap=build.page_row_limit)
 
 
+async def _admit_page_or_direct(session, request, build, expected_after_id):
+    from process.custom_import.family_block_direct_stage import has_direct_stage
+
+    family_id = None
+    if getattr(session, "scalar", None) is not None and getattr(session, "connection", None) is not None:
+        await session.execute(text("SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)"))
+        family_id = await _resolve_build_snapshot(session, build.build_id)
+        if await has_direct_stage(session, family_id):
+            from process.custom_import.family_block_direct_finalize import run_direct_admission_locked
+
+            step_result = await run_direct_admission_locked(session, request, build, expected_after_id, family_id)
+            return step_result, (family_id if step_result is None else None)
+    if family_id is not None:
+        return await _admit_locked(session, build, expected_after_id, family_id=family_id), None
+    return await _admit_locked(session, build, expected_after_id), None
+
+
 async def admit_source_batch(
     session_factory: SessionFactory,
     request: SourceBuildRequest,
@@ -262,13 +282,25 @@ async def admit_source_batch(
 
     _integer(build_id, "build_id", 1, (1 << 63) - 1)
     _integer(expected_after_id, "expected_after_id", 0, (1 << 63) - 1)
+    run_direct_seal = None
     try:
         async with _page_session(session_factory, request, build_id) as (session, build):
             if admission_permit is not None:
                 await _verify_admission_permit(session, request, admission_permit)
-            admission_result = await _admit_locked(session, build, expected_after_id)
+            admission_result, run_direct_seal = await _admit_page_or_direct(session, request, build, expected_after_id)
     except DBAPIError as error:
         admission_result = await _retry_admission_timeout(
             session_factory, request, build_id, error, admission_permit=admission_permit
+        )
+    if run_direct_seal is not None:
+        from process.custom_import.family_block_direct_finalize import run_direct_seal_step
+
+        admission_result = await run_direct_seal_step(
+            session_factory,
+            request,
+            build_id,
+            run_direct_seal,
+            admission_permit=admission_permit,
+            verify_permit=_verify_admission_permit,
         )
     return admission_result

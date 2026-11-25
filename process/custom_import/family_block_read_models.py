@@ -20,7 +20,6 @@ _COMMON = {
     models.CustomImportEntityBinding: "entity_binding",
     models.CustomImportPack: "pack",
     models.CustomImportRejection: "rejection",
-    models.CustomImportGenerationFamily: "generation_family",
     models.CustomImportWinner: "winner",
 }
 _IDENTITIES = {
@@ -63,7 +62,27 @@ def _view(model, name, source, expressions, target):
     return aliased(model, statement.subquery(name), adapt_on_names=True)
 
 
+def _generation_family_model(tables_by_role, family, pinned_target):
+    generation_id = getattr(pinned_target, "generation_id", None)
+    if generation_id is None:
+        return aliased(models.CustomImportGenerationFamily, tables_by_role["generation_family"], adapt_on_names=True)
+    return _view(
+        models.CustomImportGenerationFamily,
+        "block_generation_family",
+        family,
+        dict(
+            generation_id=_scope_number(
+                generation_id, models.CustomImportGenerationFamily.__table__.c.generation_id.type
+            ),
+            root_record_id=family.c.root_record_id,
+            family_revision_id=family.c.family_revision_id,
+        ),
+        pinned_target,
+    )
+
+
 def _build_read_models(binding, pinned_target):
+    """Build aliased ORM read models projected from one pinned compact snapshot."""
     tables_by_role = binding.tables_by_role
     models_by_type = {
         model: aliased(model, tables_by_role[role], adapt_on_names=True) for model, role in _COMMON.items()
@@ -72,6 +91,9 @@ def _build_read_models(binding, pinned_target):
         tables_by_role["family"],
         tables_by_role["query_record"],
         tables_by_role["key_dictionary"],
+    )
+    models_by_type[models.CustomImportGenerationFamily] = _generation_family_model(
+        tables_by_role, family, pinned_target
     )
     models_by_type[models.CustomImportFamilyRevision] = _view(
         models.CustomImportFamilyRevision,
@@ -121,8 +143,10 @@ def _build_read_models(binding, pinned_target):
 
 def read_models(binding, pinned_target):
     """Expose actual query identities, never a virtual unexposed child context."""
+    generation_id = getattr(pinned_target, "generation_id", None)
     cache_key = (
         binding_cache_key(binding),
+        None if generation_id is None else _checked_scope_int(generation_id),
         _checked_scope_int(pinned_target.dataset_id),
         _checked_scope_int(pinned_target.definition_revision_id),
         _checked_scope_int(pinned_target.schema_revision_id),

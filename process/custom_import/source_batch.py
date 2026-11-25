@@ -532,7 +532,16 @@ async def _load_context(
             raise CandidateRunnerError("SOURCE stream is not in the retained definition")
         deadline = session.info[staging._WINDOW].deadline
         is_complete = stream.replay_verified_at is not None
-    return staging._StreamContext(request, registry, build_id, declared), policy, bundle_id, deadline, is_complete
+        from process.custom_import import family_block_direct_stage as direct_stage
+
+        direct_info = await direct_stage.ensure_direct_stage(session, build, request.definition, registry)
+    return (
+        staging._StreamContext(request, registry, build_id, declared, direct_stage_info=direct_info),
+        policy,
+        bundle_id,
+        deadline,
+        is_complete,
+    )
 
 
 def _has_capacity(request, rows, byte_count):
@@ -627,6 +636,102 @@ async def _read_parts(session_factory, context, policy, bundle_id, cursor, sourc
     return tuple(pages), tuple(closed_parts)
 
 
+async def _read_direct_parts(session_factory, context, policy, bundle_id, cursor, deadline, bucket_count):
+    """Coalesce sequential parts into bucketed direct stage tuples without holding a read connection."""
+    from process.custom_import import family_block_direct_stage as direct_stage
+
+    request = context.request
+    identity_by_field = dict(
+        capture_bundle_id=bundle_id,
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+    )
+    slices, row_count, byte_count = [], 0, 0
+    headers = None
+    started = time.monotonic()
+    soft_deadline = started + (deadline - started) / 2
+    closed_count = 0
+    while closed_count < MAX_BATCH_ROWS and (not slices or _has_capacity(request, row_count, byte_count)):
+        now = time.monotonic()
+        if now >= deadline:
+            raise LeaseAuthorityLost("SOURCE read deadline elapsed")
+        if slices and now >= soft_deadline:
+            break
+        part, headers = await _fetch_closed_part(session_factory, identity_by_field, context, cursor, deadline, headers)
+        is_final = part.ordinal == json.loads(part.receipt.canonical_manifest)["part_count"]
+        part_budget = direct_stage.DirectSliceBudget(
+            part_row_ordinal=cursor.next_part_row_ordinal,
+            source_ordinal=cursor.next_source_ordinal,
+            bucket_count=bucket_count,
+            max_rows=MAX_BATCH_ROWS - row_count,
+            max_bytes=MAX_BATCH_BYTES - byte_count,
+            deadline=deadline,
+            soft_deadline=soft_deadline,
+            is_final_part=is_final,
+        )
+        part_slice = await direct_stage.prepare_direct_part_slice(context, part, policy, part_budget)
+        del part
+        slices.append(part_slice)
+        row_count += part_slice.row_count
+        byte_count += part_slice.byte_count
+        if not part_slice.has_reached_eof:
+            break
+        closed_count += 1
+        if is_final:
+            await _verify_metadata(session_factory, identity_by_field, context, deadline)
+            break
+        cursor = SourceCursor(
+            cursor.next_part_ordinal + 1,
+            0,
+            cursor.next_source_ordinal + part_slice.row_count,
+            cursor.next_pack_ordinal,
+        )
+    if time.monotonic() >= deadline:
+        raise LeaseAuthorityLost("SOURCE read deadline elapsed")
+    return direct_stage.merge_direct_slices(slices)
+
+
+async def _commit_direct(session_factory, context, direct_batch, expected, bundle_id, source_permit, family_id):
+    """Commit one bounded direct compact v2 SOURCE batch and advance the durable cursor."""
+    from process.custom_import import family_block_direct_stage as direct_stage
+
+    async with _page(session_factory, context.request, context.build_id, source_permit) as (session, build):
+        stream = await _cursor(session, context.build_id, context.stream_slot)
+        _match_cursor(stream, expected, build.phase)
+        is_already_complete = stream.replay_verified_at is not None
+        if is_already_complete and direct_batch.slices:
+            raise SourceCursorConflict(SourceCursor.from_model(stream), True, build.phase)
+        completed = (
+            await direct_stage.commit_direct_source_batch(
+                session, build, stream, context, direct_batch, family_id=family_id
+            )
+            if direct_batch.slices
+            else 0
+        )
+        if is_already_complete or any(part_slice.has_reached_eof for part_slice in direct_batch.slices):
+            await direct_stage.freeze_direct_source_if_complete(session, build)
+        stream = await _cursor(session, context.build_id, context.stream_slot)
+        after = SourceCursor.from_model(stream)
+        if after.next_source_ordinal - expected.next_source_ordinal != completed:
+            raise RuntimeError("SOURCE completion lacks exact durable row progress")
+        if after == expected and build.phase != "admission":
+            raise SourceCursorConflict(after, stream.replay_verified_at is not None, build.phase)
+        receipt = SourceBatchReceipt(
+            context.request.execution_id,
+            context.build_id,
+            context.request.fence,
+            context.stream_slot,
+            bundle_id,
+            expected,
+            after,
+            build.phase,
+            completed,
+            stream.replay_verified_at is not None,
+        )
+    return receipt
+
+
 async def serve_source_batch(
     session_factory,
     *,
@@ -663,6 +768,20 @@ async def serve_source_batch(
         lease_token,
         source_permit,
     )
+    if context.direct_stage_info is not None:
+        from process.custom_import.family_block_direct_stage import PreparedDirectBatch
+
+        family_id, bucket_count = context.direct_stage_info
+        direct_batch = (
+            PreparedDirectBatch((), 0, (), {})
+            if is_complete
+            else await _read_direct_parts(
+                session_factory, context, policy, bundle_id, expected_cursor, deadline, bucket_count
+            )
+        )
+        return await _commit_direct(
+            session_factory, context, direct_batch, expected_cursor, bundle_id, source_permit, family_id
+        )
     pages, closed_parts = (
         ((), ())
         if is_complete

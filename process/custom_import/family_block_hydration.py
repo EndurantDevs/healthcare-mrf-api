@@ -12,8 +12,19 @@ import msgpack
 from sqlalchemy import func, select, tuple_
 
 from process.custom_import import family_block_read as reader
+from process.custom_import import runner_codec
+from process.custom_import.family_block_records import FamilyRecord
+from process.custom_import.family_block_scalar_layout import query_scalar_fields, scalar_column
+from process.custom_import.family_block_v2_codec import (
+    COMPACT_V2_CONTRACT,
+    can_inline_root,
+    needs_inline_entity_join,
+    scalars_from_v2_wire,
+    unpack_inline_root_scalars,
+)
 
 _CONTRACT = "custom-import/family-block/v1"
+_CONTRACTS = frozenset({_CONTRACT, COMPACT_V2_CONTRACT})
 _LENGTH = struct.Struct("!Q")
 _NATIVE_IDS = 1024
 _COORDINATES = 4096
@@ -229,19 +240,20 @@ class _FamilyStreamDecoder:
         if (
             type(header) is not list
             or len(header) != 4
-            or header[0] != _CONTRACT
+            or header[0] not in _CONTRACTS
             or header[1] != definition.digest
             or type(header[2]) is not bytes
             or len(header[2]) != 32
             or header[3] is not retained
         ):
             raise reader.FamilyBlockError("selected family header differs")
+        is_v2 = header[0] == COMPACT_V2_CONTRACT
         root_wire = await self._next_object()
-        root_entry = reader.record_from_wire(definition, None, root_wire, retained=retained, include_payload=False)[0]
+        root_entry = _projected_wire_entry(definition, None, root_wire, retained=retained, is_v2=is_v2)
         if root_entry.revision_id != self.family["root_revision_id"]:
             raise reader.FamilyBlockError("selected revision differs from membership")
         records_by_key = {(0, root_entry.revision_id): root_entry}
-        decoded_children = await self._decode_collections(definition, retained, records_by_key)
+        decoded_children = await self._decode_collections(definition, retained, records_by_key, is_v2=is_v2)
         trailer = await self._next_object()
         if (
             trailer != ["complete", self.family["child_count"]]
@@ -254,7 +266,7 @@ class _FamilyStreamDecoder:
             raise reader.FamilyBlockError("selected family extent differs")
         return records_by_key
 
-    async def _decode_collections(self, definition, retained, records_by_key):
+    async def _decode_collections(self, definition, retained, records_by_key, *, is_v2=False):
         slots_by_name = self.binding.layout.collection_slots
         decoded_children = 0
         for collection_name in sorted(definition.collections_by_name):
@@ -272,9 +284,9 @@ class _FamilyStreamDecoder:
                     raise reader.FamilyBlockError("selected child framing differs")
                 if decoded_children and decoded_children % 64 == 0:
                     await asyncio.sleep(0)
-                child_entry = reader.record_from_wire(
-                    definition, collection_name, entry[1], retained=retained, include_payload=False
-                )[0]
+                child_entry = _projected_wire_entry(
+                    definition, collection_name, entry[1], retained=retained, is_v2=is_v2
+                )
                 key = (collection_slot, child_entry.revision_id)
                 if key in records_by_key:
                     raise reader.FamilyBlockError("selected family membership overlaps")
@@ -284,7 +296,30 @@ class _FamilyStreamDecoder:
         return decoded_children
 
 
-def _verify_families(families, selected_by_id):
+def _projected_wire_entry(definition, collection_name, wire_entry, *, retained, is_v2):
+    """Decode projected scalar cells from either v1 (6-cell) or v2 (4-cell positional) wire format."""
+    if is_v2 and not (type(wire_entry) is list and len(wire_entry) == 6):
+        fields = (
+            definition.root_fields
+            if collection_name is None
+            else runner_codec.fields_by_collection(definition)[collection_name]
+        )
+        revision_id, pack_id, source_ordinal, scalars_by_field = scalars_from_v2_wire(fields, wire_entry)
+        return FamilyRecord(revision_id, pack_id, source_ordinal, None, scalars_by_field, None)
+    return reader.record_from_wire(definition, collection_name, wire_entry, retained=retained, include_payload=False)[0]
+
+
+def _is_inline_family(family) -> bool:
+    return (
+        family["fragment_count"] == 0
+        and family["raw_bytes"] == 0
+        and family["stored_bytes"] == 0
+        and family["child_count"] == 0
+        and not family["retained"]
+    )
+
+
+def _verify_families(families, selected_by_id, *, allow_inline=False):
     if (
         len(families) != len(selected_by_id)
         or {family["family_revision_id"] for family in families} != selected_by_id.keys()
@@ -299,6 +334,10 @@ def _verify_families(families, selected_by_id):
                 family["child_count"],
             ) != (identity.root_record_id, root.root_revision_id, winner.entity_binding_id, identity.child_count):
                 raise reader.FamilyBlockError("selected family identity differs")
+        if _is_inline_family(family):
+            if not allow_inline:
+                raise reader.FamilyBlockError("selected inline family requires an inlineable root definition")
+            continue
         if any(
             type(family[name]) is not int or family[name] <= 0
             for name in ("fragment_count", "raw_bytes", "stored_bytes")
@@ -306,6 +345,42 @@ def _verify_families(families, selected_by_id):
             raise reader.FamilyBlockError("selected family extent differs")
         if not 0 <= family["child_count"] <= reader.MAX_DETAIL_CHILDREN:
             raise reader.CustomImportReadUnavailableError("selected families exceed the bounded detail child limit")
+
+
+def _hydrate_inline_families(context, definition, inline_families, selected_by_id, scope_digest):
+    """Project zero-fragment inline root families directly from block_family scalar columns."""
+    needs_entity = needs_inline_entity_join(definition)
+    details_by_id = {}
+    for family in inline_families:
+        family_id = family["family_revision_id"]
+        entity_value = family["_entity_canonical_value"] if needs_entity else None
+        scalars_by_field = unpack_inline_root_scalars(definition, family, entity_canonical_value=entity_value)
+        root_entry = FamilyRecord(family["root_revision_id"], 1, 0, None, scalars_by_field, None)
+        winner, identity, _root, _child = selected_by_id[family_id][0]
+        details_by_id[family_id] = reader._project_family(
+            context, winner, identity, {(0, root_entry.revision_id): root_entry}, scope_digest
+        )
+    return details_by_id
+
+
+def _family_select_statement(binding, family_ids, *, include_inline_columns):
+    table = binding.tables_by_role["family"]
+    selected_cols = [table.c[name] for name in _FAMILY_FIELDS]
+    from_clause = table
+    if include_inline_columns:
+        definition = binding.layout.definition
+        selected_cols.extend((table.c.raw_states, table.c.raw_type_overrides))
+        selected_cols.extend(table.c[scalar_column(field)] for field in query_scalar_fields(definition))
+        if needs_inline_entity_join(definition):
+            entity_table = binding.tables_by_role["entity_binding"]
+            from_clause = table.join(entity_table, entity_table.c.entity_binding_id == table.c.entity_binding_id)
+            selected_cols.append(entity_table.c.canonical_value.label("_entity_canonical_value"))
+    return (
+        select(*selected_cols)
+        .select_from(from_clause)
+        .where(table.c.family_revision_id.in_(family_ids))
+        .order_by(table.c.family_revision_id)
+    )
 
 
 async def _hydrate_group(session, context, families, selected_by_id, scope_digest, limits, *, use_direct):
@@ -333,11 +408,12 @@ async def _hydrate_group(session, context, families, selected_by_id, scope_diges
 async def hydrate_page(session, context, selected, scope_digest):
     """Project bounded native groups, preserving the caller's exact result order."""
     binding, limits = reader._binding(context), reader.FamilyBlockReadLimits()
+    definition = binding.layout.definition
+    is_inlineable = can_inline_root(definition)
     selected_by_id, details_by_id = {}, {}
     for selected_row in selected:
         selected_by_id.setdefault(selected_row[1].family_revision_id, []).append(selected_row)
     identifiers = sorted(selected_by_id)
-    table = binding.tables_by_role["family"]
     chunk_size = min(_NATIVE_IDS, limits.rows, max(1, limits.bytes // 256))
     for offset in range(0, len(identifiers), chunk_size):
         selected_by_id_chunk = {
@@ -345,12 +421,16 @@ async def hydrate_page(session, context, selected, scope_digest):
         }
         families = await _mappings(
             session,
-            select(*(table.c[name] for name in _FAMILY_FIELDS))
-            .where(table.c.family_revision_id.in_(tuple(selected_by_id_chunk)))
-            .order_by(table.c.family_revision_id),
+            _family_select_statement(binding, tuple(selected_by_id_chunk), include_inline_columns=is_inlineable),
         )
-        _verify_families(families, selected_by_id_chunk)
-        for grouped, use_direct in _family_batches(families, limits):
+        _verify_families(families, selected_by_id_chunk, allow_inline=is_inlineable)
+        inline_families = [family for family in families if family["fragment_count"] == 0]
+        fragmented_families = [family for family in families if family["fragment_count"] > 0]
+        if inline_families:
+            details_by_id.update(
+                _hydrate_inline_families(context, definition, inline_families, selected_by_id_chunk, scope_digest)
+            )
+        for grouped, use_direct in _family_batches(fragmented_families, limits):
             details_by_id.update(
                 await _hydrate_group(
                     session, context, grouped, selected_by_id_chunk, scope_digest, limits, use_direct=use_direct

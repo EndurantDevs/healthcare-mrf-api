@@ -437,11 +437,195 @@ def _require_admitted(build):
         raise CandidateRunnerError("source outcome counts require completed source admission")
 
 
+async def _compact_layout_counts(session, family_id: int) -> SourceOutcomeCounts | None:
+    """Read exact source counts from compact layout metadata when caller has table access."""
+    from sqlalchemy.exc import DBAPIError
+
+    from db.models.custom_import_family_block import CustomImportFamilyBlockLayout
+
+    try:
+        async with session.begin_nested():
+            descriptor = await session.get(CustomImportFamilyBlockLayout, family_id)
+    except DBAPIError as error:
+        if getattr(error.orig, "sqlstate", None) == "42501":
+            return None
+        raise
+    if (
+        descriptor is not None
+        and descriptor.source_accepted_family_count is not None
+        and descriptor.source_rejection_count is not None
+    ):
+        return SourceOutcomeCounts(
+            int(descriptor.source_accepted_family_count),
+            int(descriptor.source_rejection_count),
+        )
+    return None
+
+
+async def _compact_table_counts(session, schema_name: str, build) -> SourceOutcomeCounts:
+    """Count accepted source families and distinct source rejections directly from snapshot tables."""
+    from sqlalchemy import text
+    from sqlalchemy.dialects.postgresql import dialect
+
+    quoted_schema = dialect().identifier_preparer.quote_schema(schema_name)
+    accepted_count = int(
+        await session.scalar(
+            text(f"SELECT count(*) FROM {quoted_schema}.custom_import_block_family WHERE NOT retained")
+        )
+        or 0
+    )
+    if build.next_rejection_ordinal == 0:
+        return SourceOutcomeCounts(accepted_count, 0)
+    rejection_count = int(
+        await session.scalar(
+            text(
+                f"""
+                SELECT
+                    count(*) FILTER (
+                        WHERE root_key_sha256 IS NULL
+                          AND code IN ('root_not_object', 'root_key_missing')
+                    )
+                    + count(DISTINCT (root_key_sha256, code)) FILTER (
+                        WHERE root_key_sha256 IS NOT NULL
+                          AND code NOT IN ('orphan_child', 'child_not_object')
+                    )
+                FROM {quoted_schema}.custom_import_rejection
+                WHERE execution_id = :execution_id
+                  AND producing_fence = :fence
+                """
+            ),
+            {"execution_id": build.execution_id, "fence": build.producing_fence},
+        )
+        or 0
+    )
+    return SourceOutcomeCounts(accepted_count, rejection_count)
+
+
+async def _sealed_compact_outcomes(session, request: SourceBuildRequest, build) -> SourceOutcomeCounts | None:
+    import hmac
+
+    from db.models.custom_import import CustomImportGenerationSeal
+    from process.custom_import.continuation_runtime import producer_token_sha256
+    from process.custom_import.read_contracts import PinnedReadTarget
+    from process.custom_import.read_identity import resolve_generation_snapshot_binding
+
+    seal = (
+        await session.scalars(
+            select(CustomImportGenerationSeal).where(
+                CustomImportGenerationSeal.generation_id == build.generation_id,
+                CustomImportGenerationSeal.dataset_id == request.dataset_id,
+                CustomImportGenerationSeal.execution_id == request.execution_id,
+                CustomImportGenerationSeal.sealing_fence == request.fence,
+            )
+        )
+    ).one_or_none()
+    if seal is None or not hmac.compare_digest(bytes(seal.sealing_token_sha256), producer_token_sha256(request)):
+        return None
+    binding = await resolve_generation_snapshot_binding(
+        session,
+        PinnedReadTarget(
+            dataset_id=build.dataset_id,
+            generation_id=build.generation_id,
+            definition_revision_id=build.definition_revision_id,
+            schema_revision_id=build.schema_revision_id,
+            profile_id="default",
+        ),
+    )
+    if binding.family_id is None or binding.legacy_snapshot:
+        return None
+    layout_counts = await _compact_layout_counts(session, binding.family_id)
+    if layout_counts is not None:
+        return layout_counts
+    return await _compact_table_counts(session, binding.schema_name, build)
+
+
+async def _rejected_compact_outcomes(
+    session_factory, request: SourceBuildRequest, build_id: int
+) -> SourceOutcomeCounts | None:
+    from sqlalchemy import text
+    from sqlalchemy.dialects.postgresql import dialect
+
+    from process.custom_import.build_source import _page_session, _resolve_build_snapshot
+    from process.custom_import.storage_layout import snapshot_schema
+
+    async with _page_session(session_factory, request, build_id) as (session, build):
+        if build.phase != "rejected":
+            return None
+        family_id = await _resolve_build_snapshot(session, build_id)
+        schema_name = snapshot_schema(family_id)
+        quoted_schema = dialect().identifier_preparer.quote_schema(schema_name)
+        has_block_family = bool(
+            await session.scalar(
+                text("SELECT pg_catalog.to_regclass(:relation_name) IS NOT NULL"),
+                {"relation_name": f"{quoted_schema}.custom_import_block_family"},
+            )
+        )
+        if not has_block_family:
+            return None
+        has_legacy_occ = bool(
+            await session.scalar(
+                text(f"SELECT EXISTS(SELECT 1 FROM {quoted_schema}.custom_import_build_occurrence LIMIT 1)")
+            )
+        )
+        if has_legacy_occ:
+            return None
+        layout_counts = await _compact_layout_counts(session, family_id)
+        if layout_counts is not None:
+            return layout_counts
+        return await _compact_table_counts(session, schema_name, build)
+
+
+async def _compact_source_outcomes(
+    session_factory, request: SourceBuildRequest, build_id: int
+) -> SourceOutcomeCounts | None:
+    """Return exact source counts for direct compact v2 builds (sealed or rejected)."""
+    from sqlalchemy import text
+
+    from db.models.custom_import import CustomImportBuildAttempt, CustomImportExecution
+    from process.custom_import.build_source import _assert_build_identity, _set_timeout
+
+    if not callable(session_factory):
+        return None
+    is_rejected = False
+    async with session_factory() as session, session.begin():
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        await _set_timeout(session, request.statement_timeout_ms)
+        execution = await session.get(CustomImportExecution, request.execution_id)
+        build = await session.get(CustomImportBuildAttempt, build_id)
+        if execution is None or build is None:
+            return None
+        _assert_build_identity(build, request, execution)
+        if (
+            build.phase == "verified"
+            and execution.state in {"completed", "no_change"}
+            and build.generation_id is not None
+        ):
+            return await _sealed_compact_outcomes(session, request, build)
+        is_rejected = build.phase == "rejected" and execution.state == "running"
+    if is_rejected:
+        return await _rejected_compact_outcomes(session_factory, request, build_id)
+    return None
+
+
 async def count_source_outcomes(session_factory, request: SourceBuildRequest, build_id: int) -> SourceOutcomeCounts:
     """Project legacy counts under the same live fence before execution finality."""
-    async with _renew_while_reading(session_factory, request):
-        _require_admitted(await _snapshot(session_factory, request, build_id))
-        async with _session(session_factory) as session:
-            counts = await session.run_sync(lambda sync: _count_source(_CountScan(sync, request, build_id)))
-        _require_admitted(await _snapshot(session_factory, request, build_id))
-        return counts
+    from process.custom_import.runner_types import LeaseAuthorityLost
+
+    try:
+        async with _renew_while_reading(session_factory, request):
+            snapshot = await _snapshot(session_factory, request, build_id)
+            _require_admitted(snapshot)
+            if snapshot.phase == "rejected" and getattr(snapshot, "source_occurrence_count", 0) > 0:
+                compact_counts = await _compact_source_outcomes(session_factory, request, build_id)
+                if compact_counts is not None:
+                    return compact_counts
+            async with _session(session_factory) as session:
+                counts = await session.run_sync(lambda sync: _count_source(_CountScan(sync, request, build_id)))
+            _require_admitted(await _snapshot(session_factory, request, build_id))
+            return counts
+    except LeaseAuthorityLost:
+        if callable(session_factory):
+            compact_counts = await _compact_source_outcomes(session_factory, request, build_id)
+            if compact_counts is not None:
+                return compact_counts
+        raise

@@ -102,6 +102,38 @@ def candidate_hash(
     )
 
 
+class IncrementalCandidateDigest:
+    """Streaming SHA-256 builder matching ``candidate_hash_ordered`` byte-for-byte."""
+
+    def __init__(self, *, execution_id: int, fence: int, base_generation_id: int | None) -> None:
+        self._digest = _incremental_digest("candidate")
+        _digest_text_fragment(self._digest, '{"base_generation_id":')
+        _digest_text_fragment(self._digest, "null" if base_generation_id is None else str(base_generation_id))
+        _digest_text_fragment(self._digest, ',"contract":"custom-import-candidate/v1","execution_id":')
+        _digest_text_fragment(self._digest, str(execution_id))
+        _digest_text_fragment(self._digest, ',"fence":')
+        _digest_text_fragment(self._digest, str(fence))
+        _digest_text_fragment(self._digest, ',"root_keys":[')
+        self._previous_hash: bytes | None = None
+        self._has_entry = False
+
+    def update(self, root_key_hash_value: bytes) -> None:
+        """Append the next nondecreasing 32-byte root key digest."""
+        _validate_hash_value(root_key_hash_value, "ordered root key")
+        if self._previous_hash is not None and root_key_hash_value < self._previous_hash:
+            raise CandidateRunnerError("root key hashes are not ordered")
+        if self._has_entry:
+            _digest_text_fragment(self._digest, ",")
+        _digest_json_string(self._digest, root_key_hash_value.hex())
+        self._previous_hash = root_key_hash_value
+        self._has_entry = True
+
+    def digest(self) -> bytes:
+        """Close the JSON array and return the final 32-byte candidate fingerprint."""
+        _digest_text_fragment(self._digest, "]}")
+        return self._digest.digest()
+
+
 def candidate_hash_ordered(
     *,
     execution_id: int,
@@ -114,25 +146,14 @@ def candidate_hash_ordered(
     # Keep the v1 canonical document bytes without building its potentially
     # large ``root_keys`` array.  This preserves persisted hash compatibility
     # while avoiding the definition JSON validator's aggregate-array cap.
-    digest = _incremental_digest("candidate")
-    _digest_text_fragment(digest, '{"base_generation_id":')
-    _digest_text_fragment(digest, "null" if base_generation_id is None else str(base_generation_id))
-    _digest_text_fragment(digest, ',"contract":"custom-import-candidate/v1","execution_id":')
-    _digest_text_fragment(digest, str(execution_id))
-    _digest_text_fragment(digest, ',"fence":')
-    _digest_text_fragment(digest, str(fence))
-    _digest_text_fragment(digest, ',"root_keys":[')
-    previous_hash = None
-    for ordinal, root_key_hash_value in enumerate(root_key_hashes):
-        _validate_hash_value(root_key_hash_value, "ordered root key")
-        if previous_hash is not None and root_key_hash_value < previous_hash:
-            raise CandidateRunnerError("root key hashes are not ordered")
-        if ordinal:
-            _digest_text_fragment(digest, ",")
-        _digest_json_string(digest, root_key_hash_value.hex())
-        previous_hash = root_key_hash_value
-    _digest_text_fragment(digest, "]}")
-    return digest.digest()
+    builder = IncrementalCandidateDigest(
+        execution_id=execution_id,
+        fence=fence,
+        base_generation_id=base_generation_id,
+    )
+    for root_key_hash_value in root_key_hashes:
+        builder.update(root_key_hash_value)
+    return builder.digest()
 
 
 def new_family_hash(definition: CustomImportDefinition, family: RootFamily) -> bytes:
