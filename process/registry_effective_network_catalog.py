@@ -81,25 +81,53 @@ async def effective_catalog_sql(connection, manifest, control_schema):
     if coordinates is None:
         return None
     control, catalog, generation, revision = coordinates
-    ctes = _catalog_ctes(control, catalog, generation, manifest.approved_custom_revision)
+    ctes = _catalog_ctes(control, catalog, generation, revision)
     if (
-        await connection.fetchval(
-            "WITH "
-            + ctes
-            + """ SELECT EXISTS(SELECT FROM overrides o WHERE conflicting
-          OR NOT archived AND NOT EXISTS(SELECT FROM manual n
-            WHERE n.record_kind='network' AND n.record_key=o.network_id::text))"""
-        )
-        is not False
+        await connection.fetchval(_manual_bindings_may_conflict_sql(control, revision)) is not False
+        and await connection.fetchval(_catalog_conflict_sql(ctes)) is not False
     ):
         raise ValueError("registry_effective_catalog_binding_conflict")
-    return (
-        "(WITH "
-        + ctes
-        + ","
-        + _record_ctes(catalog, generation, manifest.approved_custom_revision)
-        + " SELECT * FROM effective_records)"
-    )
+    return "(WITH " + ctes + "," + _record_ctes(catalog, generation, revision) + " SELECT * FROM effective_records)"
+
+
+def _manual_bindings_may_conflict_sql(control, revision):
+    """Find necessary conditions for an imported binding conflict or missing override target."""
+    return f"""WITH manual_targets AS MATERIALIZED (
+      SELECT custom_revision,record_json->>'source_system' AS source_system,
+        record_json->>'source_key' AS source_key,record_json->>'network_id' AS target,
+        record_json->>'archived' AS archived,
+        CASE WHEN record_json->>'source_system'='aca'
+          AND record_json->>'producer_id'<>'registry-native-network-source-v1'
+          AND (NOT record_json ? 'source_key_kind' OR record_json->>'source_key_kind'='hios_plan_id')
+          AND record_json->>'source_key' ~ '^[1-9][0-9]{{4}}[A-Z]{{2}}[0-9]{{7}}(-[0-9]{{2}})?$'
+          AND jsonb_typeof(record_json#>'{{source_scope_json,checksum_network}}')='number'
+          THEN 'ACAPlan/'||(record_json->>'source_key')||'/'||
+            trim_scale((record_json#>'{{source_scope_json,checksum_network}}')::numeric)::text END AS native_aca_key
+      FROM ONLY {control}.registry_approved_record
+      WHERE approved_revision={revision} AND record_kind='network_binding'
+    ) SELECT EXISTS (
+      SELECT FROM manual_targets m WHERE m.archived IS NULL OR m.archived NOT IN ('true','false')
+        OR NOT (CASE WHEN m.target ~ '^[1-9][0-9]{{0,9}}$' THEN m.target::bigint <= 2147483647 ELSE false END)
+    ) OR EXISTS (
+      SELECT FROM manual_targets m WHERE m.archived='false' AND NOT EXISTS(
+        SELECT FROM ONLY {control}.registry_approved_record n
+        WHERE n.approved_revision={revision} AND n.record_kind='network' AND n.record_key=m.target)
+    ) OR EXISTS (
+      SELECT FROM (
+        SELECT custom_revision,source_system,source_key,target,archived FROM manual_targets
+        UNION ALL
+        SELECT custom_revision,source_system,native_aca_key,target,archived FROM manual_targets
+        WHERE native_aca_key IS NOT NULL
+      ) match_keys GROUP BY custom_revision,source_system,source_key
+      HAVING count(DISTINCT (target,archived))>1
+    )"""
+
+
+def _catalog_conflict_sql(ctes):
+    return f"""WITH {ctes} SELECT EXISTS (
+      SELECT FROM overrides o WHERE conflicting OR NOT archived AND NOT EXISTS(SELECT FROM manual n
+        WHERE n.record_kind='network' AND n.record_key=o.network_id::text)
+    )"""
 
 
 async def effective_catalog_networks_sql(connection, manifest, control_schema):
