@@ -12,7 +12,7 @@ from process import registry_network_catalog_read as catalog
 from process.network_fhir_source_witness_contract import digest
 from process.registry_aca_company_catalog import enrich_aca_company_sources
 from process.registry_catalog_policy import RegistryOrganizationVisibility
-from process.registry_effective_network_catalog import effective_catalog_sql
+from process.registry_effective_network_catalog import effective_catalog_organizations_sql, effective_catalog_sql
 from process.registry_native_network_catalog import (
     native_catalog_descriptor,
     native_catalog_rows,
@@ -260,3 +260,33 @@ async def test_source_organizations_are_visible_in_pinned_list_and_detail(
     assert selected["items"][0]["display_name"] == label
     assert selected["items"][0]["revision"] == 1
     assert hidden["total"] == 0
+
+
+@pytest.mark.parametrize("archived", [False, True])
+async def test_organization_visibility_follows_effective_binding(serving_schema, effective_catalog_db, archived):
+    connection, schema, _engine = serving_schema
+    source, company_id, group_id = await source_company(connection, schema)
+    fixture = effective_catalog_db
+    await seed_projection(fixture, source)
+    binding = json.loads(
+        await fixture.connection.fetchval(
+            f'SELECT document_json FROM "{fixture.catalog}".registry_fhir_catalog_binding'
+        )
+    )
+    await manual_record(fixture, "network", 8, {"network_id": 8, "archived": False})
+    await manual_record(
+        fixture,
+        "network_binding",
+        uuid4(),
+        binding | {"network_id": 8, "source_scope_json": binding["source_scope"], "archived": archived},
+    )
+
+    args = fixture.connection, fixture.manifest, fixture.control
+    full = await effective_catalog_sql(*args)
+    organizations = await effective_catalog_organizations_sql(*args)
+    expected = await fixture.connection.fetch(
+        f"SELECT * FROM {full} records WHERE record_kind IN ('company','group') ORDER BY record_kind,record_key"
+    )
+    actual = await fixture.connection.fetch(f"SELECT * FROM {organizations} records ORDER BY record_kind,record_key")
+    assert actual == expected
+    assert {row["record_key"] for row in actual} == (set() if archived else {str(company_id), str(group_id)})

@@ -8,7 +8,7 @@ import asyncpg
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.registry_catalog_policy import RegistryOrganizationVisibility
-from process.registry_effective_network_catalog import apply_effective_catalog_sql, effective_catalog_sql
+from process.registry_effective_network_catalog import apply_effective_catalog_sql, effective_catalog_organizations_sql
 from process.registry_network_catalog_read import (
     MAX_RESPONSE_BYTES,
     RegistryNetworkCatalogError,
@@ -188,14 +188,13 @@ async def read_registry_serving_organizations(
         if organization_policy is not None and record_ids is not None:
             parameters += (record_ids,)
         statement = sql.format(namespace=namespace, projection=projection)
-        effective_records_sql = await effective_catalog_sql(connection, manifest, control_schema)
+        effective_records_sql = await effective_catalog_organizations_sql(connection, manifest, control_schema)
         if effective_records_sql is not None:
             statement = apply_effective_catalog_sql(statement, "pinned_organizations", control_schema)
             statement = (
                 "WITH pinned_organizations AS MATERIALIZED ("
                 "SELECT approved_revision,record_kind,record_key,record_json "
-                f"FROM {effective_records_sql} WHERE record_kind IN ('company','group')), "
-                + statement.removeprefix("WITH ")
+                f"FROM {effective_records_sql} records), " + statement.removeprefix("WITH ")
             )
         page_record = await connection.fetchrow(statement, *parameters)
         if page_record is None or page_record["bounded"] is not True:
