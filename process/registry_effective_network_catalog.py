@@ -143,11 +143,13 @@ async def effective_catalog_networks_sql(connection, manifest, control_schema):
         return None
     control, catalog, generation, revision = coordinates
     return f"""(SELECT m.record_key::integer AS network_id,(m.record_json->>'archived')::boolean AS archived,
-      m.approved_revision FROM ONLY {control}.registry_approved_record m
+      m.approved_revision,m.record_json->>'display_name' AS display_name,m.record_json->'aliases' AS aliases
+      FROM ONLY {control}.registry_approved_record m
       WHERE m.approved_revision={revision} AND m.record_kind='network'
         AND jsonb_typeof(m.record_json->'network_id')='number' AND m.record_json->>'network_id'=m.record_key
         AND jsonb_typeof(m.record_json->'archived')='boolean'
-      UNION ALL SELECT n.network_id,n.archived,{revision}::bigint FROM ONLY {catalog}.registry_fhir_catalog_network n
+      UNION ALL SELECT n.network_id,n.archived,{revision}::bigint,n.display_name,n.aliases
+      FROM ONLY {catalog}.registry_fhir_catalog_network n
       WHERE n.metadata_generation='{generation}' AND NOT EXISTS(
         SELECT FROM ONLY {control}.registry_approved_record m WHERE m.approved_revision={revision}
           AND m.record_kind='network' AND m.record_key=n.network_id::text))"""

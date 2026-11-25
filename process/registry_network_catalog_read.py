@@ -7,7 +7,7 @@ import json
 import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 import asyncpg
@@ -25,7 +25,11 @@ from process.network_fhir_retained_capture_contract import PRODUCER as RETAINED_
 from process.network_fhir_retained_capture_contract import is_sha256
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
-from process.registry_effective_network_catalog import apply_effective_catalog_sql, effective_catalog_sql
+from process.registry_effective_network_catalog import (
+    apply_effective_catalog_sql,
+    effective_catalog_networks_sql,
+    effective_catalog_sql,
+)
 from process.registry_fhir_plan_tier import (
     KIND as PLAN_TIER_KIND,
 )
@@ -651,6 +655,30 @@ def catalog_network_document(document):
 _network_document = catalog_network_document
 
 
+async def _list_page_keys(connection, manifest, query, exclusions, control_schema):
+    """Page network names before reading the selected networks' companies and bindings."""
+    networks = await effective_catalog_networks_sql(connection, manifest, control_schema)
+    if networks is None:
+        return None
+    return await connection.fetchrow(
+        f"""WITH matching AS MATERIALIZED (
+          SELECT network_id,display_name FROM {networks} network
+          WHERE NOT network_id=ANY($1::integer[])
+            AND ($2::boolean IS NULL OR archived=$2)
+            AND ($3::text IS NULL OR strpos(lower(display_name),lower($3))>0
+              OR EXISTS(SELECT FROM jsonb_array_elements_text(aliases) alias
+                WHERE strpos(lower(alias),lower($3))>0))
+        ) SELECT (SELECT count(*) FROM matching) AS total,
+          ARRAY(SELECT network_id FROM matching ORDER BY lower(display_name) COLLATE "C",network_id
+            OFFSET $4 LIMIT $5) AS network_ids""",
+        exclusions,
+        query.archived,
+        query.search,
+        query.offset,
+        query.limit,
+    )
+
+
 async def _page_entry(
     connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None
 ):
@@ -710,7 +738,16 @@ async def _page_entry(
 
 
 async def _page(connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None):
-    entry = await _page_entry(connection, manifest, query, exclusions, control_schema, network_ids, organization_policy)
+    selected = None
+    if network_ids is None and query.source is None and query.benefit_code is None:
+        selected = await _list_page_keys(connection, manifest, query, exclusions, control_schema)
+    hydration_query = query
+    if selected is not None:
+        hydration_query = replace(query, offset=0)
+        network_ids = selected["network_ids"]
+    entry = await _page_entry(
+        connection, manifest, hydration_query, exclusions, control_schema, network_ids, organization_policy
+    )
     if entry is None or entry["bounded"] is not True:
         raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
     documents = _closed_json(entry["rows_json"].encode(), MAX_RESPONSE_BYTES)
@@ -728,7 +765,7 @@ async def _page(connection, manifest, query, exclusions, control_schema, network
         for company in network["companies"]
     ):
         raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
-    total = _integer(entry["total"], 9223372036854775807, minimum=0)
+    total = _integer(entry["total"] if selected is None else selected["total"], 9223372036854775807, minimum=0)
     if len(networks) != min(query.limit, max(total - query.offset, 0)) or len(
         {network["network_id"] for network in networks}
     ) != len(networks):
