@@ -283,6 +283,7 @@ def _inventory_root(candidate):
 
 def _inventory_source_metadata(candidate, inventory_entries):
     """Fold complete supplied rows, then decode canonical singletons; this grants no native custody."""
+    from process.network_compact_layout import is_independent_network_candidate
     from process.registry_source_inventory_contract import SourceInventoryAccumulator
     from process.registry_source_inventory_preparation import SourceInventoryPreparation
     from process.registry_source_recipe_store import decode_registry_source_recipes
@@ -303,8 +304,11 @@ def _inventory_source_metadata(candidate, inventory_entries):
         descriptors = tuple(
             json.loads(entry.contribution_json) for entry in inventory_entries if entry.contribution_json is not None
         )
+        is_independent = is_independent_network_candidate(candidate)
         for descriptor in descriptors:
             preparation.add_contribution(descriptor)
+            if is_independent and descriptor.get("fact_candidate_id") is not None:
+                raise ValueError
         for entry in inventory_entries:
             if entry.office_derivation_json is None:
                 raise ValueError
@@ -598,7 +602,7 @@ async def contribution_fact_sha256(connection, relation, recipe_sha256):
 
 
 async def reuse_fhir_facts(connection, retained_relation, source, table_name, recipe_sha256):
-    """Materialize only an explicitly retained legacy-v1 contract with its recorded row count."""
+    """Copy this recipe's retained facts into its local stage and verify the complete row count."""
     status = await connection.execute(
         f"""INSERT INTO pg_temp.{_identifier(table_name)}
       SELECT recipe_sha256,ordinal,fact_json FROM {retained_relation} WHERE recipe_sha256=$1""",

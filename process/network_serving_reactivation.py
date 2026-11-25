@@ -12,6 +12,7 @@ from process.network_membership_publication import (
     _publication_readiness,
 )
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
+from process.registry_effective_network_catalog import CATALOG_GENERATION, pair_network_catalog_generation
 
 
 class NetworkServingReactivationError(ValueError):
@@ -69,6 +70,23 @@ async def _reactivate(connection, namespace, generation_id, expected_head, expec
         )
         if status != "UPDATE 1":
             raise NetworkServingReactivationError("network_reactivation_head_conflict")
+        catalog = manifest.source_generations.get(CATALOG_GENERATION)
+        if catalog is not None:
+            published = await connection.fetchval(
+                f"SELECT published_at IS NOT NULL FROM {namespace}.registry_fhir_catalog_snapshot "
+                "WHERE metadata_generation=$1 FOR NO KEY UPDATE",
+                catalog,
+            )
+            if published is not True:
+                raise NetworkServingReactivationError("network_reactivation_target_unavailable")
+            await pair_network_catalog_generation(
+                connection,
+                metadata_generation=catalog,
+                generation_id=generation_id,
+                manifest_sha256=manifest.manifest_sha256,
+                approved_revision=approved_revision,
+                control_schema=namespace[1:-1],
+            )
     return NetworkServingReactivationReceipt(
         current_head, generation_id, approved_revision, manifest.manifest_sha256, has_changed
     )
@@ -77,7 +95,7 @@ async def _reactivate(connection, namespace, generation_id, expected_head, expec
 async def reactivate_network_serving_generation(
     connection, *, generation_id, expected_head, expected_approved_revision, control_schema=None
 ):
-    """Switch only the serving head inside the authorized caller's transaction.
+    """Restore the serving head and its declared catalog in the caller's transaction.
 
     The protected caller must authenticate and authorize this distinct operation
     and persist its actor, reason, immutable command and durable retry receipt.

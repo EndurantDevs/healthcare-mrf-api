@@ -82,6 +82,19 @@ def test_published_query_reads_pointer_and_metadata():
         assert field in query
 
 
+def test_independent_layout_refuses_predecessor_edges(published_entry):
+    candidate = _candidate(published_entry)
+    edges = candidate["validation_json"]["serving_readiness"]["edge_artifacts"]
+    edges[0] = {
+        "candidate_id": "00000000-0000-0000-0000-000000000002",
+        "schema_name": "network_candidate_00000000000000000000000000000002",
+    }
+    assert published.published_network_layout(candidate).artifacts[0].schema_name == edges[0]["schema_name"]
+    candidate["source_generations"]["network_storage"] = "independent-v1"
+    with pytest.raises(published.NetworkServingReadUnavailable, match="references predecessor serving data"):
+        published.published_network_layout(candidate)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("generation", [False, True, 0, -1, 1.0, "3", 2**63])
 async def test_invalid_generation_refuses_before_query(generation):

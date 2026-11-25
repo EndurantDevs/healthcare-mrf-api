@@ -14,19 +14,20 @@ from process.network_address_projection import PinnedAddressSource
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "inventory,physical,requested,recognized,refuses",
+    "inventory,physical,requested,recognized,has_independent_storage,refuses",
     [
-        (None, None, False, False, False),
-        (None, None, True, False, False),
-        (False, False, False, True, False),
-        (False, True, True, False, False),
-        (True, True, True, False, False),
-        (False, False, True, True, True),
-        (False, True, False, False, True),
+        (None, None, False, False, False, False),
+        (None, None, True, False, False, False),
+        (False, False, False, True, False, False),
+        (False, True, True, False, False, False),
+        (True, True, True, False, False, False),
+        (True, True, True, False, True, False),
+        (False, False, True, True, False, True),
+        (False, True, False, False, False, True),
     ],
 )
 async def test_composer_preserves_registered_policy_and_refuses_preparation_races(
-    monkeypatch, inventory, physical, requested, recognized, refuses
+    monkeypatch, inventory, physical, requested, recognized, has_independent_storage, refuses
 ):
     connection, request = object(), UUID(int=8)
     source_pin = PinnedAddressSource("address_fixture", "entity_address_unified", "a" * 64)
@@ -36,6 +37,9 @@ async def test_composer_preserves_registered_policy_and_refuses_preparation_race
     inputs = composition._CompositionInputs(connection, None, approved, None, None, {}, default_inputs)
     monkeypatch.setattr(composition, "_composition_inputs", AsyncMock(return_value=inputs))
     monkeypatch.setattr(composition, "resolve_registered_source_inventory", AsyncMock(return_value=inventory))
+    monkeypatch.setattr(
+        composition, "has_registered_independent_storage", AsyncMock(return_value=has_independent_storage)
+    )
     format_pin = AsyncMock(return_value=physical)
     legacy_pin = AsyncMock(return_value=legacy_inputs if recognized else None)
     monkeypatch.setattr(composition, "resolve_registered_compact_format", format_pin)
@@ -60,6 +64,9 @@ async def test_composer_preserves_registered_policy_and_refuses_preparation_race
     assert await operation == "prepared"
     selected = prepare.await_args.args[0].verified_office_inputs
     assert prepare.await_args.kwargs["inventory"] is (requested if inventory is None else inventory)
+    assert prepare.await_args.args[0].independent_storage is (
+        requested if inventory is None else has_independent_storage
+    )
     assert selected is (default_inputs if inventory is None else legacy_inputs if recognized else None)
     assert register.await_args.args[3] is source_descriptors
     if inventory is None:

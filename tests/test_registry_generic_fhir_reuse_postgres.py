@@ -612,6 +612,47 @@ async def _assert_reused_facts(context, original, rebound):
     )
 
 
+@pytest.mark.parametrize("generic_capture_db", ["modern"], indirect=True)
+async def test_independent_legacy_fhir_stage_owns_all_previous_fact_rows(generic_composition_db):
+    from process.network_approved_membership_source import pin_approved_membership_source
+    from process.network_source_contribution_custody import _drop_stage
+    from process.registry_source_recipe_composition import SourceRecipeReadContext
+
+    context = generic_composition_db
+    fixture = context.fixture
+    owner = await _publish(context, await _compose(context, context.revision))
+    connection = fixture.execution_connection
+    async with connection.transaction(isolation="repeatable_read"):
+        approved = await pin_approved_membership_source(
+            connection, approved_revision=context.revision, control_schema=fixture.control_schema
+        )
+        stage = await stage_registry_source_recipes(
+            connection,
+            (context.recipe,),
+            approved,
+            request_id=uuid4(),
+            control_schema=fixture.control_schema,
+            inventory=True,
+            read_context=SourceRecipeReadContext(
+                source_manifest=owner, verified_office_inputs=(context.address, ()), independent_storage=True
+            ),
+        )
+        try:
+            assert stage.own_fact_rows == stage.reused_fact_rows == stage.copied_reused_fact_rows == 14
+            assert stage.contribution_receipts[0]["fact_candidate_id"] is None
+            assert stage.office_derivations[0]["fact_artifact"]["fact_candidate_id"] is None
+            columns = "recipe_sha256,ordinal,fact_json"
+            prior = await connection.fetch(
+                f'SELECT {columns} FROM "{owner.schema_name}".network_source_contribution ORDER BY ordinal'
+            )
+            current = await connection.fetch(
+                f'SELECT {columns} FROM pg_temp."{stage.contribution_table_name}" ORDER BY ordinal'
+            )
+            assert len(current) == 14 and current == prior
+        finally:
+            await _drop_stage(connection, stage)
+
+
 @pytest.mark.parametrize("generic_capture_db", ["legacy", "modern"], indirect=True)
 async def test_genuine_generic_capture_composes_validates_reuses_and_keeps_old_readers(
     generic_composition_db, monkeypatch

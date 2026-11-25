@@ -24,18 +24,22 @@ from db.connection import Database, current_session
 from process.entity_address_unified import _location_key_expr
 from process.network_address_artifact import NetworkAddressArtifactError, verify_network_address_artifact
 from process.network_address_projection import PinnedAddressSource
-from process.network_compact_layout import CompactAddressRelation
+from process.network_compact_address_origin import resolve_compact_address_origin
+from process.network_compact_layout import INDEPENDENT_STORAGE, INDEPENDENT_STORAGE_KEY, CompactAddressRelation
 from process.network_legacy_membership_source import PinnedACAMembershipSource
 from process.network_membership_candidate_lifecycle import create_network_candidate, seal_network_candidate
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import publish_network_candidate
+from process.network_membership_validation import validate_network_membership_candidate
 from process.network_published_api_pin import published_api_pin_statement
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
+    _record_composition_address,
     compose_registry_membership_candidate,
 )
+from process.registry_compact_composition import prepare_compact_composition_source
 from process.registry_publication_consumer import _publication_address_sources
 from process.registry_retained_generation import RegistryRetainedGenerationError
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
@@ -62,6 +66,102 @@ from tests.test_network_initial_source_office_bindings_postgres import (
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_independent_address_origin_survives_rotation_without_parent_manifest(address_db, monkeypatch):
+    candidate_by_field = {
+        "source_generations": {
+            INDEPENDENT_STORAGE_KEY: INDEPENDENT_STORAGE,
+            "unified_address": address_db.source.generation_id,
+            "retained_network_source": "d" * 64,
+        },
+        "validation_json": {"serving_readiness": {"address_artifact": address_db.descriptor}},
+    }
+    missing_control = "retired_" + uuid4().hex
+    for rotated in (False, True):
+        if rotated:
+            await _rotate(address_db, monkeypatch)
+        async with address_db.reader.transaction(isolation="repeatable_read", readonly=True):
+            descriptor, base = await resolve_compact_address_origin(
+                address_db.reader, candidate_by_field, address_db.source, control_schema=missing_control
+            )
+            assert descriptor == address_db.descriptor
+            assert base.table_name == (
+                descriptor["retained_table"]["table_name"] if rotated else address_db.source.table_name
+            )
+            assert (
+                await address_db.reader.fetchval(f'SELECT location_key FROM "{base.schema_name}"."{base.table_name}"')
+                == "old-office"
+            )
+
+
+async def _register_independent_address(fixture):
+    connection = fixture.execution_connection
+    control = fixture.control_schema
+    candidate_id = uuid4()
+    copy_target = MembershipCopyTarget(
+        fixture.dataset_id,
+        fixture.schema_id,
+        fixture.producer_id,
+        str(candidate_id),
+        "network_candidate_" + candidate_id.hex,
+    )
+    fixture.preparation_ids.append(copy_target.candidate_id)
+    async with connection.transaction(isolation="repeatable_read"):
+        artifact, _ = await prepare_compact_composition_source(
+            connection,
+            RegistryCompositionAddressSources(fixture.source, compact=True),
+            None,
+            fixture.writer_roles,
+            (),
+            SimpleNamespace(source_manifest=None, control_schema=control),
+            independent_storage=True,
+        )
+        await create_network_candidate(
+            connection,
+            copy_target,
+            source_generations={
+                INDEPENDENT_STORAGE_KEY: INDEPENDENT_STORAGE,
+                "unified_address": fixture.source.generation_id,
+                "network_address_origin": artifact.address_artifact_sha256,
+            },
+            approved_custom_revision=0,
+            expected_head=0,
+            expected_rows=0,
+            control_schema=control,
+        )
+        await _record_composition_address(connection, copy_target, fixture.source, control, artifact.address_artifact)
+        await _bind_offices(connection, copy_target, ())
+        await seal_network_candidate(connection, copy_target, control_schema=control)
+    return copy_target, artifact
+
+
+async def test_validation_keeps_the_registered_edition_after_address_rotation(compact_publication_db, monkeypatch):
+    fixture = compact_publication_db
+    connection = fixture.execution_connection
+    control = fixture.control_schema
+    await fixture.connection.execute(
+        f"DELETE FROM \"{fixture.address.schema}\".entity_address_unified WHERE location_key='other-office'"
+    )
+    copy_target, artifact = await _register_independent_address(fixture)
+    await _rotate(fixture.address, monkeypatch)
+    async with connection.transaction(isolation="repeatable_read"):
+        report = await validate_network_membership_candidate(
+            connection, copy_target, fixture.source, control_schema=control
+        )
+        assert report["serving_readiness"] == {"address_artifact": artifact.address_artifact}
+        stored = await connection.fetchrow(
+            f'SELECT source_generations,validation_json FROM "{control}".network_membership_candidate WHERE candidate_id=$1',
+            UUID(copy_target.candidate_id),
+        )
+        _, physical = await resolve_compact_address_origin(
+            connection, stored, fixture.source, control_schema="retired_" + uuid4().hex
+        )
+        assert physical.table_name == artifact.address_artifact["retained_table"]["table_name"]
+        assert (
+            await connection.fetchval(f'SELECT location_key FROM "{physical.schema_name}"."{physical.table_name}"')
+            == "old-office"
+        )
 
 
 @asynccontextmanager

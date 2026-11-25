@@ -176,6 +176,8 @@ async def _composition_artifact(
         )
 
         options = {} if verified_stage is None else {"verified_stage": verified_stage}
+        if read_context.independent_storage:
+            options["independent_storage"] = True
         return await prepare_compact_composition_source(
             connection,
             address_sources,
@@ -293,6 +295,8 @@ async def _prepare_inventory_artifact(
     artifact_builder,
 ):
     """Complete SOURCE and office metadata before its immutable candidate identity is registered."""
+    from process.registry_typed_source_stage import is_typed_source_stage
+
     request_id, _expected_head = request_scope
     phase_artifact, office_revision = office_phase
     recipes, source_stage = recipes_and_stage
@@ -314,6 +318,7 @@ async def _prepare_inventory_artifact(
                 retained_fhir_reads=inputs.retained_fhir_reads,
                 office_matches=source_stage.office_matches,
                 source_witness_runtime=inputs.source_witness_runtime,
+                independent_storage=inputs.independent_storage and is_typed_source_stage(source_stage),
             ),
             (
                 recipes,

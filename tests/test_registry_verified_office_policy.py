@@ -332,14 +332,18 @@ async def test_prepared_address_supports_sealed_replay(monkeypatch):
     candidate["state"] = "open"
 
     async def record(query, *parameters):
-        assert "state='open'" in query and "source_generations->>'unified_address'=$3" in query
-        assert "OR validation_json->'address_source'=$2::jsonb" in query
+        assert "WHERE candidate_id=$1 AND state='open' AND source_generations->>'unified_address'=$3" in query
+        assert "SET validation_json=coalesce(validation_json,'{}'::jsonb)||$2::jsonb" in query
+        assert (
+            "AND NOT EXISTS (SELECT FROM jsonb_each($2::jsonb) wanted "
+            "WHERE c.validation_json ? wanted.key AND c.validation_json->wanted.key IS DISTINCT FROM wanted.value)"
+        ) in query
         assert parameters == (
             UUID(fixture.target.candidate_id),
-            json.dumps(expected, sort_keys=True, separators=(",", ":")),
+            json.dumps({"address_source": expected}, sort_keys=True, separators=(",", ":")),
             fixture.address.generation_id,
         )
-        candidate["validation_json"]["address_source"] = json.loads(parameters[1])
+        candidate["validation_json"].update(json.loads(parameters[1]))
         return [{"recorded": True}]
 
     connection = SimpleNamespace(fetch=record, execute=AsyncMock())

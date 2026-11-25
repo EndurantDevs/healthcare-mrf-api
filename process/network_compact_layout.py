@@ -6,6 +6,17 @@ import re
 from dataclasses import asdict, dataclass
 from uuid import UUID
 
+INDEPENDENT_STORAGE_KEY = "network_storage"
+INDEPENDENT_STORAGE = "independent-v1"
+
+
+def is_independent_network_candidate(candidate):
+    """Return whether the candidate owns its complete network serving storage."""
+    generations = candidate.get("source_generations") or {}
+    if isinstance(generations, str):
+        generations = json.loads(generations)
+    return generations.get(INDEPENDENT_STORAGE_KEY) == INDEPENDENT_STORAGE
+
 
 def compact_identifier(name):
     """Quote one strict physical identifier without accepting SQL fragments."""

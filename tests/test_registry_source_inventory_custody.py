@@ -133,6 +133,21 @@ def test_explicit_root_receipt_preserves_legacy(count):
             store.registry_source_contribution_receipt(stage)
 
 
+@pytest.mark.parametrize("anchored", [False, True])
+def test_independent_inventory_requires_local_facts(anchored):
+    from process.network_compact_layout import INDEPENDENT_STORAGE, INDEPENDENT_STORAGE_KEY
+
+    root, entries, stage, derivations = _inventory((_capture_recipe(),), anchored=anchored)
+    candidate = _candidate(_target(), root, stage, derivations)
+    assert store._inventory_source_metadata(candidate, entries)[0] == root
+    candidate["source_generations"][INDEPENDENT_STORAGE_KEY] = INDEPENDENT_STORAGE
+    if anchored:
+        with pytest.raises(store.RegistrySourceContributionError, match="inventory_invalid"):
+            store._inventory_source_metadata(candidate, entries)
+    else:
+        assert store._inventory_source_metadata(candidate, entries)[0] == root
+
+
 @pytest.mark.parametrize("damage", ["missing", "list", "partial", "reversed", "header", "incomplete"])
 def test_supplied_inventory_requires_complete_fold(damage):
     root, entries, stage, derivations = _inventory((_example(0), _example(1)))

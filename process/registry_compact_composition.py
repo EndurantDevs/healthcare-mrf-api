@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 from process.network_address_projection import PinnedAddressSource
 from process.network_compact_address_origin import resolve_compact_address_origin
+from process.network_compact_layout import INDEPENDENT_STORAGE, INDEPENDENT_STORAGE_KEY
 from process.registry_initial_source_composition import prepare_source_offices
 
 COMPACT_FORMAT_KEY = "network_serving_format"
@@ -17,6 +18,7 @@ class CompactCompositionAddressSource:
     runtime_roles: tuple[str, ...]
     address_artifact_sha256: str
     origin_manifest_sha256: str | None = None
+    address_artifact: dict | None = None
 
     @property
     def generation_sha256(self):
@@ -25,12 +27,22 @@ class CompactCompositionAddressSource:
 
 
 async def prepare_compact_composition_source(
-    connection, address_sources, approved, writer_roles, recipes, request, *, verified_stage=None
+    connection,
+    address_sources,
+    approved,
+    writer_roles,
+    recipes,
+    request,
+    *,
+    verified_stage=None,
+    independent_storage=False,
 ):
     """Resolve the named address edition and its optional retained publication origin."""
     roles = tuple(sorted(set(writer_roles["loader_roles"] + writer_roles["reader_roles"])))
     source_manifest = request.source_manifest
     generations_by_source = {"unified_address": address_sources.base_source.generation_id}
+    if independent_storage:
+        generations_by_source[INDEPENDENT_STORAGE_KEY] = INDEPENDENT_STORAGE
     if source_manifest is not None:
         generations_by_source["retained_network_source"] = source_manifest.manifest_sha256
     descriptor, physical = await resolve_compact_address_origin(
@@ -61,7 +73,11 @@ async def prepare_compact_composition_source(
             replace(request, runtime_roles=roles, origin_manifest_sha256=origin),
         )
     return CompactCompositionAddressSource(
-        address_sources.base_source, roles, descriptor["descriptor_sha256"], origin
+        address_sources.base_source,
+        roles,
+        descriptor["descriptor_sha256"],
+        origin,
+        descriptor if independent_storage else None,
     ), summary
 
 
