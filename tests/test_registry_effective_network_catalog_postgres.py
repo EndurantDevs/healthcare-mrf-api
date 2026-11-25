@@ -48,7 +48,7 @@ async def test_imported_network_visible_without_any_manual_approval(effective_ca
     assert await db.connection.fetchval(f'SELECT count(*) FROM "{db.control}".registry_approved_record') == 0
 
 
-async def test_manual_name_archive_and_binding_override_remain_authoritative(effective_catalog_db):
+async def test_manual_name_archive_and_binding_override_remain_authoritative(effective_catalog_db, monkeypatch):
     db = effective_catalog_db
     await manual_record(
         db, "network", 7, {"network_id": 7, "display_name": "Manual name", "aliases": [], "archived": True}
@@ -68,6 +68,11 @@ async def test_manual_name_archive_and_binding_override_remain_authoritative(eff
             "archived": False,
         },
     )
+
+    def unexpected_full_check(_ctes):
+        pytest.fail("Unambiguous manual overrides should avoid scanning imported bindings for conflicts")
+
+    monkeypatch.setattr(effective, "_catalog_conflict_sql", unexpected_full_check)
     catalog_records = await effective.effective_catalog_sql(db.connection, db.manifest, db.control)
     native_binding = await db.connection.fetchrow(
         "SELECT record_json FROM "
@@ -231,6 +236,53 @@ async def test_conflicting_current_manual_bindings_fail_closed(effective_catalog
         )
     with pytest.raises(ValueError, match="binding_conflict"):
         await effective.effective_catalog_sql(db.connection, db.manifest, db.control)
+
+
+@pytest.mark.parametrize("source_key", ["network-one", "unmatched"])
+async def test_missing_manual_target_refuses_only_a_matching_override(effective_catalog_db, source_key):
+    db = effective_catalog_db
+    await manual_record(
+        db,
+        "network_binding",
+        uuid4(),
+        {
+            "network_id": 8,
+            "source_system": "fhir",
+            "source_id": "source-alias",
+            "source_key": source_key,
+            "archived": False,
+        },
+    )
+    if source_key == "network-one":
+        with pytest.raises(ValueError, match="binding_conflict"):
+            await effective.effective_catalog_sql(db.connection, db.manifest, db.control)
+    else:
+        assert await effective.effective_catalog_sql(db.connection, db.manifest, db.control) is not None
+
+
+@pytest.mark.parametrize("checksum", [17.0, 18.0])
+async def test_aca_conflict_check_matches_legacy_plan_and_checksum(effective_catalog_db, checksum):
+    db = effective_catalog_db
+    for network_id, key, producer in (
+        (8, "ACAPlan/12345CA1234567/17", "registry-native-network-source-v1"),
+        (9, "12345CA1234567", "retained-aca"),
+    ):
+        await manual_record(db, "network", network_id, {"network_id": network_id, "archived": False})
+        await manual_record(
+            db,
+            "network_binding",
+            uuid4(),
+            {
+                "network_id": network_id,
+                "source_system": "aca",
+                "source_key": key,
+                "producer_id": producer,
+                "source_scope_json": {"checksum_network": checksum},
+                "archived": False,
+            },
+        )
+    check = effective._manual_bindings_may_conflict_sql(f'"{db.control}"', db.manifest.approved_custom_revision)
+    assert await db.connection.fetchval(check) is (checksum == 17.0)
 
 
 async def test_pairing_rejects_changed_manifest_and_rolls_back_head_mismatch(effective_catalog_db):
