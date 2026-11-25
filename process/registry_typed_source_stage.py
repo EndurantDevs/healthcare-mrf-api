@@ -346,9 +346,6 @@ async def _stage_typed_source_recipes(
             + _identifier(table)
             + "(network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,evidence_id text NOT NULL)"
         )
-        from process.registry_typed_membership_parity import create_order_index
-
-        await create_order_index(connection, "pg_temp." + _identifier(table), table + "_order_idx")
         mapped_outputs = await _map_typed_recipes(
             connection, recipes, approved, table, read_context, source_reader, retained_proofs, control_schema
         )
@@ -364,7 +361,6 @@ async def _copy_combined_stage(connection, typed_stage, legacy_stage, request_id
 
     matches = typed_stage.office_matches
     name = "registry_source_page_" + uuid5(request_id, "mixed:" + recipe_hash + approved.generation_id).hex
-    from process.registry_typed_membership_parity import create_order_index
 
     await connection.execute(
         "CREATE TEMP TABLE "
@@ -373,7 +369,6 @@ async def _copy_combined_stage(connection, typed_stage, legacy_stage, request_id
         + _identifier(typed_stage.table_name)
         + " INCLUDING CONSTRAINTS)"
     )
-    await create_order_index(connection, "pg_temp." + _identifier(name), name + "_order_idx")
     await connection.execute(
         "INSERT INTO pg_temp."
         + _identifier(name)
@@ -446,16 +441,6 @@ async def _copy_typed_offices(connection, copy_target, stage):
     await _copy_bindings(connection, copy_target, ())
     target_relation = _identifier(copy_target.schema_name) + ".provider_location_binding"
     index = _identifier(copy_target.schema_name) + ".typed_office_location_idx"
-    if await connection.fetchval("SELECT to_regclass($1)", index) is None:
-        require(
-            not await connection.fetchval("SELECT EXISTS(SELECT FROM " + target_relation + ")"),
-            "office_index_requires_empty_heap",
-        )
-        await connection.execute(
-            "CREATE INDEX typed_office_location_idx ON "
-            + target_relation
-            + "(location_key,provider_system,provider_id,entity_type,entity_id)"
-        )
     source_relation = "pg_temp." + _identifier(stage.office_matches.table_name)
     require(
         not await connection.fetchval(
@@ -476,6 +461,14 @@ async def _copy_typed_offices(connection, copy_target, stage):
         + source_relation
         + " ON CONFLICT DO NOTHING"
     )
+    if await connection.fetchval("SELECT to_regclass($1)", index) is None:
+        await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
+        await connection.execute(
+            "CREATE INDEX typed_office_location_idx ON "
+            + target_relation
+            + "(location_key,provider_system,provider_id,entity_type,entity_id)"
+        )
+    await connection.execute("ANALYZE " + target_relation)
 
 
 async def record_typed_source_offices(

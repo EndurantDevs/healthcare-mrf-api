@@ -167,13 +167,6 @@ async def materialize_registry_composition(connection, copy_target, command_stag
         raise RegistrySourceRetentionError("registry_composition_effective_not_empty")
     from process.registry_typed_membership_parity import create_order_index, is_typed_candidate
 
-    if is_typed_candidate(candidate):
-        await create_order_index(connection, table, "typed_effective_membership_order_idx")
-        await connection.execute(f"CREATE INDEX IF NOT EXISTS network_membership_network_idx ON {table}(network_id)")
-        await connection.execute(
-            f"CREATE INDEX IF NOT EXISTS network_membership_projection_idx ON {table}"
-            "(provider_system,provider_id,location_id,network_id)"
-        )
     source_relation = '"' + copy_target.schema_name + '".' + SOURCE_TABLE
     status = await connection.execute(
         f"INSERT INTO {table} {_allowed_source(source_relation, command_stage)}"
@@ -182,6 +175,12 @@ async def materialize_registry_composition(connection, copy_target, command_stag
     if status != f"INSERT 0 {receipt['effective_rows']}":
         raise RegistrySourceRetentionError("registry_composition_command_accounting_invalid")
     if is_typed_candidate(candidate):
+        await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
+        await create_order_index(connection, table, "typed_effective_membership_order_idx", allow_populated=True)
+        await connection.execute(
+            f"CREATE INDEX IF NOT EXISTS network_membership_projection_idx ON {table}"
+            "(provider_system,provider_id,location_id,network_id)"
+        )
         await connection.execute(f"ANALYZE {table}")
     await connection.execute(
         f"UPDATE {namespace}.network_membership_candidate SET accepted_rows=$2 WHERE candidate_id=$1",

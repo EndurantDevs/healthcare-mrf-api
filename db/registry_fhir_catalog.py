@@ -116,6 +116,7 @@ def table_sql(namespace, table, *, trigram_schema="public"):
         raise ValueError("registry_fhir_catalog_table_invalid")
     statements = [f"CREATE TABLE {namespace}.{table} ({_TABLE_DEFINITIONS[table]})"]
     indexes_by_table = {
+        "registry_fhir_catalog_source": (("registry_fhir_catalog_source_id_idx", "(source_id text_pattern_ops)"),),
         "registry_fhir_catalog_observation": (
             (
                 "registry_fhir_catalog_observation_network_idx",

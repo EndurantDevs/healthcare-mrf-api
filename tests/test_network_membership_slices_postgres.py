@@ -344,8 +344,32 @@ async def test_reuse_add_remove_move_and_empty_bucket(slice_db):
     assert (empty_receipt.total_slices, empty_receipt.removed_slices, empty_receipt.copied_edge_rows) == (0, 3, 0)
 
 
+async def _assert_independent_edge_collation_and_indexes(db, schema_name):
+    """Verify independent office edges match the address collation and expected indexes."""
+    edge_collation = await db.connection.fetchval(
+        "SELECT attcollation FROM pg_attribute "
+        "WHERE attrelid=to_regclass($1) AND attname='location_key' AND NOT attisdropped",
+        f'"{schema_name}".network_office_edge',
+    )
+    address_collation = await db.connection.fetchval(
+        "SELECT attcollation FROM pg_attribute "
+        "WHERE attrelid=to_regclass($1) AND attname='location_key' AND NOT attisdropped",
+        f'"{db.source.schema_name}"."{db.source.table_name}"',
+    )
+    assert edge_collation == address_collation
+    index_rows = await db.connection.fetch(
+        "SELECT indexname FROM pg_indexes WHERE schemaname=$1 AND tablename='network_office_edge'",
+        schema_name,
+    )
+    assert {index_row["indexname"] for index_row in index_rows} == {
+        "network_office_edge_pkey",
+        "network_office_edge_location_idx",
+    }
+
+
 @pytest.mark.asyncio
 async def test_independent_copy_restarts_and_keeps_only_local_edges(slice_db):
+    """Independent candidates reject prior slices, recover from interruption, and keep local edges."""
     from process.network_compact_preparation import _previous_slices
 
     db = slice_db
@@ -396,6 +420,7 @@ async def test_independent_copy_restarts_and_keeps_only_local_edges(slice_db):
     assert {(edge["network_id"], edge["location_key"]) for edge in edge_rows} == {
         (network, db.keys[office]) for network, office in pairs
     }
+    await _assert_independent_edge_collation_and_indexes(db, next_target.schema_name)
 
 
 @pytest.mark.asyncio

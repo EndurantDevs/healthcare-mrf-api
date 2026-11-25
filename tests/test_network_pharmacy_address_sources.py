@@ -33,8 +33,9 @@ async def test_catalog_backed_endpoint_keeps_scope_through_filtered_reads(monkey
         "(SELECT * FROM synthetic_networks)",
     )
 
-    async def projection(actual, selected, control, *, stage, result):
+    async def projection(actual, selected, control, *, stage, result, selected_networks=None):
         assert actual is driver and selected is manifest and control
+        assert selected_networks == ("ARRAY[7]::integer[]" if stage == "records" else None)
         if failure == stage:
             raise ValueError("catalog unavailable")
         return result
@@ -63,7 +64,9 @@ async def test_catalog_backed_endpoint_keeps_scope_through_filtered_reads(monkey
     for name in ("read_network_provider_page", "read_network_provider_detail", "read_network_provider_only_page"):
         monkeypatch.setattr(network_providers, name, AsyncMock(side_effect=page))
     monkeypatch.setattr(
-        catalog, "effective_catalog_sql", lambda *args: projection(*args, stage="records", result=catalog_records_sql)
+        catalog,
+        "effective_catalog_sql",
+        lambda *args, **kwargs: projection(*args, **kwargs, stage="records", result=catalog_records_sql),
     )
     monkeypatch.setattr(
         catalog,

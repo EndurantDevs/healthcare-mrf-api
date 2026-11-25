@@ -12,7 +12,7 @@ from process.registry_typed_membership_parity import (
 
 _DOMAIN = b"network-office-slice-v1\0"
 _METADATA_ROWS = 256
-_MATCH_ROWS = 50_000
+_MATCH_ROWS = 250_000
 
 
 def _parameters(start):
@@ -27,17 +27,15 @@ def _page_range(after, upper):
     return columns + ">" + _parameters(1) + " AND " + columns + "<=" + _parameters(6), (*after, *upper)
 
 
-async def _insert_matched_page(connection, tables, bounds, affected):
+def _matched_page_sql(tables, condition, affected):
     membership, bindings, addresses, work, locations = tables
-    condition, arguments = bounds
     affected_filter = (
         "TRUE"
         if affected is None
         else f"EXISTS(SELECT FROM {affected} changed WHERE changed.network_id=m.network_id AND changed.office_bucket=(get_byte(sha256(convert_to(b.location_key,'UTF8')),0)&63))"
     )
     ordered_fields = ",".join("m." + term for term in ORDER.split(","))
-    statement = await connection.prepare(
-        f"""WITH source_page AS NOT MATERIALIZED (
+    return f"""WITH source_page AS NOT MATERIALIZED (
       SELECT m.* FROM {membership} m WHERE {condition} ORDER BY {ordered_fields} FETCH FIRST {_MATCH_ROWS} ROWS WITH TIES
     ), subjects AS NOT MATERIALIZED (
       SELECT network_id,provider_system,provider_id,location_id,count(*)::bigint AS membership_rows
@@ -58,10 +56,16 @@ async def _insert_matched_page(connection, tables, bounds, affected):
       ON CONFLICT(network_id,office_bucket,location_key) DO UPDATE SET membership_rows=prior.membership_rows+excluded.membership_rows
       RETURNING location_key
     ) INSERT INTO {locations} SELECT DISTINCT location_key FROM accumulated WHERE location_key IS NOT NULL ON CONFLICT DO NOTHING"""
-    )
-    await statement.fetch(
-        *arguments,
-    )
+
+
+async def _insert_matched_page(connection, tables, bounds, affected, *, statements_by_condition=None):
+    condition, arguments = bounds
+    statement = statements_by_condition.get(condition) if statements_by_condition is not None else None
+    if statement is None:
+        statement = await connection.prepare(_matched_page_sql(tables, condition, affected))
+        if statements_by_condition is not None:
+            statements_by_condition[condition] = statement
+    await statement.fetch(*arguments)
 
 
 async def build_matched_facts(connection, schema, addresses, work, affected):
@@ -73,6 +77,8 @@ async def build_matched_facts(connection, schema, addresses, work, affected):
     await connection.execute(f"""CREATE TEMP TABLE {work}(network_id integer,location_key text COLLATE "C",office_bucket integer,membership_rows bigint NOT NULL,
       UNIQUE NULLS NOT DISTINCT(network_id,office_bucket,location_key)) ON COMMIT DROP""")
     await connection.execute(f'CREATE TEMP TABLE {locations}(location_key text COLLATE "C" PRIMARY KEY) ON COMMIT DROP')
+    tables = (membership, schema + ".provider_location_binding", addresses, work, locations)
+    statements_by_condition = {}
     after = None
     while (
         endpoint := await _last_page_key(
@@ -82,9 +88,10 @@ async def build_matched_facts(connection, schema, addresses, work, affected):
         upper_keys = tuple(endpoint)
         await _insert_matched_page(
             connection,
-            (membership, schema + ".provider_location_binding", addresses, work, locations),
+            tables,
             _page_range(after, upper_keys),
             affected,
+            statements_by_condition=statements_by_condition,
         )
         after = upper_keys
     accounting_by_field = dict(

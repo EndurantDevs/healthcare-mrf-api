@@ -16,6 +16,7 @@ from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import MAX_CORE_BYTES, NESTED_LIMIT, SNAPSHOT_COLUMNS, VIEW
 from db.registry_schema import registry_schema
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_compact_layout import CompactNetworkLayout
 from process.network_published_api_pin import read_published_api_pin
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import (
@@ -492,7 +493,7 @@ WITH source_companies AS MATERIALIZED (
  WHERE $12::text[] IS NULL OR company.source_id=($12::text[])[2]
 ), searched_edges AS MATERIALIZED (
  SELECT edge.network_id,edge.relationship_id FROM {control}.registry_fhir_catalog_relationship edge
- WHERE edge.metadata_generation=$1
+ WHERE edge.metadata_generation=$1 AND $10::text IS NOT NULL
    AND (edge.company_search LIKE $10 ESCAPE '\' OR edge.plan_search LIKE $10 ESCAPE '\')
 ), matching_edges AS NOT MATERIALIZED (
  SELECT edge.network_id,edge.relationship_id,edge.source_generation,binding.binding_id,
@@ -529,6 +530,7 @@ WITH source_companies AS MATERIALIZED (
  FROM {control}.registry_fhir_catalog_binding binding
  JOIN source_companies company ON company.source_generation=split_part(binding.document_json->>'evidence_id',':',1)
  WHERE binding.metadata_generation=$1 AND $5::uuid IS NULL AND $6::uuid IS NULL
+   AND ($7::text IS NOT NULL OR $10::text IS NOT NULL)
    AND ($7::text IS NULL OR lower(company.display_name) LIKE $7 ESCAPE '\')
    AND ($12::text[] IS NULL OR ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
      binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
@@ -608,10 +610,21 @@ def _catalog_page_statement(snapshot, manifest):
     parameters = ()
     directory_available = "false"
     if manifest is not None:
-        addresses, parameters = catalog_directory_relation(manifest, first_parameter=20)
-        directory_available = _DIRECTORY_AVAILABLE_SQL.format(
-            candidate=storage_identifier(manifest.schema_name), addresses=addresses
-        )
+        layout = manifest.compact_layout
+        if layout is not None:
+            if type(layout) is not CompactNetworkLayout:
+                raise ValueError("Verified compact layout is required")
+            ref_map = (
+                storage_identifier(layout.ref_map.schema_name) + "." + storage_identifier(layout.ref_map.table_name)
+            )
+            directory_available = (
+                f"EXISTS (SELECT FROM ONLY {ref_map} ref WHERE ref.network_id=page.network_id AND ref.row_count>0)"
+            )
+        else:
+            addresses, parameters = catalog_directory_relation(manifest, first_parameter=20)
+            directory_available = _DIRECTORY_AVAILABLE_SQL.format(
+                candidate=storage_identifier(manifest.schema_name), addresses=addresses
+            )
     return (
         _PAGE_SQL.format(control=storage_identifier(snapshot["schema_name"]), directory_available=directory_available),
         parameters,

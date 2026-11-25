@@ -241,14 +241,19 @@ async def test_preparing_provider_projection_uses_stage_facts_and_open_scope(mon
         assert actual is stage and authority is approved and schema == "control"
         events.append("append")
 
+    async def finish(_connection, relation):
+        assert relation == '"fixture".network_provider_only_evidence'
+        events.append("finish")
+
     monkeypatch.setattr(projection, "_candidate", scope)
     monkeypatch.setattr(projection, "create_provider_only_projection", create)
     monkeypatch.setattr(projection, "_append_staged_sources", append)
+    monkeypatch.setattr(projection, "_finish_provider_only_projection", finish)
     monkeypatch.setattr(projection, "_rebuild_source", AsyncMock(side_effect=AssertionError("Raw SOURCE reopened")))
     await projection.prepare_provider_only_projection(
         object(), copy_target, (), stage, approved, control_schema="control"
     )
-    assert events == ["scope", "create", "append"]
+    assert events == ["scope", "create", "append", "finish"]
 
 
 async def test_retained_flat_fallback_discards_inherited_empty_selection_marker(monkeypatch):

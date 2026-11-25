@@ -177,14 +177,19 @@ async def _create_slice_relations(connection, candidate_schema, *, typed=False, 
         content_sha256 varchar(64) NOT NULL CHECK(content_sha256~'^[0-9a-f]{{64}}$'),
         PRIMARY KEY(network_id,office_bucket))
     """)
-    location_collation = ' COLLATE "C"' if independent else ""
-    await connection.execute(f"""CREATE TABLE {candidate_schema}.network_office_edge(
-        slice_id uuid NOT NULL CHECK(slice_id<>'00000000-0000-0000-0000-000000000000'),
-        location_key varchar(64){location_collation} NOT NULL CHECK(length(location_key)>0), PRIMARY KEY(slice_id,location_key))
-    """)
-    await connection.execute(
-        f"CREATE INDEX network_office_edge_location_idx ON {candidate_schema}.network_office_edge(location_key,slice_id)"
-    )
+    if independent:
+        await connection.execute(f"""CREATE TABLE {candidate_schema}.network_office_edge(
+            slice_id uuid NOT NULL CHECK(slice_id<>'00000000-0000-0000-0000-000000000000'),
+            location_key varchar(64) NOT NULL CHECK(length(location_key)>0))
+        """)
+    else:
+        await connection.execute(f"""CREATE TABLE {candidate_schema}.network_office_edge(
+            slice_id uuid NOT NULL CHECK(slice_id<>'00000000-0000-0000-0000-000000000000'),
+            location_key varchar(64) NOT NULL CHECK(length(location_key)>0), PRIMARY KEY(slice_id,location_key))
+        """)
+        await connection.execute(
+            f"CREATE INDEX network_office_edge_location_idx ON {candidate_schema}.network_office_edge(location_key,slice_id)"
+        )
     if typed and not independent:
         await connection.execute(
             f'CREATE INDEX network_office_edge_c_order_idx ON {candidate_schema}.network_office_edge(slice_id,location_key COLLATE "C")'
@@ -326,9 +331,16 @@ async def _office_relation(connection, copy_target, address_source, office_sourc
     return compact_base_relation_sql(office_sources), relation
 
 
-async def _finish_slice_relations(connection, copy_target, work_table, *, typed=False):
+async def _finish_slice_relations(connection, copy_target, work_table, *, typed=False, independent=False):
     """Index and analyze only the completed candidate before recording its relations."""
     schema = _identifier(copy_target.schema_name)
+    if independent or not typed:
+        await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
+    if independent:
+        await connection.execute(f"ALTER TABLE {schema}.network_office_edge ADD PRIMARY KEY (slice_id,location_key)")
+        await connection.execute(
+            f"CREATE INDEX network_office_edge_location_idx ON {schema}.network_office_edge(location_key,slice_id)"
+        )
     if not typed:
         await connection.execute(
             f"CREATE INDEX network_slice_ref_slice_lookup_idx ON {schema}.network_slice_ref "
@@ -415,7 +427,7 @@ async def _prepare_slices(
             WHERE NOT EXISTS(SELECT 1 FROM {schema}.network_slice_ref r
                 WHERE r.network_id=p.network_id AND r.office_bucket=p.office_bucket)""")
         )
-        await _finish_slice_relations(connection, copy_target, work_table, **({"typed": True} if is_typed else {}))
+        await _finish_slice_relations(connection, copy_target, work_table, typed=is_typed, independent=is_independent)
     return NetworkMembershipSliceReceipt(
         copy_target.candidate_id,
         address_source.generation_id,

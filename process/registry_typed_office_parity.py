@@ -5,12 +5,12 @@ from process.network_address_projection import _identifier
 from process.network_custom_address_source import _APPROVED_CTE
 
 _KEYS = "provider_system,provider_id,location_id"
-_PAGE_SIZE = 5000
+_PAGE_SIZE = 50_000
 
 
-async def create_source_pair_index(connection, relation):
-    """Install the lookup while the isolated candidate source heap is still empty."""
-    if await connection.fetchval(f"SELECT EXISTS(SELECT FROM {relation})"):
+async def create_source_pair_index(connection, relation, *, allow_populated=False):
+    """Install the source office lookup index, optionally after bulk loading."""
+    if not allow_populated and await connection.fetchval(f"SELECT EXISTS(SELECT FROM {relation})"):
         raise ValueError("registry_typed_office_index_requires_empty_heap")
     await connection.execute(f"CREATE INDEX IF NOT EXISTS typed_source_office_idx ON {relation}({_KEYS})")
 

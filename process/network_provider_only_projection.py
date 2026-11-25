@@ -168,44 +168,53 @@ async def _create_evidence_heap(connection, relation, *, temporary=False):
       PRIMARY KEY(network_id,provider_system,provider_id,evidence_id))""")
 
 
-async def create_provider_only_projection(connection, copy_target, *, control_schema=None):
+async def create_provider_only_projection(connection, copy_target, *, control_schema=None, defer_secondary_index=False):
     """Create an empty preparation heap for the exact open candidate, never a sentinel."""
     await _candidate(connection, copy_target, None, control_schema, preparing=True)
     relation = _relation(copy_target.schema_name)
     await _create_evidence_heap(connection, relation)
-    await connection.execute(f"""CREATE INDEX provider_only_identity_idx ON {relation}
+    if not defer_secondary_index:
+        await connection.execute(f"""CREATE INDEX provider_only_identity_idx ON {relation}
+          (provider_system,provider_id,network_id,evidence_id)""")
+
+
+async def _finish_provider_only_projection(connection, relation):
+    await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
+    await connection.execute(f"""CREATE INDEX IF NOT EXISTS provider_only_identity_idx ON {relation}
       (provider_system,provider_id,network_id,evidence_id)""")
+    await connection.execute(f"ANALYZE {relation}")
 
 
 async def prepare_provider_only_projection(connection, copy_target, recipes, stage, approved, *, control_schema=None):
     """Project producer facts without reopening SOURCE; independent custody still checks every row."""
     from process.registry_typed_source_stage import is_typed_source_stage
 
+    relation = _relation(copy_target.schema_name)
     if is_typed_source_stage(stage):
         await _candidate(connection, copy_target, approved, control_schema, preparing=True)
-        await create_provider_only_projection(connection, copy_target, control_schema=control_schema)
-        await _append_typed_staged_sources(
-            connection, _relation(copy_target.schema_name), recipes, stage, approved, control_schema
+        await create_provider_only_projection(
+            connection, copy_target, control_schema=control_schema, defer_secondary_index=True
         )
-        await _append_native_staged_sources(
-            connection, _relation(copy_target.schema_name), recipes, stage, approved, control_schema
-        )
+        await _append_typed_staged_sources(connection, relation, recipes, stage, approved, control_schema)
+        await _append_native_staged_sources(connection, relation, recipes, stage, approved, control_schema)
+        await _finish_provider_only_projection(connection, relation)
         return
     recipes_by_identity, descriptors_by_identity = _staged_sources(recipes, stage)
     await _candidate(connection, copy_target, approved, control_schema, preparing=True)
-    await create_provider_only_projection(connection, copy_target, control_schema=control_schema)
+    await create_provider_only_projection(
+        connection, copy_target, control_schema=control_schema, defer_secondary_index=True
+    )
     await _append_staged_sources(
         connection,
-        _relation(copy_target.schema_name),
+        relation,
         recipes_by_identity,
         descriptors_by_identity,
         stage,
         approved,
         control_schema,
     )
-    await _append_native_staged_sources(
-        connection, _relation(copy_target.schema_name), recipes, stage, approved, control_schema
-    )
+    await _append_native_staged_sources(connection, relation, recipes, stage, approved, control_schema)
+    await _finish_provider_only_projection(connection, relation)
 
 
 def _source_query(recipe, fact_relation, control_schema, *, descriptor_version=None):

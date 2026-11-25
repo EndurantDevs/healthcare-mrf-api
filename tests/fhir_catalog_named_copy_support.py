@@ -100,8 +100,8 @@ async def _copied_schema(connection, schema, tables, reader):
 
 async def _native_refusals(held, metadata, snapshot):
     connection, reader = held.fixture.connection, held.fixture.roles["reader"]
-    base = held.retained.compact_layout.base
-    relation = f'"{base.schema_name}"."{base.table_name}"'
+    ref_map = held.retained.compact_layout.ref_map
+    relation = f'"{ref_map.schema_name}"."{ref_map.table_name}"'
     await connection.execute(f'REVOKE SELECT ON {relation} FROM "{reader}"')
     try:
         assert (await _response(held))[0] == 503
@@ -172,11 +172,11 @@ async def assert_copied_fhir_view(held, monkeypatch):
             "registry_approved_record",
         )
         connection, reader = held.fixture.connection, held.fixture.roles["reader"]
-        base = held.retained.compact_layout.base
+        ref_map = held.retained.compact_layout.ref_map
         async with (
             _copied_schema(connection, held.fixture.control_schema, controls, reader),
             _copied_schema(connection, metadata.target.schema_name, sorted(PHYSICAL_TABLES), reader),
-            _copied_schema(connection, base.schema_name, (base.table_name,), reader),
+            _copied_schema(connection, ref_map.schema_name, (ref_map.table_name,), reader),
         ):
             assert await _response(held) == before
             raw = await connection.fetchval(

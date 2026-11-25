@@ -19,9 +19,9 @@ def is_typed_candidate(candidate):
     return receipt is not None and receipt["revision"] == 6
 
 
-async def create_order_index(connection, relation, name):
-    """Create on an empty producer heap, so index construction cannot sort the full publication."""
-    if await connection.fetchval("SELECT EXISTS(SELECT FROM " + relation + ")"):
+async def create_order_index(connection, relation, name, *, allow_populated=False):
+    """Install the bounded-range order index; callers may build after bulk loading."""
+    if not allow_populated and await connection.fetchval("SELECT EXISTS(SELECT FROM " + relation + ")"):
         raise ValueError("registry_typed_parity_index_requires_empty_heap")
     await connection.execute("CREATE INDEX IF NOT EXISTS " + _identifier(name) + " ON " + relation + "(" + ORDER + ")")
 

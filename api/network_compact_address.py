@@ -181,7 +181,15 @@ def compact_npi_page(layout, network_ids, address_type, full_page):
     """Fill a small page from the indexed office prefix, or run the full selection."""
     _validate_address_selection(layout, network_ids, None, True)
     offices = _office_rows(layout, "location_key,npi,inferred_npi,type")
-    membership = _selected_office_predicate(layout, location_lookup=True)
+    if layout.geo_search is not None and layout.artifacts:
+        membership = (
+            f"EXISTS (SELECT FROM ONLY {_relation(layout.geo_search)} projected "
+            "WHERE projected.location_key=office.location_key "
+            "AND projected.canonical_network_ids OPERATOR(public.&&) CAST(:_canonical_network_ids AS integer[]) "
+            "OFFSET 0)"
+        )
+    else:
+        membership = _selected_office_predicate(layout, location_lookup=True)
     # A full page is exact: every office with a lower NPI was in the prefix.
     return f"""
     WITH prefix_page AS MATERIALIZED (
@@ -227,7 +235,7 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup,
         for name in working_columns
     )
     query = f"SELECT {output_columns} FROM ({base}) office"
-    if network_ids is not None and zip_lookup and layout.geo_search is not None:
+    if network_ids is not None and zip_lookup and layout.geo_search is not None and layout.artifacts:
         # Probe membership by office key after ZIP filtering, including offices without coordinates.
         scoped = (
             query

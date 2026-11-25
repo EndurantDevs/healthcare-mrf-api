@@ -740,3 +740,8 @@ async def test_final_response_envelope_is_bounded_even_when_every_network_row_fi
     connection.fetchrow.return_value = {"total": 100, "rows_json": rows_json}
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="response_bounds"):
         await catalog.read_fhir_catalog(connection, catalog.FHIRCatalogQuery(limit=100), excluded_network_ids=())
+
+
+def test_page_sql_guards_search_materialized_ctes_when_unfiltered():
+    assert "WHERE edge.metadata_generation=$1 AND $10::text IS NOT NULL" in catalog._PAGE_SQL
+    assert "AND ($7::text IS NOT NULL OR $10::text IS NOT NULL)" in catalog._PAGE_SQL
