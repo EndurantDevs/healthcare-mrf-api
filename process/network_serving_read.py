@@ -210,8 +210,9 @@ def _pinned_manifest(entry, *, layout=None):
         object.__setattr__(pinned, "_compact_layout", layout)
         report = _object(candidate["validation_json"])
         serving = report["serving_readiness"]
-        has_indexed_addresses = (
-            serving.get("address_artifact", {}).get("contract") == "network_indexed_address_artifact.postgres.v1"
+        address_contract = serving.get("address_artifact", {}).get("contract")
+        has_indexed_addresses = address_contract == "network_indexed_address_artifact.postgres.v1" or (
+            address_contract == "network_address_artifact.postgres.v1" and serving.get("index_definition_revision") == 2
         )
         contributions = report.get("registry_source_contributions") or {}
         offices = report.get("registry_initial_source_offices") or {}

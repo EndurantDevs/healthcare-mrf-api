@@ -80,6 +80,16 @@ async def test_manual_name_archive_and_binding_override_remain_authoritative(eff
         + " effective WHERE record_kind='network_binding' AND record_key='00000000-0000-0000-0000-000000000001'"
     )
     assert json.loads(native_binding["record_json"])["network_id"] == 8
+    scoped = await effective.effective_catalog_sql(
+        db.connection, db.manifest, db.control, selected_networks="$1::integer[]"
+    )
+    scoped_lookup = (
+        "SELECT record_json FROM "
+        + scoped
+        + " effective WHERE record_kind='network_binding' AND record_key='00000000-0000-0000-0000-000000000001'"
+    )
+    assert await db.connection.fetchrow(scoped_lookup, [8]) == native_binding
+    assert await db.connection.fetchrow(scoped_lookup, [7]) is None
     count = await _selected_networks(db.connection, (8,), db.manifest, (), db.control, None)
     assert count == (8,)
     with pytest.raises(catalog.RegistryNetworkCatalogError):
@@ -88,6 +98,7 @@ async def test_manual_name_archive_and_binding_override_remain_authoritative(eff
         f"UPDATE \"{db.control}\".registry_approved_record SET record_json=record_json||'{{\"archived\":true}}' WHERE record_kind='network_binding'"
     )
     catalog_records = await effective.effective_catalog_sql(db.connection, db.manifest, db.control)
+    assert await db.connection.fetchrow(scoped_lookup, [8]) is None
     assert (
         await db.connection.fetchval(
             "SELECT count(*) FROM "

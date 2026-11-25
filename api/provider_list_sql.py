@@ -282,6 +282,83 @@ def _provider_list_address_type_clause(
     return f"{alias}.type = 'primary'"
 
 
+def _append_available_filter(
+    address_clauses: list[str],
+    array_clause: str,
+    exists_clause: str,
+    *,
+    is_array_available: bool,
+    is_table_available: bool,
+) -> None:
+    if is_array_available and is_table_available:
+        address_clauses.append(f"({array_clause} OR {exists_clause})")
+    elif is_array_available:
+        address_clauses.append(array_clause)
+    elif is_table_available:
+        address_clauses.append(exists_clause)
+    else:
+        address_clauses.append("1=0")
+
+
+def _append_array_filters(
+    address_clauses: list[str],
+    filters_by_name: dict[str, Any],
+    provider_npi_sql: str,
+) -> dict[str, int]:
+    """Append supported procedure and medication predicates and parameters."""
+    parameters_by_name: dict[str, int] = {}
+    filter_year = filters_by_name.get("filter_year")
+    procedure_internal_codes = filters_by_name.get("procedure_internal_codes") or []
+    medication_internal_codes = filters_by_name.get("medication_internal_codes") or []
+    procedures_array_available = bool(filters_by_name.get("npi_procedures_array_available", True))
+    medications_array_available = bool(filters_by_name.get("npi_medications_array_available", True))
+    procedure_table_available = bool(filters_by_name.get("pricing_provider_procedure_available", False))
+    medication_table_available = bool(filters_by_name.get("pricing_provider_prescription_available", False))
+    if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
+        parameters_by_name["filter_year"] = int(filter_year)
+    for idx, code in enumerate(procedure_internal_codes):
+        parameter_name = f"procedure_code_{idx}"
+        parameters_by_name[parameter_name] = int(code)
+        array_clause = f"c.procedures_array @> ARRAY[:{parameter_name}]::INTEGER[]"
+        claims_pp_relation = "mrf.pricing_provider_procedure"
+        exists_clause = (
+            "EXISTS ("
+            f"SELECT 1 FROM {claims_pp_relation} AS pp "
+            f"WHERE pp.npi = {provider_npi_sql} AND pp.procedure_code = :{parameter_name}"
+            + (" AND pp.year = :filter_year" if filter_year is not None else "")
+            + ")"
+        )
+        _append_available_filter(
+            address_clauses,
+            array_clause,
+            exists_clause,
+            is_array_available=procedures_array_available,
+            is_table_available=procedure_table_available,
+        )
+    for idx, code in enumerate(medication_internal_codes):
+        parameter_name = f"medication_code_{idx}"
+        parameters_by_name[parameter_name] = int(code)
+        array_clause = f"c.medications_array @> ARRAY[:{parameter_name}]::INTEGER[]"
+        claims_pr_relation = "mrf.pricing_provider_prescription"
+        exists_clause = (
+            "EXISTS ("
+            f"SELECT 1 FROM {claims_pr_relation} AS pr "
+            f"WHERE pr.npi = {provider_npi_sql} "
+            "AND pr.rx_code_system = 'HP_RX_CODE' "
+            + ("AND pr.year = :filter_year " if filter_year is not None else "")
+            + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{parameter_name} "
+            ")"
+        )
+        _append_available_filter(
+            address_clauses,
+            array_clause,
+            exists_clause,
+            is_array_available=medications_array_available,
+            is_table_available=medication_table_available,
+        )
+    return parameters_by_name
+
+
 def _sql_with_prefix_ctes(*ctes: str | None) -> str:
     available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
     joined_ctes = ",\n".join(available_ctes)

@@ -45,7 +45,7 @@ async def _address_heap(db, schema, records):
 
 
 @pytest.fixture
-async def compact_db(slice_db):
+async def compact_db(slice_db, request):
     """Load both native compact generations and retain their original fixture cleanup."""
     db = slice_db
     manual_schema = "network_manual_test_" + uuid4().hex
@@ -80,7 +80,7 @@ async def compact_db(slice_db):
     first = await _candidate(db, [(42, 0), (42, 0), (7, 0), (88, 2)])
     async with db.connection.transaction():
         first_receipt = await _prepare(db, first)
-    second = await _candidate(db, [(42, 0), (7, 0), (99, 2)])
+    second = await _candidate(db, [(42, 0), (7, 0), (99, 2), *getattr(request, "param", ())])
     async with db.connection.transaction():
         second_receipt = await _prepare(db, second, previous=_pin(first, first_receipt))
     old_artifact = CompactEdgeArtifact(first.candidate_id, first.schema_name)
@@ -124,14 +124,14 @@ def _manifest(layout):
     return manifest
 
 
-def _lookup_manifest(layout, contract=indexed.CONTRACT):
+def _lookup_manifest(layout, contract=indexed.CONTRACT, *, index_definition_revision=None):
     """Read lookup capability from the logical publication's declared address contract."""
     manifest = _manifest(layout)
     manifest_by_field = asdict(manifest)
-    candidate_by_field = {
-        **manifest_by_field,
-        "validation_json": {"serving_readiness": {"address_artifact": {"contract": contract}}},
-    }
+    serving_by_field = {"address_artifact": {"contract": contract}}
+    if index_definition_revision is not None:
+        serving_by_field["index_definition_revision"] = index_definition_revision
+    candidate_by_field = {**manifest_by_field, "validation_json": {"serving_readiness": serving_by_field}}
     from tests.network_published_manifest_support import published_entry
 
     entry = published_entry(

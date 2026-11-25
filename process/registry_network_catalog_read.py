@@ -356,8 +356,15 @@ class RegistryNetworkCatalogLegacyBatchSelector:
             raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
 
 
-# A scalar lookup keeps the one-office stop local to each page network; EXISTS
-# can instead build an all-network alternative before returning the first item.
+_LEGACY_DIRECTORY_AVAILABLE_SQL = """coalesce((SELECT true FROM {candidate}.network_membership membership
+  JOIN {candidate}.provider_location_binding location
+    ON (location.provider_system,location.provider_id,location.location_id)=
+      (membership.provider_system,membership.provider_id,membership.location_id)
+  JOIN {addresses} address
+    ON (address.location_key,address.entity_type,address.entity_id)=
+      (location.location_key,location.entity_type,location.entity_id)
+  WHERE membership.network_id=page.network_id LIMIT 1),false)"""
+
 _BASE_SQL = """
 WITH approved AS MATERIALIZED (
   SELECT record_kind,record_key,record_revision,record_json
@@ -428,14 +435,7 @@ WITH approved AS MATERIALIZED (
   SELECT jsonb_build_object('network_id',page.network_id,'display_name',page.record_json->'display_name',
     'aliases',page.record_json->'aliases','archived',page.record_json->'archived',
     'revision',page.record_revision,
-    'directory_available',coalesce((SELECT true FROM {candidate}.network_membership membership
-      JOIN {candidate}.provider_location_binding location
-        ON (location.provider_system,location.provider_id,location.location_id)=
-          (membership.provider_system,membership.provider_id,membership.location_id)
-      JOIN {addresses} address
-        ON (address.location_key,address.entity_type,address.entity_id)=
-          (location.location_key,location.entity_type,location.entity_id)
-      WHERE membership.network_id=page.network_id LIMIT 1),false),
+    'directory_available',{directory_available},
     'priceable',NULL,'benefit_codes',(SELECT to_jsonb(benefit_codes) FROM declared_benefits
       WHERE network_id=page.network_id),
     'companies',coalesce((SELECT jsonb_agg(document ORDER BY document->>'company_id')
@@ -658,8 +658,13 @@ async def _page_entry(
     if organization_policy is not None and type(organization_policy) is not RegistryOrganizationVisibility:
         raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
     sql = _BASE_SQL if organization_policy is None else _ORGANIZATION_SQL
-    catalog_records = await effective_catalog_sql(connection, manifest, control_schema)
+    catalog_records = await effective_catalog_sql(
+        connection, manifest, control_schema, selected_networks="$6::integer[]" if network_ids is not None else None
+    )
     if catalog_records is not None:
+        if network_ids is not None:
+            # Avoid compiling expressions for a bounded indexed lookup.
+            await connection.execute("SET LOCAL jit = off")
         sql = sql.replace(
             "FROM declared_assertions GROUP BY network_id",
             """FROM (
@@ -682,16 +687,24 @@ async def _page_entry(
     )
     if organization_policy is not None:
         parameters += (organization_policy.excluded_company_ids, organization_policy.excluded_group_ids)
-    addresses, address_parameters = catalog_directory_relation(manifest, first_parameter=len(parameters) + 1)
+    layout = manifest.compact_layout
+    if layout is None:
+        directory_available = _LEGACY_DIRECTORY_AVAILABLE_SQL.format(
+            candidate=_identifier(manifest.schema_name),
+            addresses=_identifier(manifest.schema_name) + ".entity_address_unified",
+        )
+    else:
+        ref_map = _identifier(layout.ref_map.schema_name) + "." + _identifier(layout.ref_map.table_name)
+        directory_available = (
+            f"EXISTS (SELECT FROM ONLY {ref_map} ref WHERE ref.network_id=page.network_id AND ref.row_count>0)"
+        )
     entry = await connection.fetchrow(
         apply_effective_catalog_sql(
-            sql.format(
-                control=_identifier(control_schema), candidate=_identifier(manifest.schema_name), addresses=addresses
-            ),
+            sql.format(control=_identifier(control_schema), directory_available=directory_available),
             catalog_records,
             control_schema,
         ),
-        *(parameters + address_parameters),
+        *parameters,
     )
     return entry
 

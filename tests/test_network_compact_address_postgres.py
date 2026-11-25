@@ -24,6 +24,7 @@ from api.network_compact_address import (
     compact_address_read_relations,
     compact_address_relation_sql,
     compact_address_selectable,
+    compact_city_page,
     compact_selected_offices,
 )
 from api.network_read_execution import qualified_relation_sql
@@ -119,6 +120,46 @@ async def test_staged_offices_match_scoped_rows(compact_db):
         assert rows == [
             {key: value for key, value in row.items() if key != "canonical_network_ids"} for row in ordinary
         ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact_db", [((99, 3),)], indirect=True)
+async def test_compact_city_page_keeps_shared_and_custom_offices(compact_db):
+    db, layout = compact_db, compact_db.second_layout
+    base = qualified_relation_sql(layout.base.schema_name, layout.base.table_name)
+    custom = qualified_relation_sql(layout.custom.schema_name, layout.custom.table_name)
+    await db.connection.execute(f"UPDATE {base} SET city_name=$1,state_name=$2", "Other City", "IL")
+    await db.connection.execute(
+        f"UPDATE {custom} SET city_name=CASE WHEN location_key=$1 THEN $2 ELSE $3 END,state_name=$4",
+        db.keys[3],
+        "Other City",
+        "Example City",
+        "IL",
+    )
+    networks = (42, 99)
+    keys, page, ordinary = compact_city_page(layout, networks, "c.type='practice'")
+    addresses = compact_address_relation_sql(layout, network_ids=networks)
+    statement = text(f"""WITH {keys}
+      ({page}) UNION ALL (
+        SELECT DISTINCT coalesce(c.npi,c.inferred_npi) AS npi FROM {addresses} c
+        WHERE c.city_name=:city AND c.state_name=:state AND c.type='practice' AND {ordinary}
+        ORDER BY npi LIMIT :limit OFFSET :start
+      )""")
+    params = compact_address_parameters(layout) | {
+        "_canonical_network_ids": list(networks),
+        "city": "Example City",
+        "state": "IL",
+        "limit": 1,
+    }
+    async with db.engine.begin() as connection:
+        for over_budget in (False, True):
+            if over_budget:
+                await connection.execute(
+                    text(f'UPDATE "{layout.ref_map.schema_name}".network_slice_ref SET row_count=500001')
+                )
+            for start, expected_npis in ((0, [1111111111]), (1, [2222222222]), (2, [])):
+                observed = await connection.execute(statement, {**params, "start": start})
+                assert observed.scalars().all() == expected_npis
 
 
 async def _assert_sparse_taxonomy_pages(connection, statement, params):

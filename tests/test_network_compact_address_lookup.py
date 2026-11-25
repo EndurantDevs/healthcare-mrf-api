@@ -24,6 +24,7 @@ from api.network_address_scope import (
 from api.network_read_execution import qualified_relation_sql
 from api.provider_geo_sql import nearby_row_tiebreaker
 from db.models import EntityAddressUnified
+from process import network_address_artifact as named
 from process import network_bootstrap_address_artifact as bootstrap
 from process import network_indexed_address_artifact as indexed
 from tests import test_custom_import_provider_geo_sql as geo
@@ -31,10 +32,20 @@ from tests import test_network_em_provider_inputs as em_inputs
 from tests.network_compact_address_postgres_support import _layout, _lookup_manifest, _manifest
 
 
-@pytest.mark.parametrize("contract", [None, bootstrap.CONTRACT, "unknown", indexed.CONTRACT])
-def test_scoped_lookup_requires_verified_indexed_dependency(contract):
-    manifest = _lookup_manifest(_layout(), contract)
-    assert manifest.supports_location_lookup is (contract == indexed.CONTRACT)
+@pytest.mark.parametrize(
+    ("contract", "revision", "expected_lookup"),
+    [
+        (None, None, False),
+        (bootstrap.CONTRACT, None, False),
+        ("unknown", None, False),
+        (indexed.CONTRACT, None, True),
+        (named.CONTRACT, None, False),
+        (named.CONTRACT, 2, True),
+    ],
+)
+def test_scoped_lookup_requires_verified_indexed_dependency(contract, revision, expected_lookup):
+    manifest = _lookup_manifest(_layout(), contract, index_definition_revision=revision)
+    assert manifest.supports_location_lookup is expected_lookup
     # The published fixture row carries a genuine digest in place of the placeholder.
     expected = asdict(_manifest(manifest.compact_layout)) | {"manifest_sha256": manifest.manifest_sha256}
     assert asdict(manifest) == expected
@@ -58,8 +69,9 @@ def test_lookup_preserves_ordinary_query():
     layout = _layout()
     ordinary = compact.compact_address_relation_sql(layout, network_ids=(7, 42))
     lookup = compact.compact_address_relation_sql(layout, network_ids=(7, 42), location_lookup=True)
-    separator = " WHERE office.location_key IN ("
+    separator = " WHERE (office.location_key IN ("
     assert ordinary.split(" WHERE EXISTS (")[0] == lookup.split(separator)[0]
+    assert lookup.endswith("bucket_members OFFSET 0)) IS TRUE)")
     assert "office." not in compact._membership_arms(layout, selected=True)
     assert "bucket_members" not in ordinary
     selected = compact._membership_arms(layout, selected=True, location_lookup=True)
