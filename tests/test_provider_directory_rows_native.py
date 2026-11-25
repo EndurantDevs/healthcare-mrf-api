@@ -381,6 +381,24 @@ def test_identifier_label_preserves_python_scalar_and_empty_value_rules(label, r
     assert prepared["payload_json"]["available_time"] == []
 
 
+def test_identifier_descriptor_accepts_en_dash_without_joining_npi_tokens():
+    role_fields_by_name = {
+        "resourceType": "PractitionerRole",
+        "id": "identifier-description",
+        "identifier": [
+            {"type": {"text": "n\u2013pi"}, "value": "1111111111"},
+            {"type": {"coding": [{"display": "Registry \u2013 NPI"}]}, "value": "1234567893"},
+        ],
+    }
+    line = json.dumps(role_fields_by_name).encode()
+    assert assert_row_lines_parity([line]) == {}
+    [prepared] = seam.prepare_directory_rows([line], _context(CONTRACTS[0], False)).rows
+    assert prepared["payload_json"]["npi"] == 1234567893
+
+    role_fields_by_name["identifier"][1]["type"] = {"text": "NP\u0130"}
+    assert assert_row_lines_parity([json.dumps(role_fields_by_name).encode()]) == {"unicode_identifier": 1}
+
+
 def test_grouped_role_projection_preserves_meaning_of_partial_plan_net_extensions():
     role_fields_by_name = {"resourceType": "PractitionerRole", "id": "mixed-extensions"}
     role_fields_by_name["network"] = [

@@ -61992,9 +61992,8 @@ def _endpoint_dataset_hash_page_sql(
     cursor_filter = ""
     if has_cursor:
         cursor_filter = """
-           AND (dataset_id, resource_type COLLATE "C", resource_id COLLATE "C") > (
-                :dataset_id, :after_resource_type, :after_resource_id
-           )
+           AND (resource_type COLLATE "C", resource_id COLLATE "C") >
+               (:after_resource_type, :after_resource_id)
         """
     payload_projection = (
         ", CAST(payload_json AS text) AS payload_json_text, acquired_resource_sha256" if include_payload_json else ""
@@ -62384,8 +62383,8 @@ def _subset_acquired_page_sql(has_cursor: bool, *, resource_relation: tuple[str,
 
     cursor_filter = (
         """
-           AND (dataset_id, resource_type COLLATE "C", resource_id COLLATE "C") >
-               (:dataset_id, :after_resource_type, :after_resource_id)
+           AND (resource_type COLLATE "C", resource_id COLLATE "C") >
+               (:after_resource_type, :after_resource_id)
         """
         if has_cursor
         else ""

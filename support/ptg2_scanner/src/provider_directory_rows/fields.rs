@@ -265,7 +265,7 @@ pub fn normalized_identifiers(value: &Value) -> Result<Vec<Value>, Unsupported> 
     Ok(normalized)
 }
 
-/// `identifier_descriptor`, refused when lowercasing non-ASCII text could matter.
+/// `identifier_descriptor` for matching ASCII NPI tokens.
 fn identifier_descriptor(identifier: &Fields) -> Result<String, Unsupported> {
     let identifier_type = get(identifier, "type");
     let identifier_type = identifier_type
@@ -285,11 +285,16 @@ fn identifier_descriptor(identifier: &Fields) -> Result<String, Unsupported> {
     let mut lowered = Vec::new();
     for part in parts {
         if part.truthy()? {
-            let text = python_str(part)?;
+            let mut text = python_str(part)?;
             if !text.is_ascii() {
-                return Err(unsupported("unicode_identifier"));
+                // This dash remains a separator for the NPI tokens below.
+                text = text.replace('\u{2013}', "-");
+                if !text.is_ascii() {
+                    return Err(unsupported("unicode_identifier"));
+                }
             }
-            lowered.push(text.to_ascii_lowercase());
+            text.make_ascii_lowercase();
+            lowered.push(text);
         }
     }
     Ok(lowered.join(" "))
