@@ -81,3 +81,21 @@ async def test_legacy_or_missing_pin_cannot_select_block_storage(pin):
         await resolve_pinned_family_block_binding(
             object(), pin, binding.layout.definition, binding.layout.collection_slots
         )
+
+
+def test_checked_binding_reuses_identical_schema_metadata_and_isolates_distinct_keys():
+    definition = _definition()
+    slots_by_name = {name: slot for slot, name in enumerate(definition.collections_by_name, 1)}
+    first = checked_binding(23001, definition, slots_by_name)
+    second = checked_binding(23001, definition, slots_by_name, schema_name="ci_snapshot_23001")
+    copied = checked_binding(23001, definition, slots_by_name, schema_name="copied snapshot")
+    other_family = checked_binding(23002, definition, slots_by_name)
+    assert first is second
+    assert copied is not first
+    assert all(table.schema == "copied snapshot" for table in copied.tables_by_role.values())
+    assert other_family is not first
+    assert all(table.schema == "ci_snapshot_23002" for table in other_family.tables_by_role.values())
+    with pytest.raises(FamilyBlockUnavailable):
+        checked_binding(23001, definition, slots_by_name, schema_name="")
+    with pytest.raises(FamilyBlockUnavailable):
+        checked_binding(23001, definition, slots_by_name, schema_name="bad\x00schema")

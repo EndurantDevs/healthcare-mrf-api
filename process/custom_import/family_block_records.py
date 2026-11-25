@@ -191,12 +191,28 @@ def _record_parts(definition, collection, entry, fields, by_name, retained, *, c
     return wire_cells, (key_hash, key, record_payload)
 
 
-def record_from_wire(definition, collection, wire, *, retained):
+def _projected_record_from_wire(wire, by_name, retained):
+    if type(wire) is not list or len(wire) != 6:
+        raise FamilyBlockError("family record shape differs")
+    revision, pack, ordinal, payload_text, scalar_cells, sparse_cells = wire
+    _integer(revision, "revision identity")
+    _integer(pack, "pack identity")
+    _integer(ordinal, "source ordinal", zero=True)
+    if type(payload_text) is not str:
+        raise FamilyBlockError("family text is malformed")
+    if sparse_cells is not None and (not retained or type(sparse_cells) is not list or len(sparse_cells) != 5):
+        raise FamilyBlockError("sparse family evidence shape differs")
+    scalars = _scalars_from_wire(scalar_cells, by_name)
+    return FamilyRecord(revision, pack, ordinal, None, scalars, None), None
+
+
+def record_from_wire(definition, collection, wire, *, retained, include_payload=True):
     """Decode a stored role record while preserving its canonical scalar values."""
     fields = _fields(definition, collection)
-    return _record_from_wire(
-        definition, collection, wire, fields, {field.field_id: field for field in fields}, retained
-    )
+    fields_by_name = {field.field_id: field for field in fields}
+    if not include_payload:
+        return _projected_record_from_wire(wire, fields_by_name, retained)
+    return _record_from_wire(definition, collection, wire, fields, fields_by_name, retained)
 
 
 def _record_from_wire(definition, collection, wire, fields, by_name, retained):

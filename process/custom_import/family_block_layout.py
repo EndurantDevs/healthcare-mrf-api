@@ -255,10 +255,14 @@ class FamilyBlockLayout:
             raise ValueError("family layout collection slots differ")
         object.__setattr__(self, "collection_slots", MappingProxyType(slots_by_collection))
 
-    def tables(self, family_id):
+    def tables(self, family_id, *, schema_name=None):
         """Build the complete role table map for one exact family identity."""
-        metadata = MetaData(schema=snapshot_schema(family_id))
-        common = snapshot_tables(family_id)
+        default_schema = snapshot_schema(family_id)
+        target_schema = default_schema if schema_name is None else schema_name
+        if type(target_schema) is not str or not target_schema or "\x00" in target_schema:
+            raise ValueError("snapshot schema name is invalid")
+        metadata = MetaData(schema=target_schema)
+        common = snapshot_tables(family_id, schema_name=target_schema)
         tables_by_role = {role: common[name].to_metadata(metadata) for role, (_, name) in _COMMON.items()}
         winner = tables_by_role["winner"]
         winner.append_column(_big("candidate_count"))
