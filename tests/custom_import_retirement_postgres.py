@@ -13,6 +13,7 @@ from sqlalchemy.exc import DBAPIError
 
 from db.models.custom_import_storage import CustomImportSnapshotFamily, CustomImportSnapshotRetirement
 from process.custom_import import publication, retirement
+from process.custom_import.family_block_layout import COMPACT_TABLE_NAMES
 from tests.custom_import_postgres_support import isolated_publication_case
 from tests.test_custom_import_snapshot_storage_postgres import (
     _attempt,
@@ -132,6 +133,9 @@ async def test_application_owned_definer_reads_retirement_marker_without_new_gra
 async def test_retirement_removes_only_replaced_storage_and_replays_exactly():
     async with isolated_publication_case() as case:
         attempt, family_id = await _replaced_fence(case)
+        async with case.sessions() as session, session.begin():
+            for name in COMPACT_TABLE_NAMES:
+                await session.execute(text(f'CREATE TABLE "ci_snapshot_{family_id}"."{name}" (id bigint PRIMARY KEY)'))
         async with case.sessions() as session, session.begin():
             await _bounded(session)
             result = await retirement.retire_snapshot_family(
