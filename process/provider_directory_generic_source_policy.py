@@ -114,6 +114,16 @@ def current_source_storage_binding():
     return None
 
 
+def source_payload_format():
+    """Read the issued intake format without granting access to its relations."""
+    factory = _FACTORY.get()
+    binding = getattr(factory, "storage_binding", None)
+    if isinstance(binding, NamedFHIRSourceStorage) and binding.payload_format is not None:
+        _require(_source_scope(factory)[1] == binding, "policy_changed")
+        return binding.payload_format
+    return None
+
+
 @asynccontextmanager
 async def bind_generic_source_transaction_factory(factory):
     """Propagate only trusted transaction creation, never a physical worker session."""

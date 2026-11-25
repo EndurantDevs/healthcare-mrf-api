@@ -223,7 +223,7 @@ def _validate_binding_shape(binding_by_field, identity, *, phases):
     if type(binding_by_field) is dict and binding_by_field.get("contract") == NAMED_COMPACT_CONTRACT:
         keys |= {"payload_format"}
         _require(
-            binding_by_field.get("payload_format") == compact_payload.FORMAT
+            binding_by_field.get("payload_format") in (compact_payload.FORMAT, compact_payload.SHARED_BODY_FORMAT)
             and binding_by_field.get("phase") in {"loading", "prepared", "ready_for_freeze", "disposed"},
             "compact_phase_or_format_changed",
         )
@@ -279,7 +279,7 @@ def _validate_isolated_binding_storage(binding, expected_storage):
     if binding["contract"] == NAMED_ISOLATED_CONTRACT:
         _require_named_source_identity(binding["identity"])
     if binding["contract"] == NAMED_COMPACT_CONTRACT:
-        compact_storage.require_source_identity(binding["identity"])
+        compact_storage.require_source_identity(binding["identity"], payload_format=binding["payload_format"])
     _require(binding["storage"] == expected_storage, "storage_binding_changed")
     _require(binding["phase"] != "published" and binding["auxiliary"] is None, "isolated_kind_unsupported")
     if binding["contract"] == CMS_ISOLATED_CONTRACT:
@@ -774,32 +774,46 @@ async def _create_source_input_heaps(connection, policy, identity, *, by_name):
     return {key: captured[name] for key, name in names_by_kind.items()}
 
 
+def _require_shared_payload_format(publisher, payload_format):
+    if payload_format == compact_payload.SHARED_BODY_FORMAT:
+        _require(getattr(publisher.storage_binding, "payload_format", None) == payload_format, "payload_format_changed")
+
+
+async def _prepare_saved_source_storage(connection, policy, publisher, binding, payload_format):
+    saved_format = binding.get("payload_conversion", {}).get("format", binding.get("payload_format"))
+    _require_shared_payload_format(publisher, saved_format)
+    _require(payload_format is None or binding.get("payload_format") == payload_format, "payload_format_changed")
+    await _verify_tables(connection, policy, binding)
+    return binding
+
+
 async def prepare_generic_source_candidate(database, directory, candidate, *, payload_format=None):
     """Initialize two unindexed private input heaps, or authenticate exact resume."""
     identity = candidate_identity(directory, candidate)
-    _require(payload_format in (None, compact_payload.FORMAT), "payload_format_changed")
+    _require(
+        payload_format in (None, compact_payload.FORMAT, compact_payload.SHARED_BODY_FORMAT), "payload_format_changed"
+    )
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
         isolated = _require_candidate_storage(publisher, directory, identity)
+        _require_shared_payload_format(publisher, payload_format)
         if payload_format is not None:
             _require(isinstance(isolated, NamedFHIRSourceStorage), "compact_named_source_required")
-            compact_storage.require_source_identity(identity)
+            compact_storage.require_source_identity(identity, payload_format=payload_format)
         binding_by_field = await _locked(connection, policy, identity, allow_conversion=True)
         if binding_by_field is not None:
-            _require(
-                payload_format is None or binding_by_field.get("payload_format") == payload_format,
-                "payload_format_changed",
-            )
-            await _verify_tables(connection, policy, binding_by_field)
-            return binding_by_field
+            return await _prepare_saved_source_storage(connection, policy, publisher, binding_by_field, payload_format)
         old_payload = await connection.fetchval(
             f"SELECT EXISTS(SELECT FROM {storage_relation(policy.schema, RESOURCE)} WHERE dataset_id=$1)",
             candidate.dataset_id,
         )
         _require(old_payload is False and not candidate.reused_from_checkpoint, "legacy_acquisition_rerun_required")
+        if payload_format is None and getattr(isolated, "payload_format", None) is not None:
+            payload_format = isolated.payload_format
+            compact_storage.require_source_identity(identity, payload_format=payload_format)
         by_name = isinstance(isolated, NamedFHIRSourceStorage)
         tables_by_kind = (
-            await compact_storage.create_inputs(connection, policy)
+            await compact_storage.create_inputs(connection, policy, payload_format=payload_format)
             if payload_format is not None
             else await _create_source_input_heaps(connection, policy, identity, by_name=by_name)
         )
@@ -2214,6 +2228,7 @@ async def append_generic_source_batch(database, directory, candidate, resources,
         await _verify_tables_recently(connection, policy, previous)
         is_compact = previous["contract"] == NAMED_COMPACT_CONTRACT
         if is_compact:
+            _require_shared_payload_format(publisher, previous["payload_format"])
             _require(not witnesses, "compact_witness_unsupported")
             previous = await _locked(connection, policy, identity, lock="NO KEY UPDATE")
         sequence_root = "resource_aliases" if is_compact else "resource_input"

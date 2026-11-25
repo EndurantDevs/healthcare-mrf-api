@@ -301,6 +301,7 @@ def test_prepared_compact_inventory_is_closed_by_name(damage):
     }
     binding_by_field = {
         "phase": "prepared",
+        "payload_format": compact.FORMAT,
         "storage": {"storage_schema": "source_schema"},
         "auxiliary": None,
         "relationship_sha256": None,

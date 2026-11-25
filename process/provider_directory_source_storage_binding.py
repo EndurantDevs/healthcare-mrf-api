@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from db.plan_release_storage import storage_identifier
 from process.provider_directory_generic_candidate import GenericCandidateError
 
+SHARED_BODY_FORMAT = "provider-directory-shared-bodies-v1"
 _RELATIONS = ContextVar("provider_directory_isolated_source_relations", default=None)
 _CATALOG_ROOTS = frozenset({"provider_directory_source", "provider_directory_api_endpoint", "import_run"})
 
@@ -25,6 +26,7 @@ class FHIRSourceStorageBinding:
 
     catalog_schema: str
     storage_schema: str
+    payload_format = None
 
     def __post_init__(self):
         for schema in (self.catalog_schema, self.storage_schema):
@@ -34,6 +36,18 @@ class FHIRSourceStorageBinding:
 
 
 NamedFHIRSourceStorage = FHIRSourceStorageBinding
+
+
+@dataclass(frozen=True)
+class SharedBodyFHIRSourceStorage(FHIRSourceStorageBinding):
+    """Select shared payload bodies while keeping the same storage coordinates."""
+
+    payload_format = SHARED_BODY_FORMAT
+
+
+def is_named_source_storage(binding):
+    """Recognize the two issued named storage bindings."""
+    return type(binding) in (FHIRSourceStorageBinding, SharedBodyFHIRSourceStorage)
 
 
 @dataclass(frozen=True)
@@ -146,7 +160,10 @@ def _logical_snapshot(snapshot):
 
 async def verify_isolated_source_storage_coordinates(connection, policy, binding):
     """Resolve configured schema names through ordinary SQL access."""
-    _require(type(binding) is FHIRSourceStorageBinding and policy.schema == binding.storage_schema, "storage_changed")
+    _require(
+        is_named_source_storage(binding) and policy.schema == binding.storage_schema,
+        "storage_changed",
+    )
     from db.plan_release_storage import storage_relation
 
     await connection.execute(
@@ -174,8 +191,9 @@ def require_storage_schema(publisher, catalog_schema):
 
 def storage_document(publisher):
     """Return the two configured schema names without local database identities."""
-    _require(type(publisher.storage_binding) is FHIRSourceStorageBinding, "isolated_storage_required")
-    return asdict(publisher.storage_binding)
+    binding = publisher.storage_binding
+    _require(is_named_source_storage(binding), "isolated_storage_required")
+    return asdict(binding)
 
 
 @contextmanager

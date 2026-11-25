@@ -226,7 +226,9 @@ async def test_preparation_preserves_cancellation_callback(monkeypatch):
     cancellation = SimpleNamespace(check=AsyncMock())
     candidate = object()
     assert await migration.prepare_retained_prefix(directory, candidate, cancellation) == "prepared"
-    migrate.assert_awaited_once_with(directory.db, directory, candidate, check_cancelled=cancellation.check)
+    migrate.assert_awaited_once_with(
+        directory.db, directory, candidate, check_cancelled=cancellation.check, payload_format=None
+    )
 
 
 @pytest.mark.asyncio

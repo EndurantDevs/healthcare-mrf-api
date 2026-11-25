@@ -14,10 +14,12 @@ from tests.test_provider_directory_compact_payload import resource
 
 
 @asynccontextmanager
-async def storage():
+async def storage(*, shared_bodies=False):
     async with _owned_database(_database_url().set(database="postgres")) as (url, _admin):
         connection = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
-        tables = compact.CompactPayloadTables("compact_test", "aliases", "sets", "blocks")
+        tables = compact.CompactPayloadTables(
+            "compact_test", "aliases", "sets", "blocks", "shared_bodies" if shared_bodies else None
+        )
         try:
             await connection.execute("CREATE SCHEMA compact_test")
             for statement in compact.compact_payload_ddl(tables):
@@ -33,7 +35,7 @@ async def storage():
 
 async def append(connection, tables, observations, ordinal):
     return await compact.append_compact_payload_batch(
-        connection, tables, observations, dataset_id="dataset", batch_ordinal=ordinal, format_id=compact.FORMAT
+        connection, tables, observations, dataset_id="dataset", batch_ordinal=ordinal, format_id=tables.format
     )
 
 
@@ -107,6 +109,36 @@ async def test_compact_observations_resume_replay_and_native_reads():
             async with connection.transaction():
                 await append(connection, tables, changed_rows, 2)
         assert await counts(connection) == resumed
+
+
+@pytest.mark.asyncio
+async def test_shared_bodies_preserve_each_observation_across_copy_and_resume():
+    original = resource("same", npi=1000000000, value=-0.0, fhir_meta={"lastUpdated": "old"})
+    replay = resource("same", npi=1000000000, value=-0.0, fhir_meta={"lastUpdated": "new"})
+    changed = resource("same", npi=1000000000, value=1.0, fhir_fetch_url=None)
+    async with storage(shared_bodies=True) as (connection, tables):
+        async with connection.transaction():
+            await append(connection, tables, [original], 1)
+            await connection.execute("UPDATE compact_test.checkpoint SET rows_processed=1")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            async with connection.transaction():
+                await append(connection, tables, [replay, changed], 2)
+                await connection.execute("INSERT INTO compact_test.checkpoint VALUES(1,3)")
+        assert await connection.fetchval("SELECT count(*) FROM compact_test.shared_bodies") == 1
+        assert await counts(connection) == [1, 0, 1, 1]
+
+        async with connection.transaction():
+            await append(connection, tables, [replay, changed], 2)
+            await connection.execute("UPDATE compact_test.checkpoint SET rows_processed=3")
+            assert (await append(connection, tables, [replay, changed], 2))["is_replay"] is True
+        async with connection.transaction(readonly=True):
+            actual = await compact.read_compact_payload_page(connection, tables, "dataset", npi="1000000000")
+
+        assert await connection.fetchval("SELECT count(*) FROM compact_test.shared_bodies") == 2
+        assert [(row["batch_ordinal"], row["row_ordinal"]) for row in actual] == [(1, 0), (2, 0), (2, 1)]
+        assert [compact._json(json.loads(row["payload_json"])) for row in actual] == [
+            compact._json(row["payload_json"]) for row in (original, replay, changed)
+        ]
 
 
 async def assert_native_reads(connection, tables, original):
