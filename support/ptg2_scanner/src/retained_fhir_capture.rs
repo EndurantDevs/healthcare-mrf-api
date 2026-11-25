@@ -337,6 +337,7 @@ impl Encoder<'_, '_> {
             if !fallback {
                 match payload_hash(
                     object,
+                    &row.payload_json,
                     &self.input.hash_contract,
                     &row.resource_type,
                     self.input.completion_required_version == Some(3),
