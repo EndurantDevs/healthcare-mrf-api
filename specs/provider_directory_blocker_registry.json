@@ -24,11 +24,11 @@
         "status": "not_recorded",
         "checked_at": null
       },
-      "reviewed_at": "2026-10-10",
+      "reviewed_at": "2026-11-25",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://appconnect.chorushealthplans.org/developers/providerapi",
       "reason": "The public API is reachable, but a supported acquisition recipe and complete traversal have not been verified.",
-      "note": "Official public configuration now advertises a different R4 endpoint. Anonymous metadata and eight directory-family count checks succeed; four return nonzero totals. A supported acquisition recipe, complete traversal, and publication remain unverified."
+      "note": "The official portal advertises a public FHIR R4 endpoint. Anonymous metadata and eight directory-family count checks succeed, with nonzero totals for five families. A supported acquisition recipe, complete traversal, and publication remain unverified."
     },
     {
       "id": "provider-directory-blocked-first-medical-pr",
@@ -48,7 +48,7 @@
         "status": "not_recorded",
         "checked_at": null
       },
-      "reviewed_at": "2026-10-10",
+      "reviewed_at": "2026-11-25",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://devportal.firstmedicalpr.com/ApiLibrary",
       "reason": "Official portal requires a user token and no open public FHIR base is confirmed.",
@@ -68,7 +68,7 @@
         "status": "not_recorded",
         "checked_at": null
       },
-      "reviewed_at": "2026-10-10",
+      "reviewed_at": "2026-11-25",
       "source_detail": "CMS SMA Endpoint Directory Provider Directory implementation date TBD",
       "source_url": "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv",
       "reason": "CMS SMA Endpoint Directory provides no Puerto Rico Provider Directory production base and lists implementation date as TBD.",
