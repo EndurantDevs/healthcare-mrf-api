@@ -115,9 +115,10 @@ def _manual_bindings_may_conflict_sql(control, revision):
       SELECT FROM manual_targets m WHERE m.archived IS NULL OR m.archived NOT IN ('true','false')
         OR NOT (CASE WHEN m.target ~ '^[1-9][0-9]{{0,9}}$' THEN m.target::bigint <= 2147483647 ELSE false END)
     ) OR EXISTS (
-      SELECT FROM manual_targets m WHERE m.archived='false' AND NOT EXISTS(
-        SELECT FROM ONLY {control}.registry_approved_record n
-        WHERE n.approved_revision={revision} AND n.record_kind='network' AND n.record_key=m.target)
+      SELECT m.target FROM manual_targets m WHERE m.archived='false'
+      EXCEPT
+      SELECT n.record_key FROM ONLY {control}.registry_approved_record n
+      WHERE n.approved_revision={revision} AND n.record_kind='network'
     ) OR EXISTS (
       SELECT FROM (
         SELECT custom_revision,source_system,source_key,target,archived FROM manual_targets
