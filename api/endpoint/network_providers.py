@@ -153,7 +153,15 @@ async def _provider_response(request, *, provider_system=None, provider_id=None)
             manifest = await resolve_network_serving_manifest(
                 driver, generation_id=parameters_by_name["generation_id"], api_read=True
             )
-            catalog_records_sql = await catalog.effective_catalog_sql(driver, manifest, registry_schema())
+            selected_ids = parameters_by_name["network_ids"]
+            selected_sql = (
+                "ARRAY[" + ",".join(str(int(network_id)) for network_id in selected_ids) + "]::integer[]"
+                if selected_ids
+                else None
+            )
+            catalog_records_sql = await catalog.effective_catalog_sql(
+                driver, manifest, registry_schema(), selected_networks=selected_sql
+            )
             catalog_networks_sql = await catalog.effective_catalog_networks_sql(driver, manifest, registry_schema())
             with (
                 catalog.effective_catalog_read_scope(catalog_records_sql, catalog_networks_sql),

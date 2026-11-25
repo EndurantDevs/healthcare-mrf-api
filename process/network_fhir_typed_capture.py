@@ -221,6 +221,11 @@ async def _create_typed_capture_stage(writer, schema):
     return await bind_typed_graph_stage(writer, schema_name=schema, table_names=TABLES)
 
 
+async def _analyze_typed_capture_stage(writer, schema):
+    for name in TABLES.values():
+        await writer.execute("ANALYZE " + _identifier(schema) + "." + _identifier(name))
+
+
 async def capture_typed_source_graph(
     source_export, writer, *, source_profile, reviewed_origin, membership_as_of, capture_options, catalog_descriptor
 ):
@@ -244,6 +249,7 @@ async def capture_typed_source_graph(
             reviewed_origin=reviewed_origin,
             membership_as_of=membership_as_of,
         )
+        await _analyze_typed_capture_stage(writer, schema)
         await freeze_fhir_source_snapshot(
             writer, schema, namespace_owner=owner, reader_roles=readers, application_roles=readers
         )

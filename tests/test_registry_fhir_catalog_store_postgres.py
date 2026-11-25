@@ -232,8 +232,23 @@ async def register(fixture, candidate):
     return {"schema_name": candidate.schema_name, "metadata_generation": OLD}
 
 
+async def _assert_catalog_source_indexes(connection, schema_name):
+    """Verify the FHIR catalog source and binding source indexes exist with expected definitions."""
+    source_index = await connection.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname='registry_fhir_catalog_binding_source_idx'",
+        schema_name,
+    )
+    assert source_index.endswith("(metadata_generation, source_id)")
+    source_id_index = await connection.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname='registry_fhir_catalog_source_id_idx'",
+        schema_name,
+    )
+    assert source_id_index is not None and "source_id text_pattern_ops" in source_id_index
+
+
 @pytest.mark.asyncio
 async def test_copy_batches_are_bounded(storage_database):
+    """Bounded COPY writes batches before building all catalog secondary indexes."""
     fixture = storage_database
     candidate = await target(fixture)
     counted = CountConnection(fixture.connection)
@@ -272,17 +287,13 @@ async def test_copy_batches_are_bounded(storage_database):
             await store.create_fhir_catalog_indexes(
                 fixture.connection, candidate, loader_role=fixture.loader, control_schema=fixture.control
             )
-            == 10
+            == 11
         )
     assert (
         await fixture.connection.fetchval("SELECT count(*) FROM pg_indexes WHERE schemaname=$1", candidate.schema_name)
-        == 16
+        == 17
     )
-    source_index = await fixture.connection.fetchval(
-        "SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname='registry_fhir_catalog_binding_source_idx'",
-        candidate.schema_name,
-    )
-    assert source_index.endswith("(metadata_generation, source_id)")
+    await _assert_catalog_source_indexes(fixture.connection, candidate.schema_name)
     assert (
         await fixture.connection.fetchval(
             "SELECT reltuples FROM pg_class WHERE oid=$1::regclass",

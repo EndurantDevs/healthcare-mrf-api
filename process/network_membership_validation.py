@@ -303,9 +303,12 @@ async def _validate_sealed(connection, copy_target, address_source, control_sche
             raise NetworkMembershipValidationError("Compact office source differs from the pinned addresses")
         address_table = await pin_compact_office_sources(connection, copy_target, office_sources)
     await connection.execute(f"LOCK TABLE {membership_table},{binding_table} IN SHARE MODE")
-    await connection.execute(
-        f"CREATE INDEX IF NOT EXISTS network_membership_network_idx ON {membership_table}(network_id)"
-    )
+    from process.registry_typed_membership_parity import is_typed_candidate
+
+    if not is_typed_candidate(candidate_by_field):
+        await connection.execute(
+            f"CREATE INDEX IF NOT EXISTS network_membership_network_idx ON {membership_table}(network_id)"
+        )
     await connection.execute(
         f"CREATE INDEX IF NOT EXISTS network_membership_projection_idx ON {membership_table}"
         "(provider_system,provider_id,location_id,network_id)"

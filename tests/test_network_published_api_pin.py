@@ -478,3 +478,15 @@ async def test_non_api_reads_of_historical_reports_follow_the_rotated_base_heap(
         )
     expected = "entity_address_unified_v1_retained_2a" if rotated else "entity_address_unified_v1"
     assert manifest.compact_layout.base == CompactAddressRelation("published_addresses", expected)
+
+
+@pytest.mark.parametrize("city_search", [None, False, True])
+def test_published_layout_binds_city_search_only_when_declared(published_entry, city_search):
+    candidate = _candidate(published_entry)
+    serving = candidate["validation_json"]["serving_readiness"]
+    serving["geo_search"] = {"table_name": "network_geo_search"}
+    if city_search is not None:
+        serving["city_search"] = city_search
+    layout = published.published_network_layout(candidate)
+    assert layout.geo_search is not None
+    assert layout.city_search == (layout.geo_search if city_search is True else None)

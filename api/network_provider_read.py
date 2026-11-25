@@ -80,11 +80,14 @@ _PROVIDER_RESULT_SQL = """locations AS MATERIALIZED (
       FROM locations WHERE locations.provider_system=page.provider_system
         AND locations.provider_id=page.provider_id),'[]'::jsonb)) AS document
   FROM page,bounds WHERE bounds.valid AND bounds.bounded
+), totals AS MATERIALIZED (
+  SELECT count(*)::bigint AS total_count FROM identities
 ), result AS (
-  SELECT jsonb_build_object('generation_id',$8::bigint,'total_count',(SELECT count(*) FROM identities),
-    'limit',$4::integer,'offset',$5::integer,'has_more',(SELECT count(*) FROM identities)>$5+$4,
+  SELECT jsonb_build_object('generation_id',$8::bigint,'total_count',totals.total_count,
+    'limit',$4::integer,'offset',$5::integer,'has_more',totals.total_count>$5+$4,
     'providers',coalesce((SELECT jsonb_agg(document ORDER BY provider_system COLLATE "C",provider_id COLLATE "C")
       FROM providers),'[]'::jsonb))::text AS document
+  FROM totals
 )
 SELECT integrity.valid AND bounds.valid AS valid,bounds.bounded AND octet_length(result.document)<=$7 AS bounded,
   CASE WHEN integrity.valid AND bounds.valid AND bounds.bounded AND octet_length(result.document)<=$7

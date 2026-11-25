@@ -75,12 +75,15 @@ selected AS MATERIALIZED (
     'npi',CASE WHEN provider_system='npi' THEN provider_id::bigint END,
     'network_memberships',jsonb_agg(document ORDER BY network_id)) AS document
   FROM memberships GROUP BY provider_system,provider_id
+), totals AS MATERIALIZED (
+  SELECT count(*)::bigint AS total_count FROM identities
 ), result AS (
   SELECT jsonb_build_object('membership_level','provider','generation_id',${generation}::bigint,
-    'total_count',(SELECT count(*) FROM identities),'limit',${limit}::integer,'offset',${offset}::integer,
-    'has_more',(SELECT count(*) FROM identities)>${offset}+${limit},'providers',coalesce(
+    'total_count',totals.total_count,'limit',${limit}::integer,'offset',${offset}::integer,
+    'has_more',totals.total_count>${offset}+${limit},'providers',coalesce(
       (SELECT jsonb_agg(document ORDER BY provider_system COLLATE "C",provider_id COLLATE "C") FROM providers),
       '[]'::jsonb))::text AS document
+  FROM totals
 )
 SELECT bounds.valid,bounds.bounded AND octet_length(result.document)<=${maximum_bytes} AS bounded,
   CASE WHEN bounds.valid AND bounds.bounded AND octet_length(result.document)<=${maximum_bytes}
@@ -226,7 +229,9 @@ async def _page_query(connection, current, control_schema):
     from process.network_provider_only_projection import provider_only_page_sql
     from process.registry_effective_network_catalog import effective_catalog_sql
 
-    records = await effective_catalog_sql(connection, current, _control_namespace(control_schema)[1:-1])
+    records = await effective_catalog_sql(
+        connection, current, _control_namespace(control_schema)[1:-1], selected_networks="$2::integer[]"
+    )
     return provider_only_page_sql(current.schema_name, control_schema=control_schema, catalog_records=records), [
         approved.approved_revision
     ]

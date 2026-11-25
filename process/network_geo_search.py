@@ -38,7 +38,7 @@ SEARCH_COLUMNS = (
 _LOCATION_COLUMNS = (*SEARCH_COLUMNS, "city_name", "inferred_npi")
 _COLUMNS = (*_LOCATION_COLUMNS, "geo", "canonical_network_ids")
 _CITY_INDEX = TABLE + "_city_page"
-_BATCH_ROWS = 2000
+_BATCH_ROWS = 25_000
 _SCOPE_FIELDS = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
 _FIELDS = {"contract", "scope", "table_name", "row_count", "sources", "indexes", "sha256"}
 _INDEX_FIELDS = ("definition",)
@@ -267,6 +267,7 @@ async def _build_projection(connection, target, layout):
         f"ALTER TABLE {table} ALTER COLUMN canonical_network_ids SET NOT NULL, ADD CHECK(cardinality(canonical_network_ids)>0 AND array_position(canonical_network_ids,NULL) IS NULL)"
     )
     inserted = await _insert_projection(connection, table, layout)
+    await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
     await connection.execute(f"ALTER TABLE {table} ADD PRIMARY KEY(location_key)")
     await _build_geo_search_index(connection, table)
     return inserted

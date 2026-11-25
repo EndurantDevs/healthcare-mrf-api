@@ -973,7 +973,19 @@ async def _register_composition_snapshot(
     )
 
 
+async def _ensure_binding_location_index(connection, schema_name, source_stage):
+    """Add the hash location index when the typed office btree index is absent."""
+    from process.registry_typed_source_stage import is_typed_source_stage
+
+    if not (is_typed_source_stage(source_stage) and source_stage.office_matches is not None):
+        await connection.execute(
+            f"CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
+            f"ON {_identifier(schema_name)}.provider_location_binding USING hash(location_key)"
+        )
+
+
 async def _record_prepared_composition(inputs, copy_target, prepared_sources, control_schema):
+    """Record address bindings, source inventory, receipts, and required location index."""
     recipes, source_stage, artifact, initial_summary, inventory, entries = prepared_sources
     # Record the qualified address binding with admission so retirement can protect this exact generation.
     await _record_composition_address(
@@ -1028,10 +1040,7 @@ async def _record_prepared_composition(inputs, copy_target, prepared_sources, co
             retain_source_bindings=False,
             source_stage=source_stage,
         )
-    await inputs.connection.execute(
-        f"CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
-        f"ON {_identifier(copy_target.schema_name)}.provider_location_binding USING hash(location_key)"
-    )
+    await _ensure_binding_location_index(inputs.connection, copy_target.schema_name, source_stage)
 
 
 async def _record_composition_address(connection, copy_target, address_source, control_schema, address_artifact=None):

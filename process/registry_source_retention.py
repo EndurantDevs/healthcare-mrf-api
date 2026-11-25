@@ -152,22 +152,18 @@ async def retain_registry_source_memberships(connection, copy_target, stage, *, 
                     raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
                 await verify_registry_source_retention_rows(connection, copy_target, candidate, source_stage=stage)
             else:
-                from process.registry_typed_membership_parity import ORDER, create_order_index, is_typed_candidate
-                from process.registry_typed_source_stage import is_typed_source_stage
+                from process.registry_typed_membership_parity import is_typed_candidate
 
                 has_typed_memberships = is_typed_candidate(candidate)
-                if has_typed_memberships:
-                    await create_order_index(connection, source_relation, "typed_source_membership_order_idx")
-                    from process.registry_typed_office_parity import create_source_pair_index
-
-                    await create_source_pair_index(connection, source_relation)
                 projection = _stage_projection(stage_relation, stage=stage)
-                if has_typed_memberships and is_typed_source_stage(stage):
-                    projection += f" ORDER BY {ORDER}"
                 inserted = await connection.execute(f"INSERT INTO {source_relation} {projection}")
                 if inserted != f"INSERT 0 {receipt['source_rows']}":
                     raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
                 if has_typed_memberships:
+                    from process.registry_typed_office_parity import create_source_pair_index
+
+                    await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
+                    await create_source_pair_index(connection, source_relation, allow_populated=True)
                     await connection.execute(f"ANALYZE {source_relation}")
         except asyncpg.PostgresError as error:
             raise RegistrySourceRetentionError("registry_source_retention_source_invalid") from error

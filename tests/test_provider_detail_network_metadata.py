@@ -1048,3 +1048,18 @@ async def test_selected_detail_read_refusal_does_not_reconstruct(direct_detail):
         await metadata.read_direct_detail_response(boundary.request, _NPI)
     assert caught.value is error and boundary.native_read.await_count == 1
     assert boundary.depth == 0 and address_scope.current_network_address_scope() is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_read_requests_bounded_location_lookup(monkeypatch):
+    calls = []
+    original = metadata.scoped_address_relation_sql
+
+    def recording(table_ref, **kwargs):
+        calls.append((table_ref, kwargs))
+        return original(table_ref, **kwargs)
+
+    monkeypatch.setattr(metadata, "scoped_address_relation_sql", recording)
+    session = _session([_fact()])
+    await _project(session, {"npi": int(_NPI), "address_list": [{"address_key": _ADDRESS}]}, selected=(42,))
+    assert calls == [("mrf.entity_address_unified", {"location_lookup": True})]

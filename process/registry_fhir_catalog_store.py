@@ -352,6 +352,7 @@ async def create_fhir_catalog_indexes(connection, target, *, loader_role, contro
     trigram = storage_identifier(trigram_schema)
     async with connection.transaction():
         await _mutable(connection, target, loader_role, control_schema)
+        await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
         count = 0
         for table in sorted(PHYSICAL_TABLES):
             for statement in table_sql(namespace, table, trigram_schema=trigram)[1:]:

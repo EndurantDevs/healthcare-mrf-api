@@ -24,7 +24,7 @@ from process.uhc_flex_practitioner_async_safety import drain_operation
 MEMBER_COLUMNS = ("network_id", "provider_system", "provider_id", "location_id", "evidence_id")
 BINDING_COLUMNS = ("provider_system", "provider_id", "location_id", "location_key", "entity_type", "entity_id")
 _PAIR_KEYS = ("resource_type", "resource_id", "network_source_key", "location_resource_id")
-_PAIR_PAGE_SIZE = 5000
+_PAIR_PAGE_SIZE = 50_000
 _OFFICE_PAGE_BYTES = 8 * 1024**2
 _MAPPING_DDL = {
     "provider_only": "network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,evidence_id text NOT NULL,PRIMARY KEY(network_id,provider_system,provider_id,evidence_id)",
