@@ -27,6 +27,19 @@ PAGE_ERROR = (
     None,
     1,
 )
+WRAPPED_PAGE_ERROR = (
+    500,
+    {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            *PAGE_ERROR[1]["issue"],
+            {"severity": "information", "code": "processing", "diagnostics": "Request context"},
+            {"severity": "information", "code": "informational", "diagnostics": "Source context"},
+        ],
+    },
+    None,
+    1,
+)
 PAGE = (200, {"resourceType": "Bundle", "type": "searchset", "entry": []}, None, 1)
 GOOD_PROBE = (
     200,
@@ -238,7 +251,10 @@ async def test_known_apostrophe_500s_do_not_open_outage(monkeypatch, shared_sour
             request.current_url = request.partition_start_url
             assert await fetch_partition(request) == ERROR
     assert send.await_count == 20
-    assert "outage_pauses" not in response.request_concurrency_snapshot(shared_source)
+    snapshot = response.request_concurrency_snapshot(shared_source)
+    assert snapshot["http_500_organization_other"] == 20
+    assert "http_500_organization_page_error" not in snapshot
+    assert "outage_pauses" not in snapshot
 
 
 async def test_query_local_500s_do_not_pause_sibling_scans(monkeypatch, shared_source):
@@ -250,17 +266,66 @@ async def test_query_local_500s_do_not_pause_sibling_scans(monkeypatch, shared_s
         assert await fetch_partition(search_request(shared_source, 100, resource_type="Practitioner")) == PAGE
     snapshot = response.request_concurrency_snapshot(shared_source)
     assert snapshot["http_500_responses"] == outage.OUTAGE_SAMPLE_SIZE
+    assert snapshot["http_500_organization_page_error"] == outage.OUTAGE_SAMPLE_SIZE
+    assert "http_500_organization_other" not in snapshot
     assert "outage_pauses" not in snapshot and send.await_count == outage.OUTAGE_SAMPLE_SIZE + 1
 
 
-async def test_query_local_first_page_500_uses_the_existing_smaller_counts(monkeypatch):
+@pytest.mark.parametrize(
+    ("failure", "partition_identity", "expected_limit"),
+    [
+        (PAGE_ERROR, "address-postalcode=12345", 10),
+        (ERROR, "address-postalcode=12345", 8),
+        (PAGE_ERROR, None, 8),
+    ],
+)
+def test_optum_recovers_slots_amid_query_local_page_errors(failure, partition_identity, expected_limit):
+    slots = response._OptumRequestSlots(32)
+    slots.limit = 8
+    slots.waiters = 1
+    slots.saturated_seconds = 30
+    slots.last_saturated_at = 60
+    context = (None, partition_identity) if partition_identity else None
+    token = outage.PARTITION_REQUEST.set(context)
+    try:
+        for _ in range(3):
+            slots._adjust(0, 8, failure, 60, {})
+    finally:
+        outage.PARTITION_REQUEST.reset(token)
+
+    for _ in range(7):
+        slots._adjust(0, 8, PAGE, 60, {})
+    assert slots.limit == 8
+    slots._adjust(0, 8, PAGE, 60, {})
+    assert slots.limit == expected_limit
+
+
+@pytest.mark.parametrize("page_error", [PAGE_ERROR, WRAPPED_PAGE_ERROR])
+async def test_query_local_first_page_500_uses_the_existing_smaller_counts(monkeypatch, page_error):
     source_by_field = {"api_base": BASE, "_provider_directory_request_pacing_state": {}}
-    send = AsyncMock(side_effect=[PAGE_ERROR, PAGE_ERROR, PAGE])
+    send = AsyncMock(side_effect=[page_error, page_error, PAGE])
     monkeypatch.setattr(importer, "_fetch_source_json_unpaced", send)
     async with importer._source_http_session_scope(force=True, request_concurrency=32):
         assert (await fetch_partition(search_request(source_by_field, 1)))[:3] == PAGE[:3]
     queries = [parse_qs(urlsplit(call.args[1]).query) for call in send.await_args_list]
     assert queries == [{"_count": [str(count)], "name": ["A1"]} for count in (100, 25, 10)]
+
+
+@pytest.mark.parametrize(
+    "additional_issue",
+    [
+        {"severity": "error", "code": "processing", "diagnostics": 'SC="500"'},
+        {"severity": "fatal", "code": "exception"},
+        {"severity": "information", "code": "security"},
+        {"severity": "information", "code": ["processing"]},
+        "malformed issue",
+    ],
+)
+def test_page_error_requires_one_noninformational_issue(additional_issue):
+    payload = {"resourceType": "OperationOutcome", "issue": [*PAGE_ERROR[1]["issue"], additional_issue]}
+    result = (500, payload, None, 1)
+    assert not outage.is_page_error(result)
+    assert outage.is_backend_outage_response(result)
 
 
 async def test_query_local_continuation_500_is_returned_without_replaying_cursor(monkeypatch):
