@@ -14,11 +14,16 @@ from tests.test_provider_directory_compact_payload import resource
 
 
 @asynccontextmanager
-async def storage(*, shared_bodies=False):
+async def storage(*, shared_bodies=False, reference_tokens=False):
     async with _owned_database(_database_url().set(database="postgres")) as (url, _admin):
         connection = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
         tables = compact.CompactPayloadTables(
-            "compact_test", "aliases", "sets", "blocks", "shared_bodies" if shared_bodies else None
+            "compact_test",
+            "aliases",
+            "sets",
+            "blocks",
+            "shared_bodies" if shared_bodies else None,
+            "reference_tokens" if reference_tokens else None,
         )
         try:
             await connection.execute("CREATE SCHEMA compact_test")
@@ -280,3 +285,52 @@ async def test_compact_intake_preserves_an_omitted_acquisition_hash():
         assert len(stored_rows) == 1
         assert stored_rows[0]["acquired_resource_sha256"] is None
         assert json.loads(stored_rows[0]["payload_json"]) == original_by_field["payload_json"]
+
+
+@pytest.mark.asyncio
+async def test_reference_tokens_pack_network_refs_losslessly_and_reject_missing_tokens():
+    absent = resource("absent")
+    absent["payload_json"].pop("network_refs")
+    network_shapes = [
+        absent,
+        resource("null-net", network_refs=None, npi=True),
+        resource("empty-net", network_refs=[], npi=1000000000),
+        resource(
+            "ordered-net",
+            network_refs=["Organization/net-a", "Organization/net-b", "Organization/net-a", "Organization/caf\u00e9"],
+            numbers=[-0.0, 1.0, 1e-7, 1e100],
+            npi="1000000000",
+        ),
+        resource("inline-net", network_refs="inline", npi={"nested": 1}),
+        resource("mixed-net", network_refs=[1, None]),
+    ]
+    replay_row = resource(
+        "ordered-net",
+        network_refs=["Organization/net-a", "Organization/net-b", "Organization/net-a", "Organization/caf\u00e9"],
+        numbers=[-0.0, 1.0, 1e-7, 1e100],
+        npi="1000000000",
+        fhir_meta={"lastUpdated": "2026-11-26T00:00:00Z"},
+    )
+    async with storage(shared_bodies=True, reference_tokens=True) as (connection, tables):
+        async with connection.transaction():
+            assert await append(connection, tables, network_shapes, 1) == {"rows": 6, "is_replay": False}
+        async with connection.transaction():
+            assert await append(connection, tables, network_shapes, 1) == {"rows": 6, "is_replay": True}
+            assert await append(connection, tables, [replay_row], 2) == {"rows": 1, "is_replay": False}
+        assert await connection.fetchval("SELECT count(*) FROM compact_test.reference_tokens") == 3
+        assert await connection.fetchval("SELECT count(*) FROM compact_test.shared_bodies") == 6
+        async with connection.transaction(readonly=True):
+            restored = await read_all(connection, tables)
+            restored_by_obs = {(entry["batch_ordinal"], entry["row_ordinal"]): entry for entry in restored}
+            expected_by_obs = {(1, idx): entry for idx, entry in enumerate(network_shapes)} | {(2, 0): replay_row}
+            assert set(restored_by_obs) == set(expected_by_obs)
+            for key, expected in expected_by_obs.items():
+                assert compact._json(json.loads(restored_by_obs[key]["payload_json"])) == compact._json(
+                    expected["payload_json"]
+                )
+            npi_matches = await compact.read_compact_payload_page(connection, tables, "dataset", npi="1000000000")
+            assert len(npi_matches) == 3
+        with pytest.raises(candidate.GenericCandidateError, match="read_rows_missing"):
+            async with connection.transaction():
+                await connection.execute("DELETE FROM compact_test.reference_tokens WHERE token_id=1")
+                await compact.read_compact_payload_page(connection, tables, "dataset", limit=10)

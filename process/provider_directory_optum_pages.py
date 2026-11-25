@@ -7,7 +7,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from process.provider_directory_fetch_types import PartitionPageFetchResult
 from process.provider_directory_optum_outage import is_page_error
 
-MAX_RECOVERY_REQUESTS = 24
+MAX_RECOVERY_REQUESTS = 96
+RECOVERABLE_RESOURCE_TYPES = frozenset(
+    {"Location", "Organization", "Practitioner", "OrganizationAffiliation", "PractitionerRole"}
+)
 
 
 @dataclass(frozen=True)
@@ -125,7 +128,7 @@ async def recover_page(url, total, resource_type, send):
 async def recover_partition_page(directory, request, fetch_result):
     """Read bounded subpages through the original source request admission."""
     if (
-        request.resource_type not in {"Location", "Organization"}
+        request.resource_type not in RECOVERABLE_RESOURCE_TYPES
         or request.is_residual_only
         or not directory.uhc_scan.is_source(directory, request.source_record)
         or not is_page_error(fetch_result)

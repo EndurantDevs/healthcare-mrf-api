@@ -13,31 +13,53 @@ OUTAGE_DISTINCT_PARTITIONS = 4
 PROBE_DELAYS = (60, 300, 900)
 CANCELLATION_POLL_SECONDS = 30
 PAGE_ERROR_DIAGNOSTICS = "Fhir Server Unknown Exception."
+PAGING_FAILURE_PREFIX = "Paging Request Failure."
+_OPERATION_OUTCOME_ERROR = "provider_directory_resource_search_returned_operation_outcome"
+_OBSERVED_FAMILIES = frozenset(
+    {"Location", "Organization", "Practitioner", "OrganizationAffiliation", "PractitionerRole"}
+)
 
 
-def is_page_error(response):
-    """Recognize the exact query-local error returned for an unreadable search slice."""
-    status, payload, transport_error, _elapsed = response
-    if status != 500 or transport_error or not isinstance(payload, dict):
-        return False
+def _single_processing_error_diagnostics(payload):
+    if not isinstance(payload, dict):
+        return None
     issues = payload.get("issue")
     if payload.get("resourceType") != "OperationOutcome" or not isinstance(issues, list):
-        return False
+        return None
     if any(not isinstance(issue, dict) for issue in issues):
-        return False
+        return None
     relevant_issues = [
         issue
         for issue in issues
         if issue.get("severity") != "information" or issue.get("code") not in ("processing", "informational")
     ]
     if len(relevant_issues) != 1:
-        return False
+        return None
     (issue,) = relevant_issues
-    return (
-        issue.get("severity") == "error"
-        and issue.get("code") == "processing"
-        and issue.get("diagnostics") == PAGE_ERROR_DIAGNOSTICS
+    if issue.get("severity") == "error" and issue.get("code") == "processing":
+        diagnostics = issue.get("diagnostics")
+        return diagnostics if type(diagnostics) is str else None
+    return None
+
+
+def is_page_error(response):
+    """Recognize the exact query-local error returned for an unreadable search slice."""
+    status, payload, transport_error, _elapsed = response
+    is_supported_status = (status == 500 and not transport_error) or (
+        status == 200 and transport_error == _OPERATION_OUTCOME_ERROR
     )
+    if not is_supported_status:
+        return False
+    return _single_processing_error_diagnostics(payload) == PAGE_ERROR_DIAGNOSTICS
+
+
+def is_paging_failure(response):
+    """Recognize Optum's transient paging orchestrator HTTP 500 error."""
+    status, payload, transport_error, _elapsed = response
+    if status != 500 or transport_error:
+        return False
+    diagnostics = _single_processing_error_diagnostics(payload)
+    return diagnostics is not None and diagnostics.startswith(PAGING_FAILURE_PREFIX)
 
 
 def is_backend_outage_response(response):
@@ -64,7 +86,7 @@ class OptumOutage:
         is_query_local_error = is_page_error(response)
         if response[0] == 500:
             self.http_500_responses += 1
-            if context is not None and context[0].resource_type in {"Location", "Organization"}:
+            if context is not None and context[0].resource_type in _OBSERVED_FAMILIES:
                 classification = "page_error" if is_query_local_error else "other"
                 key = f"http_500_{context[0].resource_type.lower()}_{classification}"
                 self.http_500_by_family[key] = self.http_500_by_family.get(key, 0) + 1

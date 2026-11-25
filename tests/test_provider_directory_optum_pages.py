@@ -99,3 +99,75 @@ async def test_offset_recovery_rejects_ignored_slice_coordinates():
     send = AsyncMock(return_value=_search_page(2, 3))
     assert await pages.recover_page(CURSOR, 7, "Location", send) is None
     assert send.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_type",
+    ["Location", "Organization", "Practitioner", "OrganizationAffiliation", "PractitionerRole"],
+)
+async def test_recover_partition_page_covers_all_optum_partitioned_families(monkeypatch, resource_type):
+    start_url = f"{BASE}/{resource_type}?_count=2"
+    cursor_url = f"{BASE}?_getpages=synthetic%2Bhandle&_getpagesoffset=2&_count=2&_pagetype=opaque"
+
+    def make_page(start, stop):
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 5,
+                "entry": [{"resource": {"resourceType": resource_type, "id": str(idx)}} for idx in range(start, stop)],
+            },
+            None,
+            1,
+        )
+
+    async def fetch(_directory, request):
+        query = parse_qs(urlsplit(request.current_url).query)
+        start, count = int(query["_getpagesoffset"][0]), int(query["_count"][0])
+        if start <= 3 < start + count:
+            return PAGE_ERROR
+        return make_page(start, min(start + count, 5))
+
+    monkeypatch.setattr(importer.fhir_response, "fetch_partition_response", fetch)
+    state = PartitionFetchState(result_model=importer.ProviderDirectoryLocation, retained_resource_rows=[])
+    options = PartitionFetchOptions(5, "run", None, 2, False, None, 0)
+    request = PartitionChainRequest(
+        {"source_id": "test-source", "api_base": BASE}, resource_type, asyncio.Queue(), state, start_url, options
+    ).page_request(cursor_url, False, [], 5)
+    recovered = await pages.recover_partition_page(importer, request, PAGE_ERROR)
+    assert recovered is not None
+    assert recovered.unreadable_offsets == (3,)
+    assert [entry["resource"]["id"] for _, entries in recovered.batches for entry in entries] == ["2"]
+
+
+@pytest.mark.asyncio
+async def test_recover_page_handles_multiple_unreadable_slots_in_full_100_row_window():
+    bad_offsets = {12, 47, 89}
+    cursor_100 = f"{BASE}?_getpages=synthetic%2Bhandle&_getpagesoffset=100&_count=100&_pagetype=opaque"
+
+    async def send(url):
+        query = parse_qs(urlsplit(url).query)
+        start, count = int(query["_getpagesoffset"][0]), int(query["_count"][0])
+        if any(start <= bad < start + count for bad in {100 + offset for offset in bad_offsets}):
+            return PAGE_ERROR
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 300,
+                "entry": [
+                    {"resource": {"resourceType": "PractitionerRole", "id": str(idx)}}
+                    for idx in range(start, start + count)
+                ],
+            },
+            None,
+            1,
+        )
+
+    recovered = await pages.recover_page(cursor_100, 300, "PractitionerRole", send)
+    assert recovered is not None
+    assert recovered.unreadable_offsets == (112, 147, 189)
+    assert sum(len(entries) for _, entries in recovered.batches) == 97
