@@ -626,30 +626,7 @@ def build_native_nearby_count_sql(
     """Build the exact native nearby count query from normalized fragments."""
 
     if nearby.search_table_sql:
-        taxonomy_where = _taxonomy_filter_where(nearby, on_search=True)
-        total = (
-            "COUNT(*) FILTER (WHERE NOT a.shares_identity) "
-            "+ COUNT(DISTINCT (a.npi, a.address_key)) FILTER (WHERE a.shares_identity)"
-            if nearby.search_provider_facts
-            else "COUNT(DISTINCT (a.npi, a.address_key))"
-        )
-        name_scope = name_filter = ""
-        if (
-            nearby.search_provider_facts
-            and nearby.ilike_clause
-            and not _PROVIDER_COLUMN.search(nearby.search_extra_clause)
-        ):
-            # Let the trigram index select names once before matching projected offices.
-            name_scope = f"""WITH matched_npis AS MATERIALIZED (
-    SELECT d.npi FROM mrf.npi AS d WHERE TRUE{nearby.ilike_clause}
-)
-"""
-            name_filter = "\n   AND a.npi IN (SELECT npi FROM matched_npis)"
-            nearby = replace(nearby, ilike_clause="")
-        return f"""{name_scope}SELECT {total} AS total_count
-  FROM {nearby.search_table_sql} AS a{_search_npi_source(nearby)[1]}
- WHERE {_search_geo_predicates(nearby, taxonomy_where)}{name_filter}
-   {bbox_clause};"""
+        return _search_nearby_count_sql(nearby, bbox_clause)
     plan_member_sql, filters = legacy_plan or (None, ())
     extra_clause = nearby.extra_clause if plan_member_sql is None else nearby_extra_clauses(filters, None, 0)[0]
     source_sql = _NATIVE_NEARBY_COUNT_SOURCE_TEMPLATE.format(
@@ -670,6 +647,40 @@ def build_native_nearby_count_sql(
 SELECT COUNT(DISTINCT (npi, address_key)) AS total_count
   FROM local_rows
  WHERE npi IN ({plan_member_sql});"""
+
+
+def _search_nearby_count_sql(nearby: NearbySqlQuery, bbox_clause: str) -> str:
+    """Count exact projected office identities with at most one existence probe per NPI."""
+    taxonomy_where = _taxonomy_filter_where(nearby, on_search=True)
+    name_scope = name_filter = ""
+    if nearby.search_provider_facts and nearby.ilike_clause and not _PROVIDER_COLUMN.search(nearby.search_extra_clause):
+        # Let the trigram index select names once before matching projected offices.
+        name_scope = f"""WITH matched_npis AS MATERIALIZED (
+    SELECT d.npi FROM mrf.npi AS d WHERE TRUE{nearby.ilike_clause}
+)
+"""
+        name_filter = "\n   AND a.npi IN (SELECT npi FROM matched_npis)"
+        nearby = replace(nearby, ilike_clause="")
+    predicates = _search_geo_predicates(nearby, taxonomy_where) + name_filter + "\n   " + bbox_clause
+    if not nearby.search_provider_facts and not _PROVIDER_COLUMN.search(predicates):
+        return f"""WITH nearby_npis AS MATERIALIZED (
+    SELECT a.npi, count(DISTINCT a.address_key) AS office_count
+      FROM {nearby.search_table_sql} AS a
+     WHERE {predicates}
+     GROUP BY a.npi
+)
+SELECT COALESCE(sum(nearby_npis.office_count), 0)::bigint AS total_count
+  FROM nearby_npis
+ WHERE EXISTS (SELECT 1 FROM mrf.npi AS d WHERE d.npi = nearby_npis.npi);"""
+    total = (
+        "COUNT(*) FILTER (WHERE NOT a.shares_identity) "
+        "+ COUNT(DISTINCT (a.npi, a.address_key)) FILTER (WHERE a.shares_identity)"
+        if nearby.search_provider_facts
+        else "COUNT(DISTINCT (a.npi, a.address_key))"
+    )
+    return f"""{name_scope}SELECT {total} AS total_count
+  FROM {nearby.search_table_sql} AS a{_search_npi_source(nearby)[1]}
+ WHERE {predicates};"""
 
 
 GEO_ENTITY_TYPE_PREDICATE = "d.entity_type_code = :entity_type_code"

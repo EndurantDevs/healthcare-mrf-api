@@ -2,7 +2,7 @@
 
 """Read admitted numeric contexts without replacing canonical family membership."""
 
-from sqlalchemy import and_, case, inspect, select
+from sqlalchemy import Select, and_, case, inspect, select
 
 from db.models.custom_import import CustomImportChildRevision
 from process.custom_import import grouped_query as query
@@ -70,6 +70,17 @@ def _source_values(context, plan, entity_values, derived_fields):
             if roots is not None
             else None
         )
+        if (
+            scoped is None
+            and isinstance(entity_values, Select)
+            and plan.require_match
+            and plan.selected_value is None
+            and context.profile_context_slot == 0
+            and len(selectors) == 1
+            and all(field.collection is not None for field in derived_fields)
+        ):
+            bindings = query._native_child_candidate_ids(context, entity_values, selectors[0])
+            scoped = query.selected_identities(context, plan, entity_binding_ids=bindings, include_binding=True)
         selected, statement, values_by_field, states_by_field, _, child_identity = query._derived_child_values(
             context, plan, entity_values, fields, selectors, derived_fields, include_binding=True, selected=scoped
         )

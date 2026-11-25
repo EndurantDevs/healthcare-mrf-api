@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from decimal import Decimal
 from itertools import product
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import BigInteger, LargeBinary, Numeric, Text, and_, column, select, values
@@ -19,7 +20,6 @@ from tests import custom_import_grouped_child_support as fixture
 from tests import test_custom_import_grouped_child_read_postgres as child_native
 from tests import test_custom_import_grouped_score_query_postgres as scores
 from tests import test_custom_import_provider_hydration_postgres as native
-from tests.test_custom_import_projection_read_context import projection_helper as projection_helper
 
 _KEY = read_core.ReadFilter("service_code", "eq", "chosen")
 _PANEL = read_core.ReadFilter("segment", "eq", "segment_a")
@@ -52,8 +52,10 @@ def _definition():
 
 
 @pytest.fixture
-async def projection_case(monkeypatch, projection_helper):
-    projection_helper.read_projection_tables.return_value = None
+async def projection_case(monkeypatch):
+    from process.custom_import import query_projection_evidence
+
+    monkeypatch.setattr(query_projection_evidence, "read_projection_tables", AsyncMock(return_value=None))
     monkeypatch.setattr(native.fixture, "definition", _definition)
     roots = [dict(row, weight=0 if (row["npi"], row["period"]) == (native._B, 2025) else 2) for row in native._roots()]
     child_rows = [
@@ -147,8 +149,10 @@ async def _projected_context(session, context, *, omit_scope=None):
     return replace(context, projection_tables=_projection_tables(bindings_by_npi, keys_by_code, omit_scope=omit_scope))
 
 
-def _prepare(context, **changes_map):
-    return grouped_read.prepare_relation(context, fixture.query(**changes_map), _SCOPE)
+def _prepare(context, *, native_entity_scope=None, **changes_map):
+    return grouped_read.prepare_relation(
+        context, fixture.query(**changes_map), _SCOPE, native_entity_scope=native_entity_scope
+    )
 
 
 async def _assert_rows(session, contexts, expected, **changes_map):
@@ -222,6 +226,38 @@ async def test_mixed_filters_keep_exact_context(projection_case):
         ),
         **changes_map,
     )
+
+
+@pytest.mark.asyncio
+async def test_native_child_candidates_keep_current_period_and_missing_projection_error(projection_case):
+    session, legacy, projected = projection_case
+    native_npis = (native._A, native._C, child_native._ABSENT)
+    native_rows = values(column("npi", Text)).data([(npi,) for npi in native_npis]).cte("native_episode_sample")
+    native_scope = select(native_rows.c.npi)
+    order_terms = (read_core.ReadOrderTerm("output_child", "asc", "last"),)
+    for selector, expected in (
+        (_KEY, [(native._A, Decimal("2"))]),
+        (read_core.ReadFilter("service_code", "eq", "older_only"), []),
+        (read_core.ReadFilter("service_code", "eq", "absent"), []),
+    ):
+        options_by_name = dict(context_filters=(selector,), order_terms=order_terms, require_match=True)
+        original = _prepare(legacy, entity_values=native_npis, **options_by_name)
+        scoped = _prepare(projected, native_entity_scope=native_scope, **options_by_name)
+        assert "native_child_candidate_bindings AS MATERIALIZED" in str(scoped.statement)
+        assert [tuple(row) for row in (await session.execute(original.statement)).all()] == expected
+        assert [tuple(row) for row in (await session.execute(scoped.statement)).all()] == expected
+    incomplete = await _projected_context(session, projected, omit_scope="child")
+    scoped = _prepare(
+        incomplete,
+        native_entity_scope=native_scope,
+        context_filters=(_KEY,),
+        filters=(read_core.ReadFilter("output_child", "gt", 10000),),
+        require_match=True,
+    )
+    with pytest.raises(DBAPIError) as raised:
+        async with session.begin_nested():
+            await session.execute(scoped.statement)
+    assert raised.value.orig.sqlstate == "21000"
 
 
 @pytest.mark.asyncio
