@@ -285,6 +285,9 @@ async def _retention_login(fixture):
             f'GRANT SELECT ON {control}.network_serving_control,{control}.registry_publication_request TO "{role}"'
         )
         await connection.execute(
+            f'GRANT SELECT (state, source_generations) ON {control}.network_membership_candidate TO "{role}"'
+        )
+        await connection.execute(
             "GRANT SELECT,DELETE ON hp_snapshot_retention.preparation,hp_snapshot_retention.preparation_claim,"
             f'hp_snapshot_retention.preparation_relation TO "{role}"'
         )
@@ -462,3 +465,90 @@ async def test_retention_keeps_published_current_and_rollback(catalog_preparatio
     assert [
         await _candidate_state(fixture, catalog_target) for catalog_target in (rollback, current)
     ] == published_states
+
+
+async def test_retention_deletes_child_rows_before_preparation_under_restrict_fks(catalog_preparation):
+    """ON DELETE RESTRICT constraints on preparation_claim and preparation_relation must allow retirement."""
+    fixture = catalog_preparation
+    connection, control = fixture.fixture.connection, fixture.config.control_schema
+    await _install_both(fixture)
+    stale, _ = await _handed_off_catalog(fixture)
+    candidate_id = UUID(stale.candidate_id)
+    assert (
+        await connection.fetchval(
+            "SELECT count(*) FROM hp_snapshot_retention.preparation_claim WHERE preparation_id=$1", candidate_id
+        )
+        > 0
+    )
+    assert (
+        await connection.fetchval(
+            "SELECT count(*) FROM hp_snapshot_retention.preparation_relation WHERE preparation_id=$1", candidate_id
+        )
+        > 0
+    )
+    await _age_preparations(fixture, stale)
+    await connection.execute(
+        "ALTER TABLE hp_snapshot_retention.preparation_claim ADD CONSTRAINT retention_test_claim_fkey "
+        "FOREIGN KEY (preparation_id) REFERENCES hp_snapshot_retention.preparation(preparation_id) ON DELETE RESTRICT"
+    )
+    await connection.execute(
+        "ALTER TABLE hp_snapshot_retention.preparation_relation ADD CONSTRAINT retention_test_relation_fkey "
+        "FOREIGN KEY (preparation_id) REFERENCES hp_snapshot_retention.preparation(preparation_id) ON DELETE RESTRICT"
+    )
+    try:
+        async with _retention_login(fixture) as retention:
+            retired = await retire_unpublished_fhir_catalog_candidates(retention, control_schema=control, execute=True)
+    finally:
+        await connection.execute(
+            "ALTER TABLE hp_snapshot_retention.preparation_claim DROP CONSTRAINT IF EXISTS retention_test_claim_fkey"
+        )
+        await connection.execute(
+            "ALTER TABLE hp_snapshot_retention.preparation_relation "
+            "DROP CONSTRAINT IF EXISTS retention_test_relation_fkey"
+        )
+    assert retired == {"state": "retired", "schemas": [stale.schema_name], "deferred": []}
+    assert await _candidate_state(fixture, stale) == {"schema": False, "snapshot": 0, "records": 0}
+
+
+async def test_retention_keeps_paused_network_candidate_and_child_predecessor(catalog_preparation):
+    """Paused non-rejected network builds and unpublished child predecessors stay kept; rejected ones retire."""
+    fixture = catalog_preparation
+    connection, control = fixture.fixture.connection, fixture.config.control_schema
+    await _install_both(fixture)
+    referenced, referenced_snapshot = await _handed_off_catalog(fixture, as_of=date(2026, 1, 1))
+    predecessor, predecessor_snapshot = await _handed_off_catalog(fixture, as_of=date(2026, 1, 2), allocate=False)
+    child_catalog, _ = await _handed_off_catalog(fixture, as_of=date(2026, 1, 3), allocate=False)
+    rejected_only, rejected_snapshot = await _handed_off_catalog(fixture, as_of=date(2026, 1, 4), allocate=False)
+    for target_state, snapshot in (("open", referenced_snapshot), ("rejected", rejected_snapshot)):
+        candidate_id = uuid4()
+        await connection.execute(
+            f'INSERT INTO "{control}".network_membership_candidate '
+            "(candidate_id,dataset_id,schema_id,producer_id,schema_name,state,"
+            "source_generations,approved_custom_revision,expected_head,expected_rows) "
+            "VALUES($1,$2,$3,$4,$5,$6,jsonb_build_object('fhir_catalog',$7::text),0,0,0)",
+            candidate_id,
+            uuid4(),
+            uuid4(),
+            uuid4(),
+            "network_candidate_" + candidate_id.hex,
+            target_state,
+            snapshot["metadata_generation"],
+        )
+    await connection.execute(
+        f"UPDATE \"{control}\".registry_fhir_catalog_snapshot SET custody_json=coalesce(custody_json,'{{}}'::jsonb) || "
+        "jsonb_build_object('preparation',jsonb_build_object('previous_metadata_generation',$2::text)) "
+        "WHERE schema_name=$1",
+        child_catalog.schema_name,
+        predecessor_snapshot["metadata_generation"],
+    )
+    await _age_preparations(fixture, referenced, predecessor, rejected_only)
+    kept_by_schema = {
+        catalog_target.schema_name: await _candidate_state(fixture, catalog_target)
+        for catalog_target in (referenced, predecessor, child_catalog)
+    }
+    async with _retention_login(fixture) as retention:
+        retired = await retire_unpublished_fhir_catalog_candidates(retention, control_schema=control, execute=True)
+    assert retired == {"state": "retired", "schemas": [rejected_only.schema_name], "deferred": []}
+    assert await _candidate_state(fixture, rejected_only) == {"schema": False, "snapshot": 0, "records": 0}
+    for catalog_target in (referenced, predecessor, child_catalog):
+        assert await _candidate_state(fixture, catalog_target) == kept_by_schema[catalog_target.schema_name]
