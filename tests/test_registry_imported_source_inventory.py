@@ -506,6 +506,17 @@ async def test_catalogue_policy_change_invalidates_inventory_token(inventory_cas
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["AUTOMATIC_NETWORKS_PER_SOURCE", "AUTOMATIC_NETWORKS_PER_CATALOG"])
+async def test_automatic_network_limit_change_invalidates_inventory_token(inventory_case, monkeypatch, limit):
+    before = await observe(inventory_case)
+    before_token = before.token
+    monkeypatch.setattr(inventory, limit, 1)
+    after = await observe(inventory_case)
+    assert before.document == after.document
+    assert before_token != after.token
+
+
+@pytest.mark.asyncio
 async def test_published_catalog_families_key_complete_observations_by_dataset_and_digest():
     admitted = observed_descriptor()
     incomplete_by_field = {**observed_descriptor(dataset="other-dataset"), "complete": False}

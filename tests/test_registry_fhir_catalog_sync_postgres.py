@@ -301,11 +301,12 @@ def _edition_descriptor(edition):
     return source
 
 
-def _catalog_resource_rows(network_names):
+def _catalog_resource_rows(network_names, reference_only):
     """Build Organization and InsurancePlan resources for the staged-source fixture."""
     resource_rows = [source_row("Organization", "insurer", {"name": "Example Insurance"})]
     for resource_id, name in network_names.items():
-        resource_rows.append(source_row("Organization", resource_id, {"name": name, "type_codes": [{"code": "ntwk"}]}))
+        type_codes = [] if resource_id in reference_only else [{"code": "ntwk"}]
+        resource_rows.append(source_row("Organization", resource_id, {"name": name, "type_codes": type_codes}))
         resource_rows.append(
             source_row(
                 "InsurancePlan",
@@ -320,11 +321,11 @@ def _catalog_resource_rows(network_names):
     return resource_rows
 
 
-async def _staged_source(fixture, catalog_target, edition, network_names, *, source_descriptor=None):
+async def _staged_source(fixture, catalog_target, edition, network_names, *, source_descriptor=None, reference_only=()):
     """Use extraction output; native Source admission is covered by its own fixture."""
     source_descriptor = source_descriptor or _edition_descriptor(edition)
     generation = fhir_catalog_source_generation(source_descriptor)
-    resource_rows = _catalog_resource_rows(network_names)
+    resource_rows = _catalog_resource_rows(network_names, reference_only)
     extracted = extract_fhir_catalog_batch(resource_rows, profile="published_normalized")
     observations = [
         (generation, "Organization", observation.resource_id, "organization", 0, canonical_json(asdict(observation)))
@@ -505,6 +506,117 @@ async def _initial_catalog(fixture, grant):
     assert len(networks) == 2 and all(not network_row["archived"] for network_row in networks)
     sealed = await freeze_metadata(fixture, snapshot=snapshot)
     return SimpleNamespace(generation=generation, snapshot=snapshot, sealed=sealed, networks=networks)
+
+
+@pytest.mark.asyncio
+async def test_automatic_network_limit_refuses_before_allocation(metadata_custody, monkeypatch):
+    fixture = metadata_custody
+    grant = await _registry(fixture)
+    catalog_target = fixture.target
+    disposition = await _staged_source(
+        fixture,
+        catalog_target,
+        "edition-one",
+        {"network-old": "Known network", "reference-only": "Referenced network"},
+        reference_only=("reference-only",),
+    )
+    source_generation = fhir_catalog_source_generation(disposition.descriptor)
+    snapshot = await _snapshot(
+        fixture,
+        catalog_target,
+        grant,
+        [{"source_generation": source_generation, "source_id": "alias-a", "status": "current"}],
+    )
+    observations = f'"{catalog_target.schema_name}".registry_fhir_catalog_observation'
+    evidence = await fixture.connection.fetch(
+        f"SELECT * FROM {observations} ORDER BY resource_type,resource_id,ordinal"
+    )
+    sequence = f'"{fixture.control_schema}".network_registry_identity_network_id_seq'
+    identity_position = await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
+
+    for source_limit, remaining_budget, limit_scope in ((1, None, "source alias-a"), (2, 1, "catalog")):
+        monkeypatch.setattr(sync, "AUTOMATIC_NETWORKS_PER_SOURCE", source_limit)
+        expected_message = f"registry_fhir_catalog_automatic_network_limit_exceeded: {limit_scope}"
+        with (
+            sync._AUTOMATIC_NETWORKS_REMAINING.set(remaining_budget),
+            pytest.raises(ValueError, match=expected_message),
+        ):
+            await _project(fixture, catalog_target, disposition, snapshot, grant)
+        assert await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == identity_position
+        assert await _catalog_bindings(fixture, catalog_target) == []
+        assert (
+            await fixture.connection.fetch(f"SELECT * FROM {observations} ORDER BY resource_type,resource_id,ordinal")
+        ) == evidence
+
+    with sync._AUTOMATIC_NETWORKS_REMAINING.set(2):
+        projected = await _project(fixture, catalog_target, disposition, snapshot, grant)
+        assert sync._AUTOMATIC_NETWORKS_REMAINING.get() == 0
+    assert projected["networks"] == 2
+    assert projected["created_networks"] == 1
+    projected_bindings = await _catalog_bindings(fixture, catalog_target)
+    assert {json.loads(binding["document_json"])["source_key"] for binding in projected_bindings} == {
+        "network-old",
+        "reference-only",
+    }
+
+
+@pytest.mark.asyncio
+async def test_automatic_network_limits_check_copied_organization_bindings(metadata_custody, monkeypatch):
+    fixture = metadata_custody
+    grant = await _registry(fixture)
+    first = await _initial_catalog(fixture, grant)
+    catalog_target = await _new_catalog_target(fixture)
+    snapshot = await _snapshot(fixture, catalog_target, grant, first.snapshot["source_vector_json"])
+    await _copy_catalog(fixture, first.sealed, catalog_target, snapshot)
+    carried = await _catalog_bindings(fixture, catalog_target)
+    assert len(carried) == 3
+    relation = f'"{catalog_target.schema_name}".registry_fhir_catalog_binding'
+    other_bindings = (
+        ("fhir", {"organization_id": "other-network"}),
+        ("fhir", {"kind": "uhc_plan_tier_v1"}),
+        ("fhir", {"insurance_plan_id": "reviewed-plan"}),
+        ("manual", {"organization_id": "approved-network"}),
+        ("aca", {}),
+    )
+    await fixture.connection.executemany(
+        f"INSERT INTO {relation} (metadata_generation,network_id,binding_id,source_id,document_json) "
+        "VALUES ($1,7,$2,'other-source',$3::jsonb)",
+        [
+            (
+                snapshot["metadata_generation"],
+                uuid4(),
+                json.dumps({"source_system": source_system, "source_scope": scope}),
+            )
+            for source_system, scope in other_bindings
+        ],
+    )
+
+    monkeypatch.setattr(sync, "AUTOMATIC_NETWORKS_PER_SOURCE", 3)
+    monkeypatch.setattr(sync, "AUTOMATIC_NETWORKS_PER_CATALOG", 4)
+    await sync._require_automatic_binding_limits(fixture.connection, catalog_target.schema_name)
+    monkeypatch.setattr(sync, "AUTOMATIC_NETWORKS_PER_SOURCE", 2)
+    await sync._require_automatic_binding_limits(
+        fixture.connection, fixture.target.schema_name, surviving_generations=[]
+    )
+
+    successor_id = uuid4()
+    successor = replace(catalog_target, candidate_id=str(successor_id), schema_name="fhir_catalog_" + successor_id.hex)
+    fixture.schemas.append(successor.schema_name)
+    config = SimpleNamespace(grant=grant, loader_role=fixture.roles["loader"])
+    successor_snapshot_by_field = {**snapshot, "schema_name": successor.schema_name}
+    with pytest.raises(ValueError, match="registry_fhir_catalog_automatic_network_limit_exceeded: source alias-a"):
+        async with fixture.connection.transaction():
+            await sync._build_source_catalog_candidate(
+                config, fixture.connection, (None, None, None), successor, successor_snapshot_by_field, first.sealed, {}
+            )
+    assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", successor.schema_name) is None
+
+    monkeypatch.setattr(sync, "AUTOMATIC_NETWORKS_PER_SOURCE", 3)
+    monkeypatch.setattr(sync, "AUTOMATIC_NETWORKS_PER_CATALOG", 3)
+    with pytest.raises(ValueError, match="registry_fhir_catalog_automatic_network_limit_exceeded: catalog"):
+        await sync._require_automatic_binding_limits(fixture.connection, catalog_target.schema_name)
+    assert len(await _catalog_bindings(fixture, catalog_target)) == len(carried) + len(other_bindings)
+    assert len(await _catalog_bindings(fixture, fixture.target)) == len(carried)
 
 
 async def _superseding_catalog(fixture, grant, first):

@@ -15,7 +15,12 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from db.plan_release_storage import storage_identifier
-from db.registry_fhir_catalog import PROJECTOR_VERSION, SNAPSHOT_COLUMNS
+from db.registry_fhir_catalog import (
+    AUTOMATIC_NETWORKS_PER_CATALOG,
+    AUTOMATIC_NETWORKS_PER_SOURCE,
+    PROJECTOR_VERSION,
+    SNAPSHOT_COLUMNS,
+)
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_fhir_catalog_custody import (
@@ -99,6 +104,7 @@ from process.registry_publication_consumer import consume_registry_publication_o
 
 PAGE_ROWS = 1000
 EDGE_ROWS = 100
+_AUTOMATIC_NETWORKS_REMAINING = ContextVar("catalog_automatic_networks_remaining", default=None)
 
 
 def _snapshot(record):
@@ -870,6 +876,12 @@ async def _build_source_catalog_candidate(
     config, loader, source_reads, copy_target, snapshot, previous, current_by_generation, *, source_companies_only=False
 ):
     options_by_name = {"loader_role": config.loader_role, "control_schema": config.grant.control_schema}
+    if previous and not source_companies_only:
+        await _require_automatic_binding_limits(
+            loader,
+            previous["schema_name"],
+            surviving_generations=[entry["source_generation"] for entry in snapshot["source_vector_json"]],
+        )
     await create_fhir_catalog_candidate(loader, copy_target, **options_by_name)
     accounting_by_phase = {}
     if previous:
@@ -881,6 +893,7 @@ async def _build_source_catalog_candidate(
     await retire_replaced_catalog_sources(loader, copy_target, snapshot, previous, config.grant.control_schema)
     async with AsyncExitStack() as writes:
         await writes.enter_async_context(fhir_catalog_copy_landings(loader, copy_target))
+        writes.enter_context(_AUTOMATIC_NETWORKS_REMAINING.set(AUTOMATIC_NETWORKS_PER_CATALOG))
         accounting_by_phase["manual"] = await project_manual_fhir_catalog(
             loader, copy_target, snapshot, **options_by_name
         )
@@ -912,8 +925,28 @@ async def _build_source_catalog_candidate(
             source_generations=tuple(current_by_generation),
         )
     await _update_binding_statuses(loader, copy_target, current_by_generation)
+    if not source_companies_only:
+        await _require_automatic_binding_limits(loader, copy_target.schema_name)
     accounting_by_phase["indexes"] = await create_fhir_catalog_indexes(loader, copy_target, **options_by_name)
     return accounting_by_phase
+
+
+async def _require_automatic_binding_limits(connection, schema_name, *, surviving_generations=None):
+    """Check only surviving prior bindings or all bindings in the completed candidate."""
+    namespace = storage_identifier(schema_name)
+    counts = await connection.fetch(
+        f"SELECT source_id,count(*) AS total FROM (SELECT source_id FROM ONLY {namespace}.registry_fhir_catalog_binding "
+        "WHERE document_json->>'source_system'='fhir' AND document_json->'source_scope' ? 'organization_id' "
+        "AND ($2::text[] IS NULL OR split_part(document_json->>'evidence_id',':',1)=ANY($2)) "
+        "LIMIT $1) automatic GROUP BY source_id ORDER BY source_id",
+        AUTOMATIC_NETWORKS_PER_CATALOG + 1,
+        surviving_generations,
+    )
+    if sum(row["total"] for row in counts) > AUTOMATIC_NETWORKS_PER_CATALOG:
+        raise ValueError("registry_fhir_catalog_automatic_network_limit_exceeded: catalog")
+    for row in counts:
+        if row["total"] > AUTOMATIC_NETWORKS_PER_SOURCE:
+            raise ValueError(f"registry_fhir_catalog_automatic_network_limit_exceeded: source {row['source_id']}")
 
 
 async def _update_binding_statuses(loader, copy_target, current_by_generation):
@@ -1611,7 +1644,7 @@ async def project_fhir_catalog_source(
     namespace = storage_identifier(copy_target.schema_name)
     started = perf_counter()
     counts_by_kind = {"created_networks": 0, "networks": 0, "relationships": 0, "batches": 0}
-    await _create_network_targets(connection, namespace, generation)
+    await _prepare_network_targets(connection, namespace, generation, descriptor["coordinates"]["source_id"])
     after = ""
     while True:
         organization_records = await _network_organization_page(connection, namespace, generation, after)
@@ -1720,13 +1753,36 @@ async def _project_plan_tier_source(connection, copy_target, disposition, snapsh
     return counts_by_kind
 
 
+def _network_organizations(namespace):
+    return (
+        f"FROM {namespace}.registry_fhir_catalog_observation o "
+        "WHERE o.source_generation=$1 AND o.resource_type='Organization' AND o.observation_kind='organization' "
+        "AND (o.document_json->'declared_network'='true'::jsonb "
+        "OR EXISTS(SELECT FROM pg_temp.fhir_catalog_network_targets n WHERE n.resource_id=o.resource_id))"
+    )
+
+
+async def _prepare_network_targets(connection, namespace, generation, source_id):
+    """Reject unreviewed Organization fan-out before allocating any IDs for the source."""
+    await _create_network_targets(connection, namespace, generation)
+    remaining = _AUTOMATIC_NETWORKS_REMAINING.get()
+    limit = AUTOMATIC_NETWORKS_PER_SOURCE if remaining is None else min(remaining, AUTOMATIC_NETWORKS_PER_SOURCE)
+    count = await connection.fetchval(
+        f"SELECT count(*) FROM (SELECT 1 {_network_organizations(namespace)} LIMIT $2) organizations",
+        generation,
+        limit + 1,
+    )
+    if count > limit:
+        scope = "catalog" if limit < AUTOMATIC_NETWORKS_PER_SOURCE else f"source {source_id}"
+        raise ValueError(f"registry_fhir_catalog_automatic_network_limit_exceeded: {scope}")
+    if remaining is not None:
+        _AUTOMATIC_NETWORKS_REMAINING.set(remaining - count)
+
+
 async def _network_organization_page(connection, namespace, generation, after):
     return await connection.fetch(
-        f"SELECT o.resource_id,o.document_json::text AS document FROM {namespace}.registry_fhir_catalog_observation o "
-        "WHERE o.source_generation=$1 AND o.resource_type='Organization' AND o.observation_kind='organization' "
-        "AND o.resource_id>$2 COLLATE \"C\" AND (o.document_json->'declared_network'='true'::jsonb "
-        "OR EXISTS(SELECT FROM pg_temp.fhir_catalog_network_targets n WHERE n.resource_id=o.resource_id)) "
-        'ORDER BY o.resource_id COLLATE "C" LIMIT $3',
+        f"SELECT o.resource_id,o.document_json::text AS document {_network_organizations(namespace)} "
+        'AND o.resource_id>$2 COLLATE "C" ORDER BY o.resource_id COLLATE "C" LIMIT $3',
         generation,
         after,
         PAGE_ROWS,
