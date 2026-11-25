@@ -3,7 +3,12 @@
 
 from process.network_address_projection import _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
-from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
+from process.network_compact_layout import (
+    CompactAddressRelation,
+    CompactEdgeArtifact,
+    CompactNetworkLayout,
+    is_independent_network_candidate,
+)
 from process.network_serving_read import NetworkServingReadUnavailable, _object, _pinned_manifest
 
 _PUBLISHED_SQL = """SELECT jsonb_build_object(
@@ -96,13 +101,19 @@ def published_network_layout(candidate, *, retained_base_name=None):
     if retained_base_name is not None and base == artifact_base:
         # A pinned generation keeps reading the heap that rotation retained for it.
         base = CompactAddressRelation(base.schema_name, retained_base_name)
+    edges = tuple(
+        CompactEdgeArtifact(artifact["candidate_id"], artifact["schema_name"]) for artifact in serving["edge_artifacts"]
+    )
+    if is_independent_network_candidate(candidate) and (
+        any(edge.schema_name != schema for edge in edges)
+        or base.schema_name.startswith("network_candidate_")
+        or (custom is not None and custom.schema_name != schema)
+    ):
+        raise NetworkServingReadUnavailable("Independent network generation references predecessor serving data")
     layout = CompactNetworkLayout(
         CompactAddressRelation(schema, "network_slice_ref"),
         base,
-        tuple(
-            CompactEdgeArtifact(artifact["candidate_id"], artifact["schema_name"])
-            for artifact in serving["edge_artifacts"]
-        ),
+        edges,
         custom,
     )
     if type(search) is dict:

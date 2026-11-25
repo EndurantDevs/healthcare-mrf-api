@@ -164,3 +164,27 @@ async def test_declared_unwritten_fact_inventory_is_not_an_empty_dependency_set(
     }
     with pytest.raises(RegistrySourceContributionError, match="contribution_invalid"):
         await retention._source_fact_dependencies(object(), candidate_by_field, "control", None)
+
+
+async def test_retirement_checks_more_than_one_inline_batch_of_registered_recipes(monkeypatch):
+    from process.registry_source_inventory_contract import source_inventory_root
+    from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
+    from process.registry_source_recipe_store import RECIPE_DIGEST_KEY
+    from tests.registry_source_recipe_support import _capture_recipe, _example
+    from tests.test_registry_source_inventory_contract import _entries
+
+    retained = _capture_recipe()
+    entries = _entries([*(_example(index) for index in range(100)), retained])
+    reference = SourceInventoryReference(source_inventory_root(entries))
+    candidate_by_field = {
+        "source_recipes_json": reference.as_dict(),
+        "source_generations": {
+            INVENTORY_DIGEST_KEY: reference.root.entries_sha256,
+            RECIPE_DIGEST_KEY: reference.root.recipes_sha256,
+        },
+        "validation_json": {},
+    }
+    monkeypatch.setattr(retention, "_retirement_inventory", AsyncMock(return_value=(reference, entries)))
+    dependencies = await retention._candidate_dependencies(object(), candidate_by_field, "control")
+    for capture in (retained.source_pin.retained_capture, retained.source_pin.retained_successor.retained_capture):
+        assert (capture.schema_name, "provider_directory_dataset_resource") in dependencies

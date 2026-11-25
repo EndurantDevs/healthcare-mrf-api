@@ -194,6 +194,16 @@ async def resolve_registered_source_inventory(
         raise RegistryCompositionResumeError("registry_composition_resume_unavailable") from None
 
 
+async def has_registered_independent_storage(
+    connection, request_id, approved_revision, expected_head, *, control_schema=None
+):
+    """Preserve the storage contract of an interrupted composition."""
+    from process.network_compact_layout import is_independent_network_candidate
+
+    registered = await _registered_candidate(connection, request_id, approved_revision, expected_head, control_schema)
+    return registered is not None and is_independent_network_candidate(registered[1])
+
+
 async def resolve_registered_legacy_office_inputs(
     connection, request_id, approved_revision, expected_head, *, control_schema=None
 ):

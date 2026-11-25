@@ -248,7 +248,7 @@ async def test_retirement_walk_keeps_all_retained_rollbacks_and_prepared_referen
     monkeypatch.setattr(retention, "_candidate_dependencies", dependencies)
     with pytest.raises(retention.NetworkCompactRetentionError, match="artifact_referenced"):
         await retention._walk_references(connection, {("original_facts", contributions.CONTRIBUTION_TABLE)}, CONTROL)
-    dependencies.assert_awaited_once_with(connection, fixture.candidate, CONTROL)
+    dependencies.assert_awaited_once_with(connection, fixture.candidate, CONTROL, ())
     assert "eligible" not in connection.fetch.await_args.args[0]
 
 

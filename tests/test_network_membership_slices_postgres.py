@@ -345,6 +345,60 @@ async def test_reuse_add_remove_move_and_empty_bucket(slice_db):
 
 
 @pytest.mark.asyncio
+async def test_independent_copy_restarts_and_keeps_only_local_edges(slice_db):
+    from process.network_compact_preparation import _previous_slices
+
+    db = slice_db
+    pairs = [(42, 0), (42, 1), (88, 2)]
+    first = await _candidate(db, pairs)
+    async with db.connection.transaction():
+        first_receipt = await _prepare(db, first)
+    next_target = await _candidate(db, pairs)
+    generation_by_source = {"unified_address": db.source.generation_id, "network_storage": "independent-v1"}
+    await db.connection.execute(
+        f'UPDATE "{db.source_schema}".network_membership_candidate '
+        "SET source_generations = jsonb_build_object('unified_address',$2::text,'network_storage',$3::text) "
+        "WHERE candidate_id=$1",
+        UUID(next_target.candidate_id),
+        generation_by_source["unified_address"],
+        generation_by_source["network_storage"],
+    )
+    previous = await _previous_slices(
+        db.connection, {"source_generations": generation_by_source, "expected_head": 1}, db.source_schema
+    )
+    assert previous is None
+    with pytest.raises(NetworkMembershipSliceError, match="require all facts in the candidate"):
+        async with db.connection.transaction():
+            await _prepare(db, next_target, previous=_pin(first, first_receipt))
+    with pytest.raises(RuntimeError, match="interrupted independent build"):
+        async with db.connection.transaction():
+            await _prepare(db, next_target, previous=previous)
+            raise RuntimeError("interrupted independent build")
+    assert (
+        await db.connection.fetchval("SELECT to_regclass($1)", next_target.schema_name + ".network_office_edge") is None
+    )
+    async with db.connection.transaction():
+        receipt = await _prepare(db, next_target, previous=previous)
+    assert (receipt.reused_slices, receipt.copied_edge_rows) == (0, len(pairs))
+    assert {ref["artifact_candidate_id"] for ref in (await _refs(db, next_target)).values()} == {
+        UUID(next_target.candidate_id)
+    }
+    old_schema = slices._identifier(first.schema_name)
+    await db.connection.execute(
+        f"DROP TABLE {old_schema}.network_slice_ref,{old_schema}.network_office_edge,"
+        f"{old_schema}.network_membership,{old_schema}.provider_location_binding"
+    )
+    await db.connection.execute(f"DROP SCHEMA {old_schema}")
+    edge_rows = await db.connection.fetch(
+        f'SELECT r.network_id,e.location_key FROM "{next_target.schema_name}".network_slice_ref r '
+        f'JOIN "{next_target.schema_name}".network_office_edge e USING(slice_id)'
+    )
+    assert {(edge["network_id"], edge["location_key"]) for edge in edge_rows} == {
+        (network, db.keys[office]) for network, office in pairs
+    }
+
+
+@pytest.mark.asyncio
 async def test_selective_buckets_retain_exact_unexamined_refs(slice_db):
     db = slice_db
     first = await _candidate(db, [(42, 0), (88, 2)])

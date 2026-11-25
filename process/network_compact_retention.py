@@ -45,6 +45,7 @@ def _projection_sql(namespace):
     artifact = "c.validation_json#>'{serving_readiness,address_artifact}'"
     projection = f"""jsonb_build_object('candidate_id',c.candidate_id,'schema_name',c.schema_name,'state',c.state,
       'source_generations',c.source_generations,
+      'storage_relations',c.validation_json#>'{{serving_readiness,storage_relations}}',
       'address_source',jsonb_build_object(
         'schema_name',c.validation_json#>'{{address_source,schema_name}}',
         'table_name',c.validation_json#>'{{address_source,table_name}}',
@@ -214,7 +215,7 @@ async def _carrier_origin_dependencies(connection, carriers, schema):
     return dependencies
 
 
-async def _candidate_dependencies(connection, candidate, schema):
+async def _candidate_dependencies(connection, candidate, schema, retiring_generations=()):
     """Resolve full named dependency metadata outside the short retirement lock."""
     from process.network_address_artifact import _descriptor
     from process.network_compact_custom_preparation import compact_carrier_receipt, compact_custom_receipt
@@ -230,33 +231,49 @@ async def _candidate_dependencies(connection, candidate, schema):
     if is_compact_candidate(candidate):
         layout = published_network_layout(candidate)
         _require(layout is not None, "references_incomplete")
+        dependencies.update(_named_relations(report["serving_readiness"].get("storage_relations", [])))
         for relation in (layout.base, layout.custom, layout.geo_search):
             if relation is not None:
                 dependencies.add((relation.schema_name, relation.table_name))
         dependencies.update((artifact.schema_name, "network_office_edge") for artifact in layout.artifacts)
         dependencies.update(_named_relations(_descriptor(report["serving_readiness"]["address_artifact"])))
         custom, carriers = compact_custom_receipt(candidate), compact_carrier_receipt(candidate)
+        if carriers is not None:
+            _require(
+                not any(origin[0] in retiring_generations for origin in carriers.origin_references), "origin_referenced"
+            )
         for receipt in (custom, carriers):
             if receipt is not None:
                 dependencies.update(_named_relations(receipt.as_dict()))
         dependencies.update(await _carrier_origin_dependencies(connection, carriers, schema))
-    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+    from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
     from process.registry_source_recipe_store import canonical_registry_source_recipes, decode_registry_source_recipes
 
     inventory_data = await _retirement_inventory(connection, candidate)
-    if inventory_data is None:
-        recipes = decode_registry_source_recipes(candidate["source_recipes_json"])
-    else:
-        recipes = tuple(decode_registry_source_recipes("[" + entry.recipe_json + "]")[0] for entry in inventory_data[1])
-        _require(len(recipes) == verify_source_recipe_metadata(candidate).recipe_count, "references_incomplete")
     import json
 
-    dependencies.update(_named_relations(json.loads(canonical_registry_source_recipes(recipes))))
+    # Each inventory entry has its own validated recipe; a full inventory can exceed the inline batch limit.
+    batches = (
+        (candidate["source_recipes_json"],)
+        if inventory_data is None
+        else ("[" + entry.recipe_json + "]" for entry in inventory_data[1])
+    )
+    for batch in batches:
+        recipes = decode_registry_source_recipes(batch)
+        _require(
+            not any(
+                type(recipe.source_pin) is PinnedPTGOfficeMembershipSource
+                and recipe.source_pin.retained_generation_id in retiring_generations
+                for recipe in recipes
+            ),
+            "origin_referenced",
+        )
+        dependencies.update(_named_relations(json.loads(canonical_registry_source_recipes(recipes))))
     dependencies.update(await _source_fact_dependencies(connection, candidate, schema, inventory_data))
     return dependencies
 
 
-async def _walk_references(connection, requested, schema):
+async def _walk_references(connection, requested, schema, *, retiring_candidates=(), retiring_generations=()):
     namespace = _identifier(schema)
     after = None
     while True:
@@ -264,13 +281,15 @@ async def _walk_references(connection, requested, schema):
         if not rows:
             return
         for candidate_row in rows:
+            if candidate_row["candidate_id"] in retiring_candidates:
+                continue
             _require(candidate_row["bounded"] is True, "candidate_metadata_bound")
             candidate_by_field = dict(candidate_row)
             _require(
                 not any(relation[0] == candidate_by_field["schema_name"] for relation in requested),
                 "artifact_referenced",
             )
-            dependencies = await _candidate_dependencies(connection, candidate_by_field, schema)
+            dependencies = await _candidate_dependencies(connection, candidate_by_field, schema, retiring_generations)
             _require(not requested.intersection(dependencies), "artifact_referenced")
         after = rows[-1]["candidate_id"]
 

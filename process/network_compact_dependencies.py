@@ -10,6 +10,7 @@ from process.network_compact_layout import (
     CompactEdgeArtifact,
     CompactNetworkLayout,
     bind_compact_geo_search_candidate,
+    is_independent_network_candidate,
 )
 from process.network_compact_readiness import _digest, _require, compact_readiness
 from process.network_membership_validation import _json_object, _scope_report
@@ -45,6 +46,36 @@ async def capture_compact_edge_artifacts(connection, target, *, control_schema):
         else:
             artifacts.append(await _retained_edge(connection, identity, control_schema))
     return artifacts
+
+
+async def independent_network_storage_metadata(connection, candidate, base, *, control_schema):
+    """Record the named serving heaps while both candidates are still isolated."""
+    if not is_independent_network_candidate(candidate):
+        return {}
+    generations = _json_object(candidate["source_generations"])
+    schemas = [candidate["schema_name"]]
+    if base.schema_name.startswith("network_composition_"):
+        schemas.append(base.schema_name)
+    if metadata := generations.get("fhir_catalog"):
+        catalog = await connection.fetchval(
+            f"SELECT schema_name FROM {_identifier(control_schema)}.registry_fhir_catalog_snapshot "
+            "WHERE metadata_generation=$1",
+            metadata,
+        )
+        _require(catalog is not None)
+        schemas.append(catalog)
+    relations = await connection.fetch(
+        "SELECT schemaname AS schema_name,tablename AS table_name FROM pg_catalog.pg_tables "
+        "WHERE schemaname=ANY($1::text[]) ORDER BY schemaname,tablename",
+        schemas,
+    )
+    named_relations = {(row["schema_name"], row["table_name"]) for row in relations}
+    _require(set(schemas) <= {schema for schema, _ in named_relations})
+    named_relations.add((control_schema, "registry_approved_record"))
+    named_relations.add((base.schema_name, base.table_name))
+    return {
+        "storage_relations": [{"schema_name": schema, "table_name": table} for schema, table in sorted(named_relations)]
+    }
 
 
 async def verify_compact_dependencies(connection, candidate, *, control_schema, api_read=False):
@@ -95,6 +126,7 @@ async def _verified_layout(connection, candidate, base, control_schema, *, api_r
         if artifact.candidate_id == str(candidate["candidate_id"]):
             _require(artifact.schema_name == candidate["schema_name"])
         else:
+            _require(not is_independent_network_candidate(candidate))
             _require(
                 await _retained_edge(connection, artifact.candidate_id, control_schema, api_read=api_read)
                 == expected_by_field

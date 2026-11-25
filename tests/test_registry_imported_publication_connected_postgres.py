@@ -5,19 +5,27 @@ import json
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from time import perf_counter
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
-from api.network_address_scope import network_address_read_scope
+from api.endpoint import npi
+from api.network_address_scope import network_address_read_scope, scoped_address_parameters, scoped_address_relation_sql
 from api.network_provider_only_read import read_network_provider_only_page
 from api.network_provider_read import read_network_provider_page
+from api.provider_geo_sql import build_native_nearby_count_sql, build_native_nearby_sql
 from process import registry_native_provider_source as native
 from process.network_fhir_source_witness_contract import digest
+from process.network_generation_retirement import retire_network_generations
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import publish_network_candidate
+from process.network_serving_reactivation import NetworkServingReactivationError, reactivate_network_serving_generation
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
@@ -29,9 +37,10 @@ from process.registry_effective_network_catalog import (
     effective_catalog_sql,
     pair_network_catalog_generation,
 )
-from process.registry_fhir_catalog_custody import FHIRCatalogTarget
+from process.registry_fhir_catalog_custody import PHYSICAL_TABLES, FHIRCatalogTarget
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
+from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
 from process.registry_fhir_catalog_sources import FHIRCatalogSourceDisposition, fhir_catalog_source_generation
 from process.registry_fhir_catalog_store import (
     admit_catalog_preparation,
@@ -39,7 +48,11 @@ from process.registry_fhir_catalog_store import (
     create_fhir_catalog_candidate,
     named_catalog_preparation,
 )
-from process.registry_fhir_catalog_sync import project_fhir_catalog_source, stage_fhir_catalog_source
+from process.registry_fhir_catalog_sync import (
+    _seal_catalog_snapshot,
+    project_fhir_catalog_source,
+    stage_fhir_catalog_source,
+)
 from process.registry_fhir_catalog_validation import (
     canonical_json,
     metadata_generation,
@@ -119,16 +132,16 @@ async def _catalogue_mapping_pins(fixture, selected):
     selected["mapping_sha256"] = fingerprints[selected["metadata_approved_revision"]]["metadata"]
 
 
-async def _catalogue(fixture, schemas, descriptors, typed_recipe=None, *, delta_descriptor=None):
+async def _catalogue(fixture, schemas, descriptors, *, typed_source=None, delta_descriptor=None):
     """Seed prepared metadata from the real native set-based catalogue producer."""
     identity = uuid4()
     copy_target = FHIRCatalogTarget(*(str(uuid4()) for _ in range(3)), str(identity), "fhir_catalog_" + identity.hex)
     schemas.append(copy_target.schema_name)
-    descriptors = [*descriptors, *([typed_recipe.source_pin.catalog_descriptor] if typed_recipe else [])]
+    descriptors = [*descriptors, *([typed_source[0].descriptor] if typed_source else [])]
     if delta_descriptor is not None:
         descriptors.append(delta_descriptor)
     selected = snapshot(
-        standing_grant(),
+        standing_grant(control_schema=fixture.control_schema),
         descriptors,
         metadata_approved_revision=getattr(fixture, "approved_revision", 0),
         network_generation=None,
@@ -156,7 +169,7 @@ async def _catalogue(fixture, schemas, descriptors, typed_recipe=None, *, delta_
                 await _delta_catalogue(fixture, copy_target, selected, descriptor)
                 continue
             if descriptor.get("contract") != "registry-native-network-source-v1":
-                await _typed_catalogue(fixture, copy_target, selected, typed_recipe)
+                await _stage_catalogue_source(fixture, copy_target, selected, *typed_source)
                 continue
             await stage_native_catalog_source(
                 fixture.connection,
@@ -203,20 +216,24 @@ async def _delta_catalogue(fixture, copy_target, selected, descriptor):
         )
         return descriptor["admission"]["publication"]["claimed_resource_count"]
 
+    await _stage_catalogue_source(fixture, copy_target, selected, preferred_disposition, {"replay": replay})
+
+
+async def _stage_catalogue_source(fixture, copy_target, selected, disposition, source_export):
     loader = fixture.writer_roles["owner_role"]
     await stage_fhir_catalog_source(
         None,
         fixture.connection,
         copy_target,
-        preferred_disposition,
+        disposition,
         loader_role=loader,
         control_schema=fixture.control_schema,
-        source_export={"replay": replay},
+        source_export=source_export,
     )
     await project_fhir_catalog_source(
         fixture.connection,
         copy_target,
-        preferred_disposition,
+        disposition,
         selected,
         grant=standing_grant(control_schema=fixture.control_schema),
         loader_role=loader,
@@ -390,6 +407,14 @@ async def _publish(fixture, copy_target, selected, *, fail=False):
     return result
 
 
+@asynccontextmanager
+async def _serving_scope(fixture, connection, manifest, networks):
+    records = await effective_catalog_sql(connection, manifest, fixture.control_schema)
+    identities = await effective_catalog_networks_sql(connection, manifest, fixture.control_schema)
+    with effective_catalog_read_scope(records, identities), network_address_read_scope(manifest, networks) as scope:
+        yield scope
+
+
 async def _api(fixture, connection, generation=None):
     manifest = await resolve_network_serving_manifest(
         connection, generation_id=generation, control_schema=fixture.control_schema, api_read=True
@@ -403,9 +428,7 @@ async def _api(fixture, connection, generation=None):
     networks = tuple(sorted(entry["network_id"] for entry in page["items"]))
     is_mixed = hasattr(fixture, "typed_network_id")
     assert len(networks) == 2 + is_mixed
-    records = await effective_catalog_sql(connection, manifest, fixture.control_schema)
-    identities = await effective_catalog_networks_sql(connection, manifest, fixture.control_schema)
-    with effective_catalog_read_scope(records, identities), network_address_read_scope(manifest, networks) as scope:
+    async with _serving_scope(fixture, connection, manifest, networks) as scope:
         providers = await read_network_provider_only_page(connection, scope, control_schema=fixture.control_schema)
         offices = await read_network_provider_page(connection, scope, control_schema=fixture.control_schema)
     assert providers["total_count"] == 2 + is_mixed and offices["total_count"] == int(is_mixed)
@@ -470,6 +493,7 @@ async def test_positive_delta_catalog_publishes_with_ordinary_network_generation
                 control_schema=fixture.control_schema,
             )
             assert _DELTA_NETWORK in {entry["display_name"] for entry in page["items"]}
+            await _assert_paired_rollback(fixture, reader, before, generation)
     finally:
         for schema in reversed(schemas):
             await fixture.connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
@@ -496,49 +520,43 @@ async def _publication_rounds(fixture, recipes, runtime, selected):
         current, _providers = await _api(fixture, reader)
         assert current.generation_id > first.generation_id
         assert (await _api(fixture, reader, first.generation_id))[1] == providers
+        await _assert_paired_rollback(fixture, reader, first, current.generation_id)
 
 
-async def _typed_catalogue(fixture, copy_target, selected, recipe):
-    """Carry an actual approved typed FHIR binding into the prepared catalogue input."""
-    from uuid import UUID
-
-    descriptor = recipe.source_pin.catalog_descriptor
-    generation = digest(descriptor)
-    namespace = '"' + copy_target.schema_name + '"'
-    await fixture.connection.execute(
-        f"INSERT INTO {namespace}.registry_fhir_catalog_source VALUES($1,$2,$3::jsonb,'published_normalized',$4,0,now(),now())",
-        generation,
-        recipe.binding_coordinates.source_id,
-        json.dumps(descriptor),
-        recipe.source_pin.capture["graph"]["counts"]["source_rows"],
+async def _assert_paired_rollback(fixture, reader, rollback_manifest, current_generation):
+    control = f'"{fixture.control_schema}"'
+    pair = (
+        f"SELECT c.generation_id,c.metadata_generation,s.network_generation,s.manifest_sha256 "
+        f"FROM {control}.network_serving_control c JOIN {control}.registry_fhir_catalog_snapshot s "
+        "USING(metadata_generation) WHERE c.id=1"
     )
-    binding_json = await fixture.connection.fetchval(
-        f"SELECT record_json FROM \"{fixture.control_schema}\".registry_approved_record WHERE approved_revision=$1 AND record_kind='network_binding' AND record_json->>'source_system'='fhir'",
-        fixture.approved_revision,
-    )
-    binding_by_field = json.loads(binding_json)
-    binding_by_field["source_scope"] = binding_by_field.pop("source_scope_json")
-    network_json = await fixture.connection.fetchval(
-        f"SELECT record_json FROM \"{fixture.control_schema}\".registry_approved_record WHERE approved_revision=$1 AND record_kind='network' AND record_key=$2",
-        fixture.approved_revision,
-        str(binding_by_field["network_id"]),
-    )
-    network_by_field = json.loads(network_json)
-    await fixture.connection.execute(
-        f"INSERT INTO {namespace}.registry_fhir_catalog_network VALUES($1,$2,$3::text,$4::jsonb,false,1,NULL,$3::text)",
-        selected["metadata_generation"],
-        binding_by_field["network_id"],
-        network_by_field["display_name"],
-        json.dumps(network_by_field["aliases"]),
-    )
-    await fixture.connection.execute(
-        f"INSERT INTO {namespace}.registry_fhir_catalog_binding VALUES($1,$2,$3,$4,$5::jsonb)",
-        selected["metadata_generation"],
-        binding_by_field["network_id"],
-        UUID(binding_by_field["binding_id"]),
-        recipe.binding_coordinates.source_id,
-        json.dumps(binding_by_field),
-    )
+    current = await reader.fetchrow(pair)
+    assert current["generation_id"] == current["network_generation"] == current_generation
+    command_by_field = {
+        "generation_id": rollback_manifest.generation_id,
+        "expected_head": current_generation,
+        "expected_approved_revision": rollback_manifest.approved_custom_revision,
+        "control_schema": fixture.control_schema,
+    }
+    with pytest.raises(NetworkServingReactivationError, match="target_unavailable"):
+        async with fixture.connection.transaction():
+            await fixture.connection.execute(
+                f"UPDATE {control}.registry_fhir_catalog_snapshot SET published_at=NULL WHERE metadata_generation=$1",
+                rollback_manifest.source_generations["fhir_catalog"],
+            )
+            await reactivate_network_serving_generation(fixture.connection, **command_by_field)
+    assert await fixture.connection.fetchrow(pair) == current
+    async with fixture.execution_connection.transaction():
+        await reactivate_network_serving_generation(fixture.execution_connection, **command_by_field)
+    assert await reader.fetchrow(pair) == current
+    async with _reader(fixture) as (_session, fresh):
+        assert tuple(await fresh.fetchrow(pair)) == (
+            rollback_manifest.generation_id,
+            rollback_manifest.source_generations["fhir_catalog"],
+            rollback_manifest.generation_id,
+            rollback_manifest.manifest_sha256,
+        )
+        assert (await _api(fixture, fresh))[0] == rollback_manifest
 
 
 def _mixed_adapter(context, connection):
@@ -573,8 +591,9 @@ def _mixed_adapter(context, connection):
     )
 
 
-async def test_mixed_sources_publish_native_providers_without_offices(monkeypatch):
+async def test_mixed_sources_publish_native_providers_without_offices(monkeypatch, record_property):
     from tests import test_network_fhir_source_witness_publication_postgres as publication
+    from tests.source_witness_capture_postgres_support import source_modules
     from tests.test_network_fhir_typed_source_postgres import _typed_worker_capture
 
     monkeypatch.setattr(publication, "_source_capture_for_workers", _typed_worker_capture)
@@ -583,21 +602,162 @@ async def test_mixed_sources_publish_native_providers_without_offices(monkeypatc
         publication._login(context.worker, "execution") as writer,
     ):
         fixture, schemas = _mixed_adapter(context, writer), []
+        fixture.reader_engine = create_async_engine(
+            fixture.reader_url.set(drivername="postgresql+asyncpg"), poolclass=NullPool
+        )
         try:
             native_recipes, descriptors = await _native_inputs(fixture, schemas, monkeypatch)
-            selected = await _catalogue(fixture, schemas, descriptors, context.recipe)
+            source_catalog, _ = source_modules()
+            async with source_catalog.open_catalog_source_export(
+                context.case.source_runtime, source_profile=context.case.source_profile
+            ) as source_export:
+                typed_sources = [
+                    disposition
+                    async for page in source_export["inventory"]()
+                    for disposition in page
+                    if disposition.descriptor == context.recipe.source_pin.catalog_descriptor
+                ]
+                [typed_source] = typed_sources
+                selected = await _catalogue(fixture, schemas, descriptors, typed_source=(typed_source, source_export))
             runtime = replace(
                 context.runtime,
                 catalog_bindings=PublishedFHIRCatalogBindingScope(selected["metadata_generation"], "e" * 64),
             )
+            await fixture.connection.execute("INSERT INTO mrf.npi(npi) VALUES(1234567893) ON CONFLICT DO NOTHING")
+            await fixture.connection.execute(
+                "CREATE TABLE IF NOT EXISTS mrf.nucc_taxonomy(code text,display_name text)"
+            )
+            await fixture.connection.execute(f'GRANT USAGE ON SCHEMA mrf TO "{fixture.roles["reader"]}"')
+            await fixture.connection.execute(
+                f'GRANT SELECT ON mrf.npi,mrf.npi_taxonomy,mrf.nucc_taxonomy TO "{fixture.roles["reader"]}"'
+            )
+            monkeypatch.setattr(npi, "_should_include_geo_service_locations", lambda: True)
             async with _native_sealer(fixture, runtime):
-                copy_target = await _compose(fixture, (context.recipe, *native_recipes), runtime)
-                await _publish(fixture, copy_target, selected)
-            async with (
-                publication._login(context.worker, "api") as reader,
-                reader.transaction(isolation="repeatable_read", readonly=True),
-            ):
-                await _api(fixture, reader)
+                await _validate_mixed_catalog(fixture, selected)
+                await _retire_mixed_predecessors(
+                    fixture, (context.recipe, *native_recipes), runtime, selected, record_property
+                )
         finally:
+            await fixture.reader_engine.dispose()
             for schema in reversed(schemas):
                 await fixture.connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
+
+
+async def _validate_mixed_catalog(fixture, snapshot):
+    target = FHIRCatalogTarget(**snapshot["custody_json"]["preparation"]["target"])
+    config = SimpleNamespace(
+        grant=standing_grant(control_schema=fixture.control_schema), preparation_roles=fixture.preparation_roles
+    )
+    async with asyncpg.create_pool(
+        fixture.engine.url.set(drivername="postgresql").render_as_string(hide_password=False), min_size=1, max_size=1
+    ) as pool:
+        assert await _seal_catalog_snapshot(config, target, snapshot, pool) == "validated"
+
+
+async def _assert_owned_serving_relations(fixture, reader, manifest):
+    """The current generation names its routing, binding, address and paired catalog heaps."""
+    control = f'"{fixture.control_schema}"'
+    report = await reader.fetchrow(
+        f"SELECT c.validation_json#>>'{{serving_readiness,storage_relations}}' AS relations,s.schema_name AS catalog "
+        f"FROM {control}.network_membership_candidate c JOIN {control}.registry_fhir_catalog_snapshot s "
+        "ON s.metadata_generation=c.source_generations->>'fhir_catalog' WHERE c.candidate_id=$1",
+        UUID(manifest.candidate_id),
+    )
+    names = {(relation["schema_name"], relation["table_name"]) for relation in json.loads(report["relations"])}
+    assert {(pin.schema_name, pin.table_name) for pin in manifest.candidate_relation_pins} <= names
+    assert {(report["catalog"], table_name) for table_name in PHYSICAL_TABLES} <= names
+    assert [(entry.candidate_id, entry.schema_name) for entry in manifest.compact_layout.artifacts] == [
+        (manifest.candidate_id, manifest.schema_name)
+    ]
+    assert await reader.fetchval(
+        f'SELECT bool_and(artifact_candidate_id=$1) FROM "{manifest.schema_name}".network_slice_ref',
+        UUID(manifest.candidate_id),
+    )
+
+
+async def _mixed_serving_results(fixture, generation):
+    async with _reader(fixture) as (session, reader):
+        manifest, providers = await _api(fixture, reader, generation)
+        await _assert_owned_serving_relations(fixture, reader, manifest)
+        catalog = await read_fhir_catalog(
+            reader,
+            FHIRCatalogQuery(generation_id=generation, metadata_generation=manifest.source_generations["fhir_catalog"]),
+            excluded_network_ids=(),
+            control_schema=fixture.control_schema,
+        )
+        assert catalog["generation"] == str(generation)
+        assert any(
+            catalog_network["network_id"] == fixture.typed_network_id and catalog_network["directory_available"]
+            for catalog_network in catalog["items"]
+        )
+        async with _serving_scope(fixture, reader, manifest, (fixture.typed_network_id,)) as scope:
+            offices = await read_network_provider_page(reader, scope, control_schema=fixture.control_schema)
+            [provider] = offices["providers"]
+            [office] = provider["locations"]
+            assert provider["npi"] == 1234567893 and office["second_line"] == "Suite 1"
+            address = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
+            nearby = npi._nearby_sql_query("1=1", "", "", use_taxonomy_filter=False, address_table_sql=address)
+            assert nearby.search_table_sql is not None
+            parameters = scoped_address_parameters({"in_lat": 41.0, "in_long": -87.0, "radius": 1.0, "limit": 5})
+            assert await session.scalar(text(build_native_nearby_count_sql(nearby)), parameters) == 1
+            geo_providers = (
+                (await session.execute(text(build_native_nearby_sql(nearby, use_search_page=True)), parameters))
+                .mappings()
+                .all()
+            )
+            assert [geo_provider["location_key"] for geo_provider in geo_providers] == [office["location_key"]]
+        return providers, offices, catalog, [dict(geo_provider) for geo_provider in geo_providers]
+
+
+async def _retire_mixed_predecessors(fixture, recipes, runtime, selected, record_property):
+    manifests = []
+    for _ in range(3):
+        build_started = perf_counter()
+        candidate = await _compose(fixture, recipes, runtime, previous=manifests[-1] if manifests else None)
+        published = await _publish(fixture, candidate, selected)
+        record_property(
+            f"generation_{published['generation_id']}_build_and_publish_seconds", perf_counter() - build_started
+        )
+        async with _reader(fixture) as (_session, reader):
+            manifests.append(
+                await resolve_network_serving_manifest(reader, control_schema=fixture.control_schema, api_read=True)
+            )
+    oldest, previous, current = manifests
+    before = await _mixed_serving_results(fixture, current.generation_id)
+    async with _reader(fixture) as (_session, reader):
+        await _assert_paired_rollback(fixture, reader, previous, current.generation_id)
+    async with fixture.execution_connection.transaction():
+        await reactivate_network_serving_generation(
+            fixture.execution_connection,
+            generation_id=current.generation_id,
+            expected_head=previous.generation_id,
+            expected_approved_revision=current.approved_custom_revision,
+            control_schema=fixture.control_schema,
+        )
+    sizes = await fixture.connection.fetch(
+        "SELECT n.nspname AS name,sum(pg_total_relation_size(c.oid))::bigint AS bytes FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=ANY($1::text[]) AND c.relkind='r' GROUP BY n.nspname",
+        [manifest.schema_name for manifest in manifests],
+    )
+    record_property(
+        "candidate_heap_and_index_bytes",
+        json.dumps({schema_size["name"]: schema_size["bytes"] for schema_size in sizes}),
+    )
+    retired = await retire_network_generations(
+        fixture.connection,
+        generation_ids=(oldest.generation_id, previous.generation_id),
+        expected_head=current.generation_id,
+        control_schema=fixture.control_schema,
+        execute=True,
+    )
+    assert retired["state"] == "retired" and set(retired["network_schemas"]) == {
+        oldest.schema_name,
+        previous.schema_name,
+    }
+    assert await fixture.connection.fetchval(
+        "SELECT bool_and(to_regnamespace(name) IS NULL) FROM unnest($1::text[]) AS name", retired["network_schemas"]
+    )
+    assert await fixture.connection.fetchval(
+        f'SELECT array_agg(generation_id) FROM "{fixture.control_schema}".network_serving_manifest'
+    ) == [current.generation_id]
+    assert await _mixed_serving_results(fixture, current.generation_id) == before

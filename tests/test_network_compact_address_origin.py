@@ -10,7 +10,7 @@ import pytest
 from process import network_compact_address_origin as origin
 from process import network_serving_read
 from process.network_address_projection import PinnedAddressSource
-from process.network_compact_layout import CompactAddressRelation
+from process.network_compact_layout import INDEPENDENT_STORAGE, INDEPENDENT_STORAGE_KEY, CompactAddressRelation
 from process.network_compact_readiness import NetworkCompactReadinessError
 from tests.test_network_bootstrap_address_artifact import _named_descriptor
 
@@ -88,3 +88,41 @@ async def test_compact_head_keeps_independent_retained_resolver(monkeypatch):
     assert await origin._retained_origin(connection, candidate_by_name, source, "registry") is None
     retained.assert_awaited_once_with(connection, candidate_by_name, control_schema="registry")
     resolver.assert_not_awaited()
+
+
+@pytest.mark.parametrize("saved", [False, True])
+async def test_independent_address_resolves_without_predecessor(monkeypatch, saved):
+    descriptor = _named_descriptor()
+    address_source = PinnedAddressSource(
+        descriptor["namespace"]["name"], "entity_address_unified", descriptor["generation_id"]
+    )
+    candidate_by_field = {
+        "source_generations": {
+            INDEPENDENT_STORAGE_KEY: INDEPENDENT_STORAGE,
+            "unified_address": address_source.generation_id,
+            "retained_network_source": "d" * 64,
+        },
+        "validation_json": {"serving_readiness": {"address_artifact": descriptor}} if saved else {},
+    }
+    capture = AsyncMock(return_value=descriptor)
+    monkeypatch.setattr(origin, "capture_network_address_artifact", capture)
+    base = CompactAddressRelation(address_source.schema_name, address_source.table_name)
+    verify = AsyncMock(return_value=base)
+    monkeypatch.setattr(origin, "verify_network_address_artifact", verify)
+    connection = object()
+    assert await origin.resolve_compact_address_origin(
+        connection, candidate_by_field, address_source, control_schema="registry"
+    ) == (
+        descriptor,
+        base,
+    )
+    verify.assert_awaited_once_with(connection, descriptor)
+    assert capture.await_count == int(not saved)
+
+    old_source = PinnedAddressSource(
+        "network_candidate_" + "e" * 32, address_source.table_name, address_source.generation_id
+    )
+    with pytest.raises(NetworkCompactReadinessError, match="independent_address_source_required"):
+        await origin.resolve_compact_address_origin(
+            connection, candidate_by_field, old_source, control_schema="registry"
+        )

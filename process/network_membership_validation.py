@@ -254,6 +254,19 @@ async def _address_accounting(connection, copy_target, candidate, office_sources
     return await _membership_accounting(connection, *relations), None
 
 
+def _carry_prepared_metadata(candidate, report):
+    from process.network_compact_address_origin import _saved_address_artifact
+    from process.network_compact_layout import is_independent_network_candidate
+
+    retained = _json_object(candidate["validation_json"])
+    if type(retained) is dict and "writer_closure" in retained:
+        report["writer_closure"] = retained["writer_closure"]
+    if is_independent_network_candidate(candidate):
+        address_artifact = _saved_address_artifact(candidate)
+        if address_artifact is not None:
+            report["serving_readiness"] = {"address_artifact": address_artifact}
+
+
 async def _validate_sealed(connection, copy_target, address_source, control_schema, office_sources=None):
     """Validate closed inputs, returning fresh work only for complete typed office facts."""
     from process.registry_source_contribution_store import verify_registry_source_contributions_rows
@@ -302,9 +315,7 @@ async def _validate_sealed(connection, copy_target, address_source, control_sche
     )
     native_counts = await _native_accounting(connection, membership_table, control_schema, copy_target.candidate_id)
     report = _validation_report(scope_report, address_counts, native_counts)
-    retained = _json_object(candidate_by_field["validation_json"])
-    if type(retained) is dict and "writer_closure" in retained:
-        report["writer_closure"] = retained["writer_closure"]
+    _carry_prepared_metadata(candidate_by_field, report)
     await connection.execute(
         f"UPDATE {_identifier(control_schema)}.network_membership_candidate "
         "SET state='validated',validation_json=$2::jsonb WHERE candidate_id=$1",

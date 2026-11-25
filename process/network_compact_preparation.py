@@ -7,7 +7,12 @@ from uuid import UUID
 
 from process.network_address_projection import _identifier
 from process.network_compact_custom_preparation import prepare_compact_custom_contribution
-from process.network_compact_dependencies import capture_compact_edge_artifacts, compact_slice_ref_digest
+from process.network_compact_dependencies import (
+    capture_compact_edge_artifacts,
+    compact_slice_ref_digest,
+    independent_network_storage_metadata,
+)
+from process.network_compact_layout import is_independent_network_candidate
 from process.network_compact_readiness import COMPONENT, _require, compact_index_digest, has_named_compact_index_proof
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_slices import PinnedMembershipSlices, _prepare_slices
@@ -17,6 +22,8 @@ from process.registry_typed_membership_parity import is_typed_candidate
 
 
 async def _previous_slices(connection, candidate, control_schema):
+    if is_independent_network_candidate(candidate):
+        return None
     from process.network_serving_read import resolve_network_serving_manifest
 
     if candidate["expected_head"]:
@@ -138,6 +145,7 @@ async def prepare_compact_network_readiness(
         ),
         **({"slice_ref_revision": 2} if has_typed_memberships else {}),
         **({"geo_search": geo_search, "city_search": True} if geo_search is not None else {}),
+        **await independent_network_storage_metadata(connection, candidate, physical, control_schema=control_schema),
     }
     await connection.execute(
         f"UPDATE {_identifier(control_schema)}.network_membership_candidate "

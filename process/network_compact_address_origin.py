@@ -8,8 +8,8 @@ from process.network_address_artifact import (
     verify_network_address_artifact,
 )
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_compact_layout import CompactAddressRelation
-from process.network_compact_readiness import _require, is_compact_candidate
+from process.network_compact_layout import CompactAddressRelation, is_independent_network_candidate
+from process.network_compact_readiness import NetworkCompactReadinessError, _require, is_compact_candidate
 from process.network_membership_validation import _json_object
 from process.registry_retained_generation import resolve_registry_retained_generation
 
@@ -69,10 +69,26 @@ async def _retained_origin(connection, candidate, address_source, control_schema
     return descriptor, base
 
 
+async def _independent_address_origin(connection, candidate, address_source):
+    if address_source.schema_name.startswith("network_candidate_"):
+        raise NetworkCompactReadinessError("network_independent_address_source_required")
+    descriptor = _saved_address_artifact(candidate)
+    if descriptor is None:
+        descriptor = await capture_network_address_artifact(connection, address_source)
+    descriptor = _descriptor(descriptor)
+    _require(
+        descriptor["generation_id"] == address_source.generation_id
+        and descriptor["namespace"]["name"] == address_source.schema_name
+    )
+    return descriptor, await verify_network_address_artifact(connection, descriptor)
+
+
 async def resolve_compact_address_origin(connection, candidate, source, *, runtime_roles=(), control_schema):
     """Keep the candidate's address generation and its named publication locator bound."""
     _require(type(source) is PinnedAddressSource and source.table_name == "entity_address_unified")
     _require(_json_object(candidate["source_generations"]).get("unified_address") == source.generation_id)
+    if is_independent_network_candidate(candidate):
+        return await _independent_address_origin(connection, candidate, source)
     retained = await _retained_origin(connection, candidate, source, control_schema)
     if retained is not None:
         return retained

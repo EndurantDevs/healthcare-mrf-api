@@ -12,6 +12,7 @@ from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_approved_membership_source import (
     pin_approved_membership_source,
 )
+from process.network_compact_layout import INDEPENDENT_STORAGE, INDEPENDENT_STORAGE_KEY
 from process.network_custom_address_source import verify_custom_address_source as verify_custom_address_source
 from process.network_em_provider_inputs import (
     EMProviderInputs,
@@ -99,6 +100,7 @@ from process.registry_composition_addresses import (
     _verify_retained_address_sources as _verify_retained_address_sources,
 )
 from process.registry_composition_resume import (
+    has_registered_independent_storage,
     require_registered_composition_target,
     resolve_registered_compact_format,
     resolve_registered_contribution_resume,
@@ -197,6 +199,7 @@ async def _retained_source(connection, source_manifest, control_schema):
             "registry_source_contributions",
             INVENTORY_DIGEST_KEY,
             "imported_source_inventory",
+            INDEPENDENT_STORAGE_KEY,
         }
         and not key.startswith("initial_source_recipe_")
     }
@@ -804,6 +807,7 @@ class _CompositionInputs:
     compact: bool = False
     source_operation: dict | None = None
     source_witness_runtime: object = None
+    independent_storage: bool = False
 
 
 async def _composition_inputs(connection, address_sources, source_manifest, writer_roles, revision, control_schema):
@@ -972,7 +976,13 @@ async def _register_composition_snapshot(
 async def _record_prepared_composition(inputs, copy_target, prepared_sources, control_schema):
     recipes, source_stage, artifact, initial_summary, inventory, entries = prepared_sources
     # Record the qualified address binding with admission so retirement can protect this exact generation.
-    await _record_composition_address(inputs.connection, copy_target, artifact.address_source, control_schema)
+    await _record_composition_address(
+        inputs.connection,
+        copy_target,
+        artifact.address_source,
+        control_schema,
+        artifact.address_artifact if type(artifact) is CompactCompositionAddressSource else None,
+    )
     if inventory is not None:
         from process.registry_source_inventory_store import write_source_inventory
 
@@ -1024,8 +1034,8 @@ async def _record_prepared_composition(inputs, copy_target, prepared_sources, co
     )
 
 
-async def _record_composition_address(connection, copy_target, address_source, control_schema):
-    """Retain authenticated preparation coordinates before a sealed retry can need them."""
+async def _record_composition_address(connection, copy_target, address_source, control_schema, address_artifact=None):
+    """Keep the selected address edition available to retries and later readiness preparation."""
     if type(address_source) is not PinnedAddressSource:
         raise RegistryCompositionError("registry_composition_address_scope_changed")
     address_by_field = {
@@ -1033,14 +1043,20 @@ async def _record_composition_address(connection, copy_target, address_source, c
         "table_name": address_source.table_name,
         "generation_id": address_source.generation_id,
     }
+    metadata = {"address_source": address_by_field}
+    if address_artifact is not None:
+        metadata["serving_readiness"] = {"address_artifact": address_artifact}
     recorded = await connection.fetch(
-        f"UPDATE {_namespace(control_schema)}.network_membership_candidate "
-        "SET validation_json=jsonb_set(coalesce(validation_json,'{}'::jsonb),'{address_source}',$2::jsonb) "
+        f"UPDATE {_namespace(control_schema)}.network_membership_candidate c "
+        "SET validation_json=coalesce(validation_json,'{}'::jsonb)||$2::jsonb "
         "WHERE candidate_id=$1 AND state='open' AND source_generations->>'unified_address'=$3 "
-        "AND (NOT (coalesce(validation_json,'{}'::jsonb) ? 'address_source') "
-        "OR validation_json->'address_source'=$2::jsonb) RETURNING true AS recorded",
+        "AND (NOT ($2::jsonb ? 'serving_readiness') OR source_generations->>'network_address_origin'="
+        "$2::jsonb#>>'{serving_readiness,address_artifact,descriptor_sha256}') "
+        "AND NOT EXISTS (SELECT FROM jsonb_each($2::jsonb) wanted "
+        "WHERE c.validation_json ? wanted.key AND c.validation_json->wanted.key IS DISTINCT FROM wanted.value) "
+        "RETURNING true AS recorded",
         UUID(copy_target.candidate_id),
-        json.dumps(address_by_field, sort_keys=True, separators=(",", ":")),
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")),
         address_source.generation_id,
     )
     if len(recorded) != 1 or recorded[0]["recorded"] is not True:
@@ -1476,6 +1492,7 @@ async def _stage_selected_sources(inputs, recipes, request_id, control_schema, r
             and (inventory or approved.total_rows == 0)
             else None,
             source_witness_runtime=inputs.source_witness_runtime,
+            independent_storage=revision == 4 and inputs.independent_storage,
         ),
     )
     return source_stage
@@ -1515,6 +1532,8 @@ async def _prepare_selected_source_stage(
     source_stage = await _stage_selected_sources(
         inputs, recipes, request_id, control_schema, revision, inventory, verified_inputs
     )
+    if inputs.independent_storage and revision == 4:
+        generations_by_source[INDEPENDENT_STORAGE_KEY] = INDEPENDENT_STORAGE
     _bind_composition_stage(
         generations_by_source,
         source_stage,
@@ -1553,7 +1572,11 @@ async def _registered_composition_inputs(inputs, request_scope, address_sources,
     inventory = address_sources.compact if registered_inventory is None else registered_inventory
     if inventory and not address_sources.compact:
         raise RegistryCompositionError("registry_composition_source_inventory_requires_compact")
+    independent_storage = inventory and address_sources.compact
     if registered_inventory is not None:
+        independent_storage = inventory and await has_registered_independent_storage(
+            inputs.connection, request_id, approved_revision, expected_head, control_schema=control_schema
+        )
         registered_compact = await resolve_registered_compact_format(
             inputs.connection,
             request_id,
@@ -1586,7 +1609,7 @@ async def _registered_composition_inputs(inputs, request_scope, address_sources,
                 control_schema=control_schema,
             )
         inputs = replace(inputs, verified_office_inputs=verified_inputs)
-    return inputs, inventory
+    return replace(inputs, independent_storage=independent_storage), inventory
 
 
 async def _register_prepared_candidate(

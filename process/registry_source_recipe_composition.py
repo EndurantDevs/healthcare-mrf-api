@@ -103,6 +103,7 @@ class SourceRecipeReadContext:
     source_manifest: object = None
     office_matches: object = None
     source_witness_runtime: object = None
+    independent_storage: bool = False
 
 
 @dataclass(frozen=True, repr=False)

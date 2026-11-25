@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 from db.registry_schema import registry_schema
 from process import registry_typed_membership_parity
 from process.network_address_projection import PinnedAddressSource, _identifier, _lock_candidate
-from process.network_compact_layout import CompactAddressRelation
+from process.network_compact_layout import CompactAddressRelation, is_independent_network_candidate
 from process.network_membership_copy import MembershipCopyTarget
 
 SLICE_CONTRACT_VERSION = 1
@@ -167,7 +167,7 @@ async def _matched_facts(
     return accounting
 
 
-async def _create_slice_relations(connection, candidate_schema, *, typed=False):
+async def _create_slice_relations(connection, candidate_schema, *, typed=False, independent=False):
     await connection.execute(f"""CREATE TABLE {candidate_schema}.network_slice_ref(
         network_id integer NOT NULL CHECK(network_id>0),
         office_bucket integer NOT NULL CHECK(office_bucket BETWEEN 0 AND 63),
@@ -177,17 +177,19 @@ async def _create_slice_relations(connection, candidate_schema, *, typed=False):
         content_sha256 varchar(64) NOT NULL CHECK(content_sha256~'^[0-9a-f]{{64}}$'),
         PRIMARY KEY(network_id,office_bucket))
     """)
+    location_collation = ' COLLATE "C"' if independent else ""
     await connection.execute(f"""CREATE TABLE {candidate_schema}.network_office_edge(
         slice_id uuid NOT NULL CHECK(slice_id<>'00000000-0000-0000-0000-000000000000'),
-        location_key varchar(64) NOT NULL CHECK(length(location_key)>0), PRIMARY KEY(slice_id,location_key))
+        location_key varchar(64){location_collation} NOT NULL CHECK(length(location_key)>0), PRIMARY KEY(slice_id,location_key))
     """)
     await connection.execute(
         f"CREATE INDEX network_office_edge_location_idx ON {candidate_schema}.network_office_edge(location_key,slice_id)"
     )
-    if typed:
+    if typed and not independent:
         await connection.execute(
             f'CREATE INDEX network_office_edge_c_order_idx ON {candidate_schema}.network_office_edge(slice_id,location_key COLLATE "C")'
         )
+    if typed:
         await connection.execute(
             f"CREATE INDEX network_slice_ref_slice_lookup_idx ON {candidate_schema}.network_slice_ref(slice_id,artifact_candidate_id) INCLUDE(network_id)"
         )
@@ -253,11 +255,22 @@ async def _prepared_slice_refs(connection, copy_target, work_table, previous_tab
     return await _prepare_refs(connection, copy_target, work_table, previous_table)
 
 
-async def _copy_changed_edges(connection, copy_target, work_table):
+async def _copy_changed_edges(connection, copy_target, work_table, *, independent=False):
     from process.network_bootstrap_sources import NetworkBootstrapSourceError, _copy_native_batch
 
-    ref_table = _identifier(copy_target.schema_name) + ".network_slice_ref"
+    schema = _identifier(copy_target.schema_name)
+    ref_table = schema + ".network_slice_ref"
     await connection.execute(f"ANALYZE {ref_table}")
+    if independent:
+        status = await connection.execute(
+            f"INSERT INTO {schema}.network_office_edge (slice_id,location_key) "
+            f"SELECT r.slice_id,f.location_key FROM {ref_table} r CROSS JOIN LATERAL ("
+            f"SELECT f.location_key FROM {work_table} f WHERE "
+            "(f.network_id,f.office_bucket)=(r.network_id,r.office_bucket) OFFSET 0) f "
+            "WHERE r.artifact_candidate_id=$1",
+            UUID(copy_target.candidate_id),
+        )
+        return int(status.removeprefix("INSERT 0 "))
     if not await connection.fetchval(
         f"SELECT EXISTS(SELECT FROM {ref_table} WHERE artifact_candidate_id=$1)", UUID(copy_target.candidate_id)
     ):
@@ -365,6 +378,9 @@ async def _prepare_slices(
     schema = _identifier(copy_target.schema_name)
     async with connection.transaction():
         candidate = await _lock_candidate(connection, copy_target, address_source, control_schema)
+        is_independent = is_independent_network_candidate(candidate)
+        if is_independent and (previous is not None or affected is not None):
+            raise NetworkMembershipSliceError("Independent office slices require all facts in the candidate")
         await connection.execute(
             f"LOCK TABLE {schema}.network_membership,{schema}.provider_location_binding IN SHARE MODE"
         )
@@ -379,12 +395,12 @@ async def _prepare_slices(
             office_sources,
             prepared_work,
         )
-        await _create_slice_relations(connection, schema, **({"typed": True} if is_typed else {}))
+        await _create_slice_relations(connection, schema, typed=is_typed, independent=is_independent)
         carried_slices = await _carry_slice_refs(connection, schema, previous_table, affected_table)
         total_slices, reused_slices = await _prepared_slice_refs(
             connection, copy_target, work_table, previous_table, is_typed
         )
-        copied_rows = await _copy_changed_edges(connection, copy_target, work_table)
+        copied_rows = await _copy_changed_edges(connection, copy_target, work_table, independent=is_independent)
         counts = await connection.fetchrow(
             "SELECT COALESCE(sum(row_count) FILTER(WHERE artifact_candidate_id=$1),0)::bigint AS changed_rows,"
             f"COALESCE(sum(row_count),0)::bigint AS distinct_memberships FROM {schema}.network_slice_ref",

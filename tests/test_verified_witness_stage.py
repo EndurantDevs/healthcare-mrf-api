@@ -141,8 +141,8 @@ async def test_native_census_uses_physical_scope_and_rejects_drift():
         await stage._native_witness_headers(connection, recipe)
 
 
-@pytest.mark.parametrize("reuse", [False, True])
-async def test_per_recipe_maps_actual_witness_contract_and_keeps_original_anchor(monkeypatch, reuse):
+@pytest.mark.parametrize("reuse,independent", [(False, False), (True, False), (True, True)])
+async def test_per_recipe_maps_verified_facts_into_the_selected_storage(monkeypatch, reuse, independent):
     recipe, descriptor, _ = rows()
     authorizer = AsyncMock(return_value=None)
     monkeypatch.setattr(stage, "_authorize_witness_recipe", authorizer)
@@ -164,20 +164,40 @@ async def test_per_recipe_maps_actual_witness_contract_and_keeps_original_anchor
         else None
     )
     connection = SimpleNamespace(execute=AsyncMock())
+    copy = AsyncMock()
+    monkeypatch.setattr(stage, "reuse_fhir_facts", copy)
     staged_source = await stage._stage_witness_source(
-        connection, recipe, APPROVED, "synthetic", ("facts", "members"), {}, artifact
+        connection,
+        recipe,
+        APPROVED,
+        "synthetic",
+        ("facts", "members"),
+        stage.SourceRecipeReadContext(retained_fhir_reads={}, independent_storage=independent),
+        artifact,
     )
     statements = [call.args[0] for call in connection.execute.await_args_list]
     assert statements[0].startswith("CREATE TEMP TABLE")
     assert statements[1] == f'DROP TABLE pg_temp."{store.witness_mapping_workspace_name("members")}"'
     assert staged_source.table_name == "members"
-    assert mapper.await_args.args[3] == (artifact.relation if reuse else 'pg_temp."facts"')
+    assert mapper.await_args.args[3] == (artifact.relation if reuse and not independent else 'pg_temp."facts"')
     assert authorizer.await_count == 2 and capture.await_count == (0 if reuse else 1)
-    assert staged_source.descriptor["fact_candidate_id"] == (str(UUID(int=9)) if reuse else None)
+    assert staged_source.descriptor["fact_candidate_id"] == (str(UUID(int=9)) if reuse and not independent else None)
+    if independent:
+        copy.assert_awaited_once_with(connection, artifact.relation, descriptor, "facts", descriptor["recipe_sha256"])
+    else:
+        copy.assert_not_awaited()
     connection.execute.reset_mock()
     mapper.side_effect = RuntimeError("mapping failed")
     with pytest.raises(RuntimeError, match="mapping failed"):
-        await stage._stage_witness_source(connection, recipe, APPROVED, "synthetic", ("facts", "members"), {}, artifact)
+        await stage._stage_witness_source(
+            connection,
+            recipe,
+            APPROVED,
+            "synthetic",
+            ("facts", "members"),
+            stage.SourceRecipeReadContext(retained_fhir_reads={}),
+            artifact,
+        )
     assert connection.execute.await_args.args[0] == statements[1]
 
 
@@ -187,7 +207,15 @@ async def test_source_authorization_is_required_before_census_or_fact_reuse(monk
     census = AsyncMock()
     monkeypatch.setattr(stage, "_native_witness_headers", census)
     with pytest.raises(ValueError, match="admission differs"):
-        await stage._stage_witness_source(object(), recipe, APPROVED, "synthetic", ("facts", "members"), {}, None)
+        await stage._stage_witness_source(
+            object(),
+            recipe,
+            APPROVED,
+            "synthetic",
+            ("facts", "members"),
+            stage.SourceRecipeReadContext(retained_fhir_reads={}),
+            None,
+        )
     census.assert_not_awaited()
 
 
@@ -302,12 +330,15 @@ async def test_capture_rejects_changed_source_nonadvancing_cursor_and_incomplete
     import json
 
     recipe, _, _ = rows()
-    source = recipe.source_pin
+    fhir_source = recipe.source_pin
     page = FHIRSourceWitnessPageV2(
-        source, 1, ("PractitionerRole", "role-one"), json.dumps([_header(source), _edge(source)]).encode()
+        fhir_source,
+        1,
+        ("PractitionerRole", "role-one"),
+        json.dumps([_header(fhir_source), _edge(fhir_source)]).encode(),
     )
     if damage == "source":
-        page = replace(page, source=replace(source, as_of="2026-10-02"))
+        page = replace(page, source=replace(fhir_source, as_of="2026-10-02"))
     reader = AsyncMock(side_effect=[page, page])
     monkeypatch.setattr(stage, "read_fhir_source_witness_page_v2", reader)
     connection = SimpleNamespace(is_in_transaction=lambda: True, copy_records_to_table=AsyncMock(return_value="COPY 2"))
@@ -322,7 +353,15 @@ async def test_capture_rejects_changed_source_nonadvancing_cursor_and_incomplete
     mapper = AsyncMock()
     monkeypatch.setattr(stage, "map_fhir_source_witnesses_v2", mapper)
     with pytest.raises(composition.RegistrySourceCompositionError, match="accounting_invalid"):
-        await stage._stage_witness_source(connection, recipe, APPROVED, "synthetic", ("facts", "members"), {}, None)
+        await stage._stage_witness_source(
+            connection,
+            recipe,
+            APPROVED,
+            "synthetic",
+            ("facts", "members"),
+            stage.SourceRecipeReadContext(retained_fhir_reads={}),
+            None,
+        )
     mapper.assert_not_awaited()
 
 

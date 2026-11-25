@@ -24,6 +24,7 @@ from process.registry_source_contribution_store import (
     create_witness_mapping_workspace,
     map_fhir_source_witnesses_v2,
     retained_source_contributions,
+    reuse_fhir_facts,
     verified_office_fact_identity,
 )
 from process.registry_source_recipe_composition import (
@@ -171,22 +172,28 @@ async def _capture_witness_facts(connection, recipe, approved, control_schema, f
         limit = min(1000, limit * 2)
 
 
-async def _stage_witness_source(
-    connection, recipe, approved, control_schema, tables, retained_reads, artifact, *, source_witness_runtime=None
-):
+async def _stage_witness_source(connection, recipe, approved, control_schema, tables, read_context, artifact):
     fact_table, member_table = tables
+    retained_reads = read_context.retained_fhir_reads
+    source_witness_runtime = read_context.source_witness_runtime
     read = await _authorize_witness_recipe(
         connection, recipe, approved, control_schema, retained_reads, source_witness_runtime=source_witness_runtime
     )
     expected_headers = await _native_witness_headers(connection, recipe)
     await _create_source_stage_tables(connection, member_table, None)
+    relation = "pg_temp." + _identifier(fact_table)
     if artifact is None:
         copied, headers = await _capture_witness_facts(connection, recipe, approved, control_schema, fact_table, read)
         if headers != expected_headers:
             raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
-        relation = "pg_temp." + _identifier(fact_table)
     else:
-        relation, copied = artifact.relation, artifact.descriptor["fact_rows"]
+        copied = artifact.descriptor["fact_rows"]
+        if read_context.independent_storage:
+            await reuse_fhir_facts(
+                connection, artifact.relation, artifact.descriptor, fact_table, artifact.descriptor["recipe_sha256"]
+            )
+        else:
+            relation = artifact.relation
     workspace = await create_witness_mapping_workspace(connection, member_table)
     try:
         descriptor = await map_fhir_source_witnesses_v2(
@@ -199,7 +206,9 @@ async def _stage_witness_source(
     if descriptor["fact_rows"] != copied or descriptor["raw_source_rows"] != expected_headers:
         raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
     if artifact is not None:
-        descriptor = anchored_source_fact_descriptor(descriptor, artifact)
+        anchored = anchored_source_fact_descriptor(descriptor, artifact)
+        if not read_context.independent_storage:
+            descriptor = anchored
     await _authorize_witness_recipe(
         connection, recipe, approved, control_schema, retained_reads, source_witness_runtime=source_witness_runtime
     )
@@ -309,7 +318,8 @@ async def stage_verified_witness_inventory(
     await _require_source_stage_scope(connection, approved, request_id, 2)
     control_schema = registry_schema() if control_schema is None else control_schema
     _identifier(control_schema)
-    retained_reads = {} if read_context.retained_fhir_reads is None else read_context.retained_fhir_reads
+    if read_context.retained_fhir_reads is None:
+        read_context = replace(read_context, retained_fhir_reads={})
     stage_id = uuid5(request_id, recipe_sha256 + ":" + approved.generation_id).hex
     tables = _source_stage_table_names(stage_id, recipes)
     async with connection.transaction():
@@ -318,9 +328,11 @@ async def stage_verified_witness_inventory(
         )
         await _create_source_stage_tables(connection, tables[0], tables[2])
         witness_sources = []
+        copied_reused = 0
         for recipe in recipes:
             identity, capture = verified_office_fact_identity(recipe)
             member_table = "registry_witness_members_" + uuid5(request_id, identity).hex
+            artifact = retained.get(capture)
             witness_sources.append(
                 await _stage_witness_source(
                     connection,
@@ -328,12 +340,13 @@ async def stage_verified_witness_inventory(
                     approved,
                     control_schema,
                     (tables[2], member_table),
-                    retained_reads,
-                    retained.get(capture),
-                    source_witness_runtime=read_context.source_witness_runtime,
+                    read_context,
+                    artifact,
                 )
             )
-        return await _finish_witness_inventory(
+            if read_context.independent_storage and artifact is not None:
+                copied_reused += artifact.descriptor["fact_rows"]
+        stage = await _finish_witness_inventory(
             connection,
             recipes,
             approved,
@@ -343,6 +356,9 @@ async def stage_verified_witness_inventory(
             (control_schema, recipe_sha256),
             source_witness_runtime=read_context.source_witness_runtime,
         )
+        if copied_reused:
+            stage = replace(stage, reused_fact_rows=copied_reused, copied_reused_fact_rows=copied_reused)
+        return stage
 
 
 def _witness_read_context(read_context, legacy_options):
