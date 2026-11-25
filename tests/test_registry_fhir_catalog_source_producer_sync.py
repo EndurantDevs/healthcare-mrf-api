@@ -727,6 +727,7 @@ async def test_binding_conflicts_or_incomplete_pages_fail_before_allocator(monke
         else [_alias(network_id=18), _alias(network_id=19)]
     )
     source_case.loader.fetch.side_effect = [[_alias()], second_page_aliases]
+    source_case.loader.fetchval = AsyncMock(return_value=1)
     monkeypatch.setattr(sync, "_network_organization_page", AsyncMock(return_value=[{"resource_id": "network-one"}]))
     monkeypatch.setattr(sync, "allocate_fhir_catalog_network_ids", AsyncMock())
     expected_error = ValueError if failure in {"uuid-change", "registry-conflict"} else type(error)

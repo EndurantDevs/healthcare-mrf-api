@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from asyncpg import InsufficientPrivilegeError, InvalidSchemaNameError, UndefinedTableError
 
 from db.plan_release_storage import storage_identifier
-from db.registry_fhir_catalog import PROJECTOR_VERSION
+from db.registry_fhir_catalog import AUTOMATIC_NETWORKS_PER_CATALOG, AUTOMATIC_NETWORKS_PER_SOURCE, PROJECTOR_VERSION
 from process.network_cms_registry_address_capture import native_driver
 from process.network_fhir_source_witness_contract import digest
 from process.registry_fhir_catalog_extraction import fhir_source_uri
@@ -171,6 +171,10 @@ class ImportedSourceInventory:
             {
                 **inputs_by_field,
                 "fhir_edition_policy": 1,
+                "automatic_organization_network_policy": {
+                    "per_source": AUTOMATIC_NETWORKS_PER_SOURCE,
+                    "per_catalog": AUTOMATIC_NETWORKS_PER_CATALOG,
+                },
                 "carried_fhir_semantics": document.get("carried_fhir_semantics", []),
                 "superseded_fhir_endpoints": document.get("superseded_fhir_endpoints", []),
             }
