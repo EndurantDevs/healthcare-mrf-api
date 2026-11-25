@@ -193,12 +193,13 @@ class _OptumRequestSlots(AdaptiveRequestSlots):
 
     def _try_recover(self, now):
         successes = self.recent_outcomes.count("healthy")
+        recovery_responses = len(self.recent_outcomes) - self.recent_outcomes.count("page_error")
         if (
             self.limit < self.capacity
             and self.waiters
             and self.last_saturated_at == now
             and successes >= self.MIN_HEALTHY_RESPONSES
-            and successes * 5 >= len(self.recent_outcomes) * 4
+            and successes * 5 >= recovery_responses * 4
             and self.saturated_seconds >= self.MIN_SATURATED_SECONDS
         ):
             self.limit = min(self.capacity, self.limit + max(2, self.limit // 5))
@@ -234,6 +235,7 @@ def request_concurrency_snapshot(source_record: Mapping[str, Any]) -> dict[str, 
         "throttled_responses": slots.throttled_responses,
         "transient_failures": slots.transient_failures,
         **slots.transient_by_kind,
+        **outage.http_500_by_family,
         **({"http_500_responses": outage.http_500_responses} if outage.http_500_responses else {}),
         **(
             {
@@ -261,6 +263,8 @@ def _optum_request_outcome(response):
     status, payload, error, _elapsed = response
     if status in {502, 503, 504}:
         return f"transient_http_{status}"
+    if status == 500 and is_optum_partition_page_error(response):
+        return "page_error"
     if _request_timed_out(error):
         return "transient_timeout"
     if error in {"ClientConnectionResetError", "ClientOSError", "ConnectionResetError", "ServerDisconnectedError"}:

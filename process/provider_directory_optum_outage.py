@@ -21,12 +21,20 @@ def is_page_error(response):
     if status != 500 or transport_error or not isinstance(payload, dict):
         return False
     issues = payload.get("issue")
-    if payload.get("resourceType") != "OperationOutcome" or not isinstance(issues, list) or len(issues) != 1:
+    if payload.get("resourceType") != "OperationOutcome" or not isinstance(issues, list):
         return False
-    issue = issues[0]
+    if any(not isinstance(issue, dict) for issue in issues):
+        return False
+    relevant_issues = [
+        issue
+        for issue in issues
+        if issue.get("severity") != "information" or issue.get("code") not in ("processing", "informational")
+    ]
+    if len(relevant_issues) != 1:
+        return False
+    (issue,) = relevant_issues
     return (
-        isinstance(issue, dict)
-        and issue.get("severity") == "error"
+        issue.get("severity") == "error"
         and issue.get("code") == "processing"
         and issue.get("diagnostics") == PAGE_ERROR_DIAGNOSTICS
     )
@@ -47,17 +55,23 @@ class OptumOutage:
         self.probe_after = None
         self.probe_attempt = 0
         self.http_500_responses = 0
+        self.http_500_by_family: dict[str, int] = {}
         self.probes = 0
 
     def observe(self, response, now, epoch):
         """Count backend responses and pause after a sustained cross-partition outage."""
+        context = PARTITION_REQUEST.get()
+        is_query_local_error = is_page_error(response)
         if response[0] == 500:
             self.http_500_responses += 1
-        context = PARTITION_REQUEST.get()
+            if context is not None and context[0].resource_type in {"Location", "Organization"}:
+                classification = "page_error" if is_query_local_error else "other"
+                key = f"http_500_{context[0].resource_type.lower()}_{classification}"
+                self.http_500_by_family[key] = self.http_500_by_family.get(key, 0) + 1
         if context is None or self.probe_after is not None or epoch != self.epoch:
             return
         request, identity = context
-        if not identity or "'" in identity or "%27" in identity or is_page_error(response):
+        if not identity or "'" in identity or "%27" in identity or is_query_local_error:
             return
         failure = (request.resource_type, identity) if is_backend_outage_response(response) else None
         self.samples.append(failure)

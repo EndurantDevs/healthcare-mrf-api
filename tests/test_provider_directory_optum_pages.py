@@ -10,7 +10,7 @@ import pytest
 
 from process import provider_directory_optum_pages as pages
 from process.provider_directory_fetch_types import PartitionChainRequest, PartitionFetchOptions, PartitionFetchState
-from tests.test_provider_directory_optum_outage import PAGE_ERROR
+from tests.test_provider_directory_optum_outage import PAGE_ERROR, WRAPPED_PAGE_ERROR
 
 importer = importlib.import_module("process.provider_directory_fhir")
 BASE = importer.UHC_PROVIDER_DIRECTORY_BASE
@@ -37,7 +37,8 @@ def _search_page(start, stop, next_url=None):
 
 
 @pytest.mark.asyncio
-async def test_unreadable_position_saves_neighbors_and_later_pages_without_checkpoint(monkeypatch):
+@pytest.mark.parametrize("page_error", [PAGE_ERROR, WRAPPED_PAGE_ERROR])
+async def test_unreadable_position_saves_neighbors_and_later_pages_without_checkpoint(monkeypatch, page_error):
     offsets = []
 
     async def fetch(_directory, request):
@@ -48,7 +49,7 @@ async def test_unreadable_position_saves_neighbors_and_later_pages_without_check
         start, count = int(query["_getpagesoffset"][0]), int(query["_count"][0])
         offsets.append((start, count))
         if start <= 3 < start + count:
-            return PAGE_ERROR
+            return page_error
         stop = min(start + count, 7)
         next_url = pages.PageWindow(CURSOR, start, count, 7).slice_url(stop, count) if stop < 7 else None
         return _search_page(start, stop, next_url)
