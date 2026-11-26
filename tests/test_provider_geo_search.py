@@ -14,7 +14,12 @@ from api.provider_geo_search import (
     provider_geo_search_sql,
     request_geo_search,
 )
-from api.provider_geo_sql import NearbySqlQuery, build_native_nearby_count_sql, build_native_nearby_sql
+from api.provider_geo_sql import (
+    NearbySqlQuery,
+    build_native_nearby_count_sql,
+    build_native_nearby_sql,
+    build_nearby_page_edge_sql,
+)
 from process import provider_geo_search
 
 _PROJECTION = ProviderGeoSearch('"mrf".provider_geo_search_g7')
@@ -303,3 +308,25 @@ async def test_projection_is_looked_up_only_for_unscoped_unified_reads(monkeypat
     assert await request_geo_search(connection_scope(), "mrf.entity_address_unified", **lookup_by_name) == (
         ProviderGeoSearch('"mrf".provider_geo_search_g2')
     )
+
+
+def test_bounded_continuation_reads_only_the_disc_up_to_the_batch_edge():
+    nearby = _nearby()
+    cursor = "\n AND a.cursor_distance_meters > :cursor"
+    page = build_native_nearby_sql(nearby, cursor_clause=cursor)
+    bounded = build_native_nearby_sql(nearby, cursor_clause=cursor, cursor_bounded=True)
+    radius = ":radius * 1609.34"
+    edge = "CAST(:page_edge_meters AS double precision)"
+
+    # The disc is wider than the edge because <-> is spherical and ST_DWithin spheroidal; the page stops at the edge.
+    assert bounded == page.replace(f", {radius})", f", LEAST({radius}, {edge} * 1.01))", 1).replace(
+        cursor, f"{cursor}\n       AND a.cursor_distance_meters <= {edge}", 1
+    )
+    assert ":page_edge_meters" not in page
+
+    probe = build_nearby_page_edge_sql(nearby)
+    eligible = page.split("page_geo AS")[0]
+    filters = eligible[eligible.index("AND a.lat IS NOT NULL") : eligible.index("ORDER BY")].strip()
+    assert filters in probe and f"{radius} * :page_edge_share)" in probe
+    assert "a.npi, a.address_key) > (" in probe and ":cursor_distance_meters" in probe
+    assert probe.rstrip().endswith("OFFSET :limit - 1 LIMIT 1") and "DISTINCT" not in probe

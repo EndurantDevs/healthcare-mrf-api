@@ -1515,13 +1515,29 @@ def _near_provider_record(npi, address_key, distance, **fields):
     )
 
 
-def _near_paging_db(first_address_key, second_address_key):
+def _near_paging_db(first_address_key, second_address_key, statements=None, empty_edges=()):
+    """Serve two identities; ``empty_edges`` are edges whose bounded disc repeats served identities only."""
+    statements = [] if statements is None else statements
+
     class PagingConnection:
         async def all(self, sql, **params):
             sql_text = str(sql)
+            cursor = (params.get("cursor_distance_meters"), params.get("cursor_npi"))
+            if "enable_bitmapscan" in sql_text:
+                statements.append(("bitmapscan", params.get("previous", "off" if "'off'" in sql_text else "read")))
+                return [("on",)]
+            if "AS page_edge_meters" in sql_text:
+                statements.append(("edge", cursor, params["limit"], params["page_edge_share"]))
+                if cursor == (100.0, 1112223334):
+                    return [(empty_edges[0] if empty_edges else 250.0,)]
+                return []
             if "COUNT(DISTINCT (a.npi, a.address_key))" in sql_text:
                 return [types.SimpleNamespace(_mapping={"total_count": 2})]
-            if params.get("cursor_npi") == 1112223334:
+            if "cursor_npi" in params:
+                statements.append(("bounded" if ":page_edge_meters" in sql_text else "radius", cursor))
+            if params.get("page_edge_meters") in empty_edges:
+                return []
+            if params.get("cursor_npi") in (1112223334, 9999999999):
                 return [_near_provider_record(5556667778, second_address_key, 200.0)]
             if params.get("cursor_npi") == 5556667778:
                 return []
@@ -1593,6 +1609,47 @@ async def test_get_near_npi_paginates_unique_provider_addresses(monkeypatch):
     assert second_payload["next_cursor"] is None
     assert [(provider_item["npi"], provider_item["address_key"]) for provider_item in second_payload["items"]] == [
         (5556667778, second_address_key)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_edges", [(), (150.0,)])
+async def test_near_continuation_reads_bounded_disc(monkeypatch, empty_edges):
+    """A cursor near the centre probes the batch edge nearest-first instead of rereading the whole radius."""
+
+    address_keys = ["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"]
+    statements = []
+    monkeypatch.setattr(npi_module, "db", _near_paging_db(*address_keys, statements, empty_edges))
+    arguments_by_name = {"long": "-87.0", "lat": "41.0", "radius": "10", "limit": "1", "include_total": "1"}
+    opening_request = types.SimpleNamespace(args=dict(arguments_by_name), app=types.SimpleNamespace())
+    opening_page = json.loads((await npi_module.get_near_npi(opening_request)).body)
+    assert statements == []
+
+    arguments_by_name["cursor"] = opening_page["next_cursor"]
+    following_request = types.SimpleNamespace(args=arguments_by_name, app=types.SimpleNamespace())
+    following_page = json.loads((await npi_module.get_near_npi(following_request)).body)
+
+    assert [(provider["npi"], provider["address_key"]) for provider in following_page["items"]] == [
+        (5556667778, address_keys[1])
+    ]
+    assert following_page["has_more"] is False
+    nearest_first_statements = [("bitmapscan", "read"), ("bitmapscan", "off")]
+    restored = ("bitmapscan", "on")
+    served_statements = [("edge", (100.0, 1112223334), 16, 0.2), ("bounded", (100.0, 1112223334)), restored]
+    # Every row up to an empty edge repeated a served identity, so the read resumes just past that edge.
+    past_edge = (150.0, 9999999999)
+    resumed_statements = [*nearest_first_statements, ("edge", past_edge, 16, 0.2), restored, ("radius", past_edge)]
+    exhausted_statements = [
+        *nearest_first_statements,
+        ("edge", (200.0, 5556667778), 16, 0.2),
+        restored,
+        ("radius", (200.0, 5556667778)),
+    ]
+    assert statements == [
+        *nearest_first_statements,
+        *served_statements,
+        *(resumed_statements if empty_edges else []),
+        *exhausted_statements,
     ]
 
 

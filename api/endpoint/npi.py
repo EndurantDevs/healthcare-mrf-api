@@ -104,6 +104,7 @@ from api.provider_geo_sql import (
     build_native_nearby_count_sql,
     build_native_nearby_sql,
     canonical_zip_anchor_statement,
+    fetch_nearby_batch,
     native_geo_entity_scope,
     nearby_batch_identities,
     nearby_extra_clauses,
@@ -10682,16 +10683,13 @@ async def get_near_npi(
                         **query_parameters_by_name,
                         **cursor_parameters_by_name,
                     }
-                    nearby_sql = build_native_nearby_sql(
+                    batch_rows = await fetch_nearby_batch(
+                        conn,
                         nearby_query if use_search_page else replace(nearby_query, search_table_sql=None),
-                        cursor_clause=cursor_clause,
-                        use_search_page=use_search_page,
-                        legacy_page_clauses=legacy_page_clauses,
-                    )
-                    batch_rows = await conn.all(
-                        text(nearby_sql),
-                        limit=candidate_limit,
-                        **batch_parameters_by_name,
+                        cursor_clause,
+                        {**batch_parameters_by_name, "limit": candidate_limit},
+                        {"use_search_page": use_search_page, "legacy_page_clauses": legacy_page_clauses},
+                        is_requested_continuation=initial_cursor is not None,
                     )
                     if not batch_rows:
                         break

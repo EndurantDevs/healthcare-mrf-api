@@ -128,9 +128,9 @@ def nearby_search_fields(network_search_sql, search: ProviderGeoSearch | None, *
 
 
 @asynccontextmanager
-async def nearest_first_pages(connection, search: ProviderGeoSearch | None):
-    """Read projection pages nearest-first; underestimated radius rows make a bitmap scan plus sort look cheaper."""
-    if search is None:
+async def nearest_first_pages(connection, search: ProviderGeoSearch | bool | None):
+    """Read pages nearest-first; underestimated radius rows make a bitmap scan plus sort look cheaper."""
+    if not search:
         yield
         return
     previous = (await connection.all(text("SELECT current_setting('enable_bitmapscan')")))[0][0]

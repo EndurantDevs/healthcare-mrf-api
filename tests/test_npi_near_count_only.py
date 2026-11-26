@@ -16,7 +16,7 @@ from api.network_address_scope import network_address_read_scope
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.openapi_route_contract_support import load_openapi_document
-from tests.test_npi_near_snapshot import near_snapshot
+from tests.test_npi_near_snapshot import full_radius_continuations, near_snapshot
 from tests.test_openapi_spec import _collect_code_routes, _collect_spec_routes
 
 
@@ -168,6 +168,7 @@ async def test_near_unresolved_count_is_scalar_zero(near_snapshot, monkeypatch):
     assert near_snapshot.entered == near_snapshot.exited == 1 and not near_snapshot.active
 
 
+@pytest.mark.usefixtures("full_radius_continuations")
 @pytest.mark.parametrize("count_only", (None, "0", "false"))
 async def test_near_noncount_keeps_page_contract(near_snapshot, count_only):
     first = near_snapshot.provider_rows[0]._mapping

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sanic.exceptions import InvalidUsage
 
+from api import provider_geo_sql
 from api.endpoint import npi
 from tests.npi_location_hydration_support import unified_location_mapping
 from tests.test_npi_api_extended import _build_near_row, _set_near_address_column
@@ -75,6 +76,12 @@ def _install_filter_readers(monkeypatch, check):
 
 
 @pytest.fixture
+def full_radius_continuations(monkeypatch):
+    """Keep continuations on the full-radius statement for fake readers that model one page statement."""
+    monkeypatch.setattr(provider_geo_sql, "BOUNDED_CONTINUATION_RADIUS_SHARE", -1.0)
+
+
+@pytest.fixture
 def near_snapshot(monkeypatch):
     state = SimpleNamespace(
         active=False,
@@ -136,19 +143,20 @@ def near_snapshot(monkeypatch):
     return state
 
 
+@pytest.mark.usefixtures("full_radius_continuations")
 async def test_near_plan_route_materializes_legacy_count_candidates(near_snapshot, monkeypatch):
     membership = "SELECT npi FROM mrf.fixture_plan_members WHERE snapshot_key = ANY(:scope_snapshots)"
     monkeypatch.setattr(npi, "_plan_release_npi_scope", AsyncMock(return_value=(membership, {"scope_snapshots": [4]})))
     monkeypatch.setattr(npi, "request_geo_search", AsyncMock(return_value=None))
     page_statements = []
-    build = npi.build_native_nearby_sql
+    build = provider_geo_sql.build_native_nearby_sql
 
     def record_page(*args, **kwargs):
         statement = build(*args, **kwargs)
         page_statements.append(statement)
         return statement
 
-    monkeypatch.setattr(npi, "build_native_nearby_sql", record_page)
+    monkeypatch.setattr(provider_geo_sql, "build_native_nearby_sql", record_page)
     first_row = near_snapshot.provider_rows[0]._mapping
     near_snapshot.provider_rows.append(
         SimpleNamespace(_mapping={**first_row, "npi": 1000000012, "cursor_distance_meters": 200.0})
