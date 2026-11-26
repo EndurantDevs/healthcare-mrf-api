@@ -57,6 +57,7 @@ def full_refresh_page_counts(directory):
         directory.anthem.API_BASE: 1000,
         directory.CARESOURCE_PROVIDER_DIRECTORY_BASE: 1000,
         directory.HAP_PROVIDER_DIRECTORY_BASE: 1000,
+        directory.kaiser.API_BASE: directory.kaiser.PAGE_COUNT,
     }
 
 
@@ -72,7 +73,9 @@ def pagination_start_url(directory, source, url):
     )
     if api_base not in position_pagination_bases:
         return url
-    sorted_url = directory._url_with_replaced_query_item(url, "_sort", "_id")
+    sorted_url = directory._url_with_replaced_query_item(
+        directory.kaiser.start_url(directory, source, url), "_sort", "_id"
+    )
     offset_parameter = "_skip" if api_base in directory.FHIR_SYNTHETIC_SKIP_PAGINATION_BASES else "_offset"
     return directory._url_with_replaced_query_item(sorted_url, offset_parameter, "0")
 
@@ -1302,6 +1305,7 @@ def baked_seed_rows(directory, *, source_query=None):
         ),
         ("christus_health_plan", directory.christus.API_BASE, directory.christus.christus_seed_rows),
         ("mvp_health_care", directory.mvp.API_BASE, directory.mvp.seed_rows),
+        ("kaiser", directory.kaiser.API_BASE, directory.kaiser.seed_rows),
         ("configured_sources", "provider-directory-supplemental-sources", configured_seed_rows),
         (
             "provider_directory_blockers",

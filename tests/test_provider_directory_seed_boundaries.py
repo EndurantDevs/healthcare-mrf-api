@@ -33,6 +33,7 @@ def test_baked_seed_registry_resolves_generated_and_configured_sources_without_r
         "aetna_provider_directorydata",
         "christus_health_plan",
         "mvp_health_care",
+        "kaiser",
         "configured_sources",
         "provider_directory_blockers",
     ]

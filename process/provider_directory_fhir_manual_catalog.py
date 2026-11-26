@@ -29,9 +29,9 @@ from process.provider_directory_fhir_manual_seed import (
     manual_seed_metadata,
 )
 
-
+# Frozen census entry; the live manifest no longer carries a manual source.
 DEFAULT_MANUAL_SOURCE_MANIFEST = Path(__file__).resolve().parents[1] / (
-    "specs/provider_directory_endpoint_acquisition_manifest.json"
+    "specs/provider_directory_reviewed_manual_census_manifest.json"
 )
 MANUAL_ACQUISITION_CLASSIFICATION = "manual_acquisition"
 MANUAL_ACQUISITION_LAUNCH_MODE = "manual"
@@ -190,9 +190,7 @@ def _validated_base(raw_value: Any) -> str:
 
 
 def _strict_resources(raw_value: Any, *, field_name: str) -> tuple[str, ...]:
-    if type(raw_value) is not list or any(
-        type(resource_type) is not str for resource_type in raw_value
-    ):
+    if type(raw_value) is not list or any(type(resource_type) is not str for resource_type in raw_value):
         raise _manifest_error(f"{field_name}_invalid")
     resources = tuple(raw_value)
     if resources != MANUAL_CURRENT_VERSION_CENSUS_RESOURCES:
@@ -241,19 +239,14 @@ def _validated_manual_config(
         raise _manifest_error("persisted_cutoff_forbidden")
     if set(raw_config) != _MANUAL_CENSUS_FIELDS:
         raise _manifest_error("manual_contract_fields")
-    if (
-        type(raw_config.get("contract_version")) is not int
-        or raw_config["contract_version"] != 3
-    ):
+    if type(raw_config.get("contract_version")) is not int or raw_config["contract_version"] != 3:
         raise _manifest_error("contract_version_invalid")
     plan_name = _strict_text(raw_config.get("plan_name"), field_name="plan_name")
     seed_source = _strict_text(
         raw_config.get("seed_source"),
         field_name="seed_source",
     )
-    continuation_strategy, fixed_identity_by_field = (
-        _validated_manual_fixed_identity(raw_config)
-    )
+    continuation_strategy, fixed_identity_by_field = _validated_manual_fixed_identity(raw_config)
     expected_nonempty_resources = _strict_resources(
         raw_config.get("expected_nonempty_resources"),
         field_name="expected_nonempty_resources",
@@ -297,9 +290,7 @@ def _validated_manual_fixed_identity(
         "semantics": SERVER_ISSUED_SUBSET_SEMANTICS,
         "strategy_version": SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
         "traversal_version": SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
-        "canonicalization_version": (
-            SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
-        ),
+        "canonicalization_version": (SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION),
         "completion_scopes": list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES),
     }
     if any(
@@ -430,9 +421,7 @@ def reviewed_manual_census_source_id(
     manual_entries = [
         raw_entry
         for raw_entry in manifest["entries"]
-        if type(raw_entry) is dict
-        and raw_entry.get("classification")
-        == MANUAL_ACQUISITION_CLASSIFICATION
+        if type(raw_entry) is dict and raw_entry.get("classification") == MANUAL_ACQUISITION_CLASSIFICATION
     ]
     if len(manual_entries) != 1:
         raise _manifest_error("source_resolution_ambiguous")

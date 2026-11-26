@@ -88,7 +88,7 @@
       "centene": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-26", "method": "probe", "limitation": "Historical source and probe notes: Location requires at least one resource search parameter: an _count-only request is unsupported. Generic resource acquisition is blocked because stable exhaustive pagination and equivalent behavior across all directory collections remain unverified."},
       "contra-costa": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-26", "method": "rest", "limitation": "Seven public collections are configured with opaque next-link pagination; Endpoint remains excluded. The configured fallback base is retained for historical catalog HTTP 403 responses. Current artifact and unified/API readiness require separate verification."},
       "alohr": {"support_level": "acquisition-configured", "access_requirement": "private-connector", "requires_registration": true, "reviewed_at": "2026-11-26", "method": "graphql", "limitation": "Retained source notes record auth-gated FHIR REST reads; the maintained connector uses GraphQL and does not emit organization-affiliation relationships. A fresh four-resource GraphQL acquisition must validate before artifact publication, and unified/API readiness requires separate proof."},
-      "kaiser": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-26", "method": "rest", "limitation": "The reviewed public R4 source remains manual-only and excluded from automatic scheduling. Its server-issued traversal subset requires replay and reviewed one-root activation evidence. The root-neutral subset proof records advertised, returned, and deficit counts; documented terminal-window bounds remain applicable, and absence under the subset remains unknown. Downstream unified/API runtime verification requires separate proof."}
+      "kaiser": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-27", "method": "rest", "limitation": "Offset pagination with stable _id sorting and 250-row pages; the server filters rows inside each window, so pages can be short or empty before the last one. PractitionerRole, OrganizationAffiliation and InsurancePlan are crawled with _include=*, and referenced resources missing from those pages are read by _id. Resources that nothing references are not acquired. Endpoint is excluded."}
     }
   },
   "parameter_profiles": {
@@ -750,38 +750,10 @@
       "owner_id": "kaiser-provider-directory",
       "source_ids": ["pdfhir_67f47e3af69543ce63cfbf6d"],
       "canonical_base": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc",
-      "classification": "manual_acquisition",
-      "launch_mode": "manual",
+      "classification": "acquisition",
+      "launch_mode": "create",
       "resource_profile": "A7",
-      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"],
-      "manual_current_version_census": {
-        "contract_version": 3,
-        "semantics": "server-issued-traversal-subset",
-        "strategy_version": "provider-directory-fhir-server-issued-traversal-subset-v5",
-        "traversal_version": "provider-directory-fhir-smile-logical-offset-v3",
-        "canonicalization_version": "provider-directory-fhir-returned-resource-json-v2",
-        "completion_scopes": [
-          "advertised-count-monotone-decrease-bounded-by-one-percent-and-twenty-pages",
-          "terminal-logical-window-covers-advertised-pre",
-          "source-issued-continuation",
-          "returned-resource-content"
-        ],
-        "plan_name": "Kaiser Permanente Provider Directory",
-        "seed_source": "healthporta-reviewed-provider-directory-candidate",
-        "continuation_strategy": "smile-opaque-logical-offset-v3",
-        "expected_nonempty_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"],
-        "page_count": 250,
-        "verification_campaign_id": "provider-directory-reviewed-subset-2026-08-13-v7",
-        "start_urls": {
-          "InsurancePlan": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/InsurancePlan",
-          "PractitionerRole": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/PractitionerRole",
-          "Practitioner": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Practitioner",
-          "Organization": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Organization",
-          "Location": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Location",
-          "HealthcareService": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/HealthcareService",
-          "OrganizationAffiliation": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/OrganizationAffiliation"
-        }
-      }
+      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"]
     },
     {
       "entry_id": "bcbs-alabama",

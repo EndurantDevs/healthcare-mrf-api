@@ -213,7 +213,7 @@ def test_profile_source_spec_matches_reviewed_and_retained_entries():
         entry_id
         for entry_id, entry in entries_by_id.items()
         if entry["classification"] in PROFILE_SOURCE_CLASSIFICATIONS
-        and entry_id not in {"excellus-provider-directory", "vsp-provider-directory", "uhc"}
+        and entry_id not in {"excellus-provider-directory", "kaiser", "vsp-provider-directory", "uhc"}
     }
     expected_profile_entry_ids = retained_entry_ids | dataset_scoped_entry_ids | importable_entry_ids
     expected_source_ids = (
