@@ -81,6 +81,34 @@ async def _active_view(session, identity, owner=None):
     return "hp_snapshot_retention." + name
 
 
+async def read_model_family_ownership(session, spec, dataset_id):
+    """Name one installed model stage's tables for a read, without a namespace census."""
+
+    native._require_transaction(session)
+    native._require_model_family_spec(spec)
+    schema_name = native.reference_family_stage_schema(dataset_id)
+    relation_rows = (
+        await session.execute(
+            text(
+                "SELECT namespace.oid, relation.relname, relation.oid FROM pg_catalog.pg_namespace AS namespace "
+                "JOIN pg_catalog.pg_class AS relation ON relation.relnamespace=namespace.oid "
+                "WHERE namespace.nspname=:schema_name AND relation.relname=ANY(CAST(:table_names AS text[])) "
+                "AND relation.relkind='r'"
+            ),
+            {"schema_name": schema_name, "table_names": sorted(spec.table_names)},
+        )
+    ).all()
+    if len(relation_rows) != len(spec.table_names):
+        raise native.ReferenceFamilyArchiveError("reference family owned relation is missing")
+    return native.ReferenceFamilyStageOwnership(
+        spec.importer_id,
+        dataset_id,
+        schema_name,
+        int(relation_rows[0][0]),
+        tuple(sorted((str(name), int(oid)) for _schema_oid, name, oid in relation_rows)),
+    )
+
+
 async def attachment_storage(session, view, spec, *, membership_names=()):
     """Resolve the complete dependency family by its declared qualified names."""
     dependencies = (
@@ -112,9 +140,14 @@ async def attachment_storage(session, view, spec, *, membership_names=()):
     except ValueError as error:
         raise PTG2ManifestArtifactError("membership index namespace differs") from error
     await native._lock_family(session, schema, spec.table_names, "ACCESS SHARE", nowait=True)
-    ownership = await native.capture_model_family_stage_ownership(session, spec, dataset)
+    ownership = await read_model_family_ownership(session, spec, dataset)
     if ownership.schema_name != schema or set(ownership.relation_names) != set(spec.table_names):
         raise PTG2ManifestArtifactError("membership index storage names changed")
+    from api.plan_pricing_code_storage import has_locked_plain_heaps
+
+    relations = [f"{native._quoted(schema)}.{native._quoted(name)}" for name in sorted(spec.table_names)]
+    if not await has_locked_plain_heaps(session, relations):
+        raise PTG2ManifestArtifactError("membership index storage is not plain")
     return ownership
 
 

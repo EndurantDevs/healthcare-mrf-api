@@ -9,7 +9,6 @@ from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 from process.ptg_parts.ptg2_shared_source_set import (
     shared_source_set_metadata,
 )
-
 from tests.ptg2_manifest_tables_support import (
     FakeResult,
     FakeSession,
@@ -31,6 +30,7 @@ from tests.ptg2_manifest_tables_support import (
     strict_v4_serving_index,
 )
 
+
 @pytest.mark.asyncio
 async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_metadata():
     class RealishFakeSession(FakeSession):
@@ -45,9 +45,7 @@ async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_me
         ]
     )
 
-    with pytest.raises(
-        ptg2_tables.PTG2ManifestArtifactError, match="published.*sealed"
-    ):
+    with pytest.raises(ptg2_tables.PTG2ManifestArtifactError, match="published.*sealed"):
         await ptg2_tables.snapshot_serving_tables(session, snapshot_id)
     first = await ptg2_tables.snapshot_serving_tables(session, snapshot_id)
     second = await ptg2_tables.snapshot_serving_tables(session, snapshot_id)
@@ -62,10 +60,8 @@ async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_me
     assert "ptg2_v3_snapshot_scope" in sql
     assert "ptg2_v3_candidate_audit_attestation" in sql
     assert "ptg2_v3_snapshot_source" in sql
-    assert "JSON_AGG(" in sql
-    assert "raw_container_sha256" in sql
-    assert "logical_hash_deferred" in sql
-    assert "source_trace_set_hash" in sql
+    # The published manifest carries the source set; the load does not re-read every source row.
+    assert "JSON_AGG(" not in sql and "raw_container_sha256" not in sql
     assert "pgcrypto" not in sql
     source_set_sql = "snapshot.manifest->'serving_index'->'source_set'"
     assert f"{source_set_sql} AS snapshot_source_set" in " ".join(sql.split())
@@ -74,9 +70,7 @@ async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_me
     assert "txid_current_snapshot()" in sql
     assert "attestation.contract = ANY(" in sql
     query_params = session.calls[0][0][1]
-    assert query_params["attestation_contracts"] == list(
-        ptg2_tables.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
-    )
+    assert query_params["attestation_contracts"] == list(ptg2_tables.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS)
     assert "COUNT(DISTINCT code.coverage_scope_id)" not in sql
     assert "ptg2_v3_code code" not in sql
     assert not hasattr(ptg2_tables, "_PTG2_SNAPSHOT_TABLES_CACHE")
@@ -200,21 +194,15 @@ async def test_snapshot_serving_tables_rejects_every_legacy_shape(serving_index)
             "serving_binary format",
         ),
         (
-            lambda value: value["serving_binary"]["price_dictionary"].pop(
-                "block_bytes"
-            ),
+            lambda value: value["serving_binary"]["price_dictionary"].pop("block_bytes"),
             "block_bytes",
         ),
         (
-            lambda value: value["serving_binary"]["price_dictionary"].update(
-                block_bytes=65_535
-            ),
+            lambda value: value["serving_binary"]["price_dictionary"].update(block_bytes=65_535),
             "price dictionary metadata",
         ),
         (
-            lambda value: value["serving_binary"]["price_set_atom_memberships_v3"].pop(
-                "block_span"
-            ),
+            lambda value: value["serving_binary"]["price_set_atom_memberships_v3"].pop("block_span"),
             "block_span",
         ),
         (lambda value: value.pop("audit_sample"), "persisted audit sample"),
@@ -241,8 +229,8 @@ def test_strict_v3_contract_rejects_cold_unsafe_metadata(mutator, message):
 
 
 def test_v4_manifest_accepts_v3_price_contract() -> None:
-    shared_snapshot_key, generation, cold_contract, _audit = (
-        ptg2_tables._strict_v3_manifest_fields(strict_v4_serving_index())
+    shared_snapshot_key, generation, cold_contract, _audit = ptg2_tables._strict_v3_manifest_fields(
+        strict_v4_serving_index()
     )
     assert shared_snapshot_key == 43
     assert generation == "shared_blocks_v4"
@@ -252,9 +240,7 @@ def test_v4_manifest_accepts_v3_price_contract() -> None:
 def test_v4_manifest_accepts_complete_direct_prefix() -> None:
     serving_index = strict_direct_v4_serving_index()
 
-    _shared_snapshot_key, generation, _cold_contract, _audit = (
-        ptg2_tables._strict_v3_manifest_fields(serving_index)
-    )
+    _shared_snapshot_key, generation, _cold_contract, _audit = ptg2_tables._strict_v3_manifest_fields(serving_index)
 
     assert generation == "shared_blocks_v4"
 
@@ -262,9 +248,7 @@ def test_v4_manifest_accepts_complete_direct_prefix() -> None:
 def test_v4_manifest_accepts_empty_direct_prefix() -> None:
     serving_index = empty_direct_v4_serving_index()
 
-    _shared_snapshot_key, generation, _cold_contract, _audit = (
-        ptg2_tables._strict_v3_manifest_fields(serving_index)
-    )
+    _shared_snapshot_key, generation, _cold_contract, _audit = ptg2_tables._strict_v3_manifest_fields(serving_index)
 
     assert generation == "shared_blocks_v4"
 
@@ -325,9 +309,7 @@ def test_legacy_v4_manifest_without_taxonomy_projection_remains_servable() -> No
     provider_graph = serving_index["serving_binary"]["provider_graph_v4"]
     assert "inferred_taxonomy_candidates" not in provider_graph
 
-    _shared_snapshot_key, generation, _cold_contract, _audit = (
-        ptg2_tables._strict_v3_manifest_fields(serving_index)
-    )
+    _shared_snapshot_key, generation, _cold_contract, _audit = ptg2_tables._strict_v3_manifest_fields(serving_index)
     assert generation == "shared_blocks_v4"
 
 
@@ -335,21 +317,15 @@ def test_legacy_v4_manifest_without_taxonomy_projection_remains_servable() -> No
     "mutator",
     [
         lambda value: value["serving_binary"].pop("provider_graph_v4"),
-        lambda value: value["serving_binary"]["provider_graph_v4"].update(
-            representation="source_component_v1"
+        lambda value: value["serving_binary"]["provider_graph_v4"].update(representation="source_component_v1"),
+        lambda value: value["serving_binary"]["provider_graph_v4"].update(map_digest="not-a-digest"),
+        lambda value: value["serving_binary"]["provider_graph_v4"].update(npi_table="ptg2_v3_npi_scope"),
+        lambda value: value["serving_binary"]["provider_graph_v4"]["hot_prefix"].update(
+            max_online_group_npi_batches_per_set=0
         ),
-        lambda value: value["serving_binary"]["provider_graph_v4"].update(
-            map_digest="not-a-digest"
+        lambda value: value["serving_binary"]["provider_graph_v4"]["hot_prefix"].update(
+            provider_expansion_rate_page_rows=0
         ),
-        lambda value: value["serving_binary"]["provider_graph_v4"].update(
-            npi_table="ptg2_v3_npi_scope"
-        ),
-        lambda value: value["serving_binary"]["provider_graph_v4"][
-            "hot_prefix"
-        ].update(max_online_group_npi_batches_per_set=0),
-        lambda value: value["serving_binary"]["provider_graph_v4"][
-            "hot_prefix"
-        ].update(provider_expansion_rate_page_rows=0),
     ],
 )
 def test_strict_manifest_rejects_unservable_v4_graph_metadata(mutator) -> None:
@@ -367,9 +343,7 @@ def test_v4_manifest_rejects_invalid_empty_npi_resource(
     normalization_count,
 ) -> None:
     serving_index = strict_v4_serving_index()
-    resources = serving_index["serving_binary"]["provider_graph_v4"][
-        "resource_admission"
-    ]
+    resources = serving_index["serving_binary"]["provider_graph_v4"]["resource_admission"]
     resources["empty_npi_tin_only_normalization_count"] = normalization_count
 
     with pytest.raises(ptg2_tables.PTG2ManifestArtifactError, match="V4"):

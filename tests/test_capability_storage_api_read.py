@@ -72,6 +72,7 @@ class _Session:
 def _no_custody(monkeypatch):
     refuse = AsyncMock(side_effect=AssertionError("custody is not part of API reads"))
     monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", refuse)
+    monkeypatch.setattr(storage.attachments, "read_model_family_ownership", refuse)
     monkeypatch.setattr(storage.native, "_lock_family", refuse)
 
 

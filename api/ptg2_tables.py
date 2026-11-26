@@ -100,7 +100,6 @@ _PUBLISHED_SNAPSHOT_TEMPLATE = f"""
                    source_summary.distinct_source_key_count,
                    source_summary.minimum_source_key,
                    source_summary.maximum_source_key,
-                   source_summary.source_identity_rows,
                    current_setting('server_version_num')::integer
                        AS postgres_server_version_num,
                    current_database() IS NOT NULL AS database_selected,
@@ -124,24 +123,7 @@ _PUBLISHED_SNAPSHOT_TEMPLATE = f"""
                          COUNT(DISTINCT source.source_key)::bigint
                              AS distinct_source_key_count,
                          MIN(source.source_key) AS minimum_source_key,
-                         MAX(source.source_key) AS maximum_source_key,
-                         JSON_AGG(
-                             JSON_BUILD_OBJECT(
-                                 'source_key', source.source_key,
-                                 'source_type', source.source_type,
-                                 'identity_kind', source.identity_kind,
-                                 'identity_sha256', source.identity_sha256,
-                                 'raw_container_sha256',
-                                     source.raw_container_sha256,
-                                 'logical_json_sha256',
-                                     source.logical_json_sha256,
-                                 'logical_hash_deferred',
-                                     source.logical_hash_deferred,
-                                 'source_trace_set_hash',
-                                     source.source_trace_set_hash
-                             )
-                             ORDER BY source.source_key
-                         ) AS source_identity_rows
+                         MAX(source.source_key) AS maximum_source_key
                     FROM $ptg2_v3_snapshot_source source
                    WHERE source.snapshot_id = snapshot.snapshot_id
               ) source_summary
@@ -1121,20 +1103,13 @@ def _validated_published_source_fields(row_fields, source_count):
     )
     if manifest_source_set is None:
         raise PTG2ManifestArtifactError("PTG2 published source set is missing from its snapshot manifest")
-    source_set_by_field = _validated_published_source_set(
-        row_fields.get("source_identity_rows"),
-        expected_source_count=source_count,
-    )
     attested_source_set_digest = str(row_fields.get("attested_source_set_digest") or "")
-    if (
-        manifest_source_set != source_set_by_field
-        or attested_source_set_digest != source_set_by_field["raw_container_sha256_digest"]
-    ):
+    if attested_source_set_digest != manifest_source_set["raw_container_sha256_digest"]:
         raise PTG2ManifestArtifactError("PTG2 published source set does not match its manifest and attestation")
     source_key = str(row_fields.get("attested_source_key") or "").strip() or None
     if source_key is None:
         raise PTG2ManifestArtifactError("PTG2 published source key is missing from its attestation")
-    return source_set_by_field, source_key
+    return manifest_source_set, source_key
 
 
 def _validated_published_snapshot_fields(
