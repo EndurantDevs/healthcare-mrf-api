@@ -274,10 +274,25 @@ async def _stored_rows(directory, dataset_id, resource_type):
             yield stored_row["payload_json"]
 
 
-async def _missing_references(directory, dataset_id, resource_types):
-    """Hold only ids: acquired targets, then references from roles, affiliations and plans."""
+def reference_fields(
+    directory, resource_types, source_types=REFERENCE_SOURCE_TYPES, target_types=REFERENCE_TARGET_TYPES
+):
+    """Map each acquired source family to the reference fields of its acquired target families."""
+    return {
+        source_type: {
+            target_type: fields
+            for target_type, fields in directory.LINKED_REFERENCE_FIELDS.get(source_type, {}).items()
+            if target_type in target_types and target_type in resource_types
+        }
+        for source_type in source_types
+        if source_type in resource_types
+    }
+
+
+async def missing_references(directory, dataset_id, fields_by_source):
+    """Hold only ids: acquired targets, then the references the source families make to them."""
     acquired_ids_by_type = {
-        resource_type: set() for resource_type in REFERENCE_TARGET_TYPES if resource_type in resource_types
+        target_type: set() for fields_by_target in fields_by_source.values() for target_type in fields_by_target
     }
     for target_type, acquired_ids in acquired_ids_by_type.items():
         async for resource_row in _stored_rows(directory, dataset_id, target_type):
@@ -290,12 +305,7 @@ async def _missing_references(directory, dataset_id, resource_types):
         return key if key and key[1] not in acquired_ids_by_type[target_type] else None
 
     missing_keys = set()
-    for source_type in (resource_type for resource_type in REFERENCE_SOURCE_TYPES if resource_type in resource_types):
-        fields_by_target = {
-            target_type: fields
-            for target_type, fields in directory.LINKED_REFERENCE_FIELDS[source_type].items()
-            if target_type in acquired_ids_by_type
-        }
+    for source_type, fields_by_target in fields_by_source.items():
         async for resource_row in _stored_rows(directory, dataset_id, source_type):
             for target_type, reference, _field in directory._row_linked_reference_candidates(
                 resource_row, fields_by_target
@@ -305,10 +315,14 @@ async def _missing_references(directory, dataset_id, resource_types):
     return sorted(missing_keys)
 
 
+def _api_base(directory, source_record):
+    return directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+
+
 async def _read_by_id(directory, source_record, resource_key, timeout, run_id):
     """Read one referenced resource; 404/410 means the reference is dangling, not a run failure."""
     resource_type, resource_id = resource_key
-    url = f"{directory.UHC_PROVIDER_DIRECTORY_BASE}/{resource_type}/{urllib.parse.quote(resource_id, safe='')}"
+    url = f"{_api_base(directory, source_record)}/{resource_type}/{urllib.parse.quote(resource_id, safe='')}"
     status_code, payload, fetch_error, _elapsed = await directory._fetch_source_json(
         source_record, url, timeout=directory._source_resource_timeout(source_record, resource_type, timeout)
     )
@@ -322,7 +336,7 @@ async def _read_by_id(directory, source_record, resource_key, timeout, run_id):
 
 def _parse_reference(directory, source_record, resource_key, payload, fetch_url, mode, run_id):
     resource_type, resource_id = resource_key
-    url = f"{directory.UHC_PROVIDER_DIRECTORY_BASE}/{resource_type}/{urllib.parse.quote(resource_id, safe='')}"
+    url = f"{_api_base(directory, source_record)}/{resource_type}/{urllib.parse.quote(resource_id, safe='')}"
     if payload.get("resourceType") != resource_type or payload.get("id") != resource_id:
         return None
     acquisition = directory.FHIRAcquisitionContext(
@@ -349,7 +363,7 @@ async def _read_id_batch(directory, source_record, resource_keys, timeout, run_i
     if not all(re.fullmatch(r"[A-Za-z0-9.-]{1,64}", resource_id) for resource_id in expected_ids):
         return {}
     url = directory._url_with_query_params(
-        f"{directory.UHC_PROVIDER_DIRECTORY_BASE}/{resource_type}",
+        f"{_api_base(directory, source_record)}/{resource_type}",
         {"_id": ",".join(resource_id for _, resource_id in resource_keys), "_count": len(resource_keys)},
     )
     status, bundle, error, _elapsed = await directory._fetch_source_json(
@@ -381,11 +395,17 @@ class _ReferenceReader:
         self.timeout, self.run_id = timeout, run_id
         self.use_batches = use_batches
         self.concurrency = concurrency or directory._partition_fetch_concurrency()
-        self.counts_by_type = {
-            resource_type: {"fetched": 0, "missing": 0, "failed": 0} for resource_type in REFERENCE_TARGET_TYPES
-        }
-        self.written_by_type = dict.fromkeys(REFERENCE_TARGET_TYPES, 0)
         self.rows_by_model = {}
+        self.use_types(REFERENCE_BATCH_SIZE)
+
+    def use_types(self, batch_size_by_type):
+        """Read and count only these target families, in _id lists of the given sizes."""
+        self.batch_size_by_type = batch_size_by_type
+        self.counts_by_type = {
+            resource_type: {"fetched": 0, "missing": 0, "failed": 0} for resource_type in batch_size_by_type
+        }
+        self.written_by_type = dict.fromkeys(batch_size_by_type, 0)
+        return self
 
     async def _flush(self, model, minimum_rows=1):
         if len(self.rows_by_model.get(model, ())) < minimum_rows:
@@ -446,7 +466,9 @@ class _ReferenceReader:
             for key in resource_keys:
                 keys_by_type.setdefault(key[0], []).append(key)
             for resource_type, keys in keys_by_type.items():
-                batch_size = REFERENCE_BATCH_SIZE.get(resource_type, 1) if self.use_batches and not retry_round else 1
+                batch_size = (
+                    self.batch_size_by_type.get(resource_type, 1) if self.use_batches and not retry_round else 1
+                )
                 for offset in range(0, len(keys), batch_size):
                     key_queue.put_nowait(keys[offset : offset + batch_size])
             worker_count = min(self.concurrency, max(1, key_queue.qsize()))
@@ -619,6 +641,12 @@ async def hydrate_after_scan(directory, runner, resource_type, role_done):
 
 async def close_references(directory, source_record, persist, diagnostics_by_type, count_by_type, *, timeout, run_id):
     """Read by id every referenced Practitioner, Organization and Location the scans did not return."""
+    from process import provider_directory_kaiser as kaiser
+
+    if kaiser.is_source(directory, source_record):
+        return await kaiser.close_references(
+            directory, source_record, persist, diagnostics_by_type, count_by_type, timeout=timeout, run_id=run_id
+        )
     if (
         not is_source(directory, source_record)
         or not directory._is_uhc_role_postal_partition_enabled(source_record)
@@ -638,7 +666,8 @@ async def close_references(directory, source_record, persist, diagnostics_by_typ
         use_batches=bool(dataset_id and proxy_run and proxy_run.enabled(source_record)),
     )
     if dataset_id:
-        await reader.read(await _missing_references(directory, dataset_id, set(diagnostics_by_type)))
+        fields_by_source = reference_fields(directory, set(diagnostics_by_type))
+        await reader.read(await missing_references(directory, dataset_id, fields_by_source))
     for resource_type in target_types:
         diagnostic = diagnostics_by_type[resource_type]
         diagnostic["reference_closure"] = dict(reader.counts_by_type[resource_type])

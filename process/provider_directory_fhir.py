@@ -96,6 +96,7 @@ from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_generic_source_adapters as source_adapters
 from process import provider_directory_highmark as highmark
 from process import provider_directory_import_completion as import_completion_policy
+from process import provider_directory_kaiser as kaiser
 from process import provider_directory_leaf_census as leaf_census
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
@@ -1376,7 +1377,9 @@ IDAHO_MEDICAID_RESOURCE_PROFILES = {
         "PractitionerRole": ("plannet-PractitionerRole",),
     }.items()
 }
-FHIR_OFFSET_PAGINATION_BASES = frozenset({TMHP_PROVIDER_DIRECTORY_BASE, NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE})
+FHIR_OFFSET_PAGINATION_BASES = frozenset(
+    {TMHP_PROVIDER_DIRECTORY_BASE, NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE, kaiser.API_BASE}
+)
 FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset(
     {
         ARKANSAS_PROVIDER_DIRECTORY_BASE,
@@ -1536,6 +1539,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         christus.API_BASE,
+        kaiser.API_BASE,
         "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory",
         "https://api.capitalbluecrossfhir.com/r4/public-ma",
         "https://api.capitalbluecrossfhir.com/r4/public-chip",
@@ -45213,21 +45217,6 @@ async def _stream_bulk_export_output_rows(
         return state.result(error)
 
 
-def _bulk_stream_result(
-    rows: list[dict[str, Any]],
-    stream_counts_by_name: dict[str, int],
-    row_limit_by_name: dict[str, bool],
-    error: str | None,
-) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
-    return (
-        rows,
-        stream_counts_by_name["rows_fetched"],
-        stream_counts_by_name["rows_written"],
-        row_limit_by_name["reached"],
-        error,
-    )
-
-
 def _checkpointed_bulk_fetch_result(
     model: type,
     *,
@@ -52385,7 +52374,9 @@ async def _fetch_resource_rows(
                     break
                 if response_payload.get("total") is not None:
                     cached_total = response_payload["total"]
-            entries = _bundle_entries(response_payload)
+            entries = await kaiser.page_entries(
+                sys.modules[__name__], source_record, resource_type, response_payload, url, row_batch_handler, run_id
+            )
             current_version_next_link: str | None = None
             current_version_resolved_next_url: str | None = None
             current_version_continuation_identity: str | None = None
@@ -52536,7 +52527,7 @@ async def _fetch_resource_rows(
                 error_message = str(exc)
                 has_next_url = True
                 break
-            if not entries and source_api_base in FHIR_OFFSET_PAGINATION_BASES:
+            if not entries and source_api_base in FHIR_OFFSET_PAGINATION_BASES - {kaiser.API_BASE}:
                 resolved_next_url = None
             if timestamp_page_proof is not None:
                 resolved_next_url = timestamp_page_proof[timestamp_recovery.KEY]["url"]

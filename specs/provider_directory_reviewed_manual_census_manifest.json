@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "importer": "provider-directory-fhir",
+  "entries": [
+    {
+      "entry_id": "kaiser",
+      "display_name": "Kaiser Permanente",
+      "owner_id": "kaiser-provider-directory",
+      "source_ids": [
+        "pdfhir_67f47e3af69543ce63cfbf6d"
+      ],
+      "canonical_base": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc",
+      "classification": "manual_acquisition",
+      "launch_mode": "manual",
+      "resource_profile": "A7",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
+      "manual_current_version_census": {
+        "contract_version": 3,
+        "semantics": "server-issued-traversal-subset",
+        "strategy_version": "provider-directory-fhir-server-issued-traversal-subset-v5",
+        "traversal_version": "provider-directory-fhir-smile-logical-offset-v3",
+        "canonicalization_version": "provider-directory-fhir-returned-resource-json-v2",
+        "completion_scopes": [
+          "advertised-count-monotone-decrease-bounded-by-one-percent-and-twenty-pages",
+          "terminal-logical-window-covers-advertised-pre",
+          "source-issued-continuation",
+          "returned-resource-content"
+        ],
+        "plan_name": "Kaiser Permanente Provider Directory",
+        "seed_source": "healthporta-reviewed-provider-directory-candidate",
+        "continuation_strategy": "smile-opaque-logical-offset-v3",
+        "expected_nonempty_resources": [
+          "InsurancePlan",
+          "PractitionerRole",
+          "Practitioner",
+          "Organization",
+          "Location",
+          "HealthcareService",
+          "OrganizationAffiliation"
+        ],
+        "page_count": 250,
+        "verification_campaign_id": "provider-directory-reviewed-subset-2026-08-13-v7",
+        "start_urls": {
+          "InsurancePlan": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/InsurancePlan",
+          "PractitionerRole": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/PractitionerRole",
+          "Practitioner": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Practitioner",
+          "Organization": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Organization",
+          "Location": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Location",
+          "HealthcareService": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/HealthcareService",
+          "OrganizationAffiliation": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/OrganizationAffiliation"
+        }
+      }
+    }
+  ]
+}
