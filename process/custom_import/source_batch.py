@@ -9,6 +9,7 @@ import datetime as dt
 import hmac
 import json
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from uuid import UUID
@@ -25,7 +26,10 @@ from db.models.custom_import import (
 from process.custom_import import build_source as staging
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS, encode_landing_batch
 from process.custom_import.capture_store import (
+    CursorPartWindowLimits,
+    CursorPartWindowRequest,
     load_segmented_cursor_headers,
+    load_segmented_cursor_part_window,
     open_segmented_cursor_part,
     verify_segmented_stream_metadata,
 )
@@ -636,8 +640,103 @@ async def _read_parts(session_factory, context, policy, bundle_id, cursor, sourc
     return tuple(pages), tuple(closed_parts)
 
 
+_DIRECT_PREFETCH_MAX_PARTS = 64
+_DIRECT_PREFETCH_MAX_COMPRESSED_BYTES = 16 * 1024 * 1024
+_DIRECT_PREFETCH_MAX_ARROW_BYTES = 64 * 1024 * 1024
+
+
+async def _fetch_closed_part_window(
+    session_factory,
+    identity_by_field,
+    context,
+    start_part_ordinal,
+    remaining_rows,
+    deadline,
+    headers,
+):
+    """Fetch one bounded contiguous window of closed parts in a single read transaction."""
+    window_limits = CursorPartWindowLimits(
+        max_parts=_DIRECT_PREFETCH_MAX_PARTS,
+        max_rows=max(1, remaining_rows),
+        max_compressed_bytes=_DIRECT_PREFETCH_MAX_COMPRESSED_BYTES,
+        max_arrow_bytes=_DIRECT_PREFETCH_MAX_ARROW_BYTES,
+    )
+    window_req = CursorPartWindowRequest(
+        stream_slot=context.stream_slot,
+        start_part_ordinal=start_part_ordinal,
+        limits=window_limits,
+        **identity_by_field,
+    )
+    async with _read_session(session_factory) as session:
+        await _read_timeout(session, context.request, deadline)
+        return await load_segmented_cursor_part_window(session, window_req, headers=headers)
+
+
+async def _next_direct_part(
+    session_factory,
+    identity_by_field,
+    context,
+    pending_parts: deque,
+    cursor: SourceCursor,
+    remaining_rows: int,
+    deadline: float,
+    headers,
+):
+    """Pop the next prefetched part or fetch a new bounded window when depleted."""
+    if not pending_parts:
+        part_window, headers = await _fetch_closed_part_window(
+            session_factory,
+            identity_by_field,
+            context,
+            cursor.next_part_ordinal,
+            remaining_rows,
+            deadline,
+            headers,
+        )
+        pending_parts.extend(part_window)
+    return pending_parts.popleft(), headers
+
+
+@dataclass(frozen=True)
+class _DirectReadLoop:
+    """Bounded read parameters shared across one coalesced direct-stage batch."""
+
+    direct_stage: object
+    context: object
+    policy: object
+    direct_plan: object
+    bucket_count: int
+    deadline: float
+    soft_deadline: float
+
+
+async def _prepare_next_direct_slice(
+    loop_cfg: _DirectReadLoop,
+    part,
+    cursor: SourceCursor,
+    remaining_rows: int,
+    remaining_bytes: int,
+    *,
+    is_final: bool,
+):
+    """Prepare one bounded direct part slice within remaining batch and deadline limits."""
+    part_budget = loop_cfg.direct_stage.DirectSliceBudget(
+        part_row_ordinal=cursor.next_part_row_ordinal,
+        source_ordinal=cursor.next_source_ordinal,
+        bucket_count=loop_cfg.bucket_count,
+        max_rows=remaining_rows,
+        max_bytes=remaining_bytes,
+        deadline=loop_cfg.deadline,
+        soft_deadline=loop_cfg.soft_deadline,
+        is_final_part=is_final,
+    )
+    return await loop_cfg.direct_stage.prepare_direct_part_slice(
+        loop_cfg.context, part, loop_cfg.policy, part_budget, direct_plan=loop_cfg.direct_plan
+    )
+
+
 async def _read_direct_parts(session_factory, context, policy, bundle_id, cursor, deadline, bucket_count):
-    """Coalesce sequential parts into bucketed direct stage tuples without holding a read connection."""
+    """Coalesce sequential parts into bucketed direct stage buffers without holding a read connection."""
     from process.custom_import import family_block_direct_stage as direct_stage
 
     request = context.request
@@ -647,45 +746,45 @@ async def _read_direct_parts(session_factory, context, policy, bundle_id, cursor
         definition_revision_id=request.definition_revision_id,
         schema_revision_id=request.schema_revision_id,
     )
-    slices, row_count, byte_count = [], 0, 0
-    headers = None
     started = time.monotonic()
     soft_deadline = started + (deadline - started) / 2
-    closed_count = 0
+    loop_cfg = _DirectReadLoop(
+        direct_stage, context, policy, direct_stage.compile_direct_plan(context), bucket_count, deadline, soft_deadline
+    )
+    slices, row_count, byte_count, headers, closed_count = [], 0, 0, None, 0
+    pending_parts: deque = deque()
     while closed_count < MAX_BATCH_ROWS and (not slices or _has_capacity(request, row_count, byte_count)):
         now = time.monotonic()
         if now >= deadline:
             raise LeaseAuthorityLost("SOURCE read deadline elapsed")
         if slices and now >= soft_deadline:
             break
-        part, headers = await _fetch_closed_part(session_factory, identity_by_field, context, cursor, deadline, headers)
-        is_final = part.ordinal == json.loads(part.receipt.canonical_manifest)["part_count"]
-        part_budget = direct_stage.DirectSliceBudget(
-            part_row_ordinal=cursor.next_part_row_ordinal,
-            source_ordinal=cursor.next_source_ordinal,
-            bucket_count=bucket_count,
-            max_rows=MAX_BATCH_ROWS - row_count,
-            max_bytes=MAX_BATCH_BYTES - byte_count,
-            deadline=deadline,
-            soft_deadline=soft_deadline,
-            is_final_part=is_final,
+        part, headers = await _next_direct_part(
+            session_factory,
+            identity_by_field,
+            context,
+            pending_parts,
+            cursor,
+            MAX_BATCH_ROWS - row_count,
+            deadline,
+            headers,
         )
-        part_slice = await direct_stage.prepare_direct_part_slice(context, part, policy, part_budget)
+        is_final = part.ordinal == headers.part_count
+        part_slice = await _prepare_next_direct_slice(
+            loop_cfg, part, cursor, MAX_BATCH_ROWS - row_count, MAX_BATCH_BYTES - byte_count, is_final=is_final
+        )
         del part
         slices.append(part_slice)
         row_count += part_slice.row_count
         byte_count += part_slice.byte_count
-        if not part_slice.has_reached_eof:
+        if not part_slice.has_reached_eof or is_final:
+            pending_parts.clear()
+            if is_final and part_slice.has_reached_eof:
+                await _verify_metadata(session_factory, identity_by_field, context, deadline)
             break
         closed_count += 1
-        if is_final:
-            await _verify_metadata(session_factory, identity_by_field, context, deadline)
-            break
         cursor = SourceCursor(
-            cursor.next_part_ordinal + 1,
-            0,
-            cursor.next_source_ordinal + part_slice.row_count,
-            cursor.next_pack_ordinal,
+            cursor.next_part_ordinal + 1, 0, cursor.next_source_ordinal + part_slice.row_count, cursor.next_pack_ordinal
         )
     if time.monotonic() >= deadline:
         raise LeaseAuthorityLost("SOURCE read deadline elapsed")

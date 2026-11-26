@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import struct
 import tempfile
+import threading
 from collections import deque
 from collections.abc import Mapping
 from compression import zstd
@@ -57,6 +58,19 @@ _ENVELOPE_DOMAIN = b"custom-import/family-block/v1\x00storage\x00"
 _LENGTH = struct.Struct("!Q")
 _FRAGMENT = struct.Struct("!QQ")
 _DIRECTORY = struct.Struct("!qQqQ")
+_ZSTD_COMPRESS_OPTIONS = {
+    zstd.CompressionParameter.compression_level: 3,
+    zstd.CompressionParameter.checksum_flag: True,
+}
+_ZSTD_LOCAL = threading.local()
+
+
+def _zstd_compressor() -> zstd.ZstdCompressor:
+    compressor = getattr(_ZSTD_LOCAL, "compressor", None)
+    if compressor is None:
+        compressor = zstd.ZstdCompressor(options=_ZSTD_COMPRESS_OPTIONS)
+        _ZSTD_LOCAL.compressor = compressor
+    return compressor
 
 
 class FamilyBlockResourceLimit(FamilyBlockError):
@@ -287,10 +301,7 @@ def _indexed_fragment(directory, frame):
 
 
 def _compress(ordinal, raw):
-    return _FRAGMENT.pack(ordinal, len(raw)) + zstd.compress(
-        raw,
-        options={zstd.CompressionParameter.compression_level: 3, zstd.CompressionParameter.checksum_flag: True},
-    )
+    return _FRAGMENT.pack(ordinal, len(raw)) + _zstd_compressor().compress(raw, mode=zstd.ZstdCompressor.FLUSH_FRAME)
 
 
 def _frame_object(value):

@@ -13,12 +13,14 @@ pub mod company_network_assertions;
 pub mod config;
 pub mod contact_canon;
 pub mod copy_format;
+pub mod custom_import_direct_stage;
 pub mod custom_import_graph;
 pub mod custom_import_graph_projection;
 pub mod custom_import_scalar;
 pub mod custom_import_source;
 pub mod custom_import_source_columns;
 pub mod custom_import_source_payload;
+pub mod custom_import_v2_family;
 pub mod dedupe;
 pub mod entity_address_rows;
 pub mod fhir_network_identity;
@@ -125,6 +127,8 @@ mod python_api {
     include!("python_hospital_price.rs");
     include!("python_custom_import.rs");
     include!("python_custom_import_source_columns.rs");
+    include!("python_custom_import_direct_stage.rs");
+    include!("python_custom_import_v2_family.rs");
     include!("python_custom_import_graph.rs");
     include!("python_custom_import_graph_projection.rs");
     include!("python_registry.rs");
@@ -725,6 +729,15 @@ mod python_api {
         m.add_function(wrap_pyfunction!(custom_import_source_columns_v1, m)?)?;
         m.add_class::<SourceColumnsPlan>()?;
         m.add_function(wrap_pyfunction!(custom_import_source_columns_plan_v1, m)?)?;
+        m.add_class::<DirectStageColumnsPlan>()?;
+        m.add_function(wrap_pyfunction!(custom_import_direct_stage_plan_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            custom_import_finalize_direct_stage_copy_v1,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(custom_import_pack_hash_v1, m)?)?;
+        m.add_class::<V2FamilyEncoderPlan>()?;
+        m.add_function(wrap_pyfunction!(custom_import_v2_family_plan_v1, m)?)?;
         m.add_function(wrap_pyfunction!(
             custom_import_validate_source_payloads_v1,
             m
@@ -885,6 +898,16 @@ mod python_api {
                     .hasattr("custom_import_source_columns_plan_v1")
                     .unwrap());
                 assert!(module.hasattr("_SourceColumnsPlan").unwrap());
+                assert!(module
+                    .hasattr("custom_import_direct_stage_plan_v1")
+                    .unwrap());
+                assert!(module.hasattr("_DirectStageColumnsPlan").unwrap());
+                assert!(module
+                    .hasattr("custom_import_finalize_direct_stage_copy_v1")
+                    .unwrap());
+                assert!(module.hasattr("custom_import_pack_hash_v1").unwrap());
+                assert!(module.hasattr("_V2FamilyEncoderPlan").unwrap());
+                assert!(module.hasattr("custom_import_v2_family_plan_v1").unwrap());
                 assert!(module.hasattr("custom_import_graph_children_v1").unwrap());
                 assert!(module.hasattr("canon_version").unwrap());
                 assert!(module.hasattr("intersect_sorted_u32").unwrap());

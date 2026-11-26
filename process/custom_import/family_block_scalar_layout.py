@@ -72,7 +72,7 @@ def append_scalar_columns(table, fields):
         )
 
 
-def pack_query_scalars(fields, scalars):
+def pack_query_scalars(fields, scalars, *, validated: bool = False):
     """Return COPY cells in appended-column order without changing scalar values."""
     states = bytearray((len(fields) + 3) // 4)
     overrides = bytearray((len(fields) + 1) // 2)
@@ -81,9 +81,12 @@ def pack_query_scalars(fields, scalars):
         scalar = scalars.get(field.field_id)
         value, state = None, 0
         if scalar is not None:
-            if type(scalar) is not TypedScalar:
-                raise ValueError("raw query scalar is malformed")
-            checked_value = _validate_typed_scalar(scalar)
+            if validated:
+                checked_value = scalar.logical_value
+            else:
+                if type(scalar) is not TypedScalar:
+                    raise ValueError("raw query scalar is malformed")
+                checked_value = _validate_typed_scalar(scalar)
             state = 1 if scalar.value_state == "null" else 2
             if scalar.field_type != field.value_type:
                 code = _KINDS.index(scalar.field_type) + 1

@@ -1208,3 +1208,280 @@ async def test_direct_v2_compiled_npi_relation_and_root_detail_parity(monkeypatc
                         family_entitlement="full_family",
                     ),
                 )
+
+
+@pytest.mark.asyncio
+async def test_direct_v2_stage_tables_disable_autovacuum_and_batch_multiple_parts(monkeypatch):
+    """Unlogged direct stage tables disable autovacuum and multi-part batches commit in one source-batch."""
+    monkeypatch.setenv("HLTHPRT_CUSTOM_IMPORT_DIRECT_COMPACT", "true")
+    root_tuples = (
+        ("1003000126", Decimal("1.5"), True),
+        ("1234567893", Decimal("2.5"), False),
+        ("1992999874", Decimal("3.5"), True),
+        ("1003000134", Decimal("4.5"), True),
+        ("1003000142", Decimal("5.5"), False),
+        ("1003000159", Decimal("6.5"), True),
+    )
+    reloptions_by_table: dict[str, list[str] | None] = {}
+
+    async with _source_case() as case:
+        await _install_compact_schema(case)
+        connector, request, policy = await _registered_root_only_capture(
+            case,
+            monkeypatch,
+            root_tuples,
+            dataset_key="synthetic_multipart_v2",
+            idempotency_key="mp-v2-1",
+            is_score_nullable=False,
+        )
+        transports, recorded_calls = _build_hosted_writer_transports(case.sessions, request)
+        from process.custom_import import family_block_direct_stage as direct_stage
+
+        original_create_buckets = direct_stage._create_stage_bucket_tables
+
+        async def _capture_stage_reloptions(session, parent, schema_sql: str, bucket_count: int) -> None:
+            await original_create_buckets(session, parent, schema_sql, bucket_count)
+            schema_name = schema_sql.strip('"')
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT c.relname, c.reloptions FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = :schema_name AND c.relname LIKE 'direct_stage_%'"
+                    ),
+                    {"schema_name": schema_name},
+                )
+            ).all()
+            for relname, reloptions in rows:
+                reloptions_by_table[str(relname)] = list(reloptions) if reloptions is not None else None
+
+        monkeypatch.setattr(direct_stage, "_create_stage_bucket_tables", _capture_stage_reloptions)
+        async with transports as active_transports:
+            outcome = await runner.run_segmented_snowflake_candidate(
+                case.sessions, connector, request, processing_policy=policy, writer_transports=active_transports
+            )
+        assert outcome.status == "activated" and outcome.accepted_family_count == 6
+        source_calls = [entry for entry in recorded_calls if entry[0] == source_auth.SOURCE_PATH]
+        # 6 rows at partition_rows=2 produces 3 Parquet parts coalesced into 1 source-batch call.
+        assert len(source_calls) == 1
+        assert reloptions_by_table
+        for relname, reloptions in reloptions_by_table.items():
+            if relname.startswith("direct_stage_p_") or relname in {
+                direct_stage.DIRECT_COMMITMENTS_TABLE,
+                direct_stage.DIRECT_REJECTED_TABLE,
+            }:
+                assert reloptions is not None and "autovacuum_enabled=false" in reloptions
+
+
+def _nonmonotonic_membership_definition() -> CustomImportDefinition:
+    """Build a grouped Parquet definition with non-monotonic field slots and child_memberships."""
+    doc_by_key = json.loads(_derived_parquet_definition().canonical)
+    for field_doc in doc_by_key["schema"]["root"]["fields"]:
+        if field_doc["id"] == "segment":
+            field_doc["slot"] = 40
+    for field_doc in doc_by_key["schema"]["children"][0]["fields"]:
+        if field_doc["id"] == "rate_segment":
+            field_doc["slot"] = 41
+    doc_by_key["schema"]["children"].append(
+        {
+            "name": "details",
+            "parent_key": [
+                {"root": "npi", "child": "detail_npi"},
+                {"root": "period", "child": "detail_period"},
+                {"root": "segment", "child": "detail_segment"},
+            ],
+            "child_key": ["detail_service", "detail_id"],
+            "fields": [
+                {"id": "detail_npi", "slot": 50, "type": "string", "nullable": False},
+                {"id": "detail_period", "slot": 51, "type": "integer", "nullable": False},
+                {"id": "detail_segment", "slot": 52, "type": "string", "nullable": False},
+                {"id": "detail_service", "slot": 53, "type": "string", "nullable": False},
+                {"id": "detail_id", "slot": 54, "type": "integer", "nullable": False},
+                {"id": "detail_ratio", "slot": 55, "type": "decimal", "nullable": True},
+            ],
+        }
+    )
+    doc_by_key["child_memberships"] = [
+        {
+            "outer_collection": "rates",
+            "inner_collection": "details",
+            "key_mapping": [{"outer_field": "service_code", "inner_field": "detail_service"}],
+        }
+    ]
+    doc_by_key["streams"].append(
+        {
+            **doc_by_key["streams"][1],
+            "id": "details",
+            "child": "details",
+            "duplicate_policy": "reject",
+        }
+    )
+    doc_by_key["aliases"]["details"] = {
+        field_doc["id"].upper(): field_doc["id"] for field_doc in doc_by_key["schema"]["children"][1]["fields"]
+    }
+    return CustomImportDefinition.from_mapping(doc_by_key)
+
+
+def _nonmonotonic_membership_entries() -> tuple[tuple[int, str, dict[str, object]], ...]:
+    """Return 3-stream sample rows including one unmatched inner detail for membership rejection."""
+    return (
+        *_DERIVED_SAMPLE_ENTRIES,
+        (
+            3,
+            "details",
+            {
+                "detail_npi": "1234567893",
+                "detail_period": 2025,
+                "detail_segment": "segment_a",
+                "detail_service": "svc-1",
+                "detail_id": 1,
+                "detail_ratio": Decimal("1.25"),
+            },
+        ),
+        (
+            3,
+            "details",
+            {
+                "detail_npi": "1003000126",
+                "detail_period": 2025,
+                "detail_segment": "segment_a",
+                "detail_service": "svc-missing",
+                "detail_id": 2,
+                "detail_ratio": Decimal("0.50"),
+            },
+        ),
+    )
+
+
+def _nonmonotonic_cursor(definition: CustomImportDefinition) -> _PythonCursor:
+    """Build a union Snowflake mock cursor ordered by field_slot for the 3-stream fixture."""
+    ordered_fields = tuple(sorted(definition.fields, key=lambda field_spec: field_spec.field_slot))
+    ordered_ids = tuple(field_spec.field_id for field_spec in ordered_fields)
+    null_tail = (None,) * len(ordered_ids)
+    cursor_rows = (
+        (0, 1, "providers", _SNAPSHOT, *null_tail),
+        (0, 2, "rates", _SNAPSHOT, *null_tail),
+        (0, 3, "details", _SNAPSHOT, *null_tail),
+        *(
+            (1, ordinal, stream_id, None, *(values_by_field.get(field_id) for field_id in ordered_ids))
+            for ordinal, stream_id, values_by_field in _nonmonotonic_membership_entries()
+        ),
+    )
+    cursor = _PythonCursor(cursor_rows)
+    cursor.description = (
+        SimpleNamespace(name="__ci_bundle_row_kind", type_name="FIXED", is_nullable=False, precision=1, scale=0),
+        SimpleNamespace(name="__ci_stream_ordinal", type_name="FIXED", is_nullable=False, precision=2, scale=0),
+        SimpleNamespace(name="__ci_stream_id", type_name="TEXT", is_nullable=False),
+        SimpleNamespace(name="__ci_source_snapshot_token", type_name="TEXT", is_nullable=True),
+        *(_derived_column_meta(field_spec) for field_spec in ordered_fields),
+    )
+    return cursor
+
+
+def _nonmonotonic_relations_and_bindings(
+    definition: CustomImportDefinition,
+) -> tuple[tuple[SnowflakeApprovedRelation, ...], tuple[SnowflakeBundleBinding, ...]]:
+    """Build approved Snowflake relations and stream bindings for the 3-stream fixture."""
+    snapshot_rel = SnowflakeRelation("synthetic", "public", "nm_snapshots")
+    root_rel = SnowflakeRelation("synthetic", "public", "nm_roots")
+    rate_rel = SnowflakeRelation("synthetic", "public", "nm_rates")
+    detail_rel = SnowflakeRelation("synthetic", "public", "nm_details")
+    fields_by_name = runner_codec.fields_by_collection(definition)
+    stream_specs = (
+        ("providers", root_rel, definition.root_fields),
+        ("rates", rate_rel, fields_by_name["rates"]),
+        ("details", detail_rel, fields_by_name["details"]),
+    )
+    approved = (
+        SnowflakeApprovedRelation(snapshot_rel, (SnowflakeDeclaredColumn("snapshot_id", "snapshot_id"),)),
+        *(
+            SnowflakeApprovedRelation(
+                relation, tuple(SnowflakeDeclaredColumn(field.field_id, field.field_id) for field in fields)
+            )
+            for _name, relation, fields in stream_specs
+        ),
+    )
+    bindings = tuple(
+        SnowflakeBundleBinding(name, relation, snapshot_rel, tuple(field.field_id for field in fields), "snapshot_id")
+        for name, relation, fields in stream_specs
+    )
+    return approved, bindings
+
+
+async def _registered_nonmonotonic_capture(case, monkeypatch, *, idempotency_key: str):
+    """Register a 3-stream capture exercising non-monotonic slots and child_memberships rejection."""
+    policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16, 65_536, 10_000, 120, 300))
+    definition = _nonmonotonic_membership_definition()
+    approved, bindings = _nonmonotonic_relations_and_bindings(definition)
+    adapter = snowflake_python.SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    connector = SnowflakeBundleAcquisitionConnector(
+        approved_relations=approved,
+        credential_provider=_Credentials(),
+        adapter=adapter,
+        capture_limits=CaptureLimits(),
+    )
+    bundle = connector.prepare_request(
+        definition, bindings=bindings, encoding=SnowflakeBundleEncoding(partition_rows=4), processing_policy=policy
+    )
+    cursor = _nonmonotonic_cursor(definition)
+    connection = _PythonConnection(cursor)
+    monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
+    async with case.sessions() as session, session.begin():
+        registered = await register_snowflake_source_binding(
+            session,
+            dataset_key="synthetic_nonmonotonic_membership",
+            definition=bundle.definition,
+            binding=_binding(connector.build_statement(bundle), policy),
+        )
+    request = SnowflakeBundleCandidateRequest(
+        dataset_id=registered.dataset_id,
+        definition_revision_id=registered.definition_revision_id,
+        schema_revision_id=registered.schema_revision_id,
+        definition=bundle.definition,
+        bundle_request=bundle,
+        idempotency_key=idempotency_key,
+        lease_token=f"lease-{idempotency_key}".encode(),
+        source_binding_revision_id=registered.source_binding_revision_id,
+        source_binding_sha256=registered.source_binding_sha256,
+    )
+    return connector, request, policy
+
+
+@pytest.mark.asyncio
+async def test_direct_v2_nonmonotonic_slots_and_child_membership_parity(monkeypatch):
+    """Direct compact v2 matches legacy on non-monotonic field slots and child_memberships rejection."""
+    async with _source_case() as legacy_case:
+        await _install_compact_schema(legacy_case)
+        c_leg, req_leg, pol_leg = await _registered_nonmonotonic_capture(
+            legacy_case, monkeypatch, idempotency_key="nm-leg"
+        )
+        leg_out = await runner.run_segmented_snowflake_candidate(
+            legacy_case.sessions, c_leg, req_leg, processing_policy=pol_leg
+        )
+        assert leg_out.status == "activated"
+        assert (leg_out.accepted_family_count, leg_out.rejection_count) == (2, 1)
+        async with legacy_case.sessions() as session:
+            leg_family_id = await _snapshot_family_id_for_generation(session, leg_out.generation_id)
+            leg_proj = await session.get(CustomImportQueryProjection, leg_family_id)
+
+    async with _source_case() as direct_case:
+        await _install_compact_schema(direct_case)
+        c_dir, req_dir, pol_dir = await _registered_nonmonotonic_capture(
+            direct_case, monkeypatch, idempotency_key="nm-dir"
+        )
+        dir_out = await runner.run_segmented_snowflake_candidate(
+            direct_case.sessions, c_dir, req_dir, processing_policy=pol_dir, direct_compact=True
+        )
+        assert dir_out.status == "activated"
+        assert (dir_out.accepted_family_count, dir_out.rejection_count) == (2, 1)
+        assert dir_out.seal.effective_output_sha256 == leg_out.seal.effective_output_sha256
+        assert _seal_counts(dir_out.seal) == _seal_counts(leg_out.seal)
+        async with direct_case.sessions() as session:
+            dir_family_id = await _snapshot_family_id_for_generation(session, dir_out.generation_id)
+            dir_proj = await session.get(CustomImportQueryProjection, dir_family_id)
+            assert dir_proj is not None and leg_proj is not None
+            assert (dir_proj.projection_sha256, dir_proj.root_count, dir_proj.child_count) == (
+                leg_proj.projection_sha256,
+                leg_proj.root_count,
+                leg_proj.child_count,
+            )

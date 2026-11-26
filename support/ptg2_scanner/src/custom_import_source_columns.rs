@@ -280,13 +280,8 @@ impl Column {
     }
 }
 
-/// Structural validation is independent of semantic acceptance. False means a
-/// complete preselected oracle route, never a retry after a native exception.
-pub fn validate_columns(
-    layout: &ColumnLayout,
-    columns: &[Column],
-    include_preparation_bounds: bool,
-) -> Result<bool, &'static str> {
+/// Structural validation of column buffers independent of output-byte caps.
+pub(crate) fn validate_column_buffers(columns: &[Column]) -> Result<bool, &'static str> {
     for column in columns {
         let bits = (column.bit_offset + column.rows).div_ceil(8);
         if column.bit_offset > 7 || column.validity.as_ref().is_some_and(|v| v.len() != bits) {
@@ -389,6 +384,19 @@ pub fn validate_columns(
                 }
             }
         }
+    }
+    Ok(true)
+}
+
+/// Structural validation is independent of semantic acceptance. False means a
+/// complete preselected oracle route, never a retry after a native exception.
+pub fn validate_columns(
+    layout: &ColumnLayout,
+    columns: &[Column],
+    include_preparation_bounds: bool,
+) -> Result<bool, &'static str> {
+    if !validate_column_buffers(columns)? {
+        return Ok(false);
     }
     // Bound all possible escaped output before normalization or serialization.
     let mut bound = 0usize;
@@ -531,12 +539,31 @@ fn python_npi(value: &SourceValue) -> bool {
         .is_multiple_of(10)
 }
 
-pub fn prepare_column_row(
+pub(crate) enum EvaluatedColumnRow {
+    Accepted {
+        raw: (String, [u8; 32]),
+        cells: Vec<SourceValue>,
+        transport: usize,
+    },
+    Rejected {
+        code: &'static str,
+        raw: Option<(String, [u8; 32])>,
+        typed: Option<(String, [u8; 32])>,
+        transport: usize,
+    },
+    Error {
+        category: &'static str,
+        code: &'static str,
+        transport: usize,
+    },
+}
+
+pub(crate) fn evaluate_column_row(
     layout: &ColumnLayout,
     columns: &[Column],
     row: usize,
     page_limit: usize,
-) -> Result<ColumnOutcome, &'static str> {
+) -> Result<EvaluatedColumnRow, &'static str> {
     let transport = layout
         .source
         .fields
@@ -568,11 +595,10 @@ pub fn prepare_column_row(
         cells.push(cell);
     }
     if let Some(code) = transport_error {
-        return Ok(ColumnOutcome::Error {
+        return Ok(EvaluatedColumnRow::Error {
             category: "transport-error",
             code,
             transport,
-            preparation_bounds: (0, 0),
         });
     }
     let root_present = layout
@@ -592,11 +618,10 @@ pub fn prepare_column_row(
         })
         .map_err(|_| "source raw key encoding failed")?;
         if text.len() > page_limit {
-            return Ok(ColumnOutcome::Error {
+            return Ok(EvaluatedColumnRow::Error {
                 category: "preparation-error",
                 code: "raw_key_byte_limit",
                 transport,
-                preparation_bounds: (0, 0),
             });
         }
         let mut digest = Sha256::new();
@@ -638,13 +663,58 @@ pub fn prepare_column_row(
         } else {
             None
         };
-        return Ok(ColumnOutcome::Rejected {
+        return Ok(EvaluatedColumnRow::Rejected {
             code,
             raw,
             typed,
             transport,
         });
     }
+    Ok(EvaluatedColumnRow::Accepted {
+        raw: raw.unwrap(),
+        cells,
+        transport,
+    })
+}
+
+pub fn prepare_column_row(
+    layout: &ColumnLayout,
+    columns: &[Column],
+    row: usize,
+    page_limit: usize,
+) -> Result<ColumnOutcome, &'static str> {
+    let (raw, cells, transport) = match evaluate_column_row(layout, columns, row, page_limit)? {
+        EvaluatedColumnRow::Accepted {
+            raw,
+            cells,
+            transport,
+        } => (raw, cells, transport),
+        EvaluatedColumnRow::Rejected {
+            code,
+            raw,
+            typed,
+            transport,
+        } => {
+            return Ok(ColumnOutcome::Rejected {
+                code,
+                raw,
+                typed,
+                transport,
+            });
+        }
+        EvaluatedColumnRow::Error {
+            category,
+            code,
+            transport,
+        } => {
+            return Ok(ColumnOutcome::Error {
+                category,
+                code,
+                transport,
+                preparation_bounds: (0, 0),
+            });
+        }
+    };
     let preparation_input_bytes = 64
         + cells
             .iter()
@@ -656,7 +726,6 @@ pub fn prepare_column_row(
         return Err("source column output bound differs");
     }
     let documents = source_documents(&layout.source, &cells)?;
-    let raw = raw.unwrap();
     let bytes = raw.0.len()
         + documents.root_key.len()
         + documents.payload.len()

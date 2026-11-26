@@ -27,8 +27,9 @@ import msgpack
 
 from process.custom_import import runner_codec
 from process.custom_import.definition import CustomImportDefinition, Field
-from process.custom_import.family import _record_error, normalize_source_decimal
+from process.custom_import.family import _record_error, is_decimal_scalar_storage_valid, normalize_source_decimal
 from process.custom_import.family_block_codec import (
+    _DIRECTORY,
     _ENVELOPE_DOMAIN,
     _FRAGMENT,
     _LENGTH,
@@ -39,8 +40,10 @@ from process.custom_import.family_block_codec import (
     VerifiedFamily,
     _check_family_digest,
     _child_wires,
+    _compress,
     _Encoder,
     _frame_object,
+    _indexed_fragment,
     _read_object,
 )
 from process.custom_import.family_block_records import (
@@ -53,7 +56,13 @@ from process.custom_import.family_block_records import (
 )
 from process.custom_import.family_block_scalar_layout import _KINDS, query_scalar_fields, scalar_column
 from process.custom_import.family_block_storage_codec import StoredFamilyManifest
-from process.custom_import.materialization import TypedScalar, _typed_scalar
+from process.custom_import.materialization import (
+    MAX_SCALAR_INTEGER,
+    MAX_SCALAR_STRING_UTF8_BYTES,
+    MIN_SCALAR_INTEGER,
+    TypedScalar,
+    _typed_scalar,
+)
 
 COMPACT_V2_CONTRACT = "custom-import/family-block/v2"
 INLINE_STORAGE_DOMAIN = b"custom-import/family-block/v2\x00inline\x00"
@@ -339,11 +348,144 @@ def pack_staged_values(fields: tuple[Field, ...], fields_by_id: Mapping[str, obj
     return msgpack.packb(encode_slot_values(fields, fields_by_id), use_bin_type=True)
 
 
+def _checked_slot_scalar_value(field: Field, slot_entry: object) -> object:
+    """Validate and decode one non-null staged v2 slot once for direct scalar projection."""
+    value_type = field.value_type
+    if value_type == "string":
+        if (
+            type(slot_entry) is not str
+            or "\x00" in slot_entry
+            or len(slot_entry.encode("utf-8")) > MAX_SCALAR_STRING_UTF8_BYTES
+        ):
+            raise FamilyBlockError("v2 string slot is malformed")
+        return slot_entry
+    if value_type == "integer":
+        if type(slot_entry) is not int or not MIN_SCALAR_INTEGER <= slot_entry <= MAX_SCALAR_INTEGER:
+            raise FamilyBlockError("v2 integer slot is malformed")
+        return slot_entry
+    if value_type == "boolean":
+        if type(slot_entry) is not bool:
+            raise FamilyBlockError("v2 boolean slot is malformed")
+        return slot_entry
+    if value_type == "decimal":
+        if type(slot_entry) is not str:
+            raise FamilyBlockError("v2 decimal slot is malformed")
+        normalized = normalize_source_decimal(slot_entry)
+        if (
+            normalized is None
+            or format(normalized, "f") != slot_entry
+            or not is_decimal_scalar_storage_valid(normalized)
+        ):
+            raise FamilyBlockError("v2 decimal slot is not canonical")
+        return normalized
+    return decode_slot_scalar(field, slot_entry)
+
+
+def _direct_typed_scalar(field: Field, decoded_value: object) -> TypedScalar:
+    value_type = field.value_type
+    if value_type == "string":
+        return TypedScalar("string", "value", string_value=decoded_value)
+    if value_type == "integer":
+        return TypedScalar("integer", "value", integer_value=decoded_value)
+    if value_type == "decimal":
+        return TypedScalar("decimal", "value", decimal_value=decoded_value)
+    if value_type == "boolean":
+        return TypedScalar("boolean", "value", boolean_value=decoded_value)
+    if value_type == "date":
+        return TypedScalar("date", "value", date_value=decoded_value)
+    return TypedScalar("timestamp", "value", timestamp_value=decoded_value)
+
+
+def pack_v2_slot_query_scalars(
+    all_fields: tuple[Field, ...],
+    query_slot_specs: tuple[tuple[int, Field], ...],
+    packed_bytes: bytes,
+) -> tuple[object, ...]:
+    """Decode and pack query_input scalar cells directly from staged msgpack slots in one pass."""
+    slot_entries = msgpack.unpackb(packed_bytes, raw=False, strict_map_key=True)
+    if type(slot_entries) is not list or len(slot_entries) != len(all_fields):
+        raise FamilyBlockError("v2 slot vector shape differs")
+    states = bytearray((len(query_slot_specs) + 3) // 4)
+    values: list[object] = []
+    for query_idx, (slot_idx, field) in enumerate(query_slot_specs):
+        slot_entry = slot_entries[slot_idx]
+        if type(slot_entry) is list:
+            if slot_entry:
+                raise FamilyBlockError("v2 missing sentinel is malformed")
+            values.append(None)
+            continue
+        if slot_entry is None:
+            if not field.nullable:
+                raise FamilyBlockError("v2 required slot cannot be null")
+            states[query_idx // 4] |= 1 << (2 * (query_idx % 4))
+            values.append(None)
+            continue
+        states[query_idx // 4] |= 2 << (2 * (query_idx % 4))
+        values.append(_checked_slot_scalar_value(field, slot_entry))
+    return bytes(states), None, *values
+
+
 def unpack_staged_values(fields: tuple[Field, ...], packed_bytes: bytes) -> dict[str, object]:
     """Unpack staged positional msgpack bytes back into validated Python field values."""
     slot_entries = msgpack.unpackb(packed_bytes, raw=False, strict_map_key=True)
     decoded_by_field, _scalars_by_field = decode_slot_values(fields, slot_entries)
     return dict(decoded_by_field)
+
+
+def extract_staged_membership_key(
+    packed_bytes: bytes,
+    expected_len: int,
+    key_specs: tuple[tuple[int, str], ...],
+) -> tuple[object, ...] | None:
+    """Extract only the string/integer child-membership key tuple from staged msgpack slots."""
+    slot_entries = msgpack.unpackb(packed_bytes, raw=False, strict_map_key=True)
+    if type(slot_entries) is not list or len(slot_entries) != expected_len:
+        raise FamilyBlockError("v2 slot vector shape differs")
+    key_parts: list[object] = []
+    for slot_index, value_type in key_specs:
+        entry = slot_entries[slot_index]
+        if type(entry) is list:
+            if entry:
+                raise FamilyBlockError("v2 missing sentinel is malformed")
+            return None
+        if entry is None:
+            key_parts.append(None)
+            continue
+        expected_type = str if value_type == "string" else int
+        if type(entry) is not expected_type:
+            raise FamilyBlockError(f"v2 {value_type} slot is malformed")
+        key_parts.append(entry)
+    return tuple(key_parts)
+
+
+def unpack_staged_values_and_scalars(
+    fields: tuple[Field, ...], packed_bytes: bytes
+) -> tuple[dict[str, object], dict[str, TypedScalar]]:
+    """Unpack staged positional msgpack bytes into both typed values and projected scalars in one pass."""
+    slot_entries = msgpack.unpackb(packed_bytes, raw=False, strict_map_key=True)
+    if type(slot_entries) is not list or len(slot_entries) != len(fields):
+        raise FamilyBlockError("v2 slot vector shape differs")
+    decoded_by_field: dict[str, object] = {}
+    scalars_by_field: dict[str, TypedScalar] = {}
+    for field, slot_entry in zip(fields, slot_entries, strict=True):
+        if type(slot_entry) is list:
+            if slot_entry:
+                raise FamilyBlockError("v2 missing sentinel is malformed")
+            continue
+        if slot_entry is None:
+            decoded_by_field[field.field_id] = None
+            if field.projection_slot is not None:
+                if not field.nullable:
+                    raise FamilyBlockError("v2 required slot cannot be null")
+                scalars_by_field[field.field_id] = TypedScalar(field.value_type, "null")
+            continue
+        if field.projection_slot is not None:
+            decoded_scalar = _checked_slot_scalar_value(field, slot_entry)
+            decoded_by_field[field.field_id] = decoded_scalar
+            scalars_by_field[field.field_id] = _direct_typed_scalar(field, decoded_scalar)
+        else:
+            decoded_by_field[field.field_id] = decode_slot_scalar(field, slot_entry)
+    return decoded_by_field, scalars_by_field
 
 
 def v2_record_parts(
@@ -861,6 +1003,135 @@ def _verify_v2_records(verified: VerifiedFamily, check, observe) -> None:
         raise FamilyBlockError("v2 family final count differs")
     if record_file.read(1):
         raise FamilyBlockError("v2 family contains trailing records")
+
+
+class _NativeEncodedV2Family:
+    """Zero-spool encoded compact v2 family produced from Rust raw fragments + Zstd."""
+
+    def __init__(
+        self,
+        manifest: StoredFamilyManifest,
+        root_payload_sha256: bytes,
+        root_scalar_count: int,
+        child_scalar_count: int,
+        fragments: tuple[tuple[tuple[int, int, int | None, int, int | None, int], bytes], ...],
+    ):
+        self.stored_manifest = manifest
+        self.root_payload_sha256 = root_payload_sha256
+        self.root_scalar_count = root_scalar_count
+        self.child_scalar_count = child_scalar_count
+        self._fragments = fragments
+
+    def indexed_fragments(self):
+        """Yield pre-compressed fragments and directories."""
+        return self._fragments
+
+    def close(self) -> None:
+        """No temporary spool is held for an in-memory native v2 family."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+def compile_v2_family_plan(definition: CustomImportDefinition, limits: FamilyBlockLimits):
+    """Compile the Rust compact v2 family hashing/framing plan when available."""
+    try:
+        import ptg2_address_canon
+    except ImportError:
+        return None
+    builder = getattr(ptg2_address_canon, "custom_import_v2_family_plan_v1", None)
+    if not callable(builder):
+        return None
+    fields_by_name = runner_codec.fields_by_collection(definition)
+    root_specs = tuple(
+        (field.field_id, field.value_type, field.projection_slot is not None) for field in definition.root_fields
+    )
+    col_specs = tuple(
+        (
+            name,
+            tuple(
+                (field.field_id, field.value_type, field.projection_slot is not None) for field in fields_by_name[name]
+            ),
+        )
+        for name in sorted(fields_by_name)
+    )
+    return builder(
+        (
+            definition.digest,
+            root_specs,
+            col_specs,
+            can_inline_root(definition),
+            limits.fragment_bytes,
+            limits.max_record_bytes,
+            limits.max_spool_bytes,
+        )
+    )
+
+
+def _compress_native_v2_fragments(
+    raw_fragments,
+) -> tuple[tuple[tuple[tuple[int, int, int | None, int, int | None, int], bytes], ...], bytes, int]:
+    frame_digest = hashlib.sha256(_ENVELOPE_DOMAIN)
+    indexed_fragments: list[tuple[tuple[int, int, int | None, int, int | None, int], bytes]] = []
+    stored_bytes = 0
+    for ordinal, (raw_chunk, first_rec, rec_starts, first_off, continuation) in enumerate(raw_fragments):
+        frame = _compress(ordinal, raw_chunk)
+        prefix = _LENGTH.pack(len(frame))
+        stored_bytes += len(prefix) + len(frame)
+        frame_digest.update(prefix)
+        frame_digest.update(frame)
+        indexed_fragments.append(_indexed_fragment((first_rec, rec_starts, first_off, continuation), frame))
+    return tuple(indexed_fragments), frame_digest.digest(), stored_bytes
+
+
+def finalize_native_v2_family(
+    definition: CustomImportDefinition,
+    root_payload_sha256: bytes,
+    child_count: int,
+    native_entry: tuple,
+    *,
+    limits: FamilyBlockLimits,
+) -> InlineEncodedFamily | _NativeEncodedV2Family | None:
+    """Compress Rust-framed compact v2 fragments with Zstd and build its stored manifest."""
+    kind = native_entry[0]
+    if kind == "fallback":
+        return None
+    if kind == "inline":
+        _, family_sha256, storage_sha256, root_scalar_count = native_entry
+        manifest = StoredFamilyManifest(definition.digest, family_sha256, storage_sha256, False, 0, 0, 0, 0, 0)
+        return InlineEncodedFamily(manifest, root_payload_sha256, root_scalar_count)
+    _, family_sha256, root_scalar_count, child_scalar_count, raw_bytes, raw_fragments = native_entry
+    indexed_fragments, envelope_hash, stored_bytes = _compress_native_v2_fragments(raw_fragments)
+    if max(raw_bytes, stored_bytes + len(indexed_fragments) * _DIRECTORY.size) > limits.max_spool_bytes:
+        raise FamilyBlockResourceLimit("family exceeds the caller's spool budget")
+    codec_manifest = FamilyBlockManifest(
+        definition.digest,
+        family_sha256,
+        envelope_hash,
+        False,
+        child_count,
+        len(indexed_fragments),
+        raw_bytes,
+        stored_bytes,
+    )
+    storage_hash = v2_storage_envelope_sha256(codec_manifest, (directory for directory, _frame in indexed_fragments))
+    stored_manifest = StoredFamilyManifest(
+        codec_manifest.definition_sha256,
+        codec_manifest.family_sha256,
+        storage_hash,
+        False,
+        child_count,
+        len(indexed_fragments),
+        raw_bytes,
+        stored_bytes,
+        0,
+    )
+    return _NativeEncodedV2Family(
+        stored_manifest, root_payload_sha256, root_scalar_count, child_scalar_count, indexed_fragments
+    )
 
 
 def _collection_fields(definition: CustomImportDefinition, collection: str | None) -> tuple[Field, ...]:
