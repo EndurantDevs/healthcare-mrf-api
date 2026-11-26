@@ -10,9 +10,6 @@ import json
 import pytest
 
 from api import provider_directory_source_outcomes as source_outcomes
-from tests.test_provider_directory_source_local_outcomes import (
-    _outcome_selection_schema,
-)
 from api.provider_directory_source_catalog_outcomes import (
     _canonical_validated_datasets_by_source_id,
 )
@@ -31,7 +28,9 @@ from tests.test_provider_directory_dataset_artifact_db import (
     _insert_validated_shared_dataset,
     importer,
 )
-
+from tests.test_provider_directory_source_local_outcomes import (
+    _outcome_selection_schema,
+)
 
 _HASH_CASES = (
     ({}, True),
@@ -99,9 +98,7 @@ def _large_semantic_shard_list(
                 "first_identity": identity_part_list,
                 "last_identity": identity_part_list,
                 "input_sha256": input_hash,
-                "artifact_sha256": hashlib.sha256(
-                    f"artifact-{shard_index}".encode()
-                ).hexdigest(),
+                "artifact_sha256": hashlib.sha256(f"artifact-{shard_index}".encode()).hexdigest(),
                 "artifact_byte_count": 1,
             }
         )
@@ -128,9 +125,7 @@ def _large_semantic_proof_by_field(
         root_run_id=root_run_id,
     )
     proof_by_field: dict[str, object] = {
-        "contract_id": (
-            importer.PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
-        ),
+        "contract_id": (importer.PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID),
         "complete": True,
         "dataset_id": dataset_id,
         "endpoint_id": endpoint_id,
@@ -138,9 +133,7 @@ def _large_semantic_proof_by_field(
         "source_ids": source_id_list,
         "selected_resources": ["Location"],
         "proof_resource_scope": ["Location"],
-        "resource_hash_contract": (
-            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
+        "resource_hash_contract": (importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
         "semantic_projection_as_of": "2026-08-09",
         "semantic_union": {
             "added_name_count": 0,
@@ -174,8 +167,7 @@ def _large_metadata_by_field(
     """Return metadata containing one valid large semantic proof."""
 
     return {
-        "source_ids": proof_identity.get("source_id_list")
-        or ["source_primary", "source_sibling"],
+        "source_ids": proof_identity.get("source_id_list") or ["source_primary", "source_sibling"],
         "selected_resources": ["Location"],
         "expected_resources": ["Location"],
         "resource_hash_contract": importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
@@ -221,9 +213,7 @@ async def _set_shared_semantic_proof(
         metadata=json.dumps(metadata_by_field, ensure_ascii=False),
         dataset_id=dataset_id,
     )
-    proof_by_field = metadata_by_field[
-        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-    ]
+    proof_by_field = metadata_by_field[importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
     assert isinstance(proof_by_field, dict)
     await database.status(
         f"UPDATE {schema}.provider_directory_endpoint_dataset "
@@ -244,9 +234,7 @@ async def _all_source_projected_rows(database) -> list[dict[str, object]]:
         validated_status=importer.ENDPOINT_DATASET_VALIDATED,
         select_validated_candidates=False,
     )
-    return await importer._hydrate_legacy_artifact_dataset_rows(
-        projected_rows
-    )
+    return await importer._hydrate_legacy_artifact_dataset_rows(projected_rows)
 
 
 async def _install_unrelated_large_proof_hash_sentinel(database, schema: str) -> None:
@@ -266,8 +254,7 @@ async def _install_unrelated_large_proof_hash_sentinel(database, schema: str) ->
         END; $function$;"""
     )
     await database.status(
-        f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) "
-        "VALUES ('endpoint_unrelated');"
+        f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) VALUES ('endpoint_unrelated');"
     )
     await database.status(
         f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
@@ -292,9 +279,7 @@ async def _install_unrelated_large_proof_hash_sentinel(database, schema: str) ->
 def _replace_with_legacy_contract(proof_by_field: dict[str, object]) -> None:
     """Make a sealed proof disagree with its semantic parent contract."""
 
-    proof_by_field["contract_id"] = (
-        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
-    )
+    proof_by_field["contract_id"] = importer.PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
     for semantic_field in (
         "proof_resource_scope",
         "resource_hash_contract",
@@ -358,9 +343,7 @@ def _resealed_proof_mutation(
     """Reseal a malformed proof so its outer digest alone still passes."""
 
     mutated_metadata = json.loads(json.dumps(metadata_by_field))
-    proof_by_field = mutated_metadata[
-        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-    ]
+    proof_by_field = mutated_metadata[importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
     proof_by_field.pop("proof_sha256")
     _PROOF_MUTATION_BY_NAME[mutation_name](mutated_metadata, proof_by_field)
     proof_by_field["proof_sha256"] = importer._identity_hash(proof_by_field)
@@ -384,30 +367,18 @@ async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
         projected_row_list = await _all_source_projected_rows(database)
 
         assert len(projected_row_list) == 2
-        assert {
-            projected_row["publication_metadata_hash"]
-            for projected_row in projected_row_list
-        } == {canonical_payload_sha256(large_metadata_by_field)}
+        assert {projected_row["publication_metadata_hash"] for projected_row in projected_row_list} == {
+            canonical_payload_sha256(large_metadata_by_field)
+        }
         assert all(
-            importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-            not in projected_row["publication_metadata_json"]
+            importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY not in projected_row["publication_metadata_json"]
             for projected_row in projected_row_list
         )
-        assert all(
-            "completion_proof_json" not in projected_row
-            for projected_row in projected_row_list
-        )
-        assert all(
-            projected_row["content_proof_valid"] is True
-            for projected_row in projected_row_list
-        )
-        assert all(
-            projected_row["content_proof_resources"] == ["Location"]
-            for projected_row in projected_row_list
-        )
+        assert all("completion_proof_json" not in projected_row for projected_row in projected_row_list)
+        assert all(projected_row["content_proof_valid"] is True for projected_row in projected_row_list)
+        assert all(projected_row["content_proof_resources"] == ["Location"] for projected_row in projected_row_list)
         projected_byte_count_list = [
-            len(json.dumps(projected_row, sort_keys=True, default=str).encode())
-            for projected_row in projected_row_list
+            len(json.dumps(projected_row, sort_keys=True, default=str).encode()) for projected_row in projected_row_list
         ]
         assert max(projected_byte_count_list) < 8_192
         assert sum(projected_byte_count_list) < 16_384
@@ -418,13 +389,13 @@ async def _catalog_candidate_rows(database, statement):
 
 
 @pytest.mark.asyncio
-async def test_catalog_selector_uses_only_digest_valid_summary(monkeypatch):
-    """Reject raw, receipt, and tampered metadata before ranking it."""
+async def test_catalog_selector_uses_only_admitted_summary(monkeypatch):
+    """Reject raw and receipt metadata; rank an admitted summary without re-hashing it."""
 
     async with _outcome_selection_schema(monkeypatch) as (database, schema):
-        statement = source_outcomes._current_published_dataset_statement(
-            {("source-validated",)}
-        ).execution_options(schema_translate_map={"mrf": schema})
+        statement = source_outcomes._current_published_dataset_statement({("source-validated",)}).execution_options(
+            schema_translate_map={"mrf": schema}
+        )
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
             "publication_metadata_summary_json = NULL, "
@@ -453,28 +424,8 @@ async def test_catalog_selector_uses_only_digest_valid_summary(monkeypatch):
             "content_proof_resource_types = ARRAY['Practitioner'] "
             "WHERE dataset_id = 'validated-candidate';"
         )
-        tampered_rows = await _catalog_candidate_rows(database, statement)
-        await database.status(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
-            "publication_metadata_sha256 = "
-            f'"{schema}".'
-            "provider_directory_endpoint_dataset_admission_metadata_sha256("
-            "publication_metadata_summary_json, "
-            "content_proof_admission_version, content_proof_admission_kind, "
-            "content_proof_admission_sha256, content_proof_resource_types) "
-            "WHERE dataset_id = 'validated-candidate';"
-        )
-        sealed_rows = await _catalog_candidate_rows(database, statement)
+        admitted_rows = await _catalog_candidate_rows(database, statement)
 
-    assert [dataset_row["dataset_id"] for dataset_row in raw_rows] == [
-        "validated-incumbent"
-    ]
-    assert [dataset_row["dataset_id"] for dataset_row in tampered_rows] == [
-        "validated-incumbent"
-    ]
-    assert [dataset_row["dataset_id"] for dataset_row in sealed_rows] == [
-        "validated-candidate"
-    ]
-    assert sealed_rows[0]["publication_metadata"]["source_ids"] == [
-        "source-validated"
-    ]
+    assert [dataset_row["dataset_id"] for dataset_row in raw_rows] == ["validated-incumbent"]
+    assert [dataset_row["dataset_id"] for dataset_row in admitted_rows] == ["validated-candidate"]
+    assert admitted_rows[0]["publication_metadata"]["source_ids"] == ["source-validated"]

@@ -14,7 +14,6 @@ from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from api import provider_directory_source_dataset_selection as selection
 from api.provider_directory_cms_generation import RESOURCE_FILES, RESOURCE_TYPES
 from db.models import (
     ProviderDirectoryAPIEndpoint,
@@ -350,7 +349,6 @@ async def cms_database(monkeypatch, *, prepare=None, seal=True):
     """Extend the guarded disposable fixture without changing any shared database."""
     async with directory_database(monkeypatch) as original_sessions:
         schema = os.environ["HLTHPRT_DB_SCHEMA"]
-        monkeypatch.setattr(selection, "_ADMISSION_SCHEMA", schema)
         engine = original_sessions.kw["bind"].execution_options(schema_translate_map={"mrf": schema})
         sessions = async_sessionmaker(engine)
         async with sessions() as session, session.begin():

@@ -34,7 +34,7 @@ from sqlalchemy.dialects import postgresql
 from api import custom_import_provider_geo as geo
 from api import custom_import_read_http as transport
 from db.models.custom_import import CustomImportGeneration, CustomImportGenerationSeal
-from process.custom_import import publication, read_core
+from process.custom_import import read_core
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
 from tests.signed_request_reader_support import cold_caller, install_reader_factory
 from tests.test_custom_import_provider_geo_sql import _geo_row
@@ -183,8 +183,8 @@ class SyntheticSession(_Session):
             return _result([(11,)])
         if column_names == ("generation_id",):
             return _result([(self.target["generation_id"],)])
-        if column_names == ("CustomImportPublicationEvent",):
-            return _result([(self._publication_event_row(),)])
+        if column_names == ("publication_event_id",):
+            return _result([(41,)])
         if column_names == ("CustomImportDefinitionRevision", "CustomImportSchemaRevision"):
             definition = SimpleNamespace(
                 contract_version="custom-import/v1",
@@ -319,26 +319,6 @@ class SyntheticSession(_Session):
                 for index, _npi in enumerate(_NPIS)
                 if (101 + index, index + 1) in requested_families
             ]
-        )
-
-    def _publication_event_row(self):
-        details = publication._PublicationEventDetails(
-            dataset_id=11,
-            definition_revision_id=self.target["definition_revision_id"],
-            schema_revision_id=self.target["schema_revision_id"],
-            execution_id=41,
-            event_kind="activated",
-            from_generation_id=None,
-            to_generation_id=self.target["generation_id"],
-            expected_pointer_version=0,
-            committed_pointer_version=1,
-        )
-        canonical, digest = publication._event_document(details)
-        return SimpleNamespace(
-            **dataclasses.asdict(details),
-            finality_contract=publication.FINALITY_EVENT_CONTRACT,
-            canonical_event=canonical,
-            event_sha256=digest,
         )
 
 

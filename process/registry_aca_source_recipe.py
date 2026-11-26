@@ -43,6 +43,8 @@ CONTRACT = "registry-aca-retained-recipe/v1"
 _PREFIX = CONTRACT + ":"
 BATCH_CONTRACT = "registry-aca-initial-batch/v1"
 _BATCH_KEY = "registry_aca_initial_batch"
+# Found by name so a copied database reads the same stamp.
+STAMP_SQL = "SELECT obj_description(to_regnamespace(quote_ident(:schema)),'pg_namespace')"
 _BATCH_PREFIX = BATCH_CONTRACT + ":"
 _MEMBERSHIP_FIELDS = {
     "source_id",
@@ -193,9 +195,7 @@ async def admit_registry_aca_source_recipe(session, prepared, *, runtime_roles):
     recipe = _recipe(prepared, validation, runtime_roles)
     await _require_archive(await native_driver(session), recipe.source_pin)
     encoded = _PREFIX + canonical_registry_source_recipes((recipe,))
-    current = await session.scalar(
-        text("SELECT obj_description(CAST(:oid AS oid),'pg_namespace')"), {"oid": prepared.ownership.schema_oid}
-    )
+    current = await session.scalar(text(STAMP_SQL), {"schema": prepared.ownership.schema_name})
     if current not in (None, encoded):
         _invalid()
     await (await native_driver(session)).execute(
@@ -216,9 +216,7 @@ async def require_registry_aca_source_recipe(session, prepared, *, runtime_roles
         return matches[0]
     if not session.in_transaction():
         _invalid()
-    encoded = await session.scalar(
-        text("SELECT obj_description(CAST(:oid AS oid),'pg_namespace')"), {"oid": prepared.ownership.schema_oid}
-    )
+    encoded = await session.scalar(text(STAMP_SQL), {"schema": prepared.ownership.schema_name})
     if type(encoded) is not str or not encoded.startswith(_PREFIX):
         _invalid()
     recipes = decode_registry_source_recipes(encoded[len(_PREFIX) :])
@@ -502,9 +500,7 @@ async def admit_registry_aca_source_batch(session, prepared, *, runtime_roles):
     if coverage != _batch_coverage(prepared.manifest.source_metadata):
         _invalid()
     encoded = _BATCH_PREFIX + canonical_registry_source_recipes(recipes)
-    current = await session.scalar(
-        text("SELECT obj_description(CAST(:oid AS oid),'pg_namespace')"), {"oid": prepared.ownership.schema_oid}
-    )
+    current = await session.scalar(text(STAMP_SQL), {"schema": prepared.ownership.schema_name})
     if current not in (None, encoded):
         _invalid()
     await (await native_driver(session)).execute(
@@ -518,9 +514,7 @@ async def require_registry_aca_source_batch(session, prepared, *, runtime_roles)
     if not session.in_transaction():
         _invalid()
     _batch_descriptors(dict(prepared.manifest.source_metadata), runtime_roles)
-    encoded = await session.scalar(
-        text("SELECT obj_description(CAST(:oid AS oid),'pg_namespace')"), {"oid": prepared.ownership.schema_oid}
-    )
+    encoded = await session.scalar(text(STAMP_SQL), {"schema": prepared.ownership.schema_name})
     if type(encoded) is not str or not encoded.startswith(_BATCH_PREFIX):
         _invalid()
     recipes = decode_registry_source_recipes(encoded[len(_BATCH_PREFIX) :])
@@ -613,7 +607,8 @@ async def require_registry_aca_batch_read(connection, source, verified):
     ):
         _invalid()
     stamp = await connection.fetchval(
-        "SELECT pg_catalog.obj_description($1::oid,'pg_namespace')", source.prepared.ownership.schema_oid
+        "SELECT pg_catalog.obj_description(pg_catalog.to_regnamespace(pg_catalog.quote_ident($1)),'pg_namespace')",
+        source.prepared.ownership.schema_name,
     )
     if stamp != verified.stamp:
         _invalid()

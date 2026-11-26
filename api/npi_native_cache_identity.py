@@ -43,6 +43,6 @@ async def npi_publication_cache_identity(identity_rows, execute, schema, logger,
     return f"{publication_generation}:{publication_ref}"
 
 
-async def npi_canonical_publication_identity(execute, schema, logger, *, receipt_table, seal_table, session=None):
+async def npi_canonical_publication_identity(execute, schema, logger, *, session=None):
     """Use the current logical revision; historical receipts alone cannot key live data."""
     return await npi_publication_cache_identity([], execute, schema, logger, session=session)

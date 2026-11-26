@@ -84,8 +84,6 @@ _DETAIL_TABLES = (
     *NPI_CANONICAL_TABLES,
     *address_generation.RELATION_NAMES,
     *_DIRECTORY_TABLES,
-    "npi_canonical_publication_receipt",
-    "npi_canonical_publication_receipt_seal",
     "npi_result_generation",
     "mrf_address_evidence",
     "provider_enrichment_summary",
@@ -119,8 +117,6 @@ _GEO_TABLES = tuple(
             (
                 *_COMMON_TABLES,
                 *NPI_CANONICAL_TABLES,
-                "npi_canonical_publication_receipt",
-                "npi_canonical_publication_receipt_seal",
                 "npi_result_generation",
                 "nucc_taxonomy",
             )

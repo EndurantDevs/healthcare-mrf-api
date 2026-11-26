@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from api import provider_directory_source_dataset_selection as selection
 from api import provider_directory_source_outcomes as outcomes
 from api.provider_directory_source_dataset_selection import (
     _source_local_current_published_dataset_statement,
@@ -356,7 +355,6 @@ async def _outcome_selection_schema(monkeypatch):
     schema = f"provider_directory_outcomes_{uuid.uuid4().hex[:12]}"
     is_created = False
     try:
-        monkeypatch.setattr(selection, "_ADMISSION_SCHEMA", schema)
         await _create_outcome_selection_tables(database, schema)
         is_created = True
         await _insert_outcome_selection_sources(database, schema)
@@ -380,7 +378,7 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
     assert "publication_metadata_summary_json" in selected_sql
     assert "jsonb_build_object" not in selected_sql
     assert "artifact_selection_receipt_json" not in selected_sql
-    assert "admission_metadata_sha256" in selected_sql
+    assert "admission_metadata_sha256" not in selected_sql
     assert "provider_directory_dataset_resource" not in selected_sql
     assert "provider_directory_api_endpoint" not in selected_sql
     assert "provider_directory_source" in selected_sql
@@ -417,7 +415,7 @@ def test_current_source_local_query_uses_exact_profile_publication_state():
     assert selected_sql.count("LIMIT") == 1
     assert "publication_metadata_json" not in selected_sql
     assert "artifact_selection_receipt_json" not in selected_sql
-    assert "admission_metadata_sha256" in selected_sql
+    assert "admission_metadata_sha256" not in selected_sql
     assert "jsonb_build_object" in selected_sql
     assert "provider_directory_dataset_resource" not in selected_sql
     assert "published" in bound_values

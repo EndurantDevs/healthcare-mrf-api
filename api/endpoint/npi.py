@@ -11965,11 +11965,13 @@ async def read_npi_detail(request, npi, *, native_args=None):
                     canonical_publication_identity = await _npi_canonical_publication_identity(
                         session=request_session,
                     )
-                    address_overlay_serving_identity = await _provider_directory_address_overlay_serving_identity(
-                        session=request_session,
-                    )
-                    address_overlay_serving_identity = directory_overlay_cache_identity(
-                        address_overlay_serving_identity, directory_editions
+                    address_overlay_serving_identity = (
+                        directory_overlay_cache_identity(
+                            await _provider_directory_address_overlay_serving_identity(session=request_session),
+                            directory_editions,
+                        )
+                        if canonical_publication_identity is not None
+                        else None
                     )
                 is_response_cache_enabled = canonical_publication_identity is not None
             except sanic.exceptions.ServiceUnavailable:
@@ -13025,8 +13027,6 @@ async def _npi_canonical_publication_identity(*, session: Any = None) -> str | N
         _execute_stmt,
         _runtime_db_schema(),
         logger,
-        receipt_table=_schema_cache_key("npi_canonical_publication_receipt"),
-        seal_table=_schema_cache_key("npi_canonical_publication_receipt_seal"),
         session=session,
     )
 

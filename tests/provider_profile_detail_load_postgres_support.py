@@ -39,7 +39,7 @@ npi_api = importlib.import_module("api.endpoint.npi")
 fhir = importlib.import_module("process.provider_directory_fhir")
 NPI = 1000000004
 STAMP = datetime(2026, 1, 1)
-DETAIL_RELATION_COUNT = 59
+DETAIL_RELATION_COUNT = 57
 RELATIONS = tuple(
     dict.fromkeys(
         (
@@ -56,11 +56,7 @@ async def _install_detail_tables(component, monkeypatch):
     async with component.admin_engine.begin() as connection:
         before_by_name = await snapshot._inventory_relation_names(connection, schema, RELATIONS)
         before_rows = await _detail_relation_rows(connection, before_by_name)
-        later_names = {
-            "npi_result_generation",
-            "npi_canonical_publication_receipt",
-            "npi_canonical_publication_receipt_seal",
-        }
+        later_names = {"npi_result_generation"}
         # Source still owns the typed Endpoint table outside the Reader grant set.
         wanted = (
             set(RELATIONS) | {"provider_directory_api_endpoint", "provider_directory_endpoint", "import_run"}
@@ -81,11 +77,7 @@ async def _install_detail_tables(component, monkeypatch):
         await _grant_nppes_fixture_inputs(connection, component.policy)
         after_by_name = await snapshot._inventory_relation_names(connection, schema, RELATIONS)
         assert len(after_by_name) == DETAIL_RELATION_COUNT
-        assert all(
-            available
-            for name, available in after_by_name.items()
-            if not name.endswith((".npi_canonical_publication_receipt", ".npi_canonical_publication_receipt_seal"))
-        )
+        assert all(after_by_name.values())
         assert all(after_by_name[name] for name, available in before_by_name.items() if available)
         assert (
             await _detail_relation_rows(connection, {name: after_by_name[name] for name in before_rows}) == before_rows
