@@ -9,15 +9,45 @@ from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import bindparam
-from sqlalchemy.dialects.postgresql.base import PGDialect
+from sqlalchemy.dialects.postgresql.base import PGCompiler, PGDialect
 from sqlalchemy.engine import BindTyping
-from sqlalchemy.sql import visitors
 from sqlalchemy.sql.elements import BindParameter
 from sqlalchemy.sql.selectable import Select
 
 from process.custom_import.read_core import PreparedNpiEntityRelation
 
 _PARAMETER_PREFIX = "__custom_import_"
+
+
+class _CustomImportRelationCompiler(PGCompiler):
+    """Rename custom-import bind parameters during compilation without AST cloning."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._custom_bind_by_identity: dict[int, tuple[BindParameter[Any], BindParameter[Any]]] = {}
+        super().__init__(*args, **kwargs)
+
+    def visit_bindparam(self, bindparam_obj: BindParameter[Any], *args: Any, **kwargs: Any) -> str:
+        """Rewrite each distinct bind parameter to a deterministic custom-import name."""
+        if bindparam_obj.literal_execute:
+            raise ValueError("literal-execute custom-import parameters are not supported")
+        if bindparam_obj.expanding and bindparam_obj.type._is_tuple_type:
+            raise ValueError("tuple-expanding custom-import parameters are not supported")
+        entry = self._custom_bind_by_identity.get(id(bindparam_obj))
+        if entry is None:
+            replacement = bindparam(
+                f"{_PARAMETER_PREFIX}{len(self._custom_bind_by_identity)}",
+                value=bindparam_obj.value,
+                type_=bindparam_obj.type,
+                expanding=bindparam_obj.expanding,
+            )
+            self._custom_bind_by_identity[id(bindparam_obj)] = (bindparam_obj, replacement)
+        else:
+            replacement = entry[1]
+        return super().visit_bindparam(replacement, *args, **kwargs)
+
+
+class _CustomImportRelationDialect(PGDialect):
+    statement_compiler = _CustomImportRelationCompiler
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,35 +79,11 @@ class ProviderImportQuery:
 def compile_npi_entity_relation(statement: Select) -> CompiledNpiEntityRelation:
     """Compile a read-core relation once without interpolating its values."""
 
-    replacement_by_identity: dict[int, BindParameter[Any]] = {}
-
-    def _replace_bind_parameter(element: object) -> BindParameter[Any] | None:
-        if not isinstance(element, BindParameter):
-            return None
-        if element.literal_execute:
-            raise ValueError("literal-execute custom-import parameters are not supported")
-        if element.expanding and element.type._is_tuple_type:
-            raise ValueError("tuple-expanding custom-import parameters are not supported")
-        replacement = replacement_by_identity.get(id(element))
-        if replacement is None:
-            replacement = bindparam(
-                f"{_PARAMETER_PREFIX}{len(replacement_by_identity)}",
-                value=element.value,
-                type_=element.type,
-                expanding=element.expanding,
-            )
-            replacement_by_identity[id(element)] = replacement
-        return replacement
-
-    rewritten = visitors.replacement_traverse(
-        statement,
-        {},
-        _replace_bind_parameter,
-    )
-    # Apply driver casts only after the typed fragment is composed into native SQL.
-    dialect = PGDialect(paramstyle="named")
+    # Compile directly without cloning ORM-aliased subqueries (avoiding duplicate aliases),
+    # and apply driver casts only after the typed fragment is composed into native SQL.
+    dialect = _CustomImportRelationDialect(paramstyle="named")
     dialect.bind_typing = BindTyping.NONE
-    compiled = rewritten.compile(
+    compiled = statement.compile(
         dialect=dialect,
         compile_kwargs={"render_postcompile": True},
     )

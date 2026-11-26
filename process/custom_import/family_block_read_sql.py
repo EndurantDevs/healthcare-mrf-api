@@ -5,7 +5,7 @@
 from collections import OrderedDict
 from types import MappingProxyType
 
-from sqlalchemy import and_, case, cast, func, literal, literal_column, select, type_coerce
+from sqlalchemy import and_, case, cast, func, literal, literal_column, or_, select, type_coerce
 from sqlalchemy.orm import aliased
 
 from db.models.custom_import import CustomImportChildScalar, CustomImportRootScalar
@@ -147,3 +147,84 @@ def query_projection_views(binding):
     if len(_PROJECTION_VIEW_CACHE) > _PROJECTION_VIEW_CACHE_LIMIT:
         _PROJECTION_VIEW_CACHE.popitem(last=False)
     return frozen_views
+
+
+def _validated_root_field_index(context, field):
+    binding = context.family_block_binding
+    if binding is None or binding.layout.definition.digest != context.definition.digest:
+        raise FamilyBlockUnavailable("family block scalar definition differs")
+    if field.collection is not None or field.projection_slot is None:
+        raise FamilyBlockUnavailable("family block root scalar field is not queryable")
+    fields = query_scalar_fields(binding.layout.definition, None)
+    if field not in fields:
+        raise FamilyBlockUnavailable("family block root scalar field is not queryable")
+    return binding.tables_by_role["family"], fields.index(field)
+
+
+def _root_state_and_no_override(family_table, field_index):
+    state = (func.get_byte(family_table.c.raw_states, field_index // 4).op(">>")(2 * (field_index % 4))).op("&")(3)
+    no_override = or_(
+        family_table.c.raw_type_overrides.is_(None),
+        (
+            (func.get_byte(family_table.c.raw_type_overrides, field_index // 2).op(">>")(4 * (field_index % 2))).op(
+                "&"
+            )(15)
+        )
+        == 0,
+    )
+    return state, no_override
+
+
+def direct_root_scalar_predicate(context, predicate, comparison_fn):
+    """Evaluate a root scalar filter directly on the joined compact family row."""
+    family_table, field_index = _validated_root_field_index(context, predicate.field)
+    state, no_override = _root_state_and_no_override(family_table, field_index)
+    if predicate.operator == "is_missing":
+        return state == 0
+    if predicate.operator == "is_null":
+        return state == 1
+    return and_(
+        state == 2,
+        no_override,
+        comparison_fn(family_table.c[scalar_column(predicate.field)], predicate.operator, predicate.value),
+    )
+
+
+def direct_root_scalar_order_value(context, field):
+    """Project a root scalar sort expression directly from the compact family row."""
+    family_table, field_index = _validated_root_field_index(context, field)
+    state, no_override = _root_state_and_no_override(family_table, field_index)
+    return case((and_(state == 2, no_override), family_table.c[scalar_column(field)]))
+
+
+def compact_single_family_winner_base(context, winner_model, entity_model, pin_winner_fn):
+    """Join winner, compact family block (once), and entity binding for root-scoped reads."""
+    binding = context.family_block_binding
+    if binding is None or binding.layout.definition.digest != context.definition.digest:
+        raise FamilyBlockUnavailable("family block read binding differs")
+    family_table = binding.tables_by_role["family"]
+    statement = (
+        select(winner_model)
+        .select_from(winner_model)
+        .join(
+            family_table,
+            and_(
+                family_table.c.family_revision_id == winner_model.family_revision_id,
+                family_table.c.entity_binding_id == winner_model.entity_binding_id,
+            ),
+        )
+    )
+    statement = pin_winner_fn(statement, context).where(
+        winner_model.context_collection_slot == 0,
+        winner_model.context_child_revision_id.is_(None),
+    )
+    return (
+        statement.join(
+            entity_model,
+            and_(
+                entity_model.entity_binding_id == winner_model.entity_binding_id,
+                entity_model.dataset_id == winner_model.dataset_id,
+            ),
+        ),
+        family_table,
+    )

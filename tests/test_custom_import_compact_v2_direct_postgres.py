@@ -14,10 +14,11 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from sanic.compat import Header
-from sqlalchemy import select, text
+from sqlalchemy import BigInteger, String, column, select, text, values
 
 from api import control_admission_batch as admission_api
 from api import control_source_batch as source_api
+from api.custom_import_provider_sql import compile_npi_entity_relation
 from db.models.custom_import import (
     CustomImportBuildAttempt,
     CustomImportExecution,
@@ -35,11 +36,15 @@ from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
 from process.custom_import.publication import rollback_generation
 from process.custom_import.read_core import (
+    CustomImportReadEntityAbsentError,
     CustomImportReadService,
+    EntityLocator,
     ExtensionReadAuthorization,
+    NpiEntityRelationQuery,
     PinnedReadTarget,
     ReadFilter,
     ReadOrderTerm,
+    RootDetailRequest,
     SearchRequest,
 )
 from process.custom_import.snowflake import SnowflakeApprovedRelation, SnowflakeDeclaredColumn, SnowflakeRelation
@@ -53,6 +58,7 @@ from process.custom_import.snowflake_source_binding import register_snowflake_so
 from process.custom_import.storage_layout import snapshot_schema
 from tests import custom_import_grouped_child_support as grouped_child_fixture
 from tests.admission_transport_test_support import writer_tls_context
+from tests.custom_import_postgres_support import _quoted_publication_schema
 from tests.test_custom_import_build_source_postgres import _source_case
 from tests.test_custom_import_bulk_snapshot_writers_postgres import _install_snapshot_revision
 from tests.test_custom_import_derived_query import derived_document
@@ -124,13 +130,17 @@ async def _snapshot_family_id_for_generation(session, generation_id: int) -> int
     )
 
 
-def _inline_root_definition(base_definition: CustomImportDefinition) -> CustomImportDefinition:
+def _inline_root_definition(
+    base_definition: CustomImportDefinition, *, is_score_nullable: bool = False
+) -> CustomImportDefinition:
     doc_by_key = json.loads(base_definition.canonical)
     doc_by_key["streams"] = [stream for stream in doc_by_key["streams"] if stream["kind"] == "root"]
     doc_by_key["schema"]["children"] = []
     doc_by_key["aliases"] = {stream["id"]: doc_by_key["aliases"][stream["id"]] for stream in doc_by_key["streams"]}
     for slot, field in enumerate(doc_by_key["schema"]["root"]["fields"], 1):
         field["projection_slot"] = slot
+        if is_score_nullable and field["id"] == "score":
+            field["nullable"] = True
     doc_by_key["query"] = {
         "root_fields": [field["id"] for field in doc_by_key["schema"]["root"]["fields"] if field["id"] != "npi"],
         "order": [{"field": "score", "direction": "asc", "nulls": "last"}],
@@ -162,11 +172,7 @@ def _mock_root_only_cursor(stream_id: str, root_tuples: tuple[tuple[object, ...]
     return cursor
 
 
-async def _registered_root_only_capture(
-    case, monkeypatch, root_tuples, *, dataset_key="synthetic_inline_v2", idempotency_key="inline-v2-1"
-):
-    """Register a root-only Snowflake bundle capture fixture in PostgreSQL."""
-    policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16, 65_536, 10_000, 120, 300))
+def _root_only_bundle_connector(root_tuples, policy, *, is_score_nullable: bool):
     snapshot, root_rel, _detail = _relations()
     root_columns = (
         root_rel.columns[0],
@@ -174,7 +180,7 @@ async def _registered_root_only_capture(
         root_rel.columns[2],
     )
     approved = (snapshot, SnowflakeApprovedRelation(root_rel.relation, root_columns))
-    root_def = _inline_root_definition(_shared_definition())
+    root_def = _inline_root_definition(_shared_definition(), is_score_nullable=is_score_nullable)
     root_binding = SnowflakeBundleBinding(
         root_def.source_streams[0].stream_id,
         root_rel.relation,
@@ -196,7 +202,23 @@ async def _registered_root_only_capture(
         processing_policy=policy,
     )
     cursor = _mock_root_only_cursor(root_binding.stream_id, root_tuples)
-    connection = _PythonConnection(cursor)
+    return connector, adapter, bundle, _PythonConnection(cursor), cursor
+
+
+async def _registered_root_only_capture(
+    case,
+    monkeypatch,
+    root_tuples,
+    *,
+    dataset_key="synthetic_inline_v2",
+    idempotency_key="inline-v2-1",
+    is_score_nullable: bool = False,
+):
+    """Register a root-only Snowflake bundle capture fixture in PostgreSQL."""
+    policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16, 65_536, 10_000, 120, 300))
+    connector, adapter, bundle, connection, cursor = _root_only_bundle_connector(
+        root_tuples, policy, is_score_nullable=is_score_nullable
+    )
     monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
     async with case.sessions() as session, session.begin():
         registered = await register_snowflake_source_binding(
@@ -849,13 +871,15 @@ async def _grouped_hydration_summary(session, pinned_target: PinnedReadTarget) -
     prepared = await service.prepare_npi_entity_relation(
         session, authorization=auth, target=pinned_target, query=grouped_query
     )
+    _compiled_sql, compiled_entries = await _exec_compiled_relation(session, prepared)
+    assert compiled_entries
     hydrated_by_npi = await service.hydrate_npi_page(
         session,
         authorization=auth,
         pinned_target=pinned_target,
         query=grouped_query,
         prepared=prepared,
-        entity_values=("1234567893", "1003000126"),
+        entity_values=tuple(entry[0] for entry in compiled_entries),
     )
     return {
         npi: (
@@ -937,3 +961,162 @@ async def test_direct_v2_derived_projections_parity(monkeypatch):
             )
             dir_reads_by_npi = await _grouped_hydration_summary(session, dir_target)
             assert dir_reads_by_npi == leg_reads_by_npi
+
+
+async def _exec_compiled_relation(session, prepared):
+    namespace = session.get_bind().get_execution_options()["schema_translate_map"]["mrf"]
+    compiled = compile_npi_entity_relation(prepared.statement)
+    scoped_sql = compiled.sql.replace("mrf.", f"{_quoted_publication_schema(namespace)}.")
+    matched = (await session.execute(text(scoped_sql).bindparams(*compiled.typed_binds))).all()
+    return compiled.sql, matched
+
+
+async def _assert_compiled_relation_queries(case, service, auth, pinned_target):
+    """Verify compiled compact v2 NPI relations under native scope and explicit entity lists."""
+    scope_values = values(column("npi", BigInteger), name="native_npis").data(
+        [(1003000126,), (1234567893,), (1992999874,)]
+    )
+    rel_query = NpiEntityRelationQuery(
+        filters=(ReadFilter("enabled", "eq", True), ReadFilter("score", "gt", Decimal("1.0"))),
+        order_terms=(ReadOrderTerm("score", "asc", "last"),),
+    )
+    async with case.sessions() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        prepared_rel = await service.prepare_npi_entity_relation(
+            session, authorization=auth, target=pinned_target, query=rel_query
+        )
+        prepared_scoped = await service.scope_npi_entity_relation(
+            session,
+            authorization=auth,
+            pinned_target=pinned_target,
+            prepared=prepared_rel,
+            query=rel_query,
+            native_entity_scope=select(scope_values.c.npi),
+        )
+        sql_scoped, entries_scoped = await _exec_compiled_relation(session, prepared_scoped)
+        assert 'COLLATE "C"' in sql_scoped
+        assert "AS block_family_identity" not in sql_scoped
+        assert sql_scoped.count("JOIN ") == 2
+        assert sorted((entry[0], entry[1]) for entry in entries_scoped) == [
+            ("1003000126", Decimal("1.500000000000")),
+            ("1992999874", Decimal("3.250000000000")),
+        ]
+
+    async with case.sessions() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        null_query = NpiEntityRelationQuery(
+            filters=(ReadFilter("score", "is_null", None),),
+            entity_values=("1003000126", "1234567893"),
+        )
+        prepared_null = await service.prepare_npi_entity_relation(
+            session, authorization=auth, target=pinned_target, query=null_query
+        )
+        sql_null, entries_null = await _exec_compiled_relation(session, prepared_null)
+        assert 'COLLATE "C"' in sql_null
+        assert [entry[0] for entry in entries_null] == ["1234567893"]
+
+
+async def _assert_compact_page_and_string_scope(case, service, auth, pinned_target):
+    """Verify hydrate_npi_page and string-typed native scopes on compact v2."""
+    page_query = NpiEntityRelationQuery(filters=(ReadFilter("enabled", "eq", True),))
+    async with case.sessions() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        prepared_page = await service.prepare_npi_entity_relation(
+            session, authorization=auth, target=pinned_target, query=page_query
+        )
+        hydrated_full = await service.hydrate_npi_page(
+            session,
+            authorization=auth,
+            pinned_target=pinned_target,
+            query=page_query,
+            prepared=prepared_page,
+            entity_values=("1003000126", "1234567893", "1992999874"),
+            full_family=True,
+        )
+        assert sorted(hydrated_full) == ["1003000126", "1992999874"]
+        hydrated_summary = await service.hydrate_npi_page(
+            session,
+            authorization=auth,
+            pinned_target=pinned_target,
+            query=page_query,
+            prepared=prepared_page,
+            entity_values=("1003000126", "1234567893"),
+            full_family=False,
+        )
+        assert list(hydrated_summary) == ["1003000126"]
+
+        str_scope = select(values(column("npi", String), name="str_npis").data([("1992999874",)]).c.npi)
+        prepared_str_base = await service.prepare_npi_entity_relation(
+            session, authorization=auth, target=pinned_target, query=page_query
+        )
+        prepared_str = await service.scope_npi_entity_relation(
+            session,
+            authorization=auth,
+            pinned_target=pinned_target,
+            prepared=prepared_str_base,
+            query=page_query,
+            native_entity_scope=str_scope,
+        )
+        _sql_str, entries_str = await _exec_compiled_relation(session, prepared_str)
+        assert [entry[0] for entry in entries_str] == ["1992999874"]
+
+
+@pytest.mark.asyncio
+async def test_direct_v2_compiled_npi_relation_and_root_detail_parity(monkeypatch):
+    """Compiled compact v2 NPI relations execute cleanly without alias collisions and use COLLATE C."""
+    root_tuples = (
+        ("1003000126", Decimal("1.5"), True),
+        ("1234567893", None, False),
+        ("1992999874", Decimal("3.25"), True),
+    )
+    async with _source_case() as case:
+        await _install_compact_schema(case)
+        connector, request, policy = await _registered_root_only_capture(
+            case,
+            monkeypatch,
+            root_tuples,
+            dataset_key="synthetic_relation_v2",
+            idempotency_key="rel-v2-1",
+            is_score_nullable=True,
+        )
+        outcome = await runner.run_segmented_snowflake_candidate(
+            case.sessions, connector, request, processing_policy=policy, direct_compact=True
+        )
+        assert outcome.status == "activated" and outcome.accepted_family_count == 3
+        pinned_target = PinnedReadTarget(
+            request.dataset_id,
+            outcome.generation_id,
+            request.definition_revision_id,
+            request.schema_revision_id,
+            "default",
+        )
+        service = CustomImportReadService(authorizer=_ExactReadAuthorizer(pinned_target), cursor_secret=b"r" * 32)
+        auth = ExtensionReadAuthorization("synthetic-reader")
+
+        await _assert_compiled_relation_queries(case, service, auth, pinned_target)
+        await _assert_compact_page_and_string_scope(case, service, auth, pinned_target)
+        async with case.sessions() as session:
+            detail = await service.root_detail_for_entity(
+                session,
+                authorization=auth,
+                request=RootDetailRequest(
+                    target=pinned_target,
+                    entity=EntityLocator("npi", "1003000126"),
+                    family_entitlement="full_family",
+                ),
+            )
+            assert {field.field_id: field.value for field in detail.root_fields} == {
+                "npi": "1003000126",
+                "score": Decimal("1.500000000000"),
+                "enabled": True,
+            }
+            with pytest.raises(CustomImportReadEntityAbsentError):
+                await service.root_detail_for_entity(
+                    session,
+                    authorization=auth,
+                    request=RootDetailRequest(
+                        target=pinned_target,
+                        entity=EntityLocator("npi", "1000000004"),
+                        family_entitlement="full_family",
+                    ),
+                )

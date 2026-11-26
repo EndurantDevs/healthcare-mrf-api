@@ -243,18 +243,20 @@ def _selected_value_relation(context, entity_values=None):
         profile_slot=context.default_profile_slot,
     )
     field = context.definition.fields_by_id[selection.field_id]
-    statement, value = _join_root_scalar(
+    statement, selected_value_expr = _join_root_scalar(
         core._filtered_npi_winner_statement(helper, ()), helper, field, prefix="helper"
     )
     if entity_values is not None:
-        statement = statement.where(context.model(CustomImportEntityBinding).canonical_value.in_(entity_values))
+        statement = statement.where(
+            core._canonical_entity_value(context, context.model(CustomImportEntityBinding)).in_(entity_values)
+        )
     return (
         statement.where(
             winner_model.context_key_sha256 == _profile_context_digest(context, selection.default_profile, {})
         )
         .with_only_columns(
             winner_model.entity_binding_id.label("entity_binding_id"),
-            value.label("selected_value"),
+            selected_value_expr.label("selected_value"),
             maintain_column_froms=True,
         )
         .subquery("selected_entity_value")
@@ -273,7 +275,7 @@ def selected_family_statement(
     fields = context.definition.fields_by_id
     statement = core._filtered_npi_winner_statement(context, ())
     if entity_values is not None:
-        statement = statement.where(entity_model.canonical_value.in_(entity_values))
+        statement = statement.where(core._canonical_entity_value(context, entity_model).in_(entity_values))
     statement, value_expression = _join_root_scalar(statement, context, fields[selection.field_id])
     statement, group_expression = _join_root_scalar(statement, context, fields[selection.group_field_id])
     selected_value = literal(plan.selected_value)
@@ -351,7 +353,7 @@ async def _selected_family_rows(session, context, plan, entity_values):
     if not entity_values:
         return ()
     statement = selected_family_statement(context, plan, entity_values=entity_values).where(
-        entity_model.canonical_value.in_(entity_values)
+        core._canonical_entity_value(context, entity_model).in_(entity_values)
     )
     selected_rows = (await session.execute(statement.limit(len(entity_values) * 2 + 1))).all()
     if len(selected_rows) > len(entity_values) * 2:
@@ -487,7 +489,7 @@ async def hydrate_detail(session, context, request, scope):
     )
     plan = normalize_plan(context, query, scope, projection="full_family", use_default_order=False)
     matching = matching_family_statement(context, plan, entity_values=(request.entity.value,)).where(
-        entity_model.canonical_value == request.entity.value
+        core._canonical_entity_value(context, entity_model) == request.entity.value
     )
     exists = await session.scalar(matching.with_only_columns(literal(1), maintain_column_froms=True).limit(1))
     if exists is None:
