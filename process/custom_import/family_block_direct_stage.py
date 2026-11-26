@@ -16,10 +16,11 @@ import io
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from functools import lru_cache
+from typing import Any
 
 import msgpack
 import pyarrow as pa
@@ -1471,112 +1472,198 @@ async def _commit_direct_part_slice(
         )
 
 
-async def _replay_direct_part(
+_LOCAL_PREFETCH_MAX_PARTS = 64
+_LOCAL_PREFETCH_MAX_COMPRESSED_BYTES = 16 * 1024 * 1024
+_LOCAL_PREFETCH_MAX_ARROW_BYTES = 64 * 1024 * 1024
+
+
+async def _load_local_stream_cursor(session_factory, request, build_id: int, slot: int):
+    async with staging._page_session(session_factory, request, build_id) as (session, _):
+        await staging._prepare_statement(session)
+        stream_row = (
+            await session.scalars(
+                select(CustomImportBuildStream)
+                .where(CustomImportBuildStream.build_id == build_id, CustomImportBuildStream.stream_slot == slot)
+                .execution_options(populate_existing=True)
+            )
+        ).one()
+        return (
+            (stream_row.next_part_ordinal, stream_row.next_part_row_ordinal, stream_row.next_source_ordinal),
+            stream_row.replay_verified_at is not None,
+        )
+
+
+@dataclass
+class _LocalDirectReplayState:
+    """Stream context and prefetch buffer for coalesced local direct replay."""
+
+    session_factory: Any
+    stream_context: Any
+    policy: Any
+    direct_plan: Any
+    identity_by_field: dict[str, int]
+    bucket_count: int
+    headers: Any
+    pending_parts: deque = field(default_factory=deque)
+
+
+async def _fetch_local_part_window(state: _LocalDirectReplayState, start_part_ordinal: int, remaining_rows: int):
+    from process.custom_import.capture_store import (
+        CursorPartWindowLimits,
+        CursorPartWindowRequest,
+        load_segmented_cursor_part_window,
+    )
+
+    request = state.stream_context.request
+    window_request = CursorPartWindowRequest(
+        stream_slot=state.stream_context.stream_slot,
+        start_part_ordinal=start_part_ordinal,
+        limits=CursorPartWindowLimits(
+            max_parts=_LOCAL_PREFETCH_MAX_PARTS,
+            max_rows=max(1, remaining_rows),
+            max_compressed_bytes=_LOCAL_PREFETCH_MAX_COMPRESSED_BYTES,
+            max_arrow_bytes=_LOCAL_PREFETCH_MAX_ARROW_BYTES,
+        ),
+        **state.identity_by_field,
+    )
+    async with state.session_factory() as read_session:
+        await staging._set_timeout(read_session, request.statement_timeout_ms)
+        return await load_segmented_cursor_part_window(read_session, window_request, headers=state.headers)
+
+
+async def _next_local_part(state: _LocalDirectReplayState, part_ordinal: int, remaining_rows: int):
+    while state.pending_parts and state.pending_parts[0].ordinal < part_ordinal:
+        state.pending_parts.popleft()
+    if not state.pending_parts or state.pending_parts[0].ordinal != part_ordinal:
+        state.pending_parts.clear()
+        part_window, state.headers = await _fetch_local_part_window(state, part_ordinal, remaining_rows)
+        state.pending_parts.extend(part_window)
+    return state.pending_parts.popleft()
+
+
+async def _verify_local_stream_metadata(state: _LocalDirectReplayState, deadline: float):
+    from process.custom_import.capture_store import verify_segmented_stream_metadata
+
+    async with state.session_factory() as read_session:
+        await staging._set_timeout(read_session, state.stream_context.request.statement_timeout_ms)
+        await verify_segmented_stream_metadata(
+            read_session,
+            stream_slot=state.stream_context.stream_slot,
+            deadline=deadline,
+            **state.identity_by_field,
+        )
+
+
+async def _prepare_local_direct_batch(state: _LocalDirectReplayState, cursor: tuple[int, int, int]):
+    """Coalesce contiguous retained parts into one bounded direct-stage write batch."""
+    from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
+
+    request = state.stream_context.request
+    started = time.monotonic()
+    deadline = started + request.lease_seconds
+    soft_deadline = started + request.lease_seconds / 2
+    cur_part, cur_row, cur_source = cursor
+    slices: list[PreparedDirectPartSlice] = []
+    row_count = byte_count = 0
+
+    while len(slices) < _LOCAL_PREFETCH_MAX_PARTS and (
+        not slices
+        or (
+            row_count + request.page_row_limit <= MAX_BATCH_ROWS
+            and byte_count + request.page_byte_limit <= MAX_BATCH_BYTES
+        )
+    ):
+        if slices and time.monotonic() >= soft_deadline:
+            break
+        part = await _next_local_part(state, cur_part, MAX_BATCH_ROWS - row_count)
+        is_final = part.ordinal == state.headers.part_count
+        budget = DirectSliceBudget(
+            part_row_ordinal=cur_row,
+            source_ordinal=cur_source,
+            bucket_count=state.bucket_count,
+            max_rows=MAX_BATCH_ROWS - row_count,
+            max_bytes=MAX_BATCH_BYTES - byte_count,
+            deadline=deadline,
+            soft_deadline=soft_deadline,
+            is_final_part=is_final,
+        )
+        part_slice = await prepare_direct_part_slice(
+            state.stream_context, part, state.policy, budget, direct_plan=state.direct_plan
+        )
+        slices.append(part_slice)
+        row_count += part_slice.row_count
+        byte_count += part_slice.byte_count
+        if not part_slice.has_reached_eof or is_final:
+            if is_final and part_slice.has_reached_eof:
+                state.pending_parts.clear()
+                await _verify_local_stream_metadata(state, deadline)
+            break
+        cur_part += 1
+        cur_row = 0
+        cur_source += part_slice.row_count
+    return merge_direct_slices(slices)
+
+
+async def _replay_direct_stream(
     session_factory,
     stream_context,
-    part,
+    bundle_id: int,
     policy,
-    *,
-    part_row_offset: int,
-    source_start: int,
     direct_info: tuple[int, int],
-    is_final: bool,
-):
-    """Stream one retained part into direct stage bucket partitions."""
-    from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
+) -> None:
+    """Replay one stream in coalesced 64-part batches into bucketed direct stage partitions."""
+    from process.custom_import.capture_store import load_segmented_cursor_headers
 
     family_id, bucket_count = direct_info
     request = stream_context.request
-    direct_plan = compile_direct_plan(stream_context)
-    while True:
-        started = time.monotonic()
-        expected_cursor = (part.ordinal, part_row_offset, source_start + part_row_offset)
-        budget = DirectSliceBudget(
-            part_row_ordinal=part_row_offset,
-            source_ordinal=source_start + part_row_offset,
-            bucket_count=bucket_count,
-            max_rows=MAX_BATCH_ROWS,
-            max_bytes=MAX_BATCH_BYTES,
-            deadline=started + request.lease_seconds,
-            soft_deadline=started + request.lease_seconds / 2,
-            is_final_part=is_final,
+    slot = stream_context.stream_slot
+    cursor, is_verified = await _load_local_stream_cursor(session_factory, request, stream_context.build_id, slot)
+    if is_verified:
+        return
+    identity_by_field = dict(
+        capture_bundle_id=bundle_id,
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+    )
+    async with session_factory() as read_session:
+        await staging._set_timeout(read_session, request.statement_timeout_ms)
+        headers = await load_segmented_cursor_headers(read_session, stream_slot=slot, **identity_by_field)
+    state = _LocalDirectReplayState(
+        session_factory=session_factory,
+        stream_context=stream_context,
+        policy=policy,
+        direct_plan=compile_direct_plan(stream_context),
+        identity_by_field=identity_by_field,
+        bucket_count=bucket_count,
+        headers=headers,
+    )
+    while not is_verified:
+        direct_batch = await _prepare_local_direct_batch(state, cursor)
+        is_committed, actual_cursor, is_verified = await _commit_direct_part_slice(
+            session_factory,
+            request,
+            stream_context.build_id,
+            slot,
+            stream_context,
+            direct_batch,
+            family_id,
+            cursor,
         )
-        part_slice = await prepare_direct_part_slice(stream_context, part, policy, budget, direct_plan=direct_plan)
-        commit_slice = replace(part_slice, has_reached_eof=False) if is_final else part_slice
-        direct_batch = merge_direct_slices([commit_slice])
-        if direct_batch.total_rows > 0 or commit_slice.has_reached_eof:
-            is_committed, actual_cursor, is_verified = await _commit_direct_part_slice(
-                session_factory,
-                request,
-                stream_context.build_id,
-                stream_context.stream_slot,
-                stream_context,
-                direct_batch,
-                family_id,
-                expected_cursor,
-            )
-            if not is_committed:
-                if is_verified or actual_cursor[0] > part.ordinal:
-                    return
-                if actual_cursor[0] != part.ordinal or actual_cursor[1] < part_row_offset:
-                    raise CandidateRunnerError("direct SOURCE durable cursor moved behind replay")
-                part_row_offset = actual_cursor[1]
-                continue
-        part_row_offset += part_slice.row_count
-        if part_slice.has_reached_eof:
-            return
+        if not is_committed:
+            state.pending_parts.clear()
+            if not is_verified and (
+                actual_cursor[0] < cursor[0] or (actual_cursor[0] == cursor[0] and actual_cursor[1] < cursor[1])
+            ):
+                raise CandidateRunnerError("direct SOURCE durable cursor moved behind replay")
+        cursor = actual_cursor
 
 
 async def replay_direct_source(session_factory, request, registry, build_id, bundle_id, policy, cursors, direct_info):
     """Stream sealed parts directly into unlogged bucketed stage partitions."""
-    import json
-
-    contexts, primary = [], None
-    final_part_by_slot: dict[int, int] = {}
-    starts_by_stream = dict.fromkeys(registry.stream_slots, 0)
-    stream_by_id = {stream.stream_id: stream for stream in request.definition.source_streams}
-    try:
-        session = await staging._enter_context(contexts, session_factory())
-        await staging._enter_context(contexts, session.begin())
-        await staging._set_timeout(session, request.statement_timeout_ms)
-        parts = await staging._enter_context(
-            contexts,
-            staging.open_segmented_parquet_parts(
-                session,
-                capture_bundle_id=bundle_id,
-                dataset_id=request.dataset_id,
-                definition_revision_id=request.definition_revision_id,
-                schema_revision_id=request.schema_revision_id,
-            ),
-        )
-        async for part in parts:
-            stream_id = part.receipt.stream_id
-            slot = registry.stream_slots[stream_id]
-            cursor = cursors[slot]
-            is_final = part.ordinal == json.loads(part.receipt.canonical_manifest)["part_count"]
-            if part.ordinal >= cursor[0]:
-                stream_context = staging._StreamContext(request, registry, build_id, stream_by_id[stream_id])
-                await _replay_direct_part(
-                    session_factory,
-                    stream_context,
-                    part,
-                    policy,
-                    part_row_offset=cursor[1] if part.ordinal == cursor[0] else 0,
-                    source_start=starts_by_stream[stream_id],
-                    direct_info=direct_info,
-                    is_final=is_final,
-                )
-            starts_by_stream[stream_id] += part.record_count
-            if is_final:
-                final_part_by_slot[slot] = part.ordinal
-    except BaseException as exc:
-        primary = exc
-    primary = await staging._close_contexts(contexts, primary)
-    if primary is not None:
-        raise primary
-    if set(final_part_by_slot) != set(registry.stream_slots.values()):
-        raise CandidateRunnerError("source replay lacks complete stream EOF")
-    for slot, ordinal in sorted(final_part_by_slot.items()):
-        await staging._finish_part(session_factory, request, build_id, slot, ordinal)
+    del cursors
+    for stream in request.definition.source_streams:
+        stream_context = staging._StreamContext(request, registry, build_id, stream)
+        await _replay_direct_stream(session_factory, stream_context, bundle_id, policy, direct_info)
     async with staging._page_session(session_factory, request, build_id) as (session, _):
         await staging._call(session, "freeze_custom_import_build_source", (("bigint", build_id),))

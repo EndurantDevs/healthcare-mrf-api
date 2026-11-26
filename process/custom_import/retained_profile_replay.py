@@ -14,20 +14,24 @@ from db.models.custom_import import CustomImportCaptureBundle, CustomImportGener
 from process.custom_import.capture_pending import (
     SEGMENTED_PAYLOAD_CONTRACT,
     PendingCaptureRequest,
-    append_pending_parquet_part,
+    PendingParquetPart,
+    append_pending_parquet_window,
     begin_pending_parquet_bundle,
     mark_pending_parquet_eof,
     seal_pending_parquet_bundle,
 )
 from process.custom_import.capture_store import (
+    CursorPartWindowLimits,
+    CursorPartWindowRequest,
     _identity,
     _load_parquet_part_metadata,
     load_segmented_cursor_headers,
-    open_segmented_cursor_part,
+    load_segmented_cursor_part_window,
     verify_segmented_stream_metadata,
 )
 from process.custom_import.definition import canonical_json
 from process.custom_import.failure_diagnostics import FailurePhase, failure_identifiers, failure_phase
+from process.custom_import.family_block_direct_stage import is_direct_compact_enabled
 from process.custom_import.https_candidate import _renew_while_preparing
 from process.custom_import.operator import inspect_execution_evidence
 from process.custom_import.runner_registry import load_current_pointer
@@ -48,6 +52,12 @@ from process.custom_import.snowflake_segmented_runner import build_segmented_cap
 from process.custom_import.snowflake_source_binding import load_snowflake_source_binding
 
 _REPLAY_CONTRACT = "custom-import/retained-profile-replay/v1"
+_REPLAY_COPY_WINDOW_LIMITS = CursorPartWindowLimits(
+    max_parts=64,
+    max_rows=65536,
+    max_compressed_bytes=16 * 1024 * 1024,
+    max_arrow_bytes=64 * 1024 * 1024,
+)
 
 
 def _require_profile_only(previous, successor):
@@ -147,7 +157,7 @@ def _replay_receipt(receipt, origin_by_name, successor_binding_sha256):
 
 
 async def _copy_capture_parts(session_factory, parent_bundle, pending, capture_id, receipts, deadline):
-    """Copy authenticated retained parts in order and seal only after complete EOF."""
+    """Copy authenticated retained parts in bounded windows and seal only after complete EOF."""
 
     parent_ids_by_name = {
         "capture_bundle_id": parent_bundle.capture_bundle_id,
@@ -158,23 +168,34 @@ async def _copy_capture_parts(session_factory, parent_bundle, pending, capture_i
     for slot in sorted(receipts):
         async with session_factory() as reader:
             headers = await load_segmented_cursor_headers(reader, stream_slot=slot, **parent_ids_by_name)
-        for ordinal in range(1, headers.part_count + 1):
+        ordinal = 1
+        while ordinal <= headers.part_count:
+            window_request = CursorPartWindowRequest(
+                stream_slot=slot,
+                start_part_ordinal=ordinal,
+                limits=_REPLAY_COPY_WINDOW_LIMITS,
+                **parent_ids_by_name,
+            )
             # Release the read connection before writing, including with a one-connection pool.
             async with session_factory() as reader:
-                async with open_segmented_cursor_part(
-                    reader, stream_slot=slot, part_ordinal=ordinal, headers=headers, **parent_ids_by_name
-                ) as verified:
-                    part = verified
-            async with session_factory() as writer, writer.begin():
-                await append_pending_parquet_part(
-                    writer,
-                    request=pending,
-                    capture_bundle_id=capture_id,
+                part_window, headers = await load_segmented_cursor_part_window(reader, window_request, headers=headers)
+            queued_parts = tuple(
+                PendingParquetPart(
                     capture=part.capture,
                     ordinal=part.ordinal,
                     record_count=part.record_count,
                     arrow_byte_count=part.arrow_byte_count,
                 )
+                for part in part_window
+            )
+            async with session_factory() as writer, writer.begin():
+                await append_pending_parquet_window(
+                    writer,
+                    request=pending,
+                    capture_bundle_id=capture_id,
+                    parts=queued_parts,
+                )
+            ordinal = part_window[-1].ordinal + 1
         async with session_factory() as reader:
             await verify_segmented_stream_metadata(reader, stream_slot=slot, deadline=deadline, **parent_ids_by_name)
     async with session_factory() as writer, writer.begin():
@@ -266,6 +287,21 @@ async def retained_profile_request_identity(session, successor, parent_statement
     return _request_identity(_origin_document(previous, parent_bundle, base), successor.source_binding_sha256)
 
 
+async def _prepare_retained_replay(session_factory, successor, request, base, parent_statement, *, has_same_binding):
+    """Load the verified origin generation and derive replay stream manifests."""
+    async with session_factory() as session:
+        previous, parent_bundle, receipts = await _load_origin(
+            session, successor, base, parent_statement, same_binding=has_same_binding
+        )
+    origin_by_name = _origin_document(previous, parent_bundle, base)
+    identity = _request_identity(origin_by_name, request.source_binding_sha256)
+    copies_by_slot = {
+        slot: _replay_receipt(receipt, origin_by_name, request.source_binding_sha256)
+        for slot, receipt in receipts.items()
+    }
+    return parent_bundle, identity, copies_by_slot
+
+
 async def run_retained_profile_replay(
     session_factory,
     successor,
@@ -287,16 +323,9 @@ async def run_retained_profile_replay(
         raise CandidateRunnerError("compact retained replay requires the local owner")
     if writer_transports is not None:
         writer_transports.require_candidate_binding(request)
-    async with session_factory() as session:
-        previous, parent_bundle, receipts = await _load_origin(
-            session, successor, base, parent_statement, same_binding=has_same_binding
-        )
-    origin_by_name = _origin_document(previous, parent_bundle, base)
-    identity = _request_identity(origin_by_name, request.source_binding_sha256)
-    copies_by_slot = {
-        slot: _replay_receipt(receipt, origin_by_name, request.source_binding_sha256)
-        for slot, receipt in receipts.items()
-    }
+    parent_bundle, identity, copies_by_slot = await _prepare_retained_replay(
+        session_factory, successor, request, base, parent_statement, has_same_binding=has_same_binding
+    )
     submission, grant = await _reserve_bundle_execution(
         session_factory, request, statement, identity, processing_policy=policy
     )
@@ -317,6 +346,7 @@ async def run_retained_profile_replay(
     except BaseException as failure:
         await _finish_capture_failure(session_factory, request, grant, failure)
         raise
+    use_direct_compact = compact_limits is not None and writer_transports is None and is_direct_compact_enabled()
     return await build_segmented_capture(
         session_factory,
         request,
@@ -325,4 +355,5 @@ async def run_retained_profile_replay(
         writer_transports=writer_transports,
         retained_base=(base.generation_id, base.pointer_version),
         compact_limits=compact_limits,
+        direct_compact=use_direct_compact,
     )
