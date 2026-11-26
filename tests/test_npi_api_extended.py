@@ -871,9 +871,8 @@ async def test_get_plans_by_npi(monkeypatch):
         def order_by(self, *_args, **_kwargs):
             return self
 
-        async def iterate(self):
-            for row in self._rows:
-                yield row
+        async def all(self):
+            return list(self._rows)
 
     plan_entry = types.SimpleNamespace(to_json_dict=lambda: {"plan": 1})
     issuer_entry = types.SimpleNamespace(to_json_dict=lambda: {"issuer": 2})

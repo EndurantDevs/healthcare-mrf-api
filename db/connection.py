@@ -224,6 +224,14 @@ def current_session() -> AsyncSession:
     return session
 
 
+_DEFAULT_WORKER_PREPARED_STATEMENT_CACHE_SIZE = 100
+_DEFAULT_API_PREPARED_STATEMENT_CACHE_SIZE = 256
+_MAX_PREPARED_STATEMENT_CACHE_SIZE = 4096
+_DEFAULT_WORKER_QUERY_CACHE_SIZE = 500
+_DEFAULT_API_QUERY_CACHE_SIZE = 1000
+_MAX_QUERY_CACHE_SIZE = 10_000
+
+
 def _is_env_enabled(value: Optional[str], default: bool = False) -> bool:
     if value is None:
         return default
@@ -266,6 +274,57 @@ async def gather_reader_calls(database, *operations):
         for operation in operations:
             if inspect.iscoroutine(operation):
                 operation.close()
+
+
+def _bounded_cache_size(env_name: str, default: int, *, maximum: int) -> int:
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    parsed = int(raw)
+    if not 0 <= parsed <= maximum:
+        raise ValueError(f"{env_name} must be between 0 and {maximum}")
+    return parsed
+
+
+def _engine_connect_options(
+    driver: str,
+    *,
+    is_api_started: bool,
+    reader_login: Optional[Tuple[str, str]],
+) -> dict[str, Any]:
+    """Build SQLAlchemy engine options including API JIT and statement-cache sizing."""
+    options_by_name: dict[str, Any] = {}
+    if reader_login:
+        options_by_name["isolation_level"] = "REPEATABLE READ"
+        options_by_name["execution_options"] = {"postgresql_readonly": True}
+    is_http_server = bool(is_api_started or reader_login)
+    if is_http_server:
+        # API queries do not amortize JIT; startup settings also cover new pool connections.
+        if driver == "postgresql+asyncpg":
+            options_by_name["connect_args"] = {"server_settings": {"jit": "off"}}
+        elif driver == "postgresql+psycopg":
+            server_options = f"{os.getenv('PGOPTIONS', '')} -c jit=off".strip()
+            options_by_name["connect_args"] = {"options": server_options}
+    default_prepared = (
+        _DEFAULT_API_PREPARED_STATEMENT_CACHE_SIZE if is_http_server else _DEFAULT_WORKER_PREPARED_STATEMENT_CACHE_SIZE
+    )
+    default_query = _DEFAULT_API_QUERY_CACHE_SIZE if is_http_server else _DEFAULT_WORKER_QUERY_CACHE_SIZE
+    prepared_env = os.getenv("HLTHPRT_DB_PREPARED_STATEMENT_CACHE_SIZE")
+    prepared_cache_size = _bounded_cache_size(
+        "HLTHPRT_DB_PREPARED_STATEMENT_CACHE_SIZE",
+        default_prepared,
+        maximum=_MAX_PREPARED_STATEMENT_CACHE_SIZE,
+    )
+    options_by_name["query_cache_size"] = _bounded_cache_size(
+        "HLTHPRT_DB_QUERY_CACHE_SIZE",
+        default_query,
+        maximum=_MAX_QUERY_CACHE_SIZE,
+    )
+    if driver == "postgresql+asyncpg" and (is_http_server or (prepared_env is not None and bool(prepared_env.strip()))):
+        connect_args_by_name = dict(options_by_name.get("connect_args") or {})
+        connect_args_by_name["prepared_statement_cache_size"] = prepared_cache_size
+        options_by_name["connect_args"] = connect_args_by_name
+    return options_by_name
 
 
 @dataclass
@@ -318,18 +377,11 @@ class Database:
         pool_size = max(pool_min, 1)
         max_overflow = max(pool_max - pool_size, 0)
 
-        options_by_name = {}
-        if self._reader_login:
-            options_by_name["isolation_level"] = "REPEATABLE READ"
-            options_by_name["execution_options"] = {"postgresql_readonly": True}
-        if self._api_server_started or self._reader_login:
-            # API queries do not amortize JIT; startup settings also cover new pool connections.
-            if driver == "postgresql+asyncpg":
-                options_by_name["connect_args"] = {"server_settings": {"jit": "off"}}
-            elif driver == "postgresql+psycopg":
-                server_options = f"{os.getenv('PGOPTIONS', '')} -c jit=off".strip()
-                options_by_name["connect_args"] = {"options": server_options}
-
+        options_by_name = _engine_connect_options(
+            driver,
+            is_api_started=self._api_server_started,
+            reader_login=self._reader_login,
+        )
         self.engine = create_async_engine(
             url,
             pool_size=pool_size,

@@ -2,21 +2,21 @@
 
 """Source-qualified SQL for current alias-scoped formulary medications."""
 
-from sqlalchemy import and_, bindparam, select
+from sqlalchemy import String, and_, any_, bindparam, select
+from sqlalchemy.dialects.postgresql import ARRAY
 
-from api.formulary_fhir_catalog_sql import ALIAS_PAGE_FROM
-from api.formulary_fhir_catalog_sql import COVERAGE_COLUMNS
-from api.formulary_fhir_catalog_sql import CURRENT_PLAN_PREDICATES
-from api.formulary_fhir_catalog_sql import alias
-from api.formulary_fhir_catalog_sql import alias_version
-from api.formulary_fhir_catalog_sql import current
-from api.formulary_fhir_catalog_sql import dataset
-from api.formulary_fhir_catalog_sql import plan
+from api.formulary_fhir_catalog_sql import (
+    ALIAS_PAGE_FROM,
+    COVERAGE_COLUMNS,
+    CURRENT_PLAN_PREDICATES,
+    alias,
+    alias_version,
+    current,
+    dataset,
+    plan,
+)
 from api.formulary_fhir_drug_values import FHIRFormularyDrugFilters
-from db.models import FHIRFormularyAliasMembership
-from db.models import FHIRFormularyAlternative
-from db.models import FHIRFormularyMedication
-
+from db.models import FHIRFormularyAliasMembership, FHIRFormularyAlternative, FHIRFormularyMedication
 
 membership = FHIRFormularyAliasMembership.__table__
 medication = FHIRFormularyMedication.__table__
@@ -53,8 +53,7 @@ DRUG_FROM = ALIAS_PAGE_FROM.join(
     medication,
     and_(
         medication.c.source_id == membership.c.source_id,
-        medication.c.upstream_medication_id
-        == membership.c.upstream_medication_id,
+        medication.c.upstream_medication_id == membership.c.upstream_medication_id,
         medication.c.medication_version_id == membership.c.medication_version_id,
     ),
 )
@@ -90,9 +89,7 @@ def drug_statement(
     if exact_drug_id is None:
         predicates.append(medication.c.medication_version_id > bindparam("last_id"))
     else:
-        predicates.append(
-            medication.c.medication_version_id == bindparam("drug_id")
-        )
+        predicates.append(medication.c.medication_version_id == bindparam("drug_id"))
     columns_by_filter = {
         "rxnorm_id": membership.c.rxnorm_id,
         "ndc11": medication.c.ndc11,
@@ -106,10 +103,7 @@ def drug_statement(
         if filter_value is not None:
             predicates.append(filter_column == bindparam(filter_name))
     statement = (
-        select(*DRUG_COLUMNS)
-        .select_from(DRUG_FROM)
-        .where(*predicates)
-        .order_by(medication.c.medication_version_id)
+        select(*DRUG_COLUMNS).select_from(DRUG_FROM).where(*predicates).order_by(medication.c.medication_version_id)
     )
     page_limit = 2 if exact_drug_id is not None else bindparam("page_size")
     return statement.limit(page_limit)
@@ -119,16 +113,14 @@ ALTERNATIVE_FROM = DRUG_FROM.join(
     alternative,
     and_(
         alternative.c.alias_version_id == membership.c.alias_version_id,
-        alternative.c.upstream_medication_id
-        == membership.c.upstream_medication_id,
+        alternative.c.upstream_medication_id == membership.c.upstream_medication_id,
     ),
 ).outerjoin(
     target_membership,
     and_(
         target_membership.c.alias_version_id == alternative.c.alias_version_id,
         target_membership.c.source_id == membership.c.source_id,
-        target_membership.c.upstream_medication_id
-        == alternative.c.resolved_medication_id,
+        target_membership.c.upstream_medication_id == alternative.c.resolved_medication_id,
     ),
 )
 ALTERNATIVE_STATEMENT = (
@@ -142,9 +134,7 @@ ALTERNATIVE_STATEMENT = (
         *CURRENT_PLAN_PREDICATES,
         plan.c.public_id == bindparam("public_id"),
         alias.c.alias_id == bindparam("alias_id"),
-        membership.c.medication_version_id.in_(
-            bindparam("owner_drug_ids", expanding=True)
-        ),
+        membership.c.medication_version_id == any_(bindparam("owner_drug_ids", type_=ARRAY(String))),
     )
     .order_by(
         membership.c.medication_version_id,

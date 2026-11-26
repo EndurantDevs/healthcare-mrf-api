@@ -56,7 +56,7 @@ async def test_api_startup_replaces_preconnected_pool_and_preserves_worker_defau
     engines[0].dispose.assert_awaited_once()
     assert database.engine is engines[1]
     expected = (
-        {"server_settings": {"jit": "off"}}
+        {"server_settings": {"jit": "off"}, "prepared_statement_cache_size": 256}
         if "asyncpg" in driver
         else {"options": "-c work_mem=32MB -c jit=on -c jit=off"}
     )
@@ -89,7 +89,9 @@ async def test_reader_jit_and_read_only_defaults_remain_independent_of_api_start
     reader._reader_login = ("reader", "password")
     await reader.connect()
     assert options_by_name["connect_args"] == (
-        {"server_settings": {"jit": "off"}} if driver == "asyncpg" else {"options": "-c work_mem=32MB -c jit=off"}
+        {"server_settings": {"jit": "off"}, "prepared_statement_cache_size": 256}
+        if driver == "asyncpg"
+        else {"options": "-c work_mem=32MB -c jit=off"}
     )
     assert options_by_name["isolation_level"] == "REPEATABLE READ"
     assert options_by_name["execution_options"] == {"postgresql_readonly": True}
@@ -119,7 +121,10 @@ async def test_api_startup_rebuilds_preconnected_primary_and_reader_pools(monkey
     for engine in engines[:2]:
         engine.dispose.assert_awaited_once()
     assert database._reader_database is not previous_reader
-    assert all(engine.options["connect_args"] == {"server_settings": {"jit": "off"}} for engine in engines[2:])
+    assert all(
+        engine.options["connect_args"] == {"server_settings": {"jit": "off"}, "prepared_statement_cache_size": 256}
+        for engine in engines[2:]
+    )
     await callbacks["before_server_stop"](None, None)
 
 

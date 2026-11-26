@@ -13,7 +13,7 @@ from uuid import UUID
 
 import asyncpg
 from sanic.exceptions import Forbidden, InvalidUsage, SanicException, ServiceUnavailable
-from sqlalchemy import BigInteger, Boolean, MetaData, String, all_, bindparam, cast, func, or_, select, text
+from sqlalchemy import BigInteger, Boolean, MetaData, String, all_, any_, bindparam, cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, INTEGER, JSONB
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import visitors
@@ -206,7 +206,7 @@ def scoped_aca_plan_clause(*, plan_id, year, issuer_id, state, checksum_network)
     source_scope = binding_record_json["source_scope_json"]
     network_id = binding_record_json["network_id"].astext.cast(INTEGER)
     network_clause = (
-        network_id.in_(scope.network_ids)
+        network_id == any_(bindparam("_scoped_aca_network_ids", value=list(scope.network_ids), type_=ARRAY(INTEGER)))
         if scope.network_ids is not None
         else _approved_network_clause(network_id, scope)
     )
@@ -646,9 +646,10 @@ def _provider_detail_address_type_clause(address_model, table):
 
 
 def _npi_batch_address_filters(address_model, address_table, npis):
+    npis_param = bindparam("batch_npis", value=list(npis), type_=ARRAY(BigInteger))
     if address_model is EntityAddressUnified:
-        return [func.coalesce(address_table.c.npi, address_table.c.inferred_npi).in_(npis)]
-    return [address_table.c.npi.in_(npis)]
+        return [func.coalesce(address_table.c.npi, address_table.c.inferred_npi) == any_(npis_param)]
+    return [address_table.c.npi == any_(npis_param)]
 
 
 def _request_selector(request, native_args):

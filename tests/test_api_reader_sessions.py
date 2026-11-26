@@ -176,8 +176,8 @@ def reader_database(monkeypatch, sessions):
 @pytest.mark.parametrize(
     ("driver", "connection_options"),
     [
-        ("asyncpg", {"server_settings": {"jit": "off"}}),
-        ("postgresql+asyncpg", {"server_settings": {"jit": "off"}}),
+        ("asyncpg", {"server_settings": {"jit": "off"}, "prepared_statement_cache_size": 256}),
+        ("postgresql+asyncpg", {"server_settings": {"jit": "off"}, "prepared_statement_cache_size": 256}),
         ("psycopg", {"options": "-c jit=off"}),
         ("postgresql+psycopg", {"options": "-c jit=off"}),
     ],
