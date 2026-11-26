@@ -567,7 +567,7 @@ def _native_child_candidate_ids(context, entity_values, selector):
         .where(
             binding.dataset_id == pinned_target.dataset_id,
             binding.adapter_id == "npi",
-            binding.canonical_value.in_(entity_values),
+            core._canonical_entity_value(context, binding).in_(entity_values),
         )
         .subquery("native_child_bindings")
     )

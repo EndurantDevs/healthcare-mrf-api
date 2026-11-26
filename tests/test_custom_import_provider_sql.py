@@ -151,3 +151,74 @@ def test_compiler_rejects_tuple_expansion_and_literal_execution():
         compile_npi_entity_relation(tuple_statement)
     with pytest.raises(ValueError, match="literal-execute"):
         compile_npi_entity_relation(literal_statement)
+
+
+def _aliased_relation_statement():
+    """Build an ORM-aliased subquery join with VALUES binds matching compact reader SQL."""
+    from sqlalchemy import BigInteger, exists, literal_column, values
+    from sqlalchemy.orm import aliased
+
+    from db.models.custom_import import CustomImportFamilyRevision, CustomImportRootRevision, CustomImportWinner
+
+    meta = MetaData()
+    fam = Table(
+        "sample_block_family",
+        meta,
+        Column("family_revision_id", BigInteger, primary_key=True),
+        Column("root_record_id", BigInteger),
+        Column("root_revision_id", BigInteger),
+        Column("entity_binding_id", BigInteger),
+        Column("raw_field_2", Integer),
+    )
+    win = Table(
+        "sample_winner",
+        meta,
+        Column("family_revision_id", BigInteger),
+        Column("entity_binding_id", BigInteger),
+        Column("dataset_id", BigInteger),
+    )
+    winner_m = aliased(CustomImportWinner, win, adapt_on_names=True)
+    family_sub = select(
+        fam.c.family_revision_id,
+        fam.c.root_record_id,
+        fam.c.root_revision_id,
+        fam.c.entity_binding_id,
+        literal_column("1").cast(BigInteger).label("dataset_id"),
+    ).subquery("block_family_identity")
+    family_m = aliased(CustomImportFamilyRevision, family_sub, adapt_on_names=True)
+    root_sub = select(
+        fam.c.root_revision_id,
+        fam.c.root_record_id,
+        literal_column("1").cast(BigInteger).label("dataset_id"),
+    ).subquery("block_root_identity")
+    root_m = aliased(CustomImportRootRevision, root_sub, adapt_on_names=True)
+    scalar_sub = select(fam.c.root_revision_id, fam.c.root_record_id).where(fam.c.raw_field_2 == 7).subquery("s_0_2")
+    native_vals = values(Column("npi_id", BigInteger)).data([(1001,), (1002,), (1003,)]).cte("native_ids")
+
+    return (
+        select(winner_m, family_m, root_m)
+        .select_from(winner_m)
+        .join(family_m, family_m.family_revision_id == winner_m.family_revision_id)
+        .join(root_m, root_m.root_revision_id == family_m.root_revision_id)
+        .where(
+            winner_m.entity_binding_id.in_(select(native_vals.c.npi_id)),
+            exists(
+                select(1)
+                .select_from(scalar_sub)
+                .where(
+                    scalar_sub.c.root_revision_id == family_m.root_revision_id,
+                    scalar_sub.c.root_record_id == family_m.root_record_id,
+                )
+            ),
+        )
+        .with_only_columns(winner_m.entity_binding_id.label("entity_value"), maintain_column_froms=True)
+    )
+
+
+def test_compiler_preserves_orm_aliased_subquery_identities_and_values_binds():
+    """Compilation rewrites bind parameters without cloning ORM-aliased subqueries or losing VALUES binds."""
+    relation = compile_npi_entity_relation(_aliased_relation_statement())
+
+    assert relation.sql.count("AS block_family_identity") == 1
+    assert relation.sql.count("AS block_root_identity") == 1
+    assert {1001, 1002, 1003, 7} <= set(relation.values.values())

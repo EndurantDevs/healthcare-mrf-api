@@ -726,7 +726,7 @@ class CustomImportReadService:
         statement = (
             _filtered_npi_winner_statement(context, normalized_filters, context_filters=normalized_context_filters)
             .add_columns(entity_model.canonical_value)
-            .where(entity_model.canonical_value.in_(entity_values))
+            .where(_canonical_entity_value(context, entity_model).in_(entity_values))
         )
         if full_family and entity_values:
             await _require_unambiguous_npi_families(session, context, statement)
@@ -1947,6 +1947,13 @@ def _npi_entity_relation_fingerprint(
     return hashlib.sha256(_NPI_ENTITY_RELATION_FINGERPRINT_DOMAIN + _canonical_bytes(query_shape_map)).hexdigest()
 
 
+def _canonical_entity_value(context: _ReadContext, entity_model):
+    """Match compact entity bindings through their covering COLLATE C unique index."""
+    if getattr(context, "family_block_binding", None) is not None:
+        return entity_model.canonical_value.collate("C")
+    return entity_model.canonical_value
+
+
 def _npi_entity_relation_statement(
     context: _ReadContext,
     filters: tuple[_NormalizedFilter, ...],
@@ -1958,11 +1965,42 @@ def _npi_entity_relation_statement(
     """Project exact NPI bindings and optional winner-local typed sort values."""
 
     entity_model = context.model(CustomImportEntityBinding)
+    all_filters = (*context_filters, *filters)
+    if (
+        getattr(context, "family_block_binding", None) is not None
+        and context.profile_context_slot == 0
+        and all(predicate.field.collection is None for predicate in all_filters)
+        and all(context.definition.fields_by_id[term.field_id].collection is None for term in order_terms)
+    ):
+        from process.custom_import.family_block_read_sql import (
+            compact_single_family_winner_base,
+            direct_root_scalar_order_value,
+            direct_root_scalar_predicate,
+        )
+
+        winner_model = context.model(CustomImportWinner)
+        statement, _family_table = compact_single_family_winner_base(
+            context, winner_model, entity_model, _pinned_generation_winner_statement
+        )
+        statement = statement.where(
+            entity_model.dataset_id == context.target.dataset_id,
+            entity_model.adapter_id == "npi",
+        )
+        for predicate in all_filters:
+            statement = statement.where(direct_root_scalar_predicate(context, predicate, _has_scalar_comparison))
+        if entity_values is not None:
+            statement = statement.where(_canonical_entity_value(context, entity_model).in_(entity_values))
+        columns: list[object] = [entity_model.canonical_value.label("entity_value")]
+        for ordinal, term in enumerate(order_terms):
+            field = context.definition.fields_by_id[term.field_id]
+            columns.append(direct_root_scalar_order_value(context, field).label(f"sort_{ordinal}"))
+        statement = statement.with_only_columns(*columns, maintain_column_froms=True)
+        return statement if order_terms else statement.distinct()
 
     statement = _filtered_npi_winner_statement(context, filters, context_filters=context_filters)
     if entity_values is not None:
-        statement = statement.where(entity_model.canonical_value.in_(entity_values))
-    columns: list[object] = [entity_model.canonical_value.label("entity_value")]
+        statement = statement.where(_canonical_entity_value(context, entity_model).in_(entity_values))
+    columns = [entity_model.canonical_value.label("entity_value")]
     for ordinal, term in enumerate(order_terms):
         field = context.definition.fields_by_id[term.field_id]
         columns.append(_order_scalar_expression(field, context).label(f"sort_{ordinal}"))
@@ -2530,17 +2568,27 @@ async def _require_unambiguous_npi_families(session, context, statement):
         raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
 
 
-async def _entity_winner_locator(
-    session: AsyncSession,
-    context: _ReadContext,
-    entity: EntityLocator,
-) -> WinnerLocator:
-    """Resolve one entity only when its pinned profile has one root family."""
+def _entity_winner_statement(context: _ReadContext, entity: EntityLocator):
+    """Build the single-entity winner query, bypassing legacy views on compact roots."""
 
     winner_model = context.model(CustomImportWinner)
     family_model = context.model(CustomImportFamilyRevision)
     entity_model = context.model(CustomImportEntityBinding)
+    if getattr(context, "family_block_binding", None) is not None and context.profile_context_slot == 0:
+        from process.custom_import.family_block_read_sql import compact_single_family_winner_base
 
+        entity_statement, family_table = compact_single_family_winner_base(
+            context, winner_model, entity_model, _pinned_generation_winner_statement
+        )
+        return (
+            entity_statement.where(
+                entity_model.dataset_id == context.target.dataset_id,
+                entity_model.adapter_id == entity.adapter_id,
+                _canonical_entity_value(context, entity_model) == entity.value,
+            ),
+            family_table.c.root_record_id,
+            True,
+        )
     entity_statement = (
         _winner_statement(context)
         .join(
@@ -2552,13 +2600,25 @@ async def _entity_winner_locator(
         )
         .where(
             entity_model.adapter_id == entity.adapter_id,
-            entity_model.canonical_value == entity.value,
+            _canonical_entity_value(context, entity_model) == entity.value,
         )
     )
+    return entity_statement, family_model.root_record_id, False
+
+
+async def _entity_winner_locator(
+    session: AsyncSession,
+    context: _ReadContext,
+    entity: EntityLocator,
+) -> WinnerLocator:
+    """Resolve one entity only when its pinned profile has one root family."""
+
+    winner_model = context.model(CustomImportWinner)
+    entity_statement, root_record_col, is_compact_root = _entity_winner_statement(context, entity)
     family_rows = (
         await session.execute(
             entity_statement.with_only_columns(
-                family_model.root_record_id,
+                root_record_col,
                 winner_model.family_revision_id,
                 winner_model.entity_binding_id,
                 maintain_column_froms=True,
@@ -2573,10 +2633,15 @@ async def _entity_winner_locator(
     if len(family_rows) != 1:
         raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
     root_record_id, family_revision_id, entity_binding_id = family_rows[0]
+    locator_statement = (
+        entity_statement.with_only_columns(winner_model.context_key_sha256, maintain_column_froms=True)
+        if is_compact_root
+        else entity_statement
+    )
     selected_row = (
         await session.execute(
-            entity_statement.where(
-                family_model.root_record_id == root_record_id,
+            locator_statement.where(
+                root_record_col == root_record_id,
                 winner_model.family_revision_id == family_revision_id,
                 winner_model.entity_binding_id == entity_binding_id,
             )
@@ -2586,6 +2651,13 @@ async def _entity_winner_locator(
     ).one_or_none()
     if selected_row is None:
         raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+    if is_compact_root:
+        return WinnerLocator(
+            root_record_id=root_record_id,
+            family_revision_id=family_revision_id,
+            entity_binding_id=entity_binding_id,
+            context_key_sha256=bytes(selected_row[0]),
+        )
     winner, family = _winner_row(selected_row, context.profile_context_slot > 0)[:2]
     return _winner_locator(winner, family)
 
