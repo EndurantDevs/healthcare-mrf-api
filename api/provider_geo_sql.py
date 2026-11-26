@@ -14,6 +14,7 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import BigInteger, bindparam, column, select, table, text
 
 from api.custom_import_provider_sql import ProviderImportQuery
+from api.provider_geo_search import nearest_first_pages
 from api.provider_list_sql import _address_zip5_filter, _provider_list_connection, _provider_list_parameters
 from db.tiger_models import Zip_zcta5
 
@@ -244,17 +245,21 @@ def native_geo_entity_scope():
     return select(native_geo.c.npi_code).distinct()
 
 
-def _native_eligible_geo_cte(
-    nearby: NearbySqlQuery, *, projected_plan_membership: str | None = None, spatial_first: bool = False
-) -> str:
+BOUNDED_CONTINUATION_RADIUS_SHARE = 0.1
+_BOUNDED_CONTINUATION_ATTEMPTS = 4
+_PAST_EVERY_IDENTITY = MappingProxyType(
+    {"cursor_npi": 9999999999, "cursor_address_key": "ffffffff-ffff-ffff-ffff-ffffffffffff"}
+)
+_GEO_CENTER = "Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))"
+_GEO_RADIUS = ":radius * 1609.34"
+_PAGE_EDGE = "CAST(:page_edge_meters AS double precision)"
+
+
+def _native_geo_source(nearby: NearbySqlQuery, *, spatial_first: bool = False) -> tuple[str, str, str]:
+    """Return the NPI column, row source and row filters shared by eligible-row reads."""
     on_search = bool(nearby.search_table_sql)
     taxonomy_where = _taxonomy_filter_where(nearby, on_search=on_search, spatial_first=spatial_first)
     npi_column, npi_join = _search_npi_source(nearby) if on_search else _LIVE_NPI_SOURCE
-    row_keys = _address_row_key_columns(nearby.address_table_sql)
-    address_key_columns = ",\n           ".join(f"a.{column} AS _geo_address_{column}" for column in row_keys)
-    geography = _nearby_geography(nearby)
-    center = "Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))"
-    radius = ":radius * 1609.34"
     geo_source = f"{nearby.search_table_sql or nearby.address_table_sql} AS a{npi_join}"
     extra_clause = nearby.search_extra_clause if on_search else nearby.extra_clause
     filters = f"""
@@ -264,6 +269,44 @@ def _native_eligible_geo_cte(
        {nearby.geo_precision_clause}
        {nearby.geo_type_clause}
        {extra_clause}{nearby.ilike_clause}"""
+    return npi_column, geo_source, filters
+
+
+def build_nearby_page_edge_sql(nearby: NearbySqlQuery, *, legacy_page_clauses: tuple[str, str] | None = None) -> str:
+    """Find how far the next ``:limit`` raw rows after the cursor reach inside the central share of the radius.
+
+    Later identities cannot precede those rows, so a continuation only has to dedupe the disc that holds them.
+    NULL means the rows run past ``:page_edge_share`` of the radius, where one read of the whole radius is cheaper.
+    """
+    nearby = nearby.with_legacy_plan_membership(legacy_page_clauses)
+    npi_column, geo_source, filters = _native_geo_source(nearby)
+    distance = f"{_nearby_geography(nearby)} <-> {_GEO_CENTER}"
+    return f"""SELECT {distance} AS page_edge_meters
+  FROM {geo_source}
+ WHERE ST_DWithin({_nearby_geography(nearby)}, {_GEO_CENTER}, {_GEO_RADIUS} * :page_edge_share){filters}
+   AND ({distance}, {npi_column}, a.address_key) > (
+       CAST(:cursor_distance_meters AS double precision),
+       CAST(:cursor_npi AS bigint),
+       CAST(:cursor_address_key AS uuid))
+ ORDER BY {distance}
+OFFSET :limit - 1 LIMIT 1"""
+
+
+def _native_eligible_geo_cte(
+    nearby: NearbySqlQuery,
+    *,
+    projected_plan_membership: str | None = None,
+    spatial_first: bool = False,
+    cursor_bounded: bool = False,
+) -> str:
+    on_search = bool(nearby.search_table_sql)
+    npi_column, geo_source, filters = _native_geo_source(nearby, spatial_first=spatial_first)
+    row_keys = _address_row_key_columns(nearby.address_table_sql)
+    address_key_columns = ",\n           ".join(f"a.{column} AS _geo_address_{column}" for column in row_keys)
+    geography = _nearby_geography(nearby)
+    center = _GEO_CENTER
+    # <-> is spherical while ST_DWithin is spheroidal: widen a bounded disc by more than their largest difference.
+    radius = f"LEAST({_GEO_RADIUS}, {_PAGE_EDGE} * 1.01)" if cursor_bounded else _GEO_RADIUS
     preceding_ctes = ""
     if projected_plan_membership is not None:
         if not on_search or not nearby.search_provider_facts:
@@ -562,28 +605,17 @@ _NATIVE_NEARBY_COUNT_SOURCE_TEMPLATE = """
    {extra_clause}{ilike_clause}"""
 
 
-def build_native_nearby_sql(
-    nearby: NearbySqlQuery,
-    *,
-    cursor_clause: str = "",
-    use_search_page: bool = False,
-    legacy_page_clauses: tuple[str, str] | None = None,
-) -> str:
-    """Keep initial KNN reads bounded and paginate canonical address identities."""
-
-    if nearby.search_table_sql and use_search_page and not cursor_clause:
-        return _native_search_page(nearby)
-    if cursor_clause:
-        # shortcut: dedupe eligible aliases first; add indexed identity selection if deep pages dominate latency.
-        nearby = nearby.with_legacy_plan_membership(legacy_page_clauses)
-        return f"""WITH {_native_eligible_geo_cte(nearby)},
+def _native_cursor_page(nearby: NearbySqlQuery, cursor_clause: str, cursor_bounded: bool) -> str:
+    """Dedupe eligible aliases before the cursor; a bounded disc keeps that cheap near the centre only."""
+    edge_clause = f"\n       AND a.cursor_distance_meters <= {_PAGE_EDGE}" if cursor_bounded else ""
+    return f"""WITH {_native_eligible_geo_cte(nearby, cursor_bounded=cursor_bounded)},
 page_geo AS MATERIALIZED (
     SELECT a.*,
            ROW_NUMBER() OVER (
                ORDER BY a.cursor_distance_meters ASC, a.npi_code ASC, a.address_key ASC
            ) AS _geo_page_position
       FROM {_NATIVE_GEO_RELATION} AS a
-     WHERE TRUE{cursor_clause}
+     WHERE TRUE{cursor_clause}{edge_clause}
      ORDER BY a.cursor_distance_meters ASC, a.npi_code ASC, a.address_key ASC
      LIMIT :limit
 ),
@@ -596,6 +628,27 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
  ORDER BY hydrated_geo._geo_page_position ASC,
           hydrated_geo.npi_code ASC,
           hydrated_geo.address_key ASC"""
+
+
+def build_native_nearby_sql(
+    nearby: NearbySqlQuery,
+    *,
+    cursor_clause: str = "",
+    use_search_page: bool = False,
+    legacy_page_clauses: tuple[str, str] | None = None,
+    cursor_bounded: bool = False,
+) -> str:
+    """Keep initial KNN reads bounded and paginate canonical address identities.
+
+    ``cursor_bounded`` dedupes only the disc within ``:page_edge_meters`` and returns the identities inside it.
+    """
+
+    if nearby.search_table_sql and use_search_page and not cursor_clause:
+        return _native_search_page(nearby)
+    if cursor_clause:
+        return _native_cursor_page(
+            nearby.with_legacy_plan_membership(legacy_page_clauses), cursor_clause, cursor_bounded
+        )
 
     legacy_initial_clause, _ = legacy_page_clauses or (None, None)
     extra_clause = nearby.extra_clause if legacy_initial_clause is None else legacy_initial_clause
@@ -621,6 +674,47 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
         ),
         address_table_sql=nearby.address_table_sql,
     )
+
+
+async def fetch_nearby_batch(
+    connection,
+    nearby: NearbySqlQuery,
+    cursor_clause: str,
+    parameters_by_name: Mapping[str, object],
+    page_options_by_name: Mapping[str, Any],
+    *,
+    is_requested_continuation: bool,
+) -> Sequence[Any]:
+    """Read the native batch after the cursor, deduping only the disc that holds it when the cursor is central.
+
+    A disc whose rows all repeat served identities is skipped: the read resumes just past its edge. Farther out,
+    and for the first page, one read of the whole radius serves the batch.
+    """
+    batch_parameters_by_name = dict(parameters_by_name)
+    edge_sql = build_nearby_page_edge_sql(nearby, legacy_page_clauses=page_options_by_name.get("legacy_page_clauses"))
+    for _attempt in range(_BOUNDED_CONTINUATION_ATTEMPTS if is_requested_continuation else 0):
+        central_meters = BOUNDED_CONTINUATION_RADIUS_SHARE * float(batch_parameters_by_name["radius"]) * 1609.34
+        if batch_parameters_by_name["cursor_distance_meters"] > central_meters:
+            break
+        async with nearest_first_pages(connection, True):
+            # Search past the central share so a batch that straddles it still finds its edge.
+            edge_rows = await connection.all(
+                text(edge_sql), page_edge_share=2 * BOUNDED_CONTINUATION_RADIUS_SHARE, **batch_parameters_by_name
+            )
+            if not edge_rows:
+                break
+            page_edge_meters = float(edge_rows[0][0])
+            bounded_sql = build_native_nearby_sql(
+                nearby, cursor_clause=cursor_clause, cursor_bounded=True, **page_options_by_name
+            )
+            batch_rows = await connection.all(
+                text(bounded_sql), page_edge_meters=page_edge_meters, **batch_parameters_by_name
+            )
+        if batch_rows:
+            return batch_rows
+        batch_parameters_by_name.update(_PAST_EVERY_IDENTITY, cursor_distance_meters=page_edge_meters)
+    radius_sql = build_native_nearby_sql(nearby, cursor_clause=cursor_clause, **page_options_by_name)
+    return await connection.all(text(radius_sql), **batch_parameters_by_name)
 
 
 def build_native_nearby_count_sql(
@@ -929,6 +1023,8 @@ __all__ = (
     "build_imported_geo_statements",
     "build_native_nearby_count_sql",
     "build_native_nearby_sql",
+    "build_nearby_page_edge_sql",
+    "fetch_nearby_batch",
     "nearby_batch_identities",
     "nearby_extra_clauses",
     "nearby_row_tiebreaker",

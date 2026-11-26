@@ -12,6 +12,7 @@ from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import MetaData, text
 from sqlalchemy.sql.elements import TextClause
 
+from api import provider_geo_sql
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from db.connection import ConnectionProxy, current_session
@@ -59,13 +60,17 @@ async def near_database(monkeypatch):
         await grant_profile_reader(database, schema, (*tables_by_name, successor.name))
         # The geo templates retain their documented canonical namespace; only
         # relocate that namespace into this fixture's UUID-owned schema.
-        for name in ("build_native_nearby_sql", "build_native_nearby_count_sql"):
-            build = getattr(npi, name)
+        for module, name in (
+            (provider_geo_sql, "build_native_nearby_sql"),
+            (provider_geo_sql, "build_nearby_page_edge_sql"),
+            (npi, "build_native_nearby_count_sql"),
+        ):
+            build = getattr(module, name)
 
             def in_schema(*args, build=build, **kwargs):
                 return build(*args, **kwargs).replace("mrf.", f'"{schema}".')
 
-            monkeypatch.setattr(npi, name, in_schema)
+            monkeypatch.setattr(module, name, in_schema)
         execute = npi._execute_stmt
 
         async def execute_in_schema(statement, **kwargs):

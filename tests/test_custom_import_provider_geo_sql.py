@@ -706,6 +706,47 @@ async def test_postgres_legacy_plan_geo_count_and_cursor_keep_distinct_provider_
         ]
 
 
+class _SessionReader:
+    """Expose a session through the reader call the native batch helper uses."""
+
+    def __init__(self, session):
+        self.session = session
+
+    async def all(self, statement, **parameters):
+        return (await self.session.execute(statement, parameters)).all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("address_table_sql", ("mrf.npi_address", "mrf.entity_address_unified"))
+async def test_postgres_bounded_continuation_matches_radius(address_table_sql, monkeypatch):
+    """A bounded continuation returns the full-radius batch, even past an edge that only repeats aliases."""
+    monkeypatch.setattr(geo_sql, "BOUNDED_CONTINUATION_RADIUS_SHARE", 0.5)
+    async with transaction_session() as session:
+        await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
+        nearby = _imported_geo_query(address_table_sql=address_table_sql).nearby
+        reader = _SessionReader(session)
+        cursor = (0.0, 0, "00000000-0000-0000-0000-000000000000")
+        served_identities = []
+        for _ in range(8):
+            cursor_clause, cursor_parameters_by_name = npi_module._nearby_cursor_filter(cursor)
+            parameters_by_name = {"in_long": 0.0, "in_lat": 0.0, "radius": 10.0, "limit": 1}
+            parameters_by_name.update(cursor_parameters_by_name)
+            batches = [
+                await geo_sql.fetch_nearby_batch(
+                    reader, nearby, cursor_clause, parameters_by_name, {}, is_requested_continuation=is_bounded
+                )
+                for is_bounded in (False, True)
+            ]
+            assert list(map(repr, batches[1])) == list(map(repr, batches[0]))
+            if not batches[0]:
+                break
+            mapping = batches[0][0]._mapping
+            cursor = (mapping["cursor_distance_meters"], mapping["npi_code"], str(mapping["address_key"]))
+            served_identities.append(cursor[1:])
+        assert len(served_identities) == len(set(served_identities)) >= 4
+
+
 def _postgres_request(session, *, cursor_anchor=None):
     async def prepare_cursor(**_kwargs):
         return cursor_anchor
