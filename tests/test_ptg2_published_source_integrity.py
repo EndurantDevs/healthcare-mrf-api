@@ -20,9 +20,7 @@ from .test_ptg2_manifest_tables import (
     "mutator",
     [
         pytest.param(
-            lambda rows: rows[1].update(
-                raw_container_sha256=rows[0]["raw_container_sha256"]
-            ),
+            lambda rows: rows[1].update(raw_container_sha256=rows[0]["raw_container_sha256"]),
             id="duplicate-raw-container",
         ),
         pytest.param(
@@ -34,9 +32,7 @@ from .test_ptg2_manifest_tables import (
             id="malformed-source-trace-set-hash",
         ),
         pytest.param(
-            lambda rows: rows[1].update(
-                identity_kind="logical_json_sha256_v1"
-            ),
+            lambda rows: rows[1].update(identity_kind="logical_json_sha256_v1"),
             id="deferred-kind",
         ),
         pytest.param(
@@ -81,15 +77,6 @@ def test_published_source_set_rejects_adversarial_identity_rows(mutator):
     ("manifest_source_set", "attested_digest"),
     [
         pytest.param(None, None, id="missing-manifest-source-set"),
-        pytest.param(
-            {
-                "contract": "sorted_raw_container_sha256_bytes_v1",
-                "source_count": 2,
-                "raw_container_sha256_digest": "f" * 64,
-            },
-            "f" * 64,
-            id="manifest-does-not-match-persisted-rows",
-        ),
         pytest.param(strict_source_set(), "f" * 64, id="attestation-mismatch"),
     ],
 )

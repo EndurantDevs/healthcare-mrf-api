@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 
+from api import plan_pricing_code_storage as code_storage
 from api import ptg_membership_storage as storage
 from api.ptg_membership_contract import CONTRACT, SPEC, digest
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -83,7 +84,7 @@ async def test_attachment_dependency_and_namespace_drift_refuses_before_storage_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", [None, "schema", "relation"])
+@pytest.mark.parametrize("drift", [None, "schema", "relation", "row_security"])
 async def test_attachment_locks_complete_names_and_checks_recaptured_layout(monkeypatch, drift):
     rows = _dependencies()
     ownership = SimpleNamespace(schema_name=rows[0][0], relation_names=tuple(row[1] for row in rows))
@@ -93,11 +94,14 @@ async def test_attachment_locks_complete_names_and_checks_recaptured_layout(monk
         ownership.relation_names = ownership.relation_names[:-1] + ("other_table",)
     lock, capture = AsyncMock(), AsyncMock(return_value=ownership)
     monkeypatch.setattr(storage.native, "_lock_family", lock)
-    monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", capture)
+    monkeypatch.setattr(storage, "read_model_family_ownership", capture)
+    plain = AsyncMock(return_value=drift != "row_security")
+    monkeypatch.setattr(code_storage, "has_locked_plain_heaps", plain)
     session = _session(rows=rows)
     view = "hp_snapshot_retention." + storage.attachment_name(PARAMS)
     if drift:
-        with pytest.raises(PTG2ManifestArtifactError, match="storage names changed"):
+        refusal = "storage is not plain" if drift == "row_security" else "storage names changed"
+        with pytest.raises(PTG2ManifestArtifactError, match=refusal):
             await storage._attachment_storage(session, view)
     else:
         assert await storage._attachment_storage(session, view) is ownership
@@ -194,3 +198,21 @@ async def test_absent_retirement_holds_existing_fences_but_never_drops_or_delete
     lock.assert_awaited_once_with(session, PARAMS)
     locate.assert_awaited_once_with(session, PARAMS)
     session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_membership_storage_read_names_its_tables_in_one_query():
+    dataset_id = UUID(int=7)
+    names = sorted(SPEC.table_names)
+    rows = [(11, name, 100 + index) for index, name in enumerate(names)]
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        execute=AsyncMock(return_value=SimpleNamespace(all=lambda: rows)),
+    )
+    ownership = await storage.read_model_family_ownership(session, SPEC, dataset_id)
+    assert session.execute.await_count == 1
+    assert ownership.schema_name == storage.native.reference_family_stage_schema(dataset_id)
+    assert ownership.relation_names == tuple(names) and ownership.schema_oid == 11
+    session.execute.return_value = SimpleNamespace(all=lambda: rows[:-1])
+    with pytest.raises(storage.native.ReferenceFamilyArchiveError, match="relation is missing"):
+        await storage.read_model_family_ownership(session, SPEC, dataset_id)
