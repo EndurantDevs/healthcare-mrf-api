@@ -185,6 +185,11 @@ class SourceProxyRun:
             self._audit["cooldowns"] = binding.cooldown_snapshot()
             metrics["source_http_proxy"] = self._audit
 
+    def record_destination_hold(self, retry_not_before, cooldowns):
+        """Record a source-wide access boundary in the worker's durable audit."""
+        self._audit["retry_not_before"] = retry_not_before
+        self._audit["cooldowns"] = cooldowns
+
     def enabled(self, source_record):
         """Require preparation before an enabled Source can dispatch a request."""
         if self.config.policy_revision is None:

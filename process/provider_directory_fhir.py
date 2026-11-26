@@ -665,7 +665,9 @@ REVIEWED_ACCEPTING_MEDICAID_EXTENSION_URLS = frozenset(
         "https://healthporta.com/fhir/provider-directory/accepting-medicaid",
     }
 )
-FHIR_FETCH_MODES = frozenset({"rest_bundle", "rest_read", "bulk_ndjson", "graphql", vsp_directory.TRANSPORT})
+FHIR_FETCH_MODES = (
+    frozenset({"rest_bundle", "rest_read", "bulk_ndjson", "graphql"}) | source_selection.DIRECTORY_FETCH_MODES
+)
 _PUBLISH_SCOPE_UNSET = object()
 _DATASET_SERVING_RELATION_ROOT_UNSET = object()
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(resource_type.lower() for resource_type in DEFAULT_RESOURCES)
@@ -56038,8 +56040,7 @@ def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[
     if not api_base:
         return source.get("source_id") or "", "", ()
     proxy_run = source_proxy.current_run()
-    if vsp_directory.is_source(source):
-        vsp_directory.require(not _credential_spec_for_source(source), "vsp_source_credentials_forbidden")
+    if source_selection.is_anonymous_directory_source(sys.modules[__name__], source):
         credential_descriptor_by_field = None
     elif api_base in highmark.API_BASES:
         credential_descriptor_by_field = {"header_names": [highmark.KEY_HEADER], "query_param_names": []}
@@ -56494,8 +56495,9 @@ def _pagination_checkpoint_scope_identity(
         or census_contract is not None
         or is_opaque_cursor_census
         or isinstance(_source_metadata(source_record).get("provider_directory_network_snapshot"), dict)
+        or source_selection.search_directory_adapter(source_record)
     )
-    if not (source_ids and (vsp_directory.is_source(source_record) or supports_checkpoint) and canonical_api_base):
+    if not (source_ids and supports_checkpoint and canonical_api_base):
         return None
     strategy_version = (
         census_contract.strategy_version
@@ -65518,7 +65520,7 @@ async def _import_resources(
             or any(
                 _uses_alohr_graphql_connector(selected_source)
                 or _uses_uhc_official_file_connector(selected_source)
-                or vsp_directory.is_source(selected_source)
+                or source_selection.search_directory_adapter(selected_source)
                 for selected_source in source_records
             )
         ):
@@ -65812,15 +65814,13 @@ async def _import_resources(
                 if resource_completion is not None:
                     resource_completion.setdefault(resource, set()).update(source_ids)
             return import_summary
-        if vsp_directory.is_source(partition_source):
-            vsp_directory.require(
-                source_ids == [vsp_directory.SOURCE_ID]
-                and set(_endpoint_dataset_selected_resources(source_group, resources))
-                == set(vsp_directory.RESOURCE_TYPES)
-                and defer_typed_materialization
-                and per_resource_limit == page_limit == linked_resource_limit == 0
-                and not stale_cleanup,
-                "vsp_full_deferred_acquisition_required",
+        if source_selection.search_directory_adapter(partition_source):
+            source_selection.require_directory_acquisition(
+                partition_source,
+                source_ids,
+                _endpoint_dataset_selected_resources(source_group, resources),
+                defer_typed_materialization
+                and not (per_resource_limit or page_limit or linked_resource_limit or stale_cleanup),
             )
 
             async def capture_progress(details):
@@ -65830,7 +65830,7 @@ async def _import_resources(
                 await report_progress()
 
             async with asyncio.timeout(resource_deadline_seconds or None):
-                return await vsp_directory.import_group(
+                return await source_selection.search_directory_adapter(partition_source).import_group(
                     sys.modules[__name__],
                     partition_source,
                     run_id=run_id,
@@ -67931,9 +67931,9 @@ async def process_provider_directory_fhir_data(
         total=1,
         message="resolving Provider Directory source catalog",
     )
-    is_vsp_selected = census_request is None and vsp_directory.explicit_selection(requested_source_ids, source_query)
-    if is_vsp_selected:
-        vsp_directory.require(not test_mode, "vsp_test_capture_forbidden")
+    directory_adapter = source_selection.requested_directory_adapter(requested_source_ids, source_query, census_request)
+    if directory_adapter is not None:
+        source_selection.require_directory_task(directory_adapter, task, test_mode=test_mode)
         seed_rows = []
     elif census_request is not None:
         seed_rows = reviewed_census_seed_rows
@@ -67962,7 +67962,7 @@ async def process_provider_directory_fhir_data(
             limit=None if (task.get("retest_results_path") or task.get("retest_results_url")) else limit,
             source_query=source_query,
         )
-    if census_request is None and not is_vsp_selected:
+    if census_request is None and directory_adapter is None:
         retest_path, retest_tmpdir = _resolve_retest_results(
             retest_results_path,
             _clean_text(task.get("retest_results_url")),
@@ -67993,13 +67993,13 @@ async def process_provider_directory_fhir_data(
     proxy_token, proxy_run = source_proxy.enter_run(sys.modules[__name__])
     try:
         source_rows = _dedupe_source_rows([_source_row_from_seed(seed_record) for seed_record in seed_rows])
-        if is_vsp_selected:
-            source_rows = [vsp_directory.source_row(_now())]
+        if directory_adapter is not None:
+            source_rows = [directory_adapter.source_row(_now())]
         elif census_request is None:
             source_rows = [
                 source_record
                 for source_record in source_rows
-                if source_record.get("source_id") != vsp_directory.SOURCE_ID
+                if source_record.get("source_id") not in source_selection.DIRECTORY_SOURCE_IDS
             ]
             source_rows = _add_uhc_official_file_source(
                 source_rows,
