@@ -1,14 +1,19 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Retire only explicitly selected published generations and preserve already pinned reads."""
 
+import json
 from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
 
 from process.network_compact_retention import NetworkCompactRetentionError
+from process.network_fhir_source_witness_contract import canonical
+from process.network_fhir_typed_capture import COMMENT as TYPED_COMMENT
+from process.network_fhir_typed_capture import TABLES as TYPED_TABLES
 from process.network_generation_retirement import NetworkGenerationRetirementError, retire_network_generations
 from process.network_serving_read import resolve_network_serving_manifest
+from process.registry_source_recipe_store import canonical_registry_source_recipes, registry_source_recipes_sha256
 from tests.test_network_compact_publication_postgres import (
     _candidate,
     _prepare,
@@ -410,3 +415,233 @@ async def test_independent_network_storage_metadata_includes_composition_tables(
         (composition_source.schema_name, "provider_location_binding"),
         (first.schema_name, "network_membership"),
     } <= recorded_relations
+
+
+def _typed_capture_doc(capture_num, catalog, graph_doc):
+    """Build one v5 typed capture document for a synthetic fixture schema."""
+    from process.network_fhir_source_witness_contract import digest
+    from process.network_fhir_typed_capture import PREFIX, TypedGraphAnchor
+
+    anchor = TypedGraphAnchor(str(UUID(int=capture_num)), "2026-10-01T00:00:00.000000+00:00")
+    typed_schema = PREFIX + UUID(anchor.capture_id).hex
+    tables_by_kind = {kind: {"schema": typed_schema, "name": table_name} for kind, table_name in TYPED_TABLES.items()}
+    content_by_kind = {kind: {"rows": 1, "sha256": "b" * 64} for kind in TYPED_TABLES}
+    capture_by_field = {
+        "component": "registry_fhir_typed_capture",
+        "descriptor_version": 5,
+        "capture_id": anchor.capture_id,
+        "observed_at": anchor.observed_at,
+        "schema_name": typed_schema,
+        "tables": tables_by_kind,
+        "content": content_by_kind,
+        "graph": graph_doc,
+        "catalog_descriptor": catalog,
+    }
+    capture_by_field["capture_sha256"] = digest(capture_by_field)
+    return anchor, typed_schema, capture_by_field
+
+
+async def _create_typed_schema_fixture(connection, *, capture_num, dataset_id):
+    """Create a synthetic typed capture schema and signed comment."""
+    from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+    from process.network_fhir_typed_contract import graph_document
+    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+    from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+    from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
+    from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+    from tests.test_network_fhir_source_witness_contract import origin_fields
+    from tests.test_registry_fhir_catalog_sources import descriptor as catalog_descriptor
+    from tests.test_registry_fhir_catalog_sources import published_row, read_profile
+
+    observed = FHIRCatalogObservationDigests()
+    observed.add(
+        {
+            "resource_type": "PractitionerRole",
+            "resource_id": "role-one",
+            "payload_hash": "e" * 64,
+            "payload_json": {"resourceType": "PractitionerRole", "id": "role-one"},
+        }
+    )
+    families = observed.document()
+    catalog = build_fhir_catalog_observation_descriptor(
+        read_profile(),
+        published_row(dataset_id=dataset_id, resource_count=1),
+        catalog_descriptor()["tables"],
+        ("https://directory.example.test/fhir/", ["alias-a", "alias-b"]),
+        families,
+    )
+    counts = tuple(sorted((kind, family["rows"]) for kind, family in families.items()))
+    origin = origin_fields() | {
+        "schema_name": catalog["coordinates"]["dataset_schema"],
+        "source_id": catalog["coordinates"]["source_id"],
+        "dataset_id": dataset_id,
+        "source_aliases": tuple(catalog["source_aliases"]),
+        "source_uri": catalog["source_uri"],
+        "header_relation": catalog["tables"]["header"],
+        "resource_relation": catalog["tables"]["resource"],
+        "semantic_projection_as_of": "2026-10-01",
+        "resource_counts": counts,
+        "resource_hashes": tuple(sorted((kind, family["sha256"]) for kind, family in families.items())),
+        "descriptor_counts": counts,
+    }
+    graph_doc = graph_document(
+        origin,
+        "2026-10-01",
+        {"source_rows": 1, "projected_rows": 1, "pair_rows": 1, "reference_rows": 1, "provider_only_roles": 0},
+    )
+    anchor, typed_schema, capture_doc = _typed_capture_doc(capture_num, catalog, graph_doc)
+    await connection.execute(f'CREATE SCHEMA "{typed_schema}"')
+    for table_name in TYPED_TABLES.values():
+        await connection.execute(f'CREATE TABLE "{typed_schema}"."{table_name}"(id integer PRIMARY KEY)')
+    comment_literal = (TYPED_COMMENT + canonical(capture_doc)).replace("'", "''")
+    await connection.execute(f"COMMENT ON SCHEMA \"{typed_schema}\" IS '{comment_literal}'")
+    pin = PinnedTypedFHIRMembershipSource(capture_doc, anchor, catalog)
+    return RegistrySourceMembershipRecipe(pin, RegistryNetworkSourceCoordinates(**catalog["coordinates"]))
+
+
+async def _pin_typed_recipes(connection, control, candidate_id, recipes):
+    encoded = canonical_registry_source_recipes(recipes)
+    await connection.execute(
+        f"""UPDATE {control}.network_membership_candidate
+        SET source_recipes_json=$2::jsonb,
+            source_generations=coalesce(source_generations,'{{}}'::jsonb)
+              || jsonb_build_object('registry_source_recipes',$3::text)
+        WHERE candidate_id=$1""",
+        UUID(candidate_id),
+        encoded,
+        registry_source_recipes_sha256(encoded),
+    )
+
+
+async def _assert_queued_request_defers_typed_schema(fixture, control, first, current, stale_recipe):
+    """Verify an active publication request prevents dropping a referenced typed schema."""
+    request_id = uuid4()
+    await fixture.connection.execute(
+        f"""INSERT INTO {control}.registry_publication_request(request_id,actor_key,session_token_sha256,actor_json,
+        command_json,idempotency_key,request_sha256) VALUES($1,$2,$2,'{{}}',jsonb_build_object('capture_id',$3::text),'fixture',$2)""",
+        request_id,
+        "c" * 64,
+        stale_recipe.source_pin.anchor.capture_id,
+    )
+    blocked_report = await retire_network_generations(
+        fixture.connection,
+        generation_ids=[first.generation_id],
+        expected_head=current.generation_id,
+        control_schema=fixture.control_schema,
+    )
+    assert "typed_schemas" not in blocked_report
+    await fixture.connection.execute(
+        f"DELETE FROM {control}.registry_publication_request WHERE request_id=$1", request_id
+    )
+
+
+async def test_retire_network_generations_manages_typed_capture_schemas(compact_publication_db):
+    """Retire unreferenced typed schemas while keeping live, reusable, and queued ones."""
+    fixture = compact_publication_db
+    shared_recipe = await _create_typed_schema_fixture(fixture.connection, capture_num=101, dataset_id="ds-shared")
+    stale_recipe = await _create_typed_schema_fixture(fixture.connection, capture_num=102, dataset_id="ds-stale")
+    reusable_recipe = await _create_typed_schema_fixture(fixture.connection, capture_num=103, dataset_id="ds-reuse")
+    first = await _generation(fixture, 0)
+    current = await _generation(fixture, first.generation_id, networks=(88, 42))
+    retired_catalog = await _catalog(fixture, first, "a" * 64)
+    current_catalog = await _catalog(fixture, current, "b" * 64)
+    control = f'"{fixture.control_schema}"'
+    await _pin_typed_recipes(
+        fixture.connection, control, first.candidate_id, (shared_recipe, stale_recipe, reusable_recipe)
+    )
+    await _pin_typed_recipes(fixture.connection, control, current.candidate_id, (shared_recipe,))
+    await fixture.connection.execute(
+        f'INSERT INTO "{current_catalog}".registry_fhir_catalog_source VALUES($1::jsonb)',
+        json.dumps(reusable_recipe.source_pin.catalog_descriptor),
+    )
+    await _assert_queued_request_defers_typed_schema(fixture, control, first, current, stale_recipe)
+    stale_schema = stale_recipe.source_pin.capture["schema_name"]
+    listed = await retire_network_generations(
+        fixture.connection,
+        generation_ids=[first.generation_id],
+        expected_head=current.generation_id,
+        control_schema=fixture.control_schema,
+    )
+    assert listed == {
+        "state": "listed",
+        "generation_ids": [first.generation_id],
+        "network_schemas": [first.schema_name],
+        "metadata_generations": ["a" * 64],
+        "catalog_schemas": [retired_catalog],
+        "typed_schemas": [stale_schema],
+    }
+    retired = await retire_network_generations(
+        fixture.connection,
+        generation_ids=[first.generation_id],
+        expected_head=current.generation_id,
+        control_schema=fixture.control_schema,
+        execute=True,
+    )
+    assert retired == {**listed, "state": "retired"}
+    assert await fixture.connection.fetchval("SELECT to_regnamespace($1) IS NULL", stale_schema)
+    for kept_recipe in (shared_recipe, reusable_recipe):
+        assert await fixture.connection.fetchval(
+            "SELECT to_regnamespace($1) IS NOT NULL", kept_recipe.source_pin.capture["schema_name"]
+        )
+
+
+async def _create_bootstrap_schema_fixture(connection, schema_name):
+    await connection.execute(f'CREATE SCHEMA "{schema_name}"')
+    await connection.execute(f'CREATE TABLE "{schema_name}".entity_address_unified(id integer PRIMARY KEY)')
+    await connection.execute(f'CREATE TABLE "{schema_name}".npi(npi bigint PRIMARY KEY)')
+
+
+async def test_retire_network_generations_drops_unreferenced_bootstrap_schemas(compact_publication_db):
+    fixture = compact_publication_db
+    bootstrap_retired = "network_bootstrap_" + uuid4().hex
+    bootstrap_shared = "network_bootstrap_" + uuid4().hex
+    await _create_bootstrap_schema_fixture(fixture.connection, bootstrap_retired)
+    await _create_bootstrap_schema_fixture(fixture.connection, bootstrap_shared)
+
+    first = await _generation(fixture, 0, networks=(42, 88))
+    second = await _generation(fixture, first.generation_id, networks=(42, 88))
+    third = await _generation(fixture, second.generation_id, networks=(88, 42))
+    fourth = await _generation(fixture, third.generation_id, networks=(42, 88))
+    control = f'"{fixture.control_schema}"'
+    for candidate_id, bootstrap_schema in (
+        (first.candidate_id, bootstrap_retired),
+        (second.candidate_id, bootstrap_shared),
+        (third.candidate_id, bootstrap_shared),
+    ):
+        await fixture.connection.execute(
+            f"""UPDATE {control}.network_membership_candidate
+            SET validation_json=jsonb_set(coalesce(validation_json,'{{}}'::jsonb),'{{address_source}}',
+              jsonb_build_object('schema_name',$2::text,'table_name','entity_address_unified','generation_id',$3::text)),
+                source_generations=coalesce(source_generations,'{{}}'::jsonb)||jsonb_build_object('unified_address',$3::text)
+            WHERE candidate_id=$1""",
+            UUID(candidate_id),
+            bootstrap_schema,
+            fixture.source.generation_id,
+        )
+
+    listed_partial = await retire_network_generations(
+        fixture.connection,
+        generation_ids=[first.generation_id, second.generation_id],
+        expected_head=fourth.generation_id,
+        control_schema=fixture.control_schema,
+    )
+    assert listed_partial["bootstrap_schemas"] == [bootstrap_retired]
+    await retire_network_generations(
+        fixture.connection,
+        generation_ids=[first.generation_id, second.generation_id],
+        expected_head=fourth.generation_id,
+        control_schema=fixture.control_schema,
+        execute=True,
+    )
+    assert await fixture.connection.fetchval("SELECT to_regnamespace($1) IS NULL", bootstrap_retired)
+    assert await fixture.connection.fetchval("SELECT to_regnamespace($1) IS NOT NULL", bootstrap_shared)
+
+    retired_final = await retire_network_generations(
+        fixture.connection,
+        generation_ids=[third.generation_id],
+        expected_head=fourth.generation_id,
+        control_schema=fixture.control_schema,
+        execute=True,
+    )
+    assert retired_final["bootstrap_schemas"] == [bootstrap_shared]
+    assert await fixture.connection.fetchval("SELECT to_regnamespace($1) IS NULL", bootstrap_shared)
