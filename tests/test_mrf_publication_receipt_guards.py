@@ -143,7 +143,6 @@ async def test_completion_rejects_non_boolean_fixed_summary_selection(monkeypatc
         ("pending", "completion is unavailable"),
         ("generation", "generation differs"),
         ("relations", "generation differs"),
-        ("summary", "summary identity differs"),
         ("address", "address content differs"),
     ],
 )
@@ -160,13 +159,11 @@ async def test_export_admission_rechecks_all_completed_identities(monkeypatch, f
         monkeypatch.setattr(
             receipt, "read_reference_family_result_generation_authority", AsyncMock(return_value=changed)
         )
-    if failure == "summary":
-        row["summary_oid"] = 99
     if failure == "address":
         row["address_content"] = {}
     session = SimpleNamespace(
         in_transaction=lambda: failure != "transaction",
-        execute=AsyncMock(side_effect=[_result(10), _result(None if failure == "absent" else row), None, _result(14)]),
+        execute=AsyncMock(side_effect=[_result(10), _result(None if failure == "absent" else row), None]),
     )
     with pytest.raises(RuntimeError, match=message):
         await receipt.require_completed_publication(session, "synthetic")
@@ -222,16 +219,20 @@ def test_generation_documents_keep_logical_data_and_opaque_history(monkeypatch, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("edition", ["named", "legacy"])
+@pytest.mark.parametrize("edition", ["named", "legacy", "restored"])
 async def test_completed_receipt_preserves_raw_generation_edition(monkeypatch, edition):
     generation, row = _publication(monkeypatch)
+    if edition == "restored":
+        # A restored copy keeps relation names but not the stored relation ids.
+        row.update(summary_oid=99, summary_inputs={"plan": 98})
     if edition == "legacy":
         row["generation"]["relation_oids"] = ["opaque prior token"] * len(row["generation"].pop("relations"))
     before = deepcopy(row)
     session = SimpleNamespace(
-        in_transaction=lambda: True, execute=AsyncMock(side_effect=[_result(10), _result(row), None, _result(14)])
+        in_transaction=lambda: True, execute=AsyncMock(side_effect=[_result(10), _result(row), None])
     )
     assert (await receipt.require_completed_publication(session, "synthetic"))["generation"] == row["generation"]
+    assert "plan_search_summary" in str(session.execute.await_args_list[2].args[0])
     assert row == before
     receipt.current_reference_family_relation_oids.assert_awaited_once_with(
         session, importer_id="mrf", schema_name="synthetic"
