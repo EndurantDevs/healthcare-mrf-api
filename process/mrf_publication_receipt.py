@@ -197,13 +197,9 @@ async def require_completed_publication(session, schema: str, *, native_set=Fals
     await current_reference_family_relation_oids(session, importer_id="mrf", schema_name=schema)
     if not _is_reference_generation_current(publication_receipt["generation"], current.as_dict(), schema):
         raise RuntimeError("MRF publication completion generation differs")
-    inputs = await capture_summary_inputs(session, schema)
     # Use the finalizer's input-before-summary lock order; never lock its generation row.
-    summary = qualified(schema, "plan_search_summary")
-    await session.execute(text(f"LOCK TABLE {summary} IN SHARE MODE"))
-    summary_oid = (await session.execute(text("SELECT to_regclass(:name)::oid"), {"name": summary})).scalar_one()
-    if publication_receipt["summary_inputs"] != inputs or publication_receipt["summary_oid"] != summary_oid:
-        raise RuntimeError("MRF publication completion summary identity differs")
+    inputs = ", ".join(qualified(schema, name) for name in (*SUMMARY_INPUTS, "plan_search_summary"))
+    await session.execute(text(f"LOCK TABLE {inputs} IN SHARE MODE"))
     address_content = await capture_address_content(session, schema, qualified, native_set=native_set)
     require_address_coverage(address_content)
     if not native_set and publication_receipt["address_content"] != address_content:

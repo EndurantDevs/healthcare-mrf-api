@@ -379,9 +379,10 @@ def _aca_publication_fixture():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fault", [None, "legacy", "absent", "pending", "generation", "relations", "summary_inputs", "summary_oid"]
+    "fault",
+    [None, "legacy", "restored", "absent", "pending", "generation", "relations", "summary_inputs", "missing_relation"],
 )
-async def test_aca_current_publication_requires_completed_generation_and_exact_relations(monkeypatch, fault):
+async def test_aca_current_publication_requires_completed_generation_and_named_relations(monkeypatch, fault):
     from process.mrf_publication_receipt import SUMMARY_INPUTS
 
     completion, generation = _aca_publication_fixture()
@@ -410,8 +411,10 @@ async def test_aca_current_publication_requires_completed_generation_and_exact_r
             generation = replace(generation, relations=(("other", "plan"),))
         case "summary_inputs":
             publication_by_field["summary_inputs"] = json.dumps({name: 10 for name in SUMMARY_INPUTS if name != "plan"})
-        case "summary_oid":
-            current_relations[-1] = ("plan_search_summary", completion["summary_oid"] + 1)
+        case "restored":
+            current_relations = [(name, relation_id + 1000) for name, relation_id in current_relations]
+        case "missing_relation":
+            current_relations.pop()
     driver = SimpleNamespace(
         fetchrow=AsyncMock(return_value=publication_by_field), fetch=AsyncMock(return_value=current_relations)
     )
@@ -419,7 +422,7 @@ async def test_aca_current_publication_requires_completed_generation_and_exact_r
         accepted_aca, "read_reference_family_result_generation_authority", AsyncMock(return_value=generation)
     )
     monkeypatch.setattr(accepted_aca, "current_reference_family_relation_oids", AsyncMock())
-    if fault in (None, "legacy"):
+    if fault in (None, "legacy", "restored"):
         completed, serving = await accepted_aca._current_publication(object(), driver, "source")
         assert completed == {
             **{name: completion[name] for name in ("attempt_id", "import_id", "summary_oid", "summary_inputs")},

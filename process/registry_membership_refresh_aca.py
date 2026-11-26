@@ -47,21 +47,14 @@ async def _current_publication(session, driver, source_schema):
         SUMMARY_INPUTS
     ):
         _unavailable()
-    names = [*completion_by_field["summary_inputs"], "plan_search_summary"]
+    # Stored relation ids are history: a restored copy keeps the names, not the ids.
+    names = {*completion_by_field["summary_inputs"], "plan_search_summary"}
     actual = await driver.fetch(
-        "SELECT c.relname,c.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[])",
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[])",
         source_schema,
-        names,
+        list(names),
     )
-    expected_by_name = {
-        **completion_by_field["summary_inputs"],
-        "plan_search_summary": completion_by_field["summary_oid"],
-    }
-    if (
-        len(actual) != len(expected_by_name)
-        or dict(actual) != expected_by_name
-        or generation.serving_generation is None
-    ):
+    if {relation[0] for relation in actual} != names or generation.serving_generation is None:
         _unavailable()
     return completion_by_field, generation.serving_generation.as_dict()
 

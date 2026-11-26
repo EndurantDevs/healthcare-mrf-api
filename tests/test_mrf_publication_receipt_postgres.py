@@ -108,19 +108,6 @@ async def _configure_summary_tables(connection, monkeypatch, schema, *, drop_exi
     )
 
 
-async def _restore_rotated_summary_relation(engine, schema, table_name, prepare):
-    """Verify a changed serving relation invalidates a completed source receipt."""
-
-    async with engine.begin() as connection:
-        await connection.execute(text(f'ALTER TABLE "{schema}"."{table_name}" RENAME TO identity_old'))
-        await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (LIKE "{schema}".identity_old)'))
-    with pytest.raises(RuntimeError, match="completion summary identity differs"):
-        await prepare()
-    async with engine.begin() as connection:
-        await connection.execute(text(f'DROP TABLE "{schema}"."{table_name}"'))
-        await connection.execute(text(f'ALTER TABLE "{schema}".identity_old RENAME TO "{table_name}"'))
-
-
 async def _assert_summary_failure_revokes_source_admission(
     monkeypatch, plan_summary, archive_prepare, schema, authority
 ):
@@ -267,8 +254,6 @@ async def _assert_completed_source_admission(database, plan_summary, prepare, sc
 
 
 async def _assert_completed_source_becomes_stale(engine, database, schema, prepare):
-    for table_name in ("plan_search_summary", "plan_prices"):
-        await _restore_rotated_summary_relation(engine, schema, table_name, prepare)
     async with database.transaction() as session:
         await generation.publish_local_reference_family_generation(
             session,
@@ -940,8 +925,6 @@ async def test_summary_hash_precedes_live_lock_and_receipt_swaps_atomically(serv
             current = (await session.execute(text(f'SELECT * FROM "{schema}".{receipt.TABLE}'))).mappings().one()
             assert current["state"] == "complete" and current["summary_oid"] == stage_oid != old_oid
             observed_by_name["stage_oid"] = stage_oid
-            with pytest.raises(RuntimeError, match="completion summary identity differs"):
-                await receipt.require_completed_publication(session, schema)
             await preserve(session, schema_name, stage_name)
             if failure == "rotation":
                 await session.execute(text(f'ALTER TABLE "{schema}".plan_search_summary RENAME TO plan'))
