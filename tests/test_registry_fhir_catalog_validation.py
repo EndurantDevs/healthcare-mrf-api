@@ -302,3 +302,53 @@ async def test_imported_inventory_successor_skips_the_published_network_check():
     connection = SimpleNamespace(fetchrow=AsyncMock(), fetchval=AsyncMock())
     await validation._validate_prior_networks(connection, '"candidate"', '"control"', {"imported_source_inventory": {}})
     connection.fetchrow.assert_not_awaited()
+
+
+def test_source_vector_validates_network_hygiene_pin():
+    from process.registry_fhir_catalog_network_policy import SUPPORTED_NETWORK_HYGIENE_POLICIES
+
+    for hygiene_policy in sorted(SUPPORTED_NETWORK_HYGIENE_POLICIES):
+        entry_by_field = {
+            "source_generation": "a" * 64,
+            "source_id": "source-a",
+            "status": "current",
+            "network_hygiene": hygiene_policy,
+        }
+        validation.validate_fhir_catalog_source_vector([entry_by_field])
+
+    for invalid_policy in (None, "", "fhir-automatic-org-hygiene-v0:unknown", 123):
+        with pytest.raises(ValueError, match="registry_fhir_catalog_inputs_invalid"):
+            validation.validate_fhir_catalog_source_vector(
+                [
+                    {
+                        "source_generation": "a" * 64,
+                        "source_id": "source-a",
+                        "status": "current",
+                        "network_hygiene": invalid_policy,
+                    }
+                ]
+            )
+
+
+def test_network_hygiene_pin_blocks_pre_hygiene_reuse():
+    from datetime import timedelta
+
+    from process.registry_fhir_catalog_network_policy import AUTOMATIC_NETWORK_HYGIENE_VERSION, HIGHMARK_HYGIENE_KIND
+    from process.registry_fhir_catalog_sync import _is_pending_catalog_reusable
+
+    pre_hygiene_by_field = snapshot(standing_grant(), (descriptor(),))
+    hygiene_policy = f"{AUTOMATIC_NETWORK_HYGIENE_VERSION}:{HIGHMARK_HYGIENE_KIND}"
+    post_hygiene_by_field = {
+        **pre_hygiene_by_field,
+        "source_vector_json": [{**pre_hygiene_by_field["source_vector_json"][0], "network_hygiene": hygiene_policy}],
+    }
+    post_hygiene_by_field["metadata_generation"] = validation.metadata_generation(post_hygiene_by_field)
+    assert post_hygiene_by_field["metadata_generation"] != pre_hygiene_by_field["metadata_generation"]
+
+    later_expected_by_field = {
+        **post_hygiene_by_field,
+        "as_of": post_hygiene_by_field["as_of"] + timedelta(days=1),
+    }
+    later_expected_by_field["metadata_generation"] = validation.metadata_generation(later_expected_by_field)
+    assert _is_pending_catalog_reusable(pre_hygiene_by_field, later_expected_by_field, None) is False
+    assert _is_pending_catalog_reusable(post_hygiene_by_field, later_expected_by_field, None) is True

@@ -3,7 +3,7 @@
 
 import json
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -301,12 +301,16 @@ def _edition_descriptor(edition):
     return source
 
 
-def _catalog_resource_rows(network_names, reference_only):
+def _catalog_resource_rows(network_names, reference_only, part_of_by_id=None):
     """Build Organization and InsurancePlan resources for the staged-source fixture."""
+    part_of_lookup = part_of_by_id or {}
     resource_rows = [source_row("Organization", "insurer", {"name": "Example Insurance"})]
     for resource_id, name in network_names.items():
         type_codes = [] if resource_id in reference_only else [{"code": "ntwk"}]
-        resource_rows.append(source_row("Organization", resource_id, {"name": name, "type_codes": type_codes}))
+        org_by_field = {"name": name, "type_codes": type_codes}
+        if resource_id in part_of_lookup:
+            org_by_field["part_of_ref"] = part_of_lookup[resource_id]
+        resource_rows.append(source_row("Organization", resource_id, org_by_field))
         resource_rows.append(
             source_row(
                 "InsurancePlan",
@@ -321,11 +325,13 @@ def _catalog_resource_rows(network_names, reference_only):
     return resource_rows
 
 
-async def _staged_source(fixture, catalog_target, edition, network_names, *, source_descriptor=None, reference_only=()):
+async def _staged_source(
+    fixture, catalog_target, edition, network_names, *, source_descriptor=None, reference_only=(), part_of_by_id=None
+):
     """Use extraction output; native Source admission is covered by its own fixture."""
     source_descriptor = source_descriptor or _edition_descriptor(edition)
     generation = fhir_catalog_source_generation(source_descriptor)
-    resource_rows = _catalog_resource_rows(network_names, reference_only)
+    resource_rows = _catalog_resource_rows(network_names, reference_only, part_of_by_id)
     extracted = extract_fhir_catalog_batch(resource_rows, profile="published_normalized")
     observations = [
         (generation, "Organization", observation.resource_id, "organization", 0, canonical_json(asdict(observation)))
@@ -371,7 +377,7 @@ async def _staged_source(fixture, catalog_target, edition, network_names, *, sou
     )
 
 
-async def _snapshot(fixture, target, grant, vector, *, revision=6):
+async def _snapshot(fixture, target, grant, vector, *, revision=6, as_of=None):
     snapshot = expected_snapshot(fixture, target)
     async with fixture.connection.transaction():
         maps = (
@@ -388,6 +394,8 @@ async def _snapshot(fixture, target, grant, vector, *, revision=6):
         mapping_sha256=maps["metadata"],
         metadata_approved_revision=revision,
     )
+    if as_of is not None:
+        snapshot["as_of"] = as_of
     snapshot["metadata_generation"] = metadata_generation(snapshot)
     return snapshot
 
@@ -617,6 +625,233 @@ async def test_automatic_network_limits_check_copied_organization_bindings(metad
         await sync._require_automatic_binding_limits(fixture.connection, catalog_target.schema_name)
     assert len(await _catalog_bindings(fixture, catalog_target)) == len(carried) + len(other_bindings)
     assert len(await _catalog_bindings(fixture, fixture.target)) == len(carried)
+
+
+async def _poisoned_hygiene_predecessor(
+    fixture, grant, source_uri, edition, network_names, *, reference_only=(), part_of_by_id=None
+):
+    """Project all source Organizations without hygiene to emulate a pre-hygiene predecessor."""
+    sequence = f'"{fixture.control_schema}".network_registry_identity_network_id_seq'
+    await fixture.connection.execute(f"SELECT setval('{sequence}', 100)")
+    feed_descriptor = _edition_descriptor(edition)
+    feed_descriptor["source_uri"] = source_uri
+    disposition = await _staged_source(
+        fixture,
+        fixture.target,
+        edition,
+        network_names,
+        source_descriptor=feed_descriptor,
+        reference_only=reference_only,
+        part_of_by_id=part_of_by_id,
+    )
+    generation = fhir_catalog_source_generation(feed_descriptor)
+    snapshot = await _snapshot(
+        fixture,
+        fixture.target,
+        grant,
+        [{"source_generation": generation, "source_id": "alias-a", "status": "current"}],
+    )
+    async with fixture.connection.transaction():
+        await sync.project_manual_fhir_catalog(
+            fixture.connection,
+            fixture.target,
+            snapshot,
+            loader_role=fixture.roles["loader"],
+            control_schema=grant.control_schema,
+        )
+    original_hygiene = sync.automatic_network_hygiene_kind
+    sync.automatic_network_hygiene_kind = lambda _descriptor: None
+    try:
+        await _project(fixture, fixture.target, disposition, snapshot, grant)
+    finally:
+        sync.automatic_network_hygiene_kind = original_hygiene
+    sealed = await freeze_metadata(fixture, snapshot=snapshot)
+    return SimpleNamespace(generation=generation, disposition=disposition, snapshot=snapshot, sealed=sealed)
+
+
+async def _empty_source_fetch(*_args, **_kwargs):
+    return []
+
+
+async def _rebuild_hygiene_candidate(fixture, grant, previous, *, source_limit):
+    candidate_id = uuid4()
+    candidate_target = replace(
+        fixture.target, candidate_id=str(candidate_id), schema_name="fhir_catalog_" + candidate_id.hex
+    )
+    fixture.schemas.append(candidate_target.schema_name)
+    hygiene_policy = sync.automatic_network_hygiene_policy(previous.disposition.descriptor)
+    successor_entries = [
+        {**entry, "network_hygiene": hygiene_policy} if hygiene_policy is not None else dict(entry)
+        for entry in previous.snapshot["source_vector_json"]
+    ]
+    successor_snapshot = await _snapshot(fixture, candidate_target, grant, successor_entries)
+    config = SimpleNamespace(grant=grant, loader_role=fixture.roles["loader"])
+    current_by_generation = {previous.generation: previous.disposition}
+    source_reader = SimpleNamespace(fetch=_empty_source_fetch)
+    original_limit = sync.AUTOMATIC_NETWORKS_PER_SOURCE
+    sync.AUTOMATIC_NETWORKS_PER_SOURCE = source_limit
+    try:
+        async with fixture.connection.transaction():
+            await sync._build_source_catalog_candidate(
+                config,
+                fixture.connection,
+                (source_reader, None, None),
+                candidate_target,
+                successor_snapshot,
+                previous.sealed,
+                current_by_generation,
+            )
+    finally:
+        sync.AUTOMATIC_NETWORKS_PER_SOURCE = original_limit
+    return candidate_target, successor_snapshot
+
+
+@pytest.mark.asyncio
+async def test_highmark_hygiene_retires_prior_bindings(metadata_custody):
+    fixture = metadata_custody
+    grant = await _registry(fixture)
+    names_by_id = {
+        "MEDDIR-HMDE-N10": "Beebe Provider Network",
+        "DAVVIS-HMDE-NCommercial": "Davis Vision Commercial Network",
+        "CPRPrism-HMDE-Medicaid": "Highmark Delaware Medicaid",
+        "UCD-HMDE-N-000000001-001": "Advantage",
+        "ucd-hmde-n-000000002-001": "Elite Plus",
+        "cprprismHMDE-00008860342204003030": "Clinic Example",
+    }
+    previous = await _poisoned_hygiene_predecessor(
+        fixture,
+        grant,
+        "https://apicms.hmhs.com/fhir/v4/providers/HMDE",
+        "hmde-edition-1",
+        names_by_id,
+        reference_only=("cprprismHMDE-00008860342204003030",),
+    )
+    assert len(await _catalog_bindings(fixture, fixture.target)) == 6
+
+    candidate_target, successor_snapshot = await _rebuild_hygiene_candidate(fixture, grant, previous, source_limit=3)
+    candidate_bindings = await _catalog_bindings(fixture, candidate_target)
+    kept_keys = {json.loads(binding["document_json"])["source_key"] for binding in candidate_bindings}
+    assert kept_keys == {"MEDDIR-HMDE-N10", "DAVVIS-HMDE-NCommercial", "CPRPrism-HMDE-Medicaid"}
+    candidate_networks = await _catalog_networks(fixture, candidate_target)
+    assert len(candidate_networks) == 4
+    await freeze_metadata(fixture, target=candidate_target, snapshot=successor_snapshot)
+
+    with pytest.raises(ValueError, match="registry_fhir_catalog_automatic_network_limit_exceeded: source alias-a"):
+        await _rebuild_hygiene_candidate(fixture, grant, previous, source_limit=2)
+
+    vector_by_generation, _ = await sync._catalog_source_vector(
+        fixture.connection, previous.sealed, (previous.disposition,), None, False
+    )
+    assert vector_by_generation[previous.generation]["network_hygiene"] == sync.automatic_network_hygiene_policy(
+        previous.disposition.descriptor
+    )
+    later_expected = await _snapshot(
+        fixture,
+        candidate_target,
+        grant,
+        successor_snapshot["source_vector_json"],
+        as_of=previous.snapshot["as_of"] + timedelta(days=1),
+    )
+    assert sync._is_pending_catalog_reusable(previous.sealed, later_expected, None) is False
+    assert sync._is_pending_catalog_reusable(successor_snapshot, later_expected, None) is True
+
+
+@pytest.mark.asyncio
+async def test_ibx_hygiene_retires_prior_bindings(metadata_custody):
+    fixture = metadata_custody
+    grant = await _registry(fixture)
+    names_by_id = {
+        "ibx-ppo-1": "Independence PPO",
+        "ibx-davis-1": "Davis Vision Panel - Medicare",
+        "ibx-parented-specialty": "Specialty",
+        "ibx-pharm-1": "Retail Chain",
+        "ibx-pharm-2": "Retail Chain-Non-Preferred",
+        "ibx-pharm-3": "LTC-Non-Preferred",
+        "ibx-pharm-4": "Home Infusion-Preferred",
+        "ibx-pharm-5": "Specialty-Non-Preferred",
+        "ibx-pharm-6": "Mail",
+        "ibx-pharm-7": "Mail-Non-Preferred",
+    }
+    previous = await _poisoned_hygiene_predecessor(
+        fixture,
+        grant,
+        "https://eapics.ibx.com/provider/v1/fhir",
+        "ibx-edition-1",
+        names_by_id,
+        part_of_by_id={
+            "ibx-ppo-1": "Organization/ibx-parent",
+            "ibx-parented-specialty": "Organization/ibx-parent",
+        },
+    )
+    assert len(await _catalog_bindings(fixture, fixture.target)) == 10
+
+    candidate_target, successor_snapshot = await _rebuild_hygiene_candidate(fixture, grant, previous, source_limit=3)
+    candidate_bindings = await _catalog_bindings(fixture, candidate_target)
+    kept_keys = {json.loads(binding["document_json"])["source_key"] for binding in candidate_bindings}
+    assert kept_keys == {"ibx-ppo-1", "ibx-davis-1", "ibx-parented-specialty"}
+    candidate_networks = await _catalog_networks(fixture, candidate_target)
+    assert len(candidate_networks) == 4
+    await freeze_metadata(fixture, target=candidate_target, snapshot=successor_snapshot)
+
+    with pytest.raises(ValueError, match="registry_fhir_catalog_automatic_network_limit_exceeded: source alias-a"):
+        await _rebuild_hygiene_candidate(fixture, grant, previous, source_limit=2)
+
+    vector_by_generation, _ = await sync._catalog_source_vector(
+        fixture.connection, previous.sealed, (previous.disposition,), None, False
+    )
+    assert vector_by_generation[previous.generation]["network_hygiene"] == sync.automatic_network_hygiene_policy(
+        previous.disposition.descriptor
+    )
+    later_expected = await _snapshot(
+        fixture,
+        candidate_target,
+        grant,
+        successor_snapshot["source_vector_json"],
+        as_of=previous.snapshot["as_of"] + timedelta(days=1),
+    )
+    assert sync._is_pending_catalog_reusable(previous.sealed, later_expected, None) is False
+    assert sync._is_pending_catalog_reusable(successor_snapshot, later_expected, None) is True
+
+
+@pytest.mark.asyncio
+async def test_skip_automatic_binding_copy_preserves_shared(metadata_custody):
+    fixture = metadata_custody
+    grant = await _registry(fixture)
+    first = await _initial_catalog(fixture, grant)
+    copied_target = await _new_catalog_target(fixture)
+    snapshot = await _snapshot(fixture, copied_target, grant, first.snapshot["source_vector_json"])
+    async with fixture.connection.transaction():
+        await copy_fhir_catalog_snapshot(
+            fixture.connection,
+            first.sealed,
+            copied_target,
+            snapshot["metadata_generation"],
+            loader_role=fixture.roles["loader"],
+            control_schema=grant.control_schema,
+            skip_automatic_binding_generations=(first.generation,),
+        )
+    assert await _catalog_bindings(fixture, copied_target) == []
+    kept_networks = await _catalog_networks(fixture, copied_target)
+    assert {network_row["network_id"] for network_row in kept_networks} == {7}
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT count(*) FROM "{copied_target.schema_name}".registry_fhir_catalog_observation '
+            "WHERE source_generation=$1",
+            first.generation,
+        )
+        > 0
+    )
+    with pytest.raises(ValueError, match="registry_fhir_catalog_store_generation_invalid"):
+        async with fixture.connection.transaction():
+            await copy_fhir_catalog_snapshot(
+                fixture.connection,
+                first.sealed,
+                copied_target,
+                snapshot["metadata_generation"],
+                loader_role=fixture.roles["loader"],
+                control_schema=grant.control_schema,
+                skip_automatic_binding_generations=("not-a-digest",),
+            )
 
 
 async def _superseding_catalog(fixture, grant, first):

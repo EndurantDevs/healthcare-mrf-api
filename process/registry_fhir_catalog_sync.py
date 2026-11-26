@@ -52,6 +52,13 @@ from process.registry_fhir_catalog_grant import (
     verify_current_fhir_catalog_source_companies,
 )
 from process.registry_fhir_catalog_identity import FHIRNetworkIdentityInput, allocate_fhir_catalog_network_ids
+from process.registry_fhir_catalog_network_policy import (
+    automatic_network_hygiene_kind,
+    automatic_network_hygiene_policy,
+    automatic_network_organizations_sql,
+    hygiene_reprojected_generations,
+    uses_network_targets_table,
+)
 from process.registry_fhir_catalog_projection import SourceCatalogContext, format_fhir_catalog_projection
 from process.registry_fhir_catalog_publication import OPERATION, enqueue_fhir_catalog_publication
 from process.registry_fhir_catalog_reference_rollup import (
@@ -803,10 +810,14 @@ async def _catalog_source_vector(loader, previous, accepted, source_companies, s
         if source_companies is not None and generation in source_companies:
             vector_by_generation[generation]["source_companies"] = source_companies[generation]
         if source_companies_only:
-            if "extraction_transform" in prior:
-                vector_by_generation[generation]["extraction_transform"] = prior["extraction_transform"]
-        elif supports_plan_tiers(disposition.descriptor):
-            vector_by_generation[generation]["extraction_transform"] = PROJECTOR_VERSION
+            for preserved in ("extraction_transform", "network_hygiene"):
+                if preserved in prior:
+                    vector_by_generation[generation][preserved] = prior[preserved]
+        else:
+            if supports_plan_tiers(disposition.descriptor):
+                vector_by_generation[generation]["extraction_transform"] = PROJECTOR_VERSION
+            if (hygiene_policy := automatic_network_hygiene_policy(disposition.descriptor)) is not None:
+                vector_by_generation[generation]["network_hygiene"] = hygiene_policy
     return vector_by_generation, current_by_generation
 
 
@@ -872,22 +883,49 @@ async def _build_catalog_candidate(
     )
 
 
+async def _copy_previous_catalog(
+    loader, previous, copy_target, snapshot, current_by_generation, options_by_name, *, source_companies_only
+):
+    reprojected_generations = () if source_companies_only else hygiene_reprojected_generations(current_by_generation)
+    if not source_companies_only:
+        reprojected_set = set(reprojected_generations)
+        await _require_automatic_binding_limits(
+            loader,
+            previous["schema_name"],
+            surviving_generations=[
+                entry["source_generation"]
+                for entry in snapshot["source_vector_json"]
+                if entry["source_generation"] not in reprojected_set
+            ],
+        )
+    await create_fhir_catalog_candidate(loader, copy_target, **options_by_name)
+    copy_options_by_name = (
+        {**options_by_name, "skip_automatic_binding_generations": reprojected_generations}
+        if reprojected_generations
+        else options_by_name
+    )
+    return await copy_fhir_catalog_snapshot(
+        loader, previous, copy_target, snapshot["metadata_generation"], **copy_options_by_name
+    )
+
+
 async def _build_source_catalog_candidate(
     config, loader, source_reads, copy_target, snapshot, previous, current_by_generation, *, source_companies_only=False
 ):
     options_by_name = {"loader_role": config.loader_role, "control_schema": config.grant.control_schema}
-    if previous and not source_companies_only:
-        await _require_automatic_binding_limits(
-            loader,
-            previous["schema_name"],
-            surviving_generations=[entry["source_generation"] for entry in snapshot["source_vector_json"]],
-        )
-    await create_fhir_catalog_candidate(loader, copy_target, **options_by_name)
     accounting_by_phase = {}
     if previous:
-        accounting_by_phase["retained"] = await copy_fhir_catalog_snapshot(
-            loader, previous, copy_target, snapshot["metadata_generation"], **options_by_name
+        accounting_by_phase["retained"] = await _copy_previous_catalog(
+            loader,
+            previous,
+            copy_target,
+            snapshot,
+            current_by_generation,
+            options_by_name,
+            source_companies_only=source_companies_only,
         )
+    else:
+        await create_fhir_catalog_candidate(loader, copy_target, **options_by_name)
     from process.registry_imported_catalog_preparation import retire_replaced_catalog_sources
 
     await retire_replaced_catalog_sources(loader, copy_target, snapshot, previous, config.grant.control_schema)
@@ -1635,19 +1673,22 @@ async def _approved_maps(connection, control_schema, revision):
     return tuple(by_kind["company"]), tuple(by_kind["group"])
 
 
-async def project_fhir_catalog_source(
+async def _project_source_organizations(
     connection, copy_target, disposition, snapshot, *, grant, loader_role, source_connection=None, source_export=None
 ):
-    """Allocate identities and project one staged source without row-wise SQL."""
     descriptor = disposition.descriptor
     generation = fhir_catalog_source_generation(descriptor)
     namespace = storage_identifier(copy_target.schema_name)
-    started = perf_counter()
-    counts_by_kind = {"created_networks": 0, "networks": 0, "relationships": 0, "batches": 0}
-    await _prepare_network_targets(connection, namespace, generation, descriptor["coordinates"]["source_id"])
+    hygiene_kind = automatic_network_hygiene_kind(descriptor)
+    counts_by_kind = {"created_networks": 0, "networks": 0, "batches": 0}
+    await _prepare_network_targets(
+        connection, namespace, generation, descriptor["coordinates"]["source_id"], hygiene_kind=hygiene_kind
+    )
     after = ""
     while True:
-        organization_records = await _network_organization_page(connection, namespace, generation, after)
+        organization_records = await _network_organization_page(
+            connection, namespace, generation, after, hygiene_kind=hygiene_kind
+        )
         if not organization_records:
             break
         legacy_by_organization = await _legacy_identity_inputs(
@@ -1672,7 +1713,27 @@ async def project_fhir_catalog_source(
         counts_by_kind["networks"] += count
         counts_by_kind["batches"] += 1
         after = organization_records[-1]["resource_id"]
-    await connection.execute("DROP TABLE pg_temp.fhir_catalog_network_targets")
+    if uses_network_targets_table(hygiene_kind):
+        await connection.execute("DROP TABLE pg_temp.fhir_catalog_network_targets")
+    return counts_by_kind
+
+
+async def project_fhir_catalog_source(
+    connection, copy_target, disposition, snapshot, *, grant, loader_role, source_connection=None, source_export=None
+):
+    """Allocate identities and project one staged source without row-wise SQL."""
+    descriptor = disposition.descriptor
+    started = perf_counter()
+    counts_by_kind = await _project_source_organizations(
+        connection,
+        copy_target,
+        disposition,
+        snapshot,
+        grant=grant,
+        loader_role=loader_role,
+        source_connection=source_connection,
+        source_export=source_export,
+    )
     counts_by_kind["relationships"] = await project_fhir_catalog_relationships(
         connection,
         copy_target,
@@ -1753,22 +1814,18 @@ async def _project_plan_tier_source(connection, copy_target, disposition, snapsh
     return counts_by_kind
 
 
-def _network_organizations(namespace):
-    return (
-        f"FROM {namespace}.registry_fhir_catalog_observation o "
-        "WHERE o.source_generation=$1 AND o.resource_type='Organization' AND o.observation_kind='organization' "
-        "AND (o.document_json->'declared_network'='true'::jsonb "
-        "OR EXISTS(SELECT FROM pg_temp.fhir_catalog_network_targets n WHERE n.resource_id=o.resource_id))"
-    )
+def _network_organizations(namespace, hygiene_kind=None):
+    return automatic_network_organizations_sql(namespace, hygiene_kind)
 
 
-async def _prepare_network_targets(connection, namespace, generation, source_id):
+async def _prepare_network_targets(connection, namespace, generation, source_id, *, hygiene_kind=None):
     """Reject unreviewed Organization fan-out before allocating any IDs for the source."""
-    await _create_network_targets(connection, namespace, generation)
+    if uses_network_targets_table(hygiene_kind):
+        await _create_network_targets(connection, namespace, generation)
     remaining = _AUTOMATIC_NETWORKS_REMAINING.get()
     limit = AUTOMATIC_NETWORKS_PER_SOURCE if remaining is None else min(remaining, AUTOMATIC_NETWORKS_PER_SOURCE)
     count = await connection.fetchval(
-        f"SELECT count(*) FROM (SELECT 1 {_network_organizations(namespace)} LIMIT $2) organizations",
+        f"SELECT count(*) FROM (SELECT 1 {_network_organizations(namespace, hygiene_kind)} LIMIT $2) organizations",
         generation,
         limit + 1,
     )
@@ -1779,9 +1836,9 @@ async def _prepare_network_targets(connection, namespace, generation, source_id)
         _AUTOMATIC_NETWORKS_REMAINING.set(remaining - count)
 
 
-async def _network_organization_page(connection, namespace, generation, after):
+async def _network_organization_page(connection, namespace, generation, after, *, hygiene_kind=None):
     return await connection.fetch(
-        f"SELECT o.resource_id,o.document_json::text AS document {_network_organizations(namespace)} "
+        f"SELECT o.resource_id,o.document_json::text AS document {_network_organizations(namespace, hygiene_kind)} "
         'AND o.resource_id>$2 COLLATE "C" ORDER BY o.resource_id COLLATE "C" LIMIT $3',
         generation,
         after,

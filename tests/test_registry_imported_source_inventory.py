@@ -506,11 +506,20 @@ async def test_catalogue_policy_change_invalidates_inventory_token(inventory_cas
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("limit", ["AUTOMATIC_NETWORKS_PER_SOURCE", "AUTOMATIC_NETWORKS_PER_CATALOG"])
-async def test_automatic_network_limit_change_invalidates_inventory_token(inventory_case, monkeypatch, limit):
+@pytest.mark.parametrize(
+    ("attribute", "override_value"),
+    [
+        ("AUTOMATIC_NETWORKS_PER_SOURCE", 1),
+        ("AUTOMATIC_NETWORKS_PER_CATALOG", 1),
+        ("AUTOMATIC_NETWORK_HYGIENE_VERSION", "fhir-automatic-org-hygiene-v2"),
+    ],
+)
+async def test_automatic_network_limit_change_invalidates_inventory_token(
+    inventory_case, monkeypatch, attribute, override_value
+):
     before = await observe(inventory_case)
     before_token = before.token
-    monkeypatch.setattr(inventory, limit, 1)
+    monkeypatch.setattr(inventory, attribute, override_value)
     after = await observe(inventory_case)
     assert before.document == after.document
     assert before_token != after.token

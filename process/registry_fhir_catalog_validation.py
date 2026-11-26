@@ -12,6 +12,7 @@ from process.registry_fhir_catalog_extraction import (
     fhir_source_uri,
 )
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
+from process.registry_fhir_catalog_network_policy import SUPPORTED_NETWORK_HYGIENE_POLICIES
 from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_companies
 from process.registry_fhir_catalog_sources import (
     is_delta_positive_catalog_descriptor,
@@ -71,12 +72,14 @@ def validate_fhir_catalog_source_vector(vector):
     previous, seen = None, set()
     for entry in vector:
         fields = {"source_generation", "source_id", "status"}
-        optional_fields = {"extraction_transform", "source_companies"}
+        optional_fields = {"extraction_transform", "network_hygiene", "source_companies"}
         if type(entry) is not dict or not fields <= set(entry) <= fields | optional_fields:
             _invalid("inputs_invalid")
         if "extraction_transform" in entry and (
             entry["extraction_transform"] != TRANSFORM_VERSION or entry["source_id"] != UHC_PROVIDER_FILE_SOURCE_ID
         ):
+            _invalid("inputs_invalid")
+        if "network_hygiene" in entry and entry["network_hygiene"] not in SUPPORTED_NETWORK_HYGIENE_POLICIES:
             _invalid("inputs_invalid")
         if "source_companies" in entry:
             validate_fhir_catalog_source_companies(entry["source_companies"])
