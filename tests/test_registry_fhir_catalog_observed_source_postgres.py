@@ -300,8 +300,9 @@ async def test_repeatable_snapshot_pins_facts_while_other_authorized_writer_chan
         await fixture.admin.execute(f'SET ROLE "{fixture.roles_by_kind["writer"]}"')
         try:
             await fixture.admin.execute(
-                f'UPDATE "{fixture.schema}".provider_directory_dataset_resource SET payload_json=payload_json||\'{{"name":"Changed"}}\'::jsonb '
-                "WHERE resource_type='Organization'"
+                f'INSERT INTO "{fixture.schema}".provider_directory_dataset_resource '
+                "VALUES ('dataset-one','Organization','network-two',$1,'{\"name\":\"Added\"}'::jsonb)",
+                "e" * 64,
             )
         finally:
             await fixture.admin.execute("RESET ROLE")
@@ -312,6 +313,7 @@ async def test_repeatable_snapshot_pins_facts_while_other_authorized_writer_chan
     changed = await _observe(fixture)
     assert changed.descriptor["dataset_sha256"] == first.descriptor["dataset_sha256"]
     assert changed.descriptor["tables"] == first.descriptor["tables"]
+    assert changed.descriptor["admission"]["families"]["Organization"]["rows"] == 2
     assert changed.descriptor["accepted_receipt_sha256"] != first.descriptor["accepted_receipt_sha256"]
 
 
@@ -381,19 +383,6 @@ async def test_missing_source_data_and_invalid_registration_are_refused(observed
     for statement in statements_by_damage[damage]:
         await fixture.admin.execute(statement)
     with pytest.raises(FHIRCatalogObservedSourceError):
-        await _observe(fixture)
-
-
-@pytest.mark.parametrize("observed_source_db", [("heap", 2)], indirect=True)
-async def test_duplicate_key_at_page_boundary_cannot_hide_from_stream_digest(observed_source_db):
-    fixture = observed_source_db
-    await fixture.admin.execute(f'DELETE FROM "{fixture.schema}".provider_directory_dataset_resource')
-    records = [("dataset-one", "Organization", f"{index:04}", "d" * 64, '{"name":"Example"}') for index in range(1000)]
-    records.append(records[-1])
-    await fixture.admin.copy_records_to_table(
-        "provider_directory_dataset_resource", schema_name=fixture.schema, records=records
-    )
-    with pytest.raises(FHIRCatalogObservedSourceError, match="resource_count_changed"):
         await _observe(fixture)
 
 
@@ -503,8 +492,21 @@ async def test_consumed_role_reference_values_and_bounds_are_still_validated(obs
         "WHERE resource_type='PractitionerRole'",
         json.dumps({"network_refs": references}),
     )
-    with pytest.raises(ValueError):
-        await _observe(fixture)
+    reader = await fixture.connect()
+    async with (
+        fhir_catalog_reference_workspace(reader) as workspace,
+        reader.transaction(isolation="repeatable_read", readonly=True),
+    ):
+        await reader.execute("SET LOCAL search_path=pg_catalog,pg_temp,public")
+        with pytest.raises(ValueError):
+            async with staged_fhir_catalog_references(
+                reader,
+                schema_name=fixture.schema,
+                dataset_id="dataset-one",
+                source_uri="https://example.test/fhir",
+                workspace=workspace,
+            ) as stage:
+                assert not [batch async for batch in stage.iter_batches()]
 
 
 async def _assert_metadata_columns_only(reader, fixture):
@@ -693,8 +695,8 @@ async def test_bad_facts_do_not_poison_the_next_inventory_endpoint(observed_sour
     fixture = observed_source_db
     await _add_second_scope_entry(fixture, published=True)
     await fixture.admin.execute(
-        f'UPDATE "{fixture.schema}".resources_one SET payload_json=$${{"name":42}}$$ '
-        "WHERE resource_type='Organization' AND resource_id='network'"
+        f'REVOKE SELECT ON "{fixture.schema}".provider_directory_dataset_resource '
+        f'FROM "{fixture.roles_by_kind["reader"]}"'
     )
     reader = await fixture.connect()
     async with reader.transaction(isolation="repeatable_read", readonly=True):

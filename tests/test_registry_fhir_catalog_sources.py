@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 from process import registry_fhir_catalog_sources as sources
-from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
 from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
 
 
@@ -45,7 +45,7 @@ def uhc_published_row():
 
 
 def descriptor(**row_changes):
-    families = FHIRCatalogObservationDigests().document()
+    families_by_type = {resource_type: {"rows": 0} for resource_type in RESOURCE_TYPES}
     return build_fhir_catalog_observation_descriptor(
         read_profile(),
         published_row(**row_changes),
@@ -54,7 +54,7 @@ def descriptor(**row_changes):
             "resource": {"schema": "source_payload", "name": "dataset_resources"},
         },
         ("https://directory.example.test/fhir/", ["alias-a", "alias-b"]),
-        families,
+        families_by_type,
     )
 
 

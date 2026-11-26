@@ -11,7 +11,7 @@ import pytest
 
 from process import registry_fhir_catalog_observed_source as observed
 from process import registry_fhir_catalog_sources as sources
-from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
 from tests.test_registry_fhir_catalog_observation import _receipt
 from tests.test_registry_fhir_catalog_sources import descriptor, published_row, read_profile
 
@@ -43,17 +43,17 @@ def test_public_descriptor_builder_preserves_receipt_and_serialized_fields():
     }
     original = descriptor()
     tables = deepcopy(original["tables"])
-    families = FHIRCatalogObservationDigests().document()
+    families_by_type = {resource_type: {"rows": 0} for resource_type in RESOURCE_TYPES}
     actual_descriptor = observed.build_fhir_catalog_observation_descriptor(
         read_profile(),
         header_by_field,
         tables,
         ("https://example.test/fhir", ["alias-a", "alias-b"]),
-        families,
+        families_by_type,
     )
     assert sources.validate_fhir_catalog_source_descriptor(actual_descriptor) == actual_descriptor
     assert set(actual_descriptor) == set(original)
-    assert actual_descriptor["admission"]["families"] == families
+    assert actual_descriptor["admission"]["families"] == families_by_type
     assert actual_descriptor["admission"]["publication"] == {**publication, "claimed_resource_count": 0}
     assert actual_descriptor["source_aliases"] == ["alias-a", "alias-b"]
 

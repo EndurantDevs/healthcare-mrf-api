@@ -20,7 +20,7 @@ from process.registry_imported_source_inventory import (
     is_practitioner_enrichment,
     select_fhir_editions,
 )
-from process.registry_imported_source_reuse import source_edition
+from process.registry_imported_source_reuse import compatible_source_edition, source_edition
 from process.registry_native_network_catalog import native_catalog_descriptor, native_catalog_rows, native_network_ids
 
 _INVENTORY = ContextVar("registry_imported_catalog_preparation", default=None)
@@ -73,7 +73,8 @@ async def replaced_fhir_generations(connection, previous, accepted):
     if previous is None or inventory is None:
         return ()
     carried_by_feed = {
-        fhir_feed(descriptor): source_edition(descriptor) for descriptor in inventory.carried_fhir_descriptors
+        fhir_feed(descriptor): compatible_source_edition(descriptor)
+        for descriptor in inventory.carried_fhir_descriptors
     }
     descriptors = inventory.fhir_descriptors
     enrichment_feeds = {
@@ -107,7 +108,7 @@ async def replaced_fhir_generations(connection, previous, accepted):
         if (
             feed in carried_by_feed
             and feed not in retained_feeds
-            and source_edition(validate_fhir_catalog_source_descriptor(descriptor)) == carried_by_feed[feed]
+            and compatible_source_edition(validate_fhir_catalog_source_descriptor(descriptor)) == carried_by_feed[feed]
         ):
             retained_feeds.add(feed)
             continue
@@ -234,18 +235,15 @@ def imported_catalog_accounting(inventory):
 
 async def prepare_imported_catalog_snapshot(config, loader, source_pool, sealer_pool, *, source_export, inventory):
     """Use existing isolated preparation, native validation and freeze; publication remains with the caller."""
-    from process.registry_fhir_catalog_observed_source import known_fhir_catalog_families
     from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot
-    from process.registry_imported_source_inventory import catalog_observation_families
 
     if type(inventory) is not ImportedSourceInventory:
         raise ValueError("registry_imported_catalog_inventory_invalid")
     token = _INVENTORY.set(inventory)
     try:
-        with known_fhir_catalog_families(catalog_observation_families(inventory.fhir_descriptors)):
-            snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
-                config, loader, source_pool, sealer_pool, source_export=source_export
-            )
+        snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+            config, loader, source_pool, sealer_pool, source_export=source_export
+        )
     finally:
         _INVENTORY.reset(token)
     prepared = previous if snapshot is None else snapshot

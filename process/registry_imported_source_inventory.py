@@ -9,8 +9,6 @@ from datetime import date, datetime, timezone
 from functools import cached_property
 from urllib.parse import urlsplit
 
-from asyncpg import InsufficientPrivilegeError, InvalidSchemaNameError, UndefinedTableError
-
 from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import AUTOMATIC_NETWORKS_PER_CATALOG, AUTOMATIC_NETWORKS_PER_SOURCE, PROJECTOR_VERSION
 from process.network_cms_registry_address_capture import native_driver
@@ -23,7 +21,7 @@ from process.registry_fhir_catalog_sources import (
     parse_fhir_catalog_source_profile,
     validate_fhir_catalog_source_descriptor,
 )
-from process.registry_imported_source_reuse import graph_policy, source_edition
+from process.registry_imported_source_reuse import compatible_source_edition, graph_policy, source_edition
 from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
 
 INVENTORY_CONTRACT = "registry-imported-source-inventory-v1"
@@ -261,33 +259,29 @@ async def current_imported_source_inventory():
     if runtime is None:
         raise ValueError("registry_imported_native_inventory_required")
     if not runtime.observed:
-        # Each observation reads every row of every current FHIR dataset; a run keeps its first one.
+        # Each run pins one consistent inventory snapshot and keeps its first observation.
         runtime.observed.append(await _observe_current_inventory(runtime))
     return runtime.observed[0]
 
 
 async def _observe_current_inventory(runtime):
-    from process.registry_fhir_catalog_observed_source import known_fhir_catalog_families
-
     async with native_imported_source_reader() as connection:
         # Take the read locks before the first data read fixes this transaction's snapshot.
         await lock_aca_source_tables(
             connection, runtime.config.aca_source_schema, ("plan_npi_raw", "plan", "plan_networktier", "issuer")
         )
-        prior = checkpoint = retained = ()
+        prior = ()
         checkpoint_date = None
         if runtime.control_schema is not None:
             prior = await _serving_catalog_observations(connection, runtime.control_schema)
-            checkpoint, checkpoint_date = await _checkpoint_catalog_observations(connection, runtime.control_schema)
-            retained = await _retained_published_catalog_observations(connection, runtime.control_schema)
-        with known_fhir_catalog_families(catalog_observation_families(retained + checkpoint + prior)):
-            observed = await observe_imported_source_inventory(
-                connection,
-                config=runtime.config,
-                catalog_export=runtime.catalog_export,
-                effective_date=runtime.effective_date,
-                previous_fhir=prior,
-            )
+            checkpoint_date = await _checkpoint_catalog_date(connection, runtime.control_schema)
+        observed = await observe_imported_source_inventory(
+            connection,
+            config=runtime.config,
+            catalog_export=runtime.catalog_export,
+            effective_date=runtime.effective_date,
+            previous_fhir=prior,
+        )
         if runtime.control_schema is None:
             return observed
         from process.registry_aca_company_catalog import enrich_aca_company_sources
@@ -310,46 +304,18 @@ async def _serving_catalog_observations(connection, control_schema):
     return () if schema is None else await _catalog_observations(connection, schema)
 
 
-async def _checkpoint_catalog_observations(connection, control_schema):
-    """Reuse family facts and recover a graph lookup date from the current serving predecessor."""
+async def _checkpoint_catalog_date(connection, control_schema):
+    """Recover a graph lookup date from the current serving predecessor checkpoint."""
     control = storage_identifier(control_schema)
-    checkpoint = await connection.fetchrow(
-        "SELECT c.schema_name, CASE WHEN s.id=1 THEN c.as_of END AS checkpoint_date "
+    as_of = await connection.fetchval(
+        "SELECT CASE WHEN s.id=1 THEN c.as_of END "
         f"FROM {control}.registry_fhir_catalog_snapshot c LEFT JOIN {control}.network_serving_control s "
         "ON s.id=1 AND s.generation_id IS NOT DISTINCT FROM c.network_generation "
         "WHERE c.published_at IS NULL AND c.accounting_json ? 'imported_source_inventory' "
         "AND c.accounting_json ? 'registry_fhir_catalog_source' "
         "ORDER BY c.as_of DESC, c.metadata_approved_revision DESC, c.metadata_generation DESC LIMIT 1"
     )
-    if checkpoint is None:
-        return (), None
-    try:
-        # Preserve the inventory snapshot when retention removes the optional catalog.
-        async with connection.transaction():
-            observations = await _catalog_observations(connection, checkpoint["schema_name"])
-            as_of = checkpoint["checkpoint_date"]
-            return observations, as_of.isoformat() if as_of is not None else None
-    except UndefinedTableError, InvalidSchemaNameError, InsufficientPrivilegeError:
-        return (), None
-
-
-async def _retained_published_catalog_observations(connection, control_schema):
-    """Reuse admitted family facts from retained published catalog snapshots."""
-    control = storage_identifier(control_schema)
-    rows = await connection.fetch(
-        f"SELECT c.schema_name FROM {control}.registry_fhir_catalog_snapshot c "
-        f"LEFT JOIN {control}.network_serving_control s ON s.id=1 AND s.metadata_generation=c.metadata_generation "
-        "WHERE c.published_at IS NOT NULL AND s.id IS NULL "
-        "ORDER BY c.published_at DESC, c.metadata_generation DESC LIMIT 8"
-    )
-    observations = []
-    for row in rows:
-        try:
-            async with connection.transaction():
-                observations.extend(await _catalog_observations(connection, row["schema_name"]))
-        except UndefinedTableError, InvalidSchemaNameError, InsufficientPrivilegeError:
-            continue
-    return tuple(observations)
+    return as_of.isoformat() if as_of is not None else None
 
 
 async def _catalog_observations(connection, schema):
@@ -369,21 +335,6 @@ async def _catalog_observations(connection, schema):
         ):
             descriptors.append(validate_fhir_catalog_source_descriptor(descriptor))
     return tuple(descriptors)
-
-
-def catalog_observation_families(descriptors):
-    """Index admitted resource-family facts by their immutable inputs."""
-    from process.registry_fhir_catalog_observed_source import fhir_catalog_family_key
-
-    return {
-        fhir_catalog_family_key(
-            (descriptor["coordinates"]["dataset_id"], descriptor["dataset_sha256"]),
-            descriptor["tables"],
-            descriptor["source_uri"],
-        ): descriptor["admission"]["families"]
-        for descriptor in descriptors
-        if descriptor.get("admission", {}).get("kind") == "catalog_observation"
-    }
 
 
 @asynccontextmanager
@@ -531,7 +482,9 @@ def retained_unavailable_fhir_recipes(previous, inventory):
                 continue
             endpoint_id = descriptor["endpoint_id"]
             source_id = descriptor["coordinates"]["source_id"]
-            if feed in carried_by_feed and source_edition(descriptor) != source_edition(carried_by_feed[feed]):
+            if feed in carried_by_feed and compatible_source_edition(descriptor) != compatible_source_edition(
+                carried_by_feed[feed]
+            ):
                 continue
         elif type(pin) is PinnedFHIRMembershipSource:
             endpoint_id, source_id = pin.endpoint_id, pin.source_id

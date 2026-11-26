@@ -1,12 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Observe registered source data in a caller-owned read-only snapshot."""
 
-import copy
 import json
 import re
-from collections import deque
-from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import datetime, timezone
 
 import asyncpg
@@ -17,16 +13,12 @@ from process.registry_fhir_catalog_extraction import (
     RESOURCE_TYPES,
     fhir_catalog_text,
     fhir_source_uri,
-    iter_fhir_catalog_batches,
-    iter_fhir_catalog_raw_pages,
 )
 from process.registry_fhir_catalog_observation import (
     CATALOG_OBSERVATION_CONTRACT,
-    FHIRCatalogObservationDigests,
     catalog_observation_descriptor_digest,
     validate_catalog_observation_receipt,
 )
-from process.registry_fhir_catalog_reference_rollup import MAX_PAGE_REFERENCES
 from process.registry_fhir_catalog_reporting import current_fhir_catalog_report
 
 _MAX_CATALOG_ROWS = 1000
@@ -38,7 +30,6 @@ FHIR_CATALOG_HEADER_TABLE = _HEADER
 FHIR_CATALOG_RESOURCE_TABLE = _RESOURCE
 FHIR_CATALOG_SOURCE_TABLE = _SOURCE
 FHIR_CATALOG_ENDPOINT_TABLE = _ENDPOINT
-_KNOWN_FAMILIES = ContextVar("registry_fhir_catalog_known_families", default=None)
 
 
 class FHIRCatalogObservedSourceError(ValueError):
@@ -135,78 +126,46 @@ async def _registration(connection, profile, endpoint_id):
     return source_uri, source_aliases
 
 
-def fhir_catalog_family_key(dataset, tables, source_uri):
-    """Identify facts for one admitted resource relation and source URI."""
-    resource = tables["resource"]
-    return (*dataset, resource["schema"], resource["name"], source_uri)
+async def _facts(connection, profile, dataset_id, tables, source_uri=None):
+    from process.provider_directory_compact_edition import compact_edition_tables
 
-
-@contextmanager
-def known_fhir_catalog_families(families_by_dataset):
-    """Reuse admitted facts for the same immutable dataset, resource relation and source URI."""
-    token = _KNOWN_FAMILIES.set(dict(families_by_dataset))
-    try:
-        yield
-    finally:
-        _KNOWN_FAMILIES.reset(token)
-
-
-async def _observed_families(connection, profile, dataset, tables, source_uri):
-    # A published dataset never changes, so the families its earlier admission recorded still describe it.
-    known = (_KNOWN_FAMILIES.get() or {}).get(fhir_catalog_family_key(dataset, tables, source_uri))
-    if known is not None:
-        return copy.deepcopy(known)
-    return await _facts(connection, profile, dataset[0], tables, source_uri)
-
-
-async def _facts(connection, profile, dataset_id, tables, source_uri):
     report = current_fhir_catalog_report()
     if report:
         report.observation_progress(dataset_id, 0)
-    resource_relation = storage_relation(tables["resource"]["schema"], tables["resource"]["name"])
+    resource_table = tables["resource"]
+    compact_tables = (
+        await compact_edition_tables(connection, resource_table["schema"])
+        if resource_table["name"] == _RESOURCE
+        else None
+    )
+    resource_relation = (
+        compact_tables.relation("aliases")
+        if compact_tables is not None
+        else storage_relation(resource_table["schema"], resource_table["name"])
+    )
     counts = await connection.fetch(
-        "SELECT resource_type,count(*) AS rows FROM "
+        "SELECT resource_type,count(*) AS rows,count(DISTINCT resource_id) AS distinct_rows FROM "
         + resource_relation
         + ' WHERE dataset_id=$1 AND resource_type=ANY($2::text[]) GROUP BY resource_type ORDER BY resource_type COLLATE "C"',
         dataset_id,
         RESOURCE_TYPES,
     )
-    digests = FHIRCatalogObservationDigests()
-    async for page in iter_fhir_catalog_raw_pages(
-        connection,
-        schema_name=tables["resource"]["schema"],
-        dataset_id=dataset_id,
-        resource_relation=tables["resource"],
-    ):
-        digests.add_page(page, lambda rows: _validate_metadata_page(rows, source_uri))
-        if report:
-            report.observation_progress(dataset_id, len(page))
-    families = digests.document()
-    counts_by_type = dict.fromkeys(RESOURCE_TYPES, 0)
+    families_by_type = {resource_type: {"rows": 0} for resource_type in RESOURCE_TYPES}
     for count in counts:
-        if count["resource_type"] not in RESOURCE_TYPES or type(count["rows"]) is not int or count["rows"] < 0:
+        distinct_rows = count.get("distinct_rows", count["rows"])
+        if (
+            count["resource_type"] not in RESOURCE_TYPES
+            or type(count["rows"]) is not int
+            or count["rows"] < 0
+            or type(distinct_rows) is not int
+            or distinct_rows != count["rows"]
+        ):
             _fail("resource_count_changed")
-        counts_by_type[count["resource_type"]] = count["rows"]
-    if any(families[family]["rows"] != counts_by_type[family] for family in RESOURCE_TYPES):
-        _fail("resource_count_changed")
+        families_by_type[count["resource_type"]] = {"rows": count["rows"]}
     if report:
+        report.observation_progress(dataset_id, sum(family["rows"] for family in families_by_type.values()))
         report.observation_progress(dataset_id, 0)
-    return families
-
-
-def _validate_metadata_page(page, source_uri):
-    metadata_rows = tuple(row for row in page if row["resource_type"] in {"Organization", "InsurancePlan"})
-    if metadata_rows:
-        deque(iter_fhir_catalog_batches(metadata_rows, profile="published_normalized", source_uri=source_uri), maxlen=0)
-    for row in page:
-        if row["resource_type"] in {"OrganizationAffiliation", "PractitionerRole"}:
-            references = row["payload_json"].get("network_refs")
-            if references is None:
-                continue
-            if type(references) is not list or len(references) > MAX_PAGE_REFERENCES:
-                _fail("reference_bounds")
-            for reference in references:
-                fhir_catalog_text(reference, 2048, strip=False)
+    return families_by_type
 
 
 async def collect_fhir_catalog_observation(connection, profile, *, endpoint_id, dataset_id, require_current=True):
@@ -232,9 +191,7 @@ async def collect_fhir_catalog_observation(connection, profile, *, endpoint_id, 
             header = await _header(connection, profile, endpoint_id, dataset_id, require_current, header_schema)
             source_uri, aliases = await _registration(connection, profile, endpoint_id)
             tables = await catalog_observation_tables(connection, profile, dataset_id, header_schema)
-            families = await _observed_families(
-                connection, profile, (dataset_id, header["dataset_hash"]), tables, source_uri
-            )
+            families = await _facts(connection, profile, dataset_id, tables, source_uri)
     except asyncpg.PostgresError as error:
         raise FHIRCatalogObservedSourceError("registry_fhir_catalog_observed_source_read_unavailable") from error
     descriptor = validate_fhir_catalog_source_descriptor(

@@ -1,34 +1,21 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Canonical observation checksums; authenticated readers and grants confer authority."""
+"""Canonical observation receipts; authenticated readers and grants confer authority."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-import sys
 from datetime import datetime, timedelta
 
 from process.registry_fhir_catalog_extraction import (
-    DEFAULT_BYTES,
     MAX_BYTES,
-    MAX_ROWS,
     RESOURCE_TYPES,
-    SOURCE_RESOURCE_ID,
-    _check_fhir_catalog_page_bounds,
-    _decode_fhir_catalog_page,
     fhir_catalog_json_bytes,
     fhir_catalog_text,
 )
-from process.registry_fhir_catalog_reference_rollup import MAX_PAGE_REFERENCES
-
-try:
-    from ptg2_address_canon import encode_catalog_observation_page as _native_page
-except ImportError:
-    _native_page = None
 
 CATALOG_OBSERVATION_CONTRACT = "registry-fhir-catalog-observation-v1"
-_ROW_FIELDS = {"resource_type", "resource_id", "payload_hash", "payload_json"}
 _RECEIPT_FIELDS = {"version", "kind", "contract", "publication", "families"}
 _PUBLICATION_FIELDS = {
     "root_run_id",
@@ -96,141 +83,6 @@ def _published_at(value):
         _fail()
 
 
-def _observation_frame(row):
-    if type(row) is not dict or set(row) != _ROW_FIELDS:
-        _fail()
-    if (
-        type(row["resource_type"]) is not str
-        or row["resource_type"] not in RESOURCE_TYPES
-        or type(row["resource_id"]) is not str
-        or SOURCE_RESOURCE_ID.fullmatch(row["resource_id"]) is None
-        or type(row["payload_json"]) is not dict
-    ):
-        _fail()
-    _digest(row["payload_hash"])
-    return _canonical(row)
-
-
-def _mixed_native_page(observation_rows, page_bytes, integer_limit):
-    if not observation_rows or len(observation_rows) > MAX_ROWS:
-        return None
-    encoded, metadata = [], []
-    total_bytes = 1 + len(observation_rows)
-    for observation_row in observation_rows:
-        frames = _native_page((observation_row,), page_bytes, MAX_PAGE_REFERENCES, integer_limit)
-        if frames is None:
-            try:
-                row_by_field = dict(
-                    zip(("resource_type", "resource_id", "payload_hash", "payload_json"), observation_row)
-                )
-                row_by_field["payload_json"] = json.loads(row_by_field["payload_json"])
-                frame = _observation_frame(row_by_field)
-            except ValueError, RecursionError:
-                # Recheck the complete page to preserve reference rejection order.
-                return None
-            metadata.append(row_by_field)
-        else:
-            frame = frames[0]
-            if observation_row[0] in {"Organization", "InsurancePlan"}:
-                metadata.append(json.loads(frame))
-        total_bytes += len(frame)
-        if total_bytes > page_bytes:
-            return None
-        encoded.append(frame)
-    return encoded, tuple(metadata)
-
-
-class FHIRCatalogObservationDigests:
-    """Hash an ordered row stream with fixed memory and explicit empty families."""
-
-    def __init__(self):
-        self._hashes_by_type = {
-            resource_type: hashlib.sha256(
-                _canonical({"contract": CATALOG_OBSERVATION_CONTRACT, "resource_type": resource_type}) + b"\n"
-            )
-            for resource_type in RESOURCE_TYPES
-        }
-        self._counts_by_type = dict.fromkeys(RESOURCE_TYPES, 0)
-        self._last_key = None
-
-    def add(self, row):
-        """Accept one exact source row, rejecting duplicates and non-bytewise order."""
-        encoded = _observation_frame(row)
-        resource_type, resource_id = row["resource_type"], row["resource_id"]
-        key = (resource_type.encode("ascii"), resource_id.encode("ascii"))
-        if self._last_key is not None and key <= self._last_key:
-            _fail("order_invalid")
-        count = self._counts_by_type[resource_type] + 1
-        _count(count)
-        self._hashes_by_type[resource_type].update(encoded + b"\n")
-        self._counts_by_type[resource_type] = count
-        self._last_key = key
-
-    def document(self):
-        """Return a detached four-family receipt fragment without ending the stream."""
-        return {
-            resource_type: {
-                "rows": self._counts_by_type[resource_type],
-                "sha256": self._hashes_by_type[resource_type].hexdigest(),
-            }
-            for resource_type in RESOURCE_TYPES
-        }
-
-    def add_page(self, source_records, validate_metadata, *, page_bytes=DEFAULT_BYTES):
-        """Observe a complete bounded SQL page atomically, with a reference encoding fallback."""
-        _check_fhir_catalog_page_bounds(source_records, page_bytes)
-        observation_rows = tuple(
-            tuple(source_record[field] for field in ("resource_type", "resource_id", "payload_hash", "payload_json"))
-            for source_record in source_records
-        )
-        encoded, metadata = None, None
-        if _native_page is not None and all(
-            type(field_value) is str for observation_row in observation_rows for field_value in observation_row
-        ):
-            try:
-                integer_limit = sys.get_int_max_str_digits()
-                encoded = _native_page(observation_rows, page_bytes, MAX_PAGE_REFERENCES, integer_limit)
-                if encoded is None:
-                    mixed_page = _mixed_native_page(observation_rows, page_bytes, integer_limit)
-                    if mixed_page is not None:
-                        encoded, metadata = mixed_page
-            except UnicodeError:
-                encoded = None
-        if encoded is None:
-            page = _decode_fhir_catalog_page(source_records, page_bytes)
-            validate_metadata(page)
-            candidate = FHIRCatalogObservationDigests()
-            candidate._hashes_by_type = {family: digest.copy() for family, digest in self._hashes_by_type.items()}
-            candidate._counts_by_type = self._counts_by_type.copy()
-            candidate._last_key = self._last_key
-            for observation_row in page:
-                candidate.add(observation_row)
-            self._hashes_by_type = candidate._hashes_by_type
-            self._counts_by_type = candidate._counts_by_type
-            self._last_key = candidate._last_key
-            return
-        if metadata is None:
-            metadata = tuple(
-                json.loads(frame)
-                for observation_row, frame in zip(observation_rows, encoded)
-                if observation_row[0] in {"Organization", "InsurancePlan"}
-            )
-        validate_metadata(metadata)
-        last_key = self._last_key
-        counts = self._counts_by_type.copy()
-        for resource_type, resource_id, _, _ in observation_rows:
-            key = (resource_type.encode("ascii"), resource_id.encode("ascii"))
-            if last_key is not None and key <= last_key:
-                _fail("order_invalid")
-            counts[resource_type] += 1
-            _count(counts[resource_type])
-            last_key = key
-        for observation_row, frame in zip(observation_rows, encoded):
-            self._hashes_by_type[observation_row[0]].update(frame + b"\n")
-        self._counts_by_type = counts
-        self._last_key = last_key
-
-
 def validate_catalog_observation_receipt(receipt):
     """Validate the closed receipt while preserving independently absent old proofs."""
     from process.delta_dental_directory_producer import METADATA_KEY
@@ -256,11 +108,17 @@ def validate_catalog_observation_receipt(receipt):
     families = receipt["families"]
     if type(families) is not dict or set(families) != set(RESOURCE_TYPES):
         _fail()
+    family_fields = None
     for family in families.values():
-        if type(family) is not dict or set(family) != {"rows", "sha256"}:
+        if type(family) is not dict or set(family) not in ({"rows"}, {"rows", "sha256"}):
+            _fail()
+        if family_fields is None:
+            family_fields = set(family)
+        elif set(family) != family_fields:
             _fail()
         _count(family["rows"])
-        _digest(family["sha256"])
+        if "sha256" in family:
+            _digest(family["sha256"])
     if METADATA_KEY in receipt:
         from process.delta_dental_directory_producer import validate_delta_positive_receipt
 

@@ -140,20 +140,50 @@ async def test_registration_requires_exact_ordered_aliases_and_source_uri():
 
 
 @pytest.mark.asyncio
-async def test_observation_count_mismatch_rejects_incomplete_stream(monkeypatch):
+async def test_observation_facts_aggregates_family_counts_and_rejects_invalid_rows():
     connection = connection_mock()
     connection.fetch.return_value = [{"resource_type": "Organization", "rows": 1}]
+    families = await observed.collect_fhir_catalog_observation_facts(
+        connection, read_profile(), "dataset-one", descriptor()["tables"], "https://directory.example.test/fhir/"
+    )
+    assert families == {
+        "InsurancePlan": {"rows": 0},
+        "Organization": {"rows": 1},
+        "OrganizationAffiliation": {"rows": 0},
+        "PractitionerRole": {"rows": 0},
+    }
+    assert 'FROM "source_payload"."dataset_resources"' in connection.fetch.await_args.args[0]
 
-    async def pages(*args, **kwargs):
-        if False:
-            yield ()
-
-    monkeypatch.setattr(observed, "iter_fhir_catalog_raw_pages", pages)
+    connection.fetch.return_value = [{"resource_type": "Organization", "rows": -1}]
     with pytest.raises(ValueError, match="resource_count_changed"):
         await observed.collect_fhir_catalog_observation_facts(
             connection, read_profile(), "dataset-one", descriptor()["tables"], "https://directory.example.test/fhir/"
         )
-    assert 'FROM "source_payload"."dataset_resources"' in connection.fetch.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_observation_facts_counts_compact_edition_alias_table_directly(monkeypatch):
+    from process import provider_directory_compact_edition as compact_edition
+    from process.provider_directory_compact_payload import CompactPayloadTables
+
+    compact_tables = CompactPayloadTables(
+        "compact_ed",
+        compact_edition.OUTPUT_ALIASES,
+        compact_edition.REFERENCE_SETS,
+        compact_edition.BODY_BLOCKS,
+    )
+    monkeypatch.setattr(compact_edition, "compact_edition_tables", AsyncMock(return_value=compact_tables))
+    connection = connection_mock()
+    connection.fetch.return_value = [{"resource_type": "PractitionerRole", "rows": 42}]
+    tables_by_kind = {
+        "header": {"schema": "compact_ed", "name": "provider_directory_endpoint_dataset"},
+        "resource": {"schema": "compact_ed", "name": "provider_directory_dataset_resource"},
+    }
+    families = await observed.collect_fhir_catalog_observation_facts(
+        connection, read_profile(), "dataset-one", tables_by_kind
+    )
+    assert families["PractitionerRole"] == {"rows": 42}
+    assert 'FROM "compact_ed"."provider_directory_resource_output_aliases"' in connection.fetch.await_args.args[0]
 
 
 @pytest.mark.asyncio
