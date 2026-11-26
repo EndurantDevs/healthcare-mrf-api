@@ -6,13 +6,21 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import Column, MetaData, String, Table, select
 from sqlalchemy.dialects.postgresql import asyncpg as sa_asyncpg
 
 from api.endpoint import npi as npi_endpoint
 from api.endpoint import site_intelligence
 from api.network_address_scope import _npi_batch_address_filters
-from api.provider_detail_sql import _npi_detail_address_filters
+from api.provider_detail_sql import (
+    _npi_detail_address_filters,
+    any_bigint_filter,
+    any_int_filter,
+    any_string_filter,
+    build_external_rx_crosswalk_query,
+    build_provider_cost_profiles_query,
+    build_provider_geography_clauses,
+)
 from db.connection import Database
 
 
@@ -261,3 +269,60 @@ async def test_provider_hydration_and_ffs_helpers_compile_to_single_any_array_sh
     await npi_endpoint._fetch_provider_enrichment_ffs_rows([1111111111, 2222222222, 3333333333])
     assert captured_sqls[-2] == captured_sqls[-1]
     assert "= ANY ($1::BIGINT[])" in captured_sqls[-1]
+
+
+def test_plan_and_pricing_any_filters_compile_to_single_array_shapes():
+    from db.models import Plan, PricingProviderProcedureCostProfile
+
+    plan_table = Plan.__table__
+    plan_sql_1 = _compile_asyncpg_sql(
+        select(plan_table.c.plan_id).where(
+            any_int_filter(plan_table.c.issuer_id, [101], "issuer_ids"),
+            any_string_filter(plan_table.c.state, ["IL"], "zip_states"),
+        )
+    )
+    plan_sql_3 = _compile_asyncpg_sql(
+        select(plan_table.c.plan_id).where(
+            any_int_filter(plan_table.c.issuer_id, [101, 102, 103], "issuer_ids"),
+            any_string_filter(plan_table.c.state, ["IL", "NY", "TX"], "zip_states"),
+        )
+    )
+    assert plan_sql_1 == plan_sql_3
+    assert "= ANY ($1::INTEGER[])" in plan_sql_1
+    assert "= ANY ($2::VARCHAR[])" in plan_sql_1
+
+    cost_table = PricingProviderProcedureCostProfile.__table__
+    geo_clauses_1 = build_provider_geography_clauses(cost_table, {"zip5": ["60654"]})
+    geo_clauses_3 = build_provider_geography_clauses(cost_table, {"zip5": ["60654", "60610", "60611"]})
+    cost_sql_1 = _compile_asyncpg_sql(
+        build_provider_cost_profiles_query(
+            cost_table, year=2025, npis=[1111111111], internal_codes=[99213], geography_clauses=geo_clauses_1
+        )
+    )
+    cost_sql_3 = _compile_asyncpg_sql(
+        build_provider_cost_profiles_query(
+            cost_table,
+            year=2025,
+            npis=[1111111111, 2222222222, 3333333333],
+            internal_codes=[99213, 99214, 99215],
+            geography_clauses=geo_clauses_3,
+        )
+    )
+    assert cost_sql_1 == cost_sql_3
+    assert cost_sql_1.count("::BIGINT[])") == 2
+    assert "::VARCHAR[])" in cost_sql_1
+
+    crosswalk_table = Table(
+        "code_crosswalk",
+        MetaData(),
+        Column("from_system", String),
+        Column("from_code", String),
+        Column("to_system", String),
+        Column("to_code", String),
+    )
+    rx_sql_1 = _compile_asyncpg_sql(build_external_rx_crosswalk_query(crosswalk_table, "RX", ["A"], ["NDC"]))
+    rx_sql_3 = _compile_asyncpg_sql(
+        build_external_rx_crosswalk_query(crosswalk_table, "RX", ["A", "B", "C"], ["NDC", "RXNORM"])
+    )
+    assert rx_sql_1 == rx_sql_3
+    assert rx_sql_1.count("::VARCHAR[])") == 4

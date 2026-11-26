@@ -17,6 +17,7 @@ from api.endpoint.network_catalog import _catalog_response
 from api.endpoint.pagination import parse_bool_alias, parse_pagination
 from api.for_human import attributes_labels, benefits_labels
 from api.network_address_scope import canonical_network_read, current_network_address_scope, scoped_aca_plan_clause
+from api.provider_detail_sql import any_bigint_filter, any_int_filter, any_string_filter
 from db.connection import db as sa_db
 from db.models import (
     GeoZipLookup,
@@ -534,7 +535,7 @@ async def _fetch_networks_by_checksum(session, checksums):
                 issuer_table.c.issuer_id == plan_network_tier_table.c.issuer_id,
             )
         )
-        .where(plan_network_tier_table.c.checksum_network.in_(checksums))
+        .where(any_bigint_filter(plan_network_tier_table.c.checksum_network, checksums, "checksum_network"))
     )
 
     if current_network_address_scope() is not None:
@@ -663,7 +664,7 @@ async def get_autocomplete_list(request):
         zip_states = await _states_for_zip(session, zip_code)
         if not zip_states:
             return response.json({"plans": []}, default=str)
-        stmt = stmt.where(plan_table.c.state.in_(zip_states))
+        stmt = stmt.where(any_string_filter(plan_table.c.state, zip_states, "zip_states"))
 
     stmt = stmt.limit(100)
 
@@ -687,7 +688,7 @@ async def get_autocomplete_list(request):
         plan_network_tier_table.c.plan_id,
         plan_network_tier_table.c.checksum_network,
         plan_network_tier_table.c.network_tier,
-    ).where(plan_network_tier_table.c.plan_id.in_(plan_ids))
+    ).where(any_string_filter(plan_network_tier_table.c.plan_id, plan_ids, "plan_ids"))
 
     network_result = await session.execute(network_stmt)
     for plan_id, checksum, tier in _result_rows(network_result):
@@ -812,7 +813,7 @@ async def find_a_plan(request):
     issuer_filters.extend(requested_issuer_ids)
     issuer_filters = sorted(set(issuer_filters))
     if issuer_filters:
-        plan_filters.append(plan_table.c.issuer_id.in_(issuer_filters))
+        plan_filters.append(any_int_filter(plan_table.c.issuer_id, issuer_filters, "issuer_ids"))
         if len(issuer_filters) == 1:
             _append_filter(filters_by_name, "issuer_id", issuer_filters[0])
         else:
@@ -845,7 +846,7 @@ async def find_a_plan(request):
                 },
                 default=str,
             )
-        plan_filters.append(plan_table.c.state.in_(zip_states))
+        plan_filters.append(any_string_filter(plan_table.c.state, zip_states, "zip_states"))
 
     if rating_area:
         _append_filter(filters_by_name, "rating_area", rating_area)
@@ -900,15 +901,21 @@ async def find_a_plan(request):
         summary_filters.append(plan_search_summary_table.c.premium_max <= premium_max)
         _append_filter(filters_by_name, "premium_max", premium_max)
     if plan_types:
-        summary_filters.append(plan_search_summary_table.c.plan_type.in_(plan_types))
+        summary_filters.append(any_string_filter(plan_search_summary_table.c.plan_type, plan_types, "plan_types"))
         _append_filter(filters_by_name, "plan_types", plan_types)
     if metal_levels:
         lowered_levels = [metal_level.lower() for metal_level in metal_levels]
-        summary_filters.append(func.lower(plan_search_summary_table.c.metal_level).in_(lowered_levels))
+        summary_filters.append(
+            any_string_filter(func.lower(plan_search_summary_table.c.metal_level), lowered_levels, "metal_levels")
+        )
         _append_filter(filters_by_name, "metal_levels", metal_levels)
     if csr_variations:
         normalized_csr_values = [csr_variation.lower() for csr_variation in csr_variations]
-        summary_filters.append(func.lower(plan_search_summary_table.c.csr_variation).in_(normalized_csr_values))
+        summary_filters.append(
+            any_string_filter(
+                func.lower(plan_search_summary_table.c.csr_variation), normalized_csr_values, "csr_variations"
+            )
+        )
         _append_filter(filters_by_name, "csr_variations", csr_variations)
 
     join_condition = and_(
@@ -1049,9 +1056,11 @@ async def find_a_plan(request):
 
     price_bounds_by_plan = {}
     if plan_ids:
-        price_stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id.in_(plan_ids))
+        price_stmt = select(plan_prices_table).where(
+            any_string_filter(plan_prices_table.c.plan_id, plan_ids, "plan_ids")
+        )
         if plan_years:
-            price_stmt = price_stmt.where(plan_prices_table.c.year.in_(plan_years))
+            price_stmt = price_stmt.where(any_int_filter(plan_prices_table.c.year, plan_years, "plan_years"))
         if rating_area:
             price_stmt = price_stmt.where(plan_prices_table.c.rating_area_id == rating_area)
         if age is not None:
@@ -1182,7 +1191,7 @@ async def get_price_plans_bulk(request):
         rating_area = str(rating_area).strip()
         if not rating_area:
             rating_area = None
-    stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id.in_(plan_ids))
+    stmt = select(plan_prices_table).where(any_string_filter(plan_prices_table.c.plan_id, plan_ids, "plan_ids"))
     if year is not None:
         stmt = stmt.where(plan_prices_table.c.year == year)
     if rating_area:
