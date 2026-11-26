@@ -124,14 +124,14 @@ def test_rendered_inventory_summary_and_access_requirements():
         if candidate_line.startswith("| Aetna Commercial/Medicare (`aetna-commercial-medicare`) |")
         and "| Bulk |" in candidate_line
     )
-    assert "| Required | 2026-10-11 | 2026-11-25 |" in aetna_row
+    assert "| Required | 2026-11-26 | 2027-01-10 |" in aetna_row
     assert "OAuth2 client credentials and Bulk" in aetna_row
     cigna_row = next(
         candidate_line
         for candidate_line in rendered_document.splitlines()
         if candidate_line.startswith("| Cigna (`cigna`) |")
     )
-    assert "| Not required | 2026-10-11 | 2026-11-25 |" in cigna_row
+    assert "| Not required | 2026-11-26 | 2027-01-10 |" in cigna_row
     assert "Sequential REST pagination" in cigna_row
 
 
