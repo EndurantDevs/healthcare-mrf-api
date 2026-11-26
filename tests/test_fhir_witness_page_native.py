@@ -380,3 +380,219 @@ def test_canonicalize_address_keys_batch_and_batch_json_match_canonicalize_batch
     assert re.fullmatch(r"\[.*\]", raw_json.decode()) is not None
     with pytest.raises(ValueError, match="canonical_bound_exceeded"):
         native.canonicalize_batch_json(addresses, len(raw_json) - 1)
+
+
+def _sorted_fused_witness_fixture():
+    """Build 32 sorted mixed-family witness rows and matching direct native tuples."""
+    resource_types = ["Location", "Organization"]
+    raw_rows = sorted(
+        _parallel_retained_rows(resource_types, derive=False),
+        key=lambda raw_row: (raw_row["resource_type"], raw_row["resource_id"]),
+    )
+    witness_rows = tuple(
+        {
+            "dataset_id": "ds-1",
+            "resource_type": raw_row["resource_type"],
+            "resource_id": raw_row["resource_id"],
+            "payload_hash": raw_row["payload_hash"],
+            "payload_json": raw_row["payload_json"],
+            "acquired_resource_sha256": raw_row["acquired_resource_sha256"],
+        }
+        for raw_row in raw_rows
+    )
+    direct_rows = [
+        (
+            raw_row["resource_type"],
+            raw_row["resource_id"],
+            raw_row["payload_hash"],
+            raw_row["payload_json"],
+            raw_row["acquired_resource_sha256"],
+            None,
+        )
+        for raw_row in raw_rows
+    ]
+    return resource_types, witness_rows, direct_rows
+
+
+def test_validate_and_encode_retained_fhir_witness_page_matches_separate_calls():
+    """Verify fused witness validation and retained encoding match separate native calls."""
+    from process.network_fhir_retained_native import prepare_retained_fhir_witness_page
+
+    native = _native()
+    if not hasattr(native, "validate_and_encode_retained_fhir_witness_page"):
+        pytest.skip("validate_and_encode_retained_fhir_witness_page not built in active extension")
+    resource_types, witness_rows, direct_rows = _sorted_fused_witness_fixture()
+    context_tuple = ("src-1", "rel-1", 0, "transport_neutral_v2", None, resource_types, False)
+    context_by_field = {
+        "source_id": "src-1",
+        "release_id": "rel-1",
+        "observed_at_pg_micros": 0,
+        "hash_contract": "transport_neutral_v2",
+        "resource_types": resource_types,
+        "derive": False,
+    }
+    separate = native.encode_retained_fhir_capture_rows(context_tuple, direct_rows)
+    exact_bytes = len(json.dumps(witness_rows, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode())
+    cursor, prepared = prepare_retained_fhir_witness_page(
+        witness_rows,
+        context_by_field,
+        ("ds-1", None, exact_bytes),
+        fused_encoder=lambda rows, _ctx, ds, prev, budget: native.validate_and_encode_retained_fhir_witness_page(
+            rows, context_tuple, ds, prev, budget
+        ),
+        reference_validator=lambda _rows: None,
+        reference_records=lambda _rows: (),
+    )
+    assert cursor == (witness_rows[-1]["resource_type"], witness_rows[-1]["resource_id"])
+    assert (prepared.root_bytes, prepared.families, prepared.row_count) == (separate[3], separate[4], separate[5])
+    with pytest.raises(ValueError, match="page_bounds"):
+        native.validate_and_encode_retained_fhir_witness_page(
+            witness_rows, context_tuple, "ds-1", None, exact_bytes - 1
+        )
+    with pytest.raises(ValueError, match="resource_order"):
+        native.validate_and_encode_retained_fhir_witness_page(
+            witness_rows,
+            context_tuple,
+            "ds-1",
+            (witness_rows[0]["resource_type"], witness_rows[0]["resource_id"]),
+            exact_bytes,
+        )
+    non_str_rows = ({**witness_rows[0], "payload_json": {"resource_id": witness_rows[0]["resource_id"]}},)
+    assert (
+        native.validate_and_encode_retained_fhir_witness_page(non_str_rows, context_tuple, "ds-1", None, exact_bytes)
+        is None
+    )
+
+
+def _pipelined_location_pages():
+    """Build a two-page Location origin and witness fixture for pipelined COPY tests."""
+    from process.network_fhir_source_witness_contract import source_origin
+    from tests.test_named_fhir_typed_graph import origin_fields
+
+    origin = source_origin(
+        origin_fields()
+        | {
+            "resource_counts": (("Location", 2),),
+            "resource_hashes": (("Location", "e" * 64),),
+            "descriptor_counts": (("Location", 2),),
+        }
+    )
+    pages = tuple(
+        (
+            {
+                "dataset_id": origin.dataset_id,
+                "resource_type": "Location",
+                "resource_id": f"loc-{index}",
+                "payload_hash": ("a" if index == 1 else "b") * 64,
+                "payload_json": f'{{"status":"active","first_line":"{index} Main St"}}',
+                "acquired_resource_sha256": None,
+            },
+        )
+        for index in (1, 2)
+    )
+    return origin, pages
+
+
+@pytest.mark.asyncio
+async def test_consume_pipelined_overlaps_prefetch_with_binary_copy():
+    """Verify binary COPY pipelining starts fetching page two while page one COPY runs."""
+    import asyncio
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from process.network_fhir_source_witness_contract import CONTRACT
+    from process.network_fhir_typed_source import _consume
+
+    native = _native()
+    if not hasattr(native, "prepare_typed_fhir_copy_page"):
+        pytest.skip("prepare_typed_fhir_copy_page not built in active extension")
+    origin, pages = _pipelined_location_pages()
+    copy_started, page_two_fetched = asyncio.Event(), asyncio.Event()
+    events = []
+
+    class _PipelinedConnection:
+        async def copy_to_table(self, _table, **copy_options):
+            assert (
+                copy_options["schema_name"] == "candidate_generation"
+                and copy_options["format"] == "binary"
+                and len(copy_options["columns"]) == 18
+            )
+            if not copy_started.is_set():
+                copy_started.set()
+                await asyncio.wait_for(page_two_fetched.wait(), timeout=2.0)
+            events.append(f"copy:{len(bytes(copy_options['source']))}")
+            return "COPY 1"
+
+    async def _pages():
+        events.append("yield:1")
+        yield pages[0]
+        await asyncio.wait_for(copy_started.wait(), timeout=2.0)
+        events.append("yield:2")
+        page_two_fetched.set()
+        yield pages[1]
+
+    @asynccontextmanager
+    async def _export(**_selection):
+        yield {"contract": CONTRACT, "origin": origin, "resources": _pages}
+
+    stage = SimpleNamespace(
+        schema_name="candidate_generation",
+        names={"cells": "source_cells"},
+        require_ready=lambda *, complete: None,
+    )
+    total = await _consume(_export, _PipelinedConnection(), stage, object(), origin, checker=False, as_of="2026-01-01")
+    assert total == 2
+    assert events[:2] == ["yield:1", "yield:2"] and events[2].startswith("copy:")
+
+
+@pytest.mark.asyncio
+async def test_consume_pipelined_stops_fail_closed_before_prefetching():
+    """Verify invalid page one raises before advancing the witness iterator to page two."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from process.network_fhir_source_witness_contract import CONTRACT
+    from process.network_fhir_typed_contract import TypedFHIRGraphError
+    from process.network_fhir_typed_source import _consume
+
+    native = _native()
+    if not hasattr(native, "prepare_typed_fhir_copy_page"):
+        pytest.skip("prepare_typed_fhir_copy_page not built in active extension")
+    origin, pages = _pipelined_location_pages()
+    fetched_pages = []
+
+    async def _bad_pages():
+        yield ({**pages[0][0], "dataset_id": "wrong-dataset"},)
+        fetched_pages.append("page-2")
+        yield pages[1]
+
+    @asynccontextmanager
+    async def _bad_export(**_selection):
+        yield {"contract": CONTRACT, "origin": origin, "resources": _bad_pages}
+
+    stage = SimpleNamespace(
+        schema_name="candidate_generation",
+        names={"cells": "source_cells"},
+        require_ready=lambda *, complete: None,
+    )
+    with pytest.raises(TypedFHIRGraphError, match="resource_scope"):
+        await _consume(_bad_export, SimpleNamespace(), stage, object(), origin, checker=False, as_of="2026-01-01")
+    assert fetched_pages == []
+
+
+@pytest.mark.asyncio
+async def test_drain_prefetch_task_cancels_in_flight_fetch():
+    """Verify cancelling an in-flight prefetch task drains cleanly without leaking exceptions."""
+    import asyncio
+
+    from process.network_fhir_typed_source import _drain_prefetch_task
+
+    blocked = asyncio.Event()
+
+    async def _never_returns():
+        await blocked.wait()
+
+    pending_task = asyncio.create_task(_never_returns())
+    await asyncio.sleep(0)
+    await _drain_prefetch_task(pending_task)
+    assert pending_task.cancelled()

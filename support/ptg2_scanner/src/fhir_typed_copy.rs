@@ -1,9 +1,11 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 //! Parallel Rust extraction and PostgreSQL binary COPY encoding for typed FHIR `source_cells`.
 //!
-//! Any row whose payload fails the exact `network_fhir_typed_sql.py` shape contract (or uses
-//! float `npi`, NUL bytes, or unsupported JSON) causes the page to return `Ok(None)` so the
-//! caller falls back to `PROJECT_SQL` with identical PostgreSQL semantics and error codes.
+//! Uses a zero-copy borrowing `serde::Deserialize` visitor that skips unused FHIR metadata
+//! fields without building a `serde_json::Value` DOM. Any row whose payload fails the exact
+//! `network_fhir_typed_sql.py` shape contract (or uses float `npi`, NUL bytes, or unsupported
+//! JSON) causes the page to return `Ok(None)` so the caller falls back to `PROJECT_SQL` with
+//! identical PostgreSQL semantics and error codes.
 
 use crate::fhir_witness_page::{
     registry_location_uuid_bytes, validate_witness_page, WitnessPageRow, WitnessPageSummary,
@@ -11,25 +13,41 @@ use crate::fhir_witness_page::{
 };
 use crate::network_membership_codec::{write_field, COPY_HEADER};
 use rayon::prelude::*;
-use serde_json::{Map, Value};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde_json::value::RawValue;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::fmt;
 
 const CELL_FIELD_COUNT: i16 = 18;
 const PG_TEXT_OID: i32 = 25;
 const PARALLEL_THRESHOLD: usize = 16;
 
-const ADDRESS_KEYS: [&str; 6] = [
-    "first_line",
-    "second_line",
-    "city_name",
-    "state_name",
-    "postal_code",
-    "country_code",
-];
-
 enum CellExtractError {
     Fallback,
     Hard(&'static str),
+}
+
+#[derive(Clone, Copy)]
+enum CellKind {
+    Entity,
+    Location,
+    PractitionerRole,
+    OrganizationAffiliation,
+}
+
+#[derive(Default)]
+struct TypedCellFields<'de> {
+    npi: Option<Cow<'de, str>>,
+    active: Option<bool>,
+    practitioner_ref: Option<Cow<'de, str>>,
+    participating_organization_ref: Option<Cow<'de, str>>,
+    network_refs: Vec<Cow<'de, str>>,
+    location_refs: Vec<Cow<'de, str>>,
+    period_start: Option<Cow<'de, str>>,
+    period_end: Option<Cow<'de, str>>,
+    status: Option<Cow<'de, str>>,
+    address: [Option<Cow<'de, str>>; 6],
 }
 
 fn is_pg_exact_int(text: &str) -> bool {
@@ -40,61 +58,282 @@ fn is_pg_exact_int(text: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+#[inline]
 fn has_nul(text: &str) -> bool {
     text.as_bytes().contains(&0)
 }
 
-fn extract_opt_text<'a>(
-    map: &'a Map<String, Value>,
-    key: &str,
-) -> Result<Option<&'a str>, CellExtractError> {
-    match map.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) if !has_nul(text) => Ok(Some(text.as_str())),
-        _ => Err(CellExtractError::Fallback),
+struct OptTextSeed;
+
+impl<'de> DeserializeSeed<'de> for OptTextSeed {
+    type Value = Option<Cow<'de, str>>;
+
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        struct OptTextVisitor;
+        impl<'de> Visitor<'de> for OptTextVisitor {
+            type Value = Option<Cow<'de, str>>;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("null or NUL-free JSON string")
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_borrowed_str<E: de::Error>(self, text: &'de str) -> Result<Self::Value, E> {
+                if has_nul(text) {
+                    return Err(E::custom("nul"));
+                }
+                Ok(Some(Cow::Borrowed(text)))
+            }
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                if has_nul(text) {
+                    return Err(E::custom("nul"));
+                }
+                Ok(Some(Cow::Owned(text.to_owned())))
+            }
+            fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+                if has_nul(&text) {
+                    return Err(E::custom("nul"));
+                }
+                Ok(Some(Cow::Owned(text)))
+            }
+        }
+        deserializer.deserialize_any(OptTextVisitor)
     }
 }
 
-fn extract_opt_bool(map: &Map<String, Value>, key: &str) -> Result<Option<bool>, CellExtractError> {
-    match map.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Bool(flag)) => Ok(Some(*flag)),
-        _ => Err(CellExtractError::Fallback),
+struct OptBoolSeed;
+
+impl<'de> DeserializeSeed<'de> for OptBoolSeed {
+    type Value = Option<bool>;
+
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        struct OptBoolVisitor;
+        impl Visitor<'_> for OptBoolVisitor {
+            type Value = Option<bool>;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("null or boolean")
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_bool<E: de::Error>(self, flag: bool) -> Result<Self::Value, E> {
+                Ok(Some(flag))
+            }
+        }
+        deserializer.deserialize_any(OptBoolVisitor)
+    }
+}
+
+struct OptTextArraySeed;
+
+impl<'de> DeserializeSeed<'de> for OptTextArraySeed {
+    type Value = Vec<Cow<'de, str>>;
+
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        struct OptTextArrayVisitor;
+        impl<'de> Visitor<'de> for OptTextArrayVisitor {
+            type Value = Vec<Cow<'de, str>>;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("null or array of NUL-free strings")
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(Vec::new())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64));
+                while let Some(item) = seq.next_element_seed(TextItemSeed)? {
+                    items.push(item);
+                }
+                Ok(items)
+            }
+        }
+        deserializer.deserialize_any(OptTextArrayVisitor)
+    }
+}
+
+struct TextItemSeed;
+
+impl<'de> DeserializeSeed<'de> for TextItemSeed {
+    type Value = Cow<'de, str>;
+
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        struct TextItemVisitor;
+        impl<'de> Visitor<'de> for TextItemVisitor {
+            type Value = Cow<'de, str>;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("NUL-free JSON string")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, text: &'de str) -> Result<Self::Value, E> {
+                if has_nul(text) {
+                    return Err(E::custom("nul"));
+                }
+                Ok(Cow::Borrowed(text))
+            }
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                if has_nul(text) {
+                    return Err(E::custom("nul"));
+                }
+                Ok(Cow::Owned(text.to_owned()))
+            }
+            fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+                if has_nul(&text) {
+                    return Err(E::custom("nul"));
+                }
+                Ok(Cow::Owned(text))
+            }
+        }
+        deserializer.deserialize_str(TextItemVisitor)
+    }
+}
+
+fn parse_raw_npi<'de, E: de::Error>(raw: &'de RawValue) -> Result<Option<Cow<'de, str>>, E> {
+    let token = raw.get();
+    if token == "null" {
+        return Ok(None);
+    }
+    if token.starts_with('"') {
+        if !token.as_bytes().contains(&b'\\') {
+            let inner = &token[1..token.len() - 1];
+            if has_nul(inner) {
+                return Err(E::custom("nul"));
+            }
+            return Ok(Some(Cow::Borrowed(inner)));
+        }
+        let decoded: String = serde_json::from_str(token).map_err(E::custom)?;
+        if has_nul(&decoded) {
+            return Err(E::custom("nul"));
+        }
+        return Ok(Some(Cow::Owned(decoded)));
+    }
+    if is_pg_exact_int(token) {
+        return Ok(Some(Cow::Borrowed(token)));
+    }
+    Err(E::custom("invalid_npi"))
+}
+
+struct TypedCellFieldsSeed {
+    kind: CellKind,
+}
+
+impl<'de> DeserializeSeed<'de> for TypedCellFieldsSeed {
+    type Value = TypedCellFields<'de>;
+
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        struct FieldsVisitor {
+            kind: CellKind,
+        }
+        impl<'de> Visitor<'de> for FieldsVisitor {
+            type Value = TypedCellFields<'de>;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("FHIR resource payload object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fields = TypedCellFields::default();
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match (self.kind, key.as_ref()) {
+                        (
+                            CellKind::Entity
+                            | CellKind::PractitionerRole
+                            | CellKind::OrganizationAffiliation,
+                            "npi",
+                        ) => {
+                            let raw: &'de RawValue = map.next_value()?;
+                            fields.npi = parse_raw_npi(raw)?;
+                        }
+                        (
+                            CellKind::Entity
+                            | CellKind::PractitionerRole
+                            | CellKind::OrganizationAffiliation,
+                            "active",
+                        ) => {
+                            fields.active = map.next_value_seed(OptBoolSeed)?;
+                        }
+                        (CellKind::Location, "status") => {
+                            fields.status = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (CellKind::Location, "first_line") => {
+                            fields.address[0] = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (CellKind::Location, "second_line") => {
+                            fields.address[1] = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (CellKind::Location, "city_name") => {
+                            fields.address[2] = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (CellKind::Location, "state_name") => {
+                            fields.address[3] = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (CellKind::Location, "postal_code") => {
+                            fields.address[4] = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (CellKind::Location, "country_code") => {
+                            fields.address[5] = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (
+                            CellKind::PractitionerRole | CellKind::OrganizationAffiliation,
+                            "practitioner_ref",
+                        ) => {
+                            fields.practitioner_ref = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (
+                            CellKind::PractitionerRole | CellKind::OrganizationAffiliation,
+                            "participating_organization_ref",
+                        ) => {
+                            fields.participating_organization_ref =
+                                map.next_value_seed(OptTextSeed)?;
+                        }
+                        (
+                            CellKind::PractitionerRole | CellKind::OrganizationAffiliation,
+                            "network_refs",
+                        ) => {
+                            fields.network_refs = map.next_value_seed(OptTextArraySeed)?;
+                        }
+                        (
+                            CellKind::PractitionerRole | CellKind::OrganizationAffiliation,
+                            "location_refs",
+                        ) => {
+                            fields.location_refs = map.next_value_seed(OptTextArraySeed)?;
+                        }
+                        (
+                            CellKind::PractitionerRole | CellKind::OrganizationAffiliation,
+                            "period_start",
+                        ) => {
+                            fields.period_start = map.next_value_seed(OptTextSeed)?;
+                        }
+                        (
+                            CellKind::PractitionerRole | CellKind::OrganizationAffiliation,
+                            "period_end",
+                        ) => {
+                            fields.period_end = map.next_value_seed(OptTextSeed)?;
+                        }
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor { kind: self.kind })
     }
 }
 
 pub type PreparedTypedCopy = (Vec<u8>, usize, WitnessPageSummary);
-
-fn extract_opt_npi(map: &Map<String, Value>) -> Result<Option<&str>, CellExtractError> {
-    match map.get("npi") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) if !has_nul(text) => Ok(Some(text.as_str())),
-        Some(Value::Number(number)) if is_pg_exact_int(number.as_str()) => {
-            Ok(Some(number.as_str()))
-        }
-        _ => Err(CellExtractError::Fallback),
-    }
-}
-
-fn extract_text_array<'a>(
-    map: &'a Map<String, Value>,
-    key: &str,
-) -> Result<Vec<&'a str>, CellExtractError> {
-    match map.get(key) {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(items)) => {
-            let mut values = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Value::String(text) if !has_nul(text) => values.push(text.as_str()),
-                    _ => return Err(CellExtractError::Fallback),
-                }
-            }
-            Ok(values)
-        }
-        _ => Err(CellExtractError::Fallback),
-    }
-}
 
 fn write_opt_text(value: Option<&str>, out: &mut Vec<u8>) -> Result<(), CellExtractError> {
     match value {
@@ -119,7 +358,7 @@ fn write_opt_bool(value: Option<bool>, out: &mut Vec<u8>) {
     }
 }
 
-fn write_text_array(items: &[&str], out: &mut Vec<u8>) -> Result<(), CellExtractError> {
+fn write_text_array(items: &[Cow<'_, str>], out: &mut Vec<u8>) -> Result<(), CellExtractError> {
     if items.is_empty() {
         // PostgreSQL binary array format for empty 0-dimensional text[].
         out.extend_from_slice(&12i32.to_be_bytes());
@@ -152,20 +391,61 @@ fn write_text_array(items: &[&str], out: &mut Vec<u8>) -> Result<(), CellExtract
     Ok(())
 }
 
-fn parse_payload_object(raw: &str) -> Result<Map<String, Value>, CellExtractError> {
-    let parsed: Value = serde_json::from_str(raw).map_err(|_| CellExtractError::Fallback)?;
-    match parsed {
-        Value::Object(map) => Ok(map),
-        Value::String(inner) => match serde_json::from_str::<Value>(&inner) {
-            Ok(Value::Object(map)) => Ok(map),
-            _ => Err(CellExtractError::Fallback),
-        },
-        _ => Err(CellExtractError::Fallback),
+fn deserialize_object_fields<'de>(
+    raw: &'de str,
+    kind: CellKind,
+) -> Result<TypedCellFields<'de>, CellExtractError> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let fields = TypedCellFieldsSeed { kind }
+        .deserialize(&mut deserializer)
+        .map_err(|_| CellExtractError::Fallback)?;
+    deserializer.end().map_err(|_| CellExtractError::Fallback)?;
+    Ok(fields)
+}
+
+fn encode_cell_fields(
+    row: &WitnessPageRow<'_>,
+    kind: CellKind,
+    site_id: Option<[u8; 16]>,
+    fields: &TypedCellFields<'_>,
+) -> Result<Vec<u8>, CellExtractError> {
+    let subject_ref = match kind {
+        CellKind::PractitionerRole => fields.practitioner_ref.as_deref(),
+        CellKind::OrganizationAffiliation => fields.participating_organization_ref.as_deref(),
+        CellKind::Entity | CellKind::Location => None,
+    };
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(&CELL_FIELD_COUNT.to_be_bytes());
+    write_opt_text(Some(row.resource_type), &mut out)?;
+    write_opt_text(Some(row.resource_id), &mut out)?;
+    write_opt_text(Some(row.payload_hash), &mut out)?;
+    write_opt_text(fields.npi.as_deref(), &mut out)?;
+    write_opt_bool(fields.active, &mut out);
+    write_opt_text(subject_ref, &mut out)?;
+    write_text_array(&fields.network_refs, &mut out)?;
+    write_text_array(&fields.location_refs, &mut out)?;
+    write_opt_text(fields.period_start.as_deref(), &mut out)?;
+    write_opt_text(fields.period_end.as_deref(), &mut out)?;
+    write_opt_text(fields.status.as_deref(), &mut out)?;
+    for value in &fields.address {
+        write_opt_text(value.as_deref(), &mut out)?;
     }
+    match site_id {
+        Some(uuid) => write_field(&uuid, &mut out),
+        None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+    }
+    Ok(out)
 }
 
 fn encode_cell_row(row: &WitnessPageRow<'_>, source_id: &str) -> Result<Vec<u8>, CellExtractError> {
-    let site_id = if row.resource_type == "Location" {
+    let kind = match row.resource_type {
+        "Organization" | "Practitioner" => CellKind::Entity,
+        "Location" => CellKind::Location,
+        "PractitionerRole" => CellKind::PractitionerRole,
+        "OrganizationAffiliation" => CellKind::OrganizationAffiliation,
+        _ => return Err(CellExtractError::Fallback),
+    };
+    let site_id = if matches!(kind, CellKind::Location) {
         Some(
             registry_location_uuid_bytes(source_id, row.resource_id)
                 .map_err(CellExtractError::Hard)?,
@@ -173,67 +453,12 @@ fn encode_cell_row(row: &WitnessPageRow<'_>, source_id: &str) -> Result<Vec<u8>,
     } else {
         None
     };
-    let map = parse_payload_object(row.payload_json)?;
-    let mut npi: Option<&str> = None;
-    let mut active: Option<bool> = None;
-    let mut subject_ref: Option<&str> = None;
-    let mut network_refs: Vec<&str> = Vec::new();
-    let mut location_refs: Vec<&str> = Vec::new();
-    let mut period_start: Option<&str> = None;
-    let mut period_end: Option<&str> = None;
-    let mut location_status: Option<&str> = None;
-    let mut address_values: [Option<&str>; 6] = [None; 6];
-
-    match row.resource_type {
-        "Organization" | "Practitioner" => {
-            npi = extract_opt_npi(&map)?;
-            active = extract_opt_bool(&map, "active")?;
-        }
-        "Location" => {
-            location_status = extract_opt_text(&map, "status")?;
-            for (slot, key) in address_values.iter_mut().zip(ADDRESS_KEYS.iter()) {
-                *slot = extract_opt_text(&map, key)?;
-            }
-        }
-        "PractitionerRole" | "OrganizationAffiliation" => {
-            npi = extract_opt_npi(&map)?;
-            active = extract_opt_bool(&map, "active")?;
-            let practitioner_ref = extract_opt_text(&map, "practitioner_ref")?;
-            let participating_org_ref = extract_opt_text(&map, "participating_organization_ref")?;
-            subject_ref = if row.resource_type == "PractitionerRole" {
-                practitioner_ref
-            } else {
-                participating_org_ref
-            };
-            network_refs = extract_text_array(&map, "network_refs")?;
-            location_refs = extract_text_array(&map, "location_refs")?;
-            period_start = extract_opt_text(&map, "period_start")?;
-            period_end = extract_opt_text(&map, "period_end")?;
-        }
-        _ => return Err(CellExtractError::Fallback),
+    let trimmed = row.payload_json.trim_start();
+    if trimmed.starts_with('{') {
+        let fields = deserialize_object_fields(trimmed, kind)?;
+        return encode_cell_fields(row, kind, site_id, &fields);
     }
-
-    let mut out = Vec::with_capacity(256);
-    out.extend_from_slice(&CELL_FIELD_COUNT.to_be_bytes());
-    write_opt_text(Some(row.resource_type), &mut out)?;
-    write_opt_text(Some(row.resource_id), &mut out)?;
-    write_opt_text(Some(row.payload_hash), &mut out)?;
-    write_opt_text(npi, &mut out)?;
-    write_opt_bool(active, &mut out);
-    write_opt_text(subject_ref, &mut out)?;
-    write_text_array(&network_refs, &mut out)?;
-    write_text_array(&location_refs, &mut out)?;
-    write_opt_text(period_start, &mut out)?;
-    write_opt_text(period_end, &mut out)?;
-    write_opt_text(location_status, &mut out)?;
-    for value in address_values {
-        write_opt_text(value, &mut out)?;
-    }
-    match site_id {
-        Some(uuid) => write_field(&uuid, &mut out),
-        None => out.extend_from_slice(&(-1i32).to_be_bytes()),
-    }
-    Ok(out)
+    Err(CellExtractError::Fallback)
 }
 
 /// Validate a typed witness page and emit a PostgreSQL binary COPY payload for `source_cells`.
@@ -324,7 +549,7 @@ mod tests {
                 resource_type: "Location",
                 resource_id: "loc-1",
                 payload_hash: &hash,
-                payload_json: "{\"status\":\"active\",\"first_line\":\"123 Main St\",\"city_name\":\"Austin\",\"state_name\":\"TX\",\"postal_code\":\"78701\"}",
+                payload_json: "{\"status\":\"active\",\"first_line\":\"123 \\\"Main\\\" St\",\"city_name\":\"Austin\",\"state_name\":\"TX\",\"postal_code\":\"78701\",\"unused_nested\":{\"a\":[1,2,3]}}",
                 acquired_resource_sha256: None,
             },
             WitnessPageRow {
@@ -332,7 +557,7 @@ mod tests {
                 resource_type: "PractitionerRole",
                 resource_id: "role-1",
                 payload_hash: &hash,
-                payload_json: "{\"npi\":1234567893,\"active\":true,\"practitioner_ref\":\"Practitioner/p1\",\"network_refs\":[\"Organization/n1\"],\"location_refs\":[\"Location/loc-1\"],\"period_start\":\"2026-01-01\"}",
+                payload_json: "{\"npi\":1234567893,\"active\":true,\"practitioner_ref\":\"Practitioner/p1\",\"network_refs\":[\"Organization/n1\"],\"location_refs\":[\"Location/loc-1\"],\"period_start\":\"2026-01-01\",\"extra_blob\":{\"nested\":true}}",
                 acquired_resource_sha256: None,
             },
         ];
@@ -363,9 +588,12 @@ mod tests {
         for bad_payload in [
             "{\"active\":\"yes\"}",
             "{\"npi\":123.45}",
+            "{\"npi\":-0}",
+            "{\"npi\":\"123\\u00004\"}",
             "{\"network_refs\":[123]}",
             "{\"practitioner_ref\":\"bad\\u0000id\"}",
             "{\"participating_organization_ref\":42}",
+            "{\"npi\":\"1000000004\"} trailing",
         ] {
             let rows = [WitnessPageRow {
                 dataset_id: "ds-1",
@@ -385,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_double_encoded_json_string_payload() {
+    fn falls_back_on_double_encoded_json_string_payload() {
         let hash = "a".repeat(64);
         let allowed = BTreeSet::from(["Organization".to_owned()]);
         let project = allowed.clone();
@@ -398,9 +626,10 @@ mod tests {
             payload_json: "\"{\\\"npi\\\":\\\"1000000004\\\",\\\"active\\\":true}\"",
             acquired_resource_sha256: None,
         }];
-        let (_, count, _) = prepare_typed_page_copy(&rows, &options, "source-one", &project)
-            .unwrap()
-            .unwrap();
-        assert_eq!(count, 1);
+        assert!(
+            prepare_typed_page_copy(&rows, &options, "source-one", &project)
+                .unwrap()
+                .is_none()
+        );
     }
 }

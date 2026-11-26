@@ -119,30 +119,33 @@ fn validate_fhir_witness_page(
     };
     let allowed_set = allowed_kinds.map(|items| items.into_iter().collect::<BTreeSet<_>>());
     let (check_marker, completion_v3, validate_ids, validate_hashes) = flags;
+    let pool = location_canon_pool()?;
     let summary = py
         .detach(|| {
-            let borrowed: Vec<crate::fhir_witness_page::WitnessPageRow<'_>> = extracted
-                .iter()
-                .map(|row| crate::fhir_witness_page::WitnessPageRow {
-                    dataset_id: &row.0,
-                    resource_type: &row.1,
-                    resource_id: &row.2,
-                    payload_hash: &row.3,
-                    payload_json: &row.4,
-                    acquired_resource_sha256: row.5.as_deref(),
-                })
-                .collect();
-            let options = crate::fhir_witness_page::WitnessValidationOptions {
-                dataset_id,
-                allowed_kinds: allowed_set.as_ref(),
-                after,
-                check_marker,
-                completion_v3,
-                validate_ids,
-                validate_hashes,
-                max_bytes,
-            };
-            crate::fhir_witness_page::validate_witness_page(&borrowed, &options)
+            pool.install(|| {
+                let borrowed: Vec<crate::fhir_witness_page::WitnessPageRow<'_>> = extracted
+                    .iter()
+                    .map(|row| crate::fhir_witness_page::WitnessPageRow {
+                        dataset_id: &row.0,
+                        resource_type: &row.1,
+                        resource_id: &row.2,
+                        payload_hash: &row.3,
+                        payload_json: &row.4,
+                        acquired_resource_sha256: row.5.as_deref(),
+                    })
+                    .collect();
+                let options = crate::fhir_witness_page::WitnessValidationOptions {
+                    dataset_id,
+                    allowed_kinds: allowed_set.as_ref(),
+                    after,
+                    check_marker,
+                    completion_v3,
+                    validate_ids,
+                    validate_hashes,
+                    max_bytes,
+                };
+                crate::fhir_witness_page::validate_witness_page(&borrowed, &options)
+            })
         })
         .map_err(PyValueError::new_err)?;
     Ok(Some((summary.last_type, summary.last_id, summary.counts)))
@@ -307,11 +310,7 @@ fn fold_stored_resource_roots_page(
         {
             return Err(PyValueError::new_err("membership_row_changed"));
         }
-        extracted.push((
-            kind_obj.extract()?,
-            id_obj.extract()?,
-            hash_obj.extract()?,
-        ));
+        extracted.push((kind_obj.extract()?, id_obj.extract()?, hash_obj.extract()?));
     }
     let allowed_set: BTreeSet<String> = allowed_kinds.into_iter().collect();
     let (root_bytes, families) = py
@@ -367,7 +366,11 @@ fn compact_json_utf8_len_fits(rows: &Bound<'_, PyAny>, max_bytes: usize) -> PyRe
                 let text = value.extract::<WitnessBackedStr>()?;
                 crate::fhir_witness_page::json_str_utf8_len(&text)
             } else if value.is_exact_instance_of::<PyBool>() {
-                if value.extract::<bool>()? { 4 } else { 5 }
+                if value.extract::<bool>()? {
+                    4
+                } else {
+                    5
+                }
             } else if value.is_exact_instance_of::<PyInt>() {
                 match value.extract::<i64>() {
                     Ok(number) => itoa_buf.format(number).len(),

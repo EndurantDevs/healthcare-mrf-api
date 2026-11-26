@@ -6,28 +6,98 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn digest(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    Sha256::digest(bytes)
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(HEX[usize::from(byte >> 4)]),
-                char::from(HEX[usize::from(byte & 15)]),
-            ]
-        })
-        .collect()
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+trait JsonSink {
+    fn push_byte(&mut self, byte: u8);
+    fn extend_bytes(&mut self, bytes: &[u8]);
+}
+
+impl JsonSink for Vec<u8> {
+    #[inline]
+    fn push_byte(&mut self, byte: u8) {
+        self.push(byte);
+    }
+
+    #[inline]
+    fn extend_bytes(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+struct Sha256Sink {
+    hasher: Sha256,
+    buffer: [u8; 4096],
+    len: usize,
+}
+
+impl Sha256Sink {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            buffer: [0u8; 4096],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) {
+        if self.len != 0 {
+            self.hasher.update(&self.buffer[..self.len]);
+            self.len = 0;
+        }
+    }
+
+    fn finish_hex(mut self) -> String {
+        self.flush();
+        let digest = self.hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        out
+    }
+}
+
+impl JsonSink for Sha256Sink {
+    #[inline]
+    fn push_byte(&mut self, byte: u8) {
+        if self.len == self.buffer.len() {
+            self.flush();
+        }
+        self.buffer[self.len] = byte;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn extend_bytes(&mut self, bytes: &[u8]) {
+        if bytes.len() <= self.buffer.len() - self.len {
+            self.buffer[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+            return;
+        }
+        self.flush();
+        if bytes.len() >= self.buffer.len() {
+            self.hasher.update(bytes);
+        } else {
+            self.buffer[..bytes.len()].copy_from_slice(bytes);
+            self.len = bytes.len();
+        }
+    }
 }
 
 fn sha256(value: &Value) -> String {
-    let encoded = json_bytes(value, true, true);
-    digest(&encoded)
+    let mut sink = Sha256Sink::new();
+    write_json_to(value, true, true, &mut sink);
+    sink.finish_hex()
 }
 
-fn sha256_object(value: &Map<String, Value>, capacity: usize) -> String {
-    let mut encoded = Vec::with_capacity(capacity);
-    write_object(value, true, true, &mut encoded);
-    digest(&encoded)
+fn sha256_object(value: &Map<String, Value>, spaced: bool, ascii: bool) -> String {
+    let mut sink = Sha256Sink::new();
+    write_object_to(value, spaced, ascii, &mut sink);
+    sink.finish_hex()
 }
 
 pub(super) fn payload_hash(
@@ -42,13 +112,7 @@ pub(super) fn payload_hash(
     {
         return Ok(hash);
     }
-    payload_hash_content(
-        payload.clone(),
-        raw_payload.len(),
-        contract,
-        resource_type,
-        completion_v3,
-    )
+    payload_hash_content(payload.clone(), contract, resource_type, completion_v3)
 }
 
 pub(super) fn payload_hash_owned(
@@ -63,13 +127,7 @@ pub(super) fn payload_hash_owned(
     {
         return Ok(hash);
     }
-    payload_hash_content(
-        payload,
-        raw_payload.len(),
-        contract,
-        resource_type,
-        completion_v3,
-    )
+    payload_hash_content(payload, contract, resource_type, completion_v3)
 }
 
 fn merged_or_transport_bound_hash(
@@ -90,14 +148,13 @@ fn merged_or_transport_bound_hash(
         return Ok(Some(hash));
     }
     if contract == "transport_bound_v1" {
-        return Ok(Some(sha256_object(payload, raw_payload.len())));
+        return Ok(Some(sha256_object(payload, true, true)));
     }
     Ok(None)
 }
 
 fn payload_hash_content(
     mut content: Map<String, Value>,
-    raw_len: usize,
     contract: &str,
     resource_type: &str,
     completion_v3: bool,
@@ -111,12 +168,10 @@ fn payload_hash_content(
         content.remove(field);
     }
     if completion_v3 {
-        let mut encoded = Vec::with_capacity(raw_len);
-        write_object(&content, false, false, &mut encoded);
-        return Ok(digest(&encoded));
+        return Ok(sha256_object(&content, false, false));
     }
     if contract == "transport_neutral_v2" {
-        return Ok(sha256_object(&content, raw_len));
+        return Ok(sha256_object(&content, true, true));
     }
     if let Some(Value::Object(metadata)) = content.get_mut("fhir_meta") {
         metadata.remove("lastUpdated");
@@ -125,22 +180,34 @@ fn payload_hash_content(
         }
     }
     if contract == "semantic_content_v4" && resource_type == "Organization" {
-        return organization_hash(&content);
+        return organization_hash(content);
     }
     if ["names", "family_name", "given_names", "full_name"]
         .iter()
         .all(|field| content.contains_key(*field))
     {
-        return practitioner_hash(&content);
+        return practitioner_hash(content);
     }
-    Ok(sha256_object(&content, raw_len))
+    Ok(sha256_object(&content, true, true))
 }
 
-fn composed_hash(base: Map<String, Value>, hashes: BTreeSet<String>) -> String {
-    sha256(&serde_json::json!({"base_hash": sha256(&Value::Object(base)), "name_hashes": hashes}))
+fn composed_hash(base: &Map<String, Value>, hashes: &BTreeSet<String>) -> String {
+    let base_hash = sha256_object(base, true, true);
+    let mut sink = Sha256Sink::new();
+    sink.extend_bytes(b"{\"base_hash\": ");
+    write_string_to(&base_hash, true, &mut sink);
+    sink.extend_bytes(b", \"name_hashes\": [");
+    for (index, hash) in hashes.iter().enumerate() {
+        if index > 0 {
+            sink.extend_bytes(b", ");
+        }
+        write_string_to(hash, true, &mut sink);
+    }
+    sink.extend_bytes(b"]}");
+    sink.finish_hex()
 }
 
-fn practitioner_hash(payload: &Map<String, Value>) -> std::result::Result<String, &'static str> {
+fn practitioner_hash(mut payload: Map<String, Value>) -> std::result::Result<String, &'static str> {
     let names = match &payload["names"] {
         Value::Null => &[][..],
         Value::Array(names) => names.as_slice(),
@@ -193,11 +260,11 @@ fn practitioner_hash(payload: &Map<String, Value>) -> std::result::Result<String
             return Err("invalid_name_projection");
         }
     }
-    let mut base = payload.clone();
     for field in ["names", "family_name", "given_names", "full_name"] {
-        base.remove(field);
+        payload.remove(field);
     }
-    Ok(composed_hash(base, canonical.iter().map(sha256).collect()))
+    let name_hashes: BTreeSet<String> = canonical.iter().map(sha256).collect();
+    Ok(composed_hash(&payload, &name_hashes))
 }
 
 fn truthy(value: &Value) -> bool {
@@ -234,7 +301,17 @@ fn organization_texts(
     }
 }
 
-fn organization_hash(payload: &Map<String, Value>) -> std::result::Result<String, &'static str> {
+fn hash_kind_value(kind: &str, value: &str) -> String {
+    let mut sink = Sha256Sink::new();
+    sink.extend_bytes(b"{\"kind\": ");
+    write_string_to(kind, true, &mut sink);
+    sink.extend_bytes(b", \"value\": ");
+    write_string_to(value, true, &mut sink);
+    sink.push_byte(b'}');
+    sink.finish_hex()
+}
+
+fn organization_hash(mut payload: Map<String, Value>) -> std::result::Result<String, &'static str> {
     if ["names", "family_name", "given_names", "full_name"]
         .iter()
         .all(|field| payload.contains_key(*field))
@@ -283,34 +360,29 @@ fn organization_hash(payload: &Map<String, Value>) -> std::result::Result<String
             return Err("invalid_name_projection");
         }
     }
-    let mut base = payload.clone();
     for field in ["name", "aliases", "name_variants"] {
-        base.remove(field);
+        payload.remove(field);
     }
-    let hashes = variants
+    let hashes: BTreeSet<String> = variants
         .iter()
-        .map(|name| sha256(&serde_json::json!({"kind": "name", "value": name})))
-        .chain(
-            labels
-                .iter()
-                .map(|label| sha256(&serde_json::json!({"kind": "label", "value": label}))),
-        )
+        .map(|name| hash_kind_value("name", name))
+        .chain(labels.iter().map(|label| hash_kind_value("label", label)))
         .collect();
-    Ok(composed_hash(base, hashes))
+    Ok(composed_hash(&payload, &hashes))
 }
 
 pub(crate) fn json_bytes(value: &Value, spaced: bool, ascii: bool) -> Vec<u8> {
     let mut output = Vec::new();
-    write_json(value, spaced, ascii, &mut output);
+    write_json_to(value, spaced, ascii, &mut output);
     output
 }
 
-fn write_json(value: &Value, spaced: bool, ascii: bool, output: &mut Vec<u8>) {
+fn write_json_to<S: JsonSink>(value: &Value, spaced: bool, ascii: bool, output: &mut S) {
     match value {
-        Value::Null => output.extend_from_slice(b"null"),
-        Value::Bool(true) => output.extend_from_slice(b"true"),
-        Value::Bool(false) => output.extend_from_slice(b"false"),
-        Value::Number(number) => output.extend_from_slice(
+        Value::Null => output.extend_bytes(b"null"),
+        Value::Bool(true) => output.extend_bytes(b"true"),
+        Value::Bool(false) => output.extend_bytes(b"false"),
+        Value::Number(number) => output.extend_bytes(
             if number.as_str() == "-0" {
                 "0"
             } else {
@@ -318,69 +390,131 @@ fn write_json(value: &Value, spaced: bool, ascii: bool, output: &mut Vec<u8>) {
             }
             .as_bytes(),
         ),
-        Value::String(text) => write_string(text, ascii, output),
-        Value::Array(values) => write_array(values, spaced, ascii, output),
-        Value::Object(values) => write_object(values, spaced, ascii, output),
+        Value::String(text) => write_string_to(text, ascii, output),
+        Value::Array(values) => write_array_to(values, spaced, ascii, output),
+        Value::Object(values) => write_object_to(values, spaced, ascii, output),
     }
 }
 
 pub(super) fn object_json_bytes(value: &Map<String, Value>, spaced: bool, ascii: bool) -> Vec<u8> {
     let mut output = Vec::new();
-    write_object(value, spaced, ascii, &mut output);
+    write_object_to(value, spaced, ascii, &mut output);
     output
 }
 
 pub(super) fn write_array(values: &[Value], spaced: bool, ascii: bool, output: &mut Vec<u8>) {
-    output.push(b'[');
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            output.extend_from_slice(if spaced { b", " } else { b"," });
-        }
-        write_json(value, spaced, ascii, output);
-    }
-    output.push(b']');
+    write_array_to(values, spaced, ascii, output);
 }
 
-fn write_object(values: &Map<String, Value>, spaced: bool, ascii: bool, output: &mut Vec<u8>) {
-    output.push(b'{');
+fn write_array_to<S: JsonSink>(values: &[Value], spaced: bool, ascii: bool, output: &mut S) {
+    output.push_byte(b'[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.extend_bytes(if spaced { b", " } else { b"," });
+        }
+        write_json_to(value, spaced, ascii, output);
+    }
+    output.push_byte(b']');
+}
+
+fn write_object_to<S: JsonSink>(
+    values: &Map<String, Value>,
+    spaced: bool,
+    ascii: bool,
+    output: &mut S,
+) {
+    output.push_byte(b'{');
     for (index, (key, value)) in values.iter().enumerate() {
         if index > 0 {
-            output.extend_from_slice(if spaced { b", " } else { b"," });
+            output.extend_bytes(if spaced { b", " } else { b"," });
         }
-        write_string(key, ascii, output);
-        output.extend_from_slice(if spaced { b": " } else { b":" });
-        write_json(value, spaced, ascii, output);
+        write_string_to(key, ascii, output);
+        output.extend_bytes(if spaced { b": " } else { b":" });
+        write_json_to(value, spaced, ascii, output);
     }
-    output.push(b'}');
+    output.push_byte(b'}');
 }
 
 pub(crate) fn write_string(text: &str, ascii: bool, output: &mut Vec<u8>) {
-    output.push(b'"');
-    for character in text.chars() {
-        match character {
-            '"' => output.extend_from_slice(br#"\""#),
-            '\\' => output.extend_from_slice(br#"\\"#),
-            '\u{0008}' => output.extend_from_slice(br#"\b"#),
-            '\u{000c}' => output.extend_from_slice(br#"\f"#),
-            '\n' => output.extend_from_slice(br#"\n"#),
-            '\r' => output.extend_from_slice(br#"\r"#),
-            '\t' => output.extend_from_slice(br#"\t"#),
-            character
-                if character <= '\u{001f}' || (ascii && !(' '..='~').contains(&character)) =>
-            {
-                let mut units = [0; 2];
-                for unit in character.encode_utf16(&mut units) {
-                    output.extend_from_slice(b"\\u");
-                    for shift in [12, 8, 4, 0] {
-                        output.push(b"0123456789abcdef"[usize::from((*unit >> shift) & 15)]);
-                    }
-                }
+    write_string_to(text, ascii, output);
+}
+
+fn write_string_to<S: JsonSink>(text: &str, ascii: bool, output: &mut S) {
+    output.push_byte(b'"');
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte >= 0x20 && byte != b'"' && byte != b'\\' && (!ascii || byte < 0x7f) {
+            index += 1;
+            continue;
+        }
+        if start < index {
+            output.extend_bytes(&bytes[start..index]);
+        }
+        match byte {
+            b'"' => {
+                output.extend_bytes(br#"\""#);
+                index += 1;
             }
-            character => {
-                let mut bytes = [0; 4];
-                output.extend_from_slice(character.encode_utf8(&mut bytes).as_bytes());
+            b'\\' => {
+                output.extend_bytes(br#"\\"#);
+                index += 1;
+            }
+            0x08 => {
+                output.extend_bytes(br#"\b"#);
+                index += 1;
+            }
+            0x0c => {
+                output.extend_bytes(br#"\f"#);
+                index += 1;
+            }
+            b'\n' => {
+                output.extend_bytes(br#"\n"#);
+                index += 1;
+            }
+            b'\r' => {
+                output.extend_bytes(br#"\r"#);
+                index += 1;
+            }
+            b'\t' => {
+                output.extend_bytes(br#"\t"#);
+                index += 1;
+            }
+            0x00..=0x1f | 0x7f => {
+                let escaped = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[usize::from(byte >> 4)],
+                    HEX[usize::from(byte & 15)],
+                ];
+                output.extend_bytes(&escaped);
+                index += 1;
+            }
+            _ => {
+                let character = text[index..].chars().next().unwrap();
+                let mut units = [0u16; 2];
+                for unit in character.encode_utf16(&mut units) {
+                    let escaped = [
+                        b'\\',
+                        b'u',
+                        HEX[usize::from((*unit >> 12) & 15)],
+                        HEX[usize::from((*unit >> 8) & 15)],
+                        HEX[usize::from((*unit >> 4) & 15)],
+                        HEX[usize::from(*unit & 15)],
+                    ];
+                    output.extend_bytes(&escaped);
+                }
+                index += character.len_utf8();
             }
         }
+        start = index;
     }
-    output.push(b'"');
+    if start < bytes.len() {
+        output.extend_bytes(&bytes[start..]);
+    }
+    output.push_byte(b'"');
 }

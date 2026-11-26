@@ -170,6 +170,18 @@ def _encode_retained_batch(resource_rows, context, native_encoder, location_id, 
     return native_encoder(encoded)
 
 
+def _finish_native_batch(rows, context, encoded, *, reference_validator, reference_records):
+    bindings, evidence, plans, root, families, count, unsupported, owned = encoded
+    _validate_native((bindings, evidence, plans), root, families, count, unsupported, owned, len(rows))
+    fallback_rows = [rows[index] for index in unsupported]
+    if fallback_rows:
+        reference_validator(fallback_rows)
+    derived = reference_records(fallback_rows) if fallback_rows and context["derive"] else ()
+    extra, owned = _fallback_batches(derived, owned)
+    batches = tuple(tuple(native) + additional for native, additional in zip((bindings, evidence, plans), extra))
+    return PreparedRetainedFhirBatch(batches, root, families, count, tuple(unsupported), owned)
+
+
 def prepare_retained_fhir_batch(
     rows,
     context,
@@ -183,12 +195,37 @@ def prepare_retained_fhir_batch(
 ):
     """Validate fallback rows before root use and prepare all retained COPY bytes before writes."""
     encoded = _encode_retained_batch(rows, context, native_encoder, location_id, rows_encoder, native_location_id)
-    bindings, evidence, plans, root, families, count, unsupported, owned = encoded
-    _validate_native((bindings, evidence, plans), root, families, count, unsupported, owned, len(rows))
-    fallback_rows = [rows[index] for index in unsupported]
-    if fallback_rows:
-        reference_validator(fallback_rows)
-    derived = reference_records(fallback_rows) if fallback_rows and context["derive"] else ()
-    extra, owned = _fallback_batches(derived, owned)
-    batches = tuple(tuple(native) + additional for native, additional in zip((bindings, evidence, plans), extra))
-    return PreparedRetainedFhirBatch(batches, root, families, count, tuple(unsupported), owned)
+    return _finish_native_batch(
+        rows,
+        context,
+        encoded,
+        reference_validator=reference_validator,
+        reference_records=reference_records,
+    )
+
+
+def prepare_retained_fhir_witness_page(
+    rows,
+    context,
+    witness_bounds,
+    *,
+    fused_encoder,
+    reference_validator,
+    reference_records,
+):
+    """Validate witness scope/order/budget and encode retained rows in one native call."""
+    if len(rows) > 1000:
+        raise RetainedFhirNativeError("row_limit")
+    dataset_id, after, max_bytes = witness_bounds
+    prepared = fused_encoder(rows, context, dataset_id, after, max_bytes)
+    if prepared is None:
+        return None
+    last_type, last_id, encoded = prepared
+    batch = _finish_native_batch(
+        rows,
+        context,
+        encoded,
+        reference_validator=reference_validator,
+        reference_records=reference_records,
+    )
+    return (last_type, last_id), batch
