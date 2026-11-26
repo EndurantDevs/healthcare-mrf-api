@@ -472,6 +472,48 @@ async def test_owner_retained_replay_seals_compact_candidate_before_publication(
         await _assert_compact_refresh_publication(case, rejected, candidate, carried)
 
 
+async def test_owner_retained_replay_direct_compact_coalesces_parts_and_preserves_parity(monkeypatch):
+    async with _source_case() as case:
+        await _install_storage_profile_fixture(case)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(
+                _install_snapshot_revision, case.schema_name, "20261104020000_custom_import_family_blocks"
+            )
+        connector, original, policy, _, _ = await _registered_runtime(case, monkeypatch, child_text=True)
+        baseline = await runner.run_segmented_snowflake_candidate(
+            case.sessions, connector, original, processing_policy=policy
+        )
+        assert baseline.status == "activated"
+        original_statement = connector.build_statement(original.bundle_request)
+        base = await _profile_source_base(case, baseline)
+        request = replace(
+            original, idempotency_key="synthetic-direct-compact-rebuild", lease_token=b"synthetic-direct-owner"
+        )
+        limits = FamilyBlockLimits(max_spool_bytes=16 * 1024**2, max_record_bytes=64 * 1024)
+        monkeypatch.setenv("HLTHPRT_CUSTOM_IMPORT_DIRECT_COMPACT", "true")
+        candidate = await _replay_profile(
+            case, original_statement, connector, request, baseline, base=base, compact_limits=limits
+        )
+        assert candidate.seal.effective_output_sha256 == baseline.seal.effective_output_sha256
+        async with case.sessions() as session:
+            family_id = await session.scalar(
+                select(CustomImportSnapshotFamily.family_id).where(
+                    CustomImportSnapshotFamily.generation_id == candidate.generation_id
+                )
+            )
+            layout = await session.get(CustomImportFamilyBlockLayout, family_id)
+            assert layout is not None and layout.phase == "logged"
+            legacy_roots = await session.scalar(
+                text(f'SELECT count(*) FROM "{snapshot_schema(family_id)}".custom_import_root_revision')
+            )
+            assert legacy_roots == 0
+        publication = await _approve_profile_publication(case, original, baseline, candidate)
+        await _assert_current_child_text_lookups(case, request, candidate.generation_id)
+        await _assert_unchanged_compact_replay(
+            case, request, original_statement, replace(candidate, publication=publication), limits
+        )
+
+
 async def _assert_unchanged_compact_replay(case, request, original_statement, candidate, limits):
     compact_base = await _profile_source_base(case, candidate)
     retry = replace(request, idempotency_key="synthetic-compact-refresh", lease_token=b"synthetic-refresh-owner")

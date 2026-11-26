@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -449,6 +449,149 @@ async def append_pending_parquet_part(
         )
     )
     return 1
+
+
+@dataclass(frozen=True)
+class PendingParquetPart:
+    """One verified Parquet part queued for batched pending-capture insertion."""
+
+    capture: SealedCapture
+    ordinal: int
+    record_count: int
+    arrow_byte_count: int
+
+
+def _part_budget_increments(part: PendingParquetPart, values_by_field: Mapping[str, Any]) -> dict[str, int]:
+    return dict(
+        zip(
+            _ACCOUNTING_FIELDS,
+            (
+                1,
+                len(part.capture.payload),
+                part.capture.manifest.decoded_bytes,
+                part.arrow_byte_count,
+                part.record_count,
+                len(values_by_field["canonical_capture_manifest"].encode("utf-8")),
+            ),
+            strict=True,
+        )
+    )
+
+
+async def _verify_pending_part_window(
+    session: AsyncSession,
+    request: PendingCaptureRequest,
+    parts: Sequence[PendingParquetPart],
+) -> tuple[str, list[tuple[PendingParquetPart, dict[str, Any]]]]:
+    stream_id = parts[0].capture.manifest.stream_id
+    verified_entries: list[tuple[PendingParquetPart, dict[str, Any]]] = []
+    previous_ordinal: int | None = None
+    for part in parts:
+        if part.capture.manifest.stream_id != stream_id:
+            raise CaptureStoreError("batched pending capture parts must belong to one stream")
+        if previous_ordinal is not None and part.ordinal != previous_ordinal + 1:
+            raise CaptureBundleConflict("pending capture part ordinal is not contiguous")
+        previous_ordinal = part.ordinal
+        values_by_field = await _verified_part_values(
+            session, request, part.capture, part.ordinal, part.record_count, part.arrow_byte_count
+        )
+        verified_entries.append((part, values_by_field))
+    return stream_id, verified_entries
+
+
+async def _load_existing_window_parts(
+    session: AsyncSession,
+    bundle_id: int,
+    stream_slot: int,
+    first_ordinal: int,
+    last_ordinal: int,
+) -> dict[int, CustomImportCaptureParquetPart]:
+    stored_parts = (
+        await session.scalars(
+            select(CustomImportCaptureParquetPart).where(
+                CustomImportCaptureParquetPart.capture_bundle_id == bundle_id,
+                CustomImportCaptureParquetPart.stream_slot == stream_slot,
+                CustomImportCaptureParquetPart.part_ordinal >= first_ordinal,
+                CustomImportCaptureParquetPart.part_ordinal <= last_ordinal,
+            )
+        )
+    ).all()
+    return {stored_part.part_ordinal: stored_part for stored_part in stored_parts}
+
+
+def _collect_pending_window_inserts(
+    bundle_id: int,
+    stream_slot: int,
+    committed_part_count: int,
+    verified_entries: Sequence[tuple[PendingParquetPart, dict[str, Any]]],
+    stored_by_ordinal: Mapping[int, CustomImportCaptureParquetPart],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    expected_next = committed_part_count + 1
+    totals_by_field = dict.fromkeys(_ACCOUNTING_FIELDS, 0)
+    insert_rows: list[dict[str, Any]] = []
+    for part, values_by_field in verified_entries:
+        stored_part = stored_by_ordinal.get(part.ordinal)
+        if stored_part is not None:
+            if any(
+                getattr(stored_part, field_name) != expected_value
+                for field_name, expected_value in values_by_field.items()
+            ):
+                raise CaptureBundleConflict("pending capture part retry has drifted")
+            continue
+        if part.ordinal != expected_next:
+            raise CaptureBundleConflict("pending capture part ordinal is not contiguous")
+        expected_next += 1
+        for field_name, delta in _part_budget_increments(part, values_by_field).items():
+            totals_by_field[field_name] += delta
+        insert_rows.append({"capture_bundle_id": bundle_id, "stream_slot": stream_slot, **values_by_field})
+    return insert_rows, totals_by_field
+
+
+async def append_pending_parquet_window(
+    session: AsyncSession,
+    *,
+    request: PendingCaptureRequest,
+    capture_bundle_id: int,
+    parts: Sequence[PendingParquetPart],
+) -> int:
+    """Insert one contiguous window of parts for a single stream inside one transaction."""
+
+    if not parts:
+        return 0
+    request = _request(session, request)
+    stream_id, verified_entries = await _verify_pending_part_window(session, request, parts)
+    bundle, _ = await _lock_bundle(session, request, capture_bundle_id)
+    stored = await _pending_stream(session, bundle, request, stream_id)
+    if stored.eof_at is not None:
+        raise CaptureBundleConflict("pending capture stream has reached EOF")
+    stored_by_ordinal = await _load_existing_window_parts(
+        session,
+        bundle.capture_bundle_id,
+        stored.stream_slot,
+        verified_entries[0][0].ordinal,
+        verified_entries[-1][0].ordinal,
+    )
+    insert_rows, totals_by_field = _collect_pending_window_inserts(
+        bundle.capture_bundle_id,
+        stored.stream_slot,
+        stored.committed_part_count,
+        verified_entries,
+        stored_by_ordinal,
+    )
+    if not insert_rows:
+        await _fresh_remaining_seconds(session, request, bundle)
+        return 0
+    _check_budget(stored, totals_by_field, request.policy.stream_budget)
+    _check_budget(bundle, totals_by_field, request.policy.bundle_budget)
+    await validate_dataset_retained_bytes(
+        session,
+        dataset_id=request.dataset_id,
+        new_byte_count=totals_by_field["byte_count"] + totals_by_field["manifest_byte_count"],
+        maximum_retained_bytes=request.policy.maximum_dataset_retained_bytes,
+    )
+    await _fresh_remaining_seconds(session, request, bundle)
+    await session.execute(insert(CustomImportCaptureParquetPart), insert_rows)
+    return len(insert_rows)
 
 
 async def _verified_part_values(session, request, capture, ordinal, record_count, arrow_byte_count):
