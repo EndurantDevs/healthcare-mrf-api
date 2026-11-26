@@ -699,6 +699,12 @@ async def _verify_structure_and_log(
     await staging._prepare_statement(session)
     await session.execute(text(f"ALTER TABLE {schema_sql}.{DIRECT_COMMITMENTS_TABLE} SET LOGGED"))
     await staging._prepare_statement(session)
+    await session.execute(
+        text(
+            f"CREATE INDEX IF NOT EXISTS {DIRECT_COMMITMENTS_TABLE}_family_idx ON {schema_sql}.{DIRECT_COMMITMENTS_TABLE} (family_revision_id)"
+        )
+    )
+    await staging._prepare_statement(session)
     await session.execute(text(f"UPDATE {schema_sql}.{DIRECT_PROGRESS_TABLE} SET finalize_stage = 'f4b' WHERE id = 1"))
 
 
@@ -830,55 +836,51 @@ async def _build_spot_check_evidence(
     return evidence_by_field
 
 
+async def _iter_cursor_batches(
+    session, cursor_name: str, query_sql: str, params_by_name: dict[str, object] | None = None
+):
+    """Stream one ordered SQL query in bounded batches and explicitly close its PostgreSQL portal."""
+    await staging._prepare_statement(session)
+    await session.execute(text("SET LOCAL cursor_tuple_fraction = 1.0"))
+    await staging._prepare_statement(session)
+    await session.execute(text(f"DECLARE {cursor_name} NO SCROLL CURSOR FOR {query_sql}"), params_by_name or {})
+    try:
+        while True:
+            await staging._prepare_statement(session)
+            batch_rows = (await session.execute(text(f"FETCH {_MATERIALIZATION_PAGE_LIMIT} FROM {cursor_name}"))).all()
+            if not batch_rows:
+                break
+            yield batch_rows
+            if len(batch_rows) < _MATERIALIZATION_PAGE_LIMIT:
+                break
+    finally:
+        await session.execute(text(f"CLOSE {cursor_name}"))
+
+
 async def _digest_direct_families(session, binding: FamilyBlockBinding, generation, material, effective) -> int:
     schema_sql = _DIALECT.identifier_preparer.quote_schema(snapshot_schema(binding.family_id))
     entity_sql = _DIALECT.identifier_preparer.format_table(binding.tables_by_role["entity_binding"])
+    family_sql = f"""
+        SELECT c.root_record_id, c.logical_key_sha256, c.key_contract_sha256, c.canonical_logical_key,
+               c.family_sha256, c.child_count, c.root_payload_sha256, c.root_source_ordinal,
+               e.adapter_id, e.value_sha256, e.canonical_value,
+               CASE WHEN c.retained THEN 'retained' ELSE 'source' END
+        FROM {schema_sql}.{DIRECT_COMMITMENTS_TABLE} c
+        JOIN {entity_sql} e ON e.entity_binding_id = c.entity_binding_id AND e.dataset_id = :dataset_id
+        ORDER BY c.logical_key_sha256
+    """
     family_count = 0
-    after_family_hash: bytes | None = None
-    while True:
-        family_where = "" if after_family_hash is None else "WHERE c.logical_key_sha256 > :after_hash"
-        family_sql = text(
-            f"""
-            SELECT c.root_record_id, c.logical_key_sha256, c.key_contract_sha256, c.canonical_logical_key,
-                   c.family_sha256, c.child_count, c.root_payload_sha256, c.root_source_ordinal,
-                   e.adapter_id, e.value_sha256, e.canonical_value,
-                   CASE WHEN c.retained THEN 'retained' ELSE 'source' END
-            FROM {schema_sql}.{DIRECT_COMMITMENTS_TABLE} c
-            JOIN {entity_sql} e ON e.entity_binding_id = c.entity_binding_id AND e.dataset_id = :dataset_id
-            {family_where}
-            ORDER BY c.logical_key_sha256
-            LIMIT :page_limit
-            """
-        )
-        family_params_by_name: dict[str, object] = {
-            "dataset_id": generation.dataset_id,
-            "page_limit": _MATERIALIZATION_PAGE_LIMIT,
-        }
-        if after_family_hash is not None:
-            family_params_by_name["after_hash"] = after_family_hash
-        await staging._prepare_statement(session)
-        family_batch = (await session.execute(family_sql, family_params_by_name)).all()
-        if not family_batch:
-            break
+    async for family_batch in _iter_cursor_batches(
+        session, "direct_family_digest_cur", family_sql, {"dataset_id": generation.dataset_id}
+    ):
         for f_row in family_batch:
             for is_eff, digest in enumerate((material, effective)):
                 publication._add_digest_record(
                     digest, "family_commitment", compact_materialization._family_document(f_row, effective=bool(is_eff))
                 )
             family_count += 1
-        after_family_hash = bytes(family_batch[-1][1])
-        if len(family_batch) < _MATERIALIZATION_PAGE_LIMIT:
-            break
     return family_count
 
-
-_DIRECT_WINNER_CURSOR_CLAUSE = """
-  AND (w.profile_slot, e.adapter_id, e.value_sha256, e.canonical_value,
-       c.key_contract_sha256, c.logical_key_sha256,
-       coalesce(w.context_child_key_sha256, ''::bytea), c.family_sha256,
-       w.context_collection_slot, w.context_key_sha256)
-    > (:k0, :k1, :k2, :k3, :k4, :k5, :k6, :k7, :k8, :k9)
-"""
 
 _DIRECT_WINNER_DIGEST_SQL = """
     SELECT w.profile_slot, w.entity_binding_id, w.context_key_sha256, w.family_revision_id,
@@ -897,28 +899,12 @@ _DIRECT_WINNER_DIGEST_SQL = """
      AND p.definition_revision_id = w.definition_revision_id AND p.schema_revision_id = w.schema_revision_id
     WHERE w.generation_id = :generation_id AND w.dataset_id = :dataset_id
       AND w.definition_revision_id = :definition_revision_id AND w.schema_revision_id = :schema_revision_id
-      {cursor_clause}
-    ORDER BY w.profile_slot, e.adapter_id, e.value_sha256, e.canonical_value,
+      AND w.profile_slot = :profile_slot
+    ORDER BY e.adapter_id, e.value_sha256, e.canonical_value,
              c.key_contract_sha256, c.logical_key_sha256,
              coalesce(w.context_child_key_sha256, ''::bytea), c.family_sha256,
              w.context_collection_slot, w.context_key_sha256
-    LIMIT :page_limit
 """
-
-
-def _winner_cursor_key(last_winner_row) -> tuple[object, ...]:
-    return (
-        int(last_winner_row[0]),
-        last_winner_row[6],
-        bytes(last_winner_row[7]),
-        last_winner_row[8],
-        bytes(last_winner_row[9]),
-        bytes(last_winner_row[10]),
-        bytes(last_winner_row[11]),
-        bytes(last_winner_row[12]),
-        int(last_winner_row[4]),
-        bytes(last_winner_row[2]),
-    )
 
 
 async def _digest_direct_winners(
@@ -933,41 +919,31 @@ async def _digest_direct_winners(
     quote = _DIALECT.identifier_preparer.format_table
     entity_sql = quote(binding.tables_by_role["entity_binding"])
     winner_sql = quote(binding.tables_by_role["winner"])
+    winner_sql_text = _DIRECT_WINNER_DIGEST_SQL.format(
+        winner_sql=winner_sql,
+        schema_sql=schema_sql,
+        commitments_table=DIRECT_COMMITMENTS_TABLE,
+        entity_sql=entity_sql,
+        profiles_sql=profiles_sql,
+    )
     winner_count = 0
-    after_winner_key: tuple[object, ...] | None = None
-    while True:
-        winner_sql_stmt = text(
-            _DIRECT_WINNER_DIGEST_SQL.format(
-                winner_sql=winner_sql,
-                schema_sql=schema_sql,
-                commitments_table=DIRECT_COMMITMENTS_TABLE,
-                entity_sql=entity_sql,
-                profiles_sql=profiles_sql,
-                cursor_clause="" if after_winner_key is None else _DIRECT_WINNER_CURSOR_CLAUSE,
-            )
-        )
-        winner_params_by_name: dict[str, object] = {
+    profile_count = len(binding.layout.definition.selection_profiles)
+    for profile_slot in range(1, profile_count + 1):
+        winner_params_by_name = {
             "generation_id": generation.generation_id,
             "dataset_id": generation.dataset_id,
             "definition_revision_id": generation.definition_revision_id,
             "schema_revision_id": generation.schema_revision_id,
-            "page_limit": _MATERIALIZATION_PAGE_LIMIT,
+            "profile_slot": profile_slot,
         }
-        if after_winner_key is not None:
-            for key_idx, key_part in enumerate(after_winner_key):
-                winner_params_by_name[f"k{key_idx}"] = key_part
-        await staging._prepare_statement(session)
-        winner_batch = (await session.execute(winner_sql_stmt, winner_params_by_name)).all()
-        if not winner_batch:
-            break
-        for w_row in winner_batch:
-            publication._add_digest_record_to_all(
-                (material, effective), "winner_commitment", compact_materialization._winner_document(w_row)
-            )
-            winner_count += 1
-        after_winner_key = _winner_cursor_key(winner_batch[-1])
-        if len(winner_batch) < _MATERIALIZATION_PAGE_LIMIT:
-            break
+        async for winner_batch in _iter_cursor_batches(
+            session, "direct_winner_digest_cur", winner_sql_text, winner_params_by_name
+        ):
+            for w_row in winner_batch:
+                publication._add_digest_record_to_all(
+                    (material, effective), "winner_commitment", compact_materialization._winner_document(w_row)
+                )
+                winner_count += 1
     return winner_count
 
 
@@ -1087,29 +1063,10 @@ async def _direct_candidate_digests(
         fence=request.fence,
         base_generation_id=build.base_generation_id,
     )
-    after_hash: bytes | None = None
-    while True:
-        where_sql = "" if after_hash is None else "WHERE logical_key_sha256 > :after_hash"
-        query_params_by_name: dict[str, object] = {"page_limit": _MATERIALIZATION_PAGE_LIMIT}
-        if after_hash is not None:
-            query_params_by_name["after_hash"] = after_hash
-        await staging._prepare_statement(session)
-        hash_batch = (
-            await session.scalars(
-                text(
-                    f"SELECT logical_key_sha256 FROM {schema_sql}.{DIRECT_COMMITMENTS_TABLE} "
-                    f"{where_sql} ORDER BY logical_key_sha256 LIMIT :page_limit"
-                ),
-                query_params_by_name,
-            )
-        ).all()
-        if not hash_batch:
-            break
-        for hash_entry in hash_batch:
-            digest_builder.update(bytes(hash_entry))
-        after_hash = bytes(hash_batch[-1])
-        if len(hash_batch) < _MATERIALIZATION_PAGE_LIMIT:
-            break
+    hash_sql = f"SELECT logical_key_sha256 FROM {schema_sql}.{DIRECT_COMMITMENTS_TABLE} ORDER BY logical_key_sha256"
+    async for hash_batch in _iter_cursor_batches(session, "direct_candidate_digest_cur", hash_sql):
+        for hash_row in hash_batch:
+            digest_builder.update(bytes(hash_row[0]))
     return source_digest, digest_builder.digest()
 
 

@@ -46,10 +46,13 @@ __all__ = (
     "CaptureReceipt",
     "CaptureStoreError",
     "CaptureStoreTransactionRequired",
+    "CursorPartWindowLimits",
+    "CursorPartWindowRequest",
     "ReplayableParquetCapture",
     "SegmentedParquetPart",
     "load_replayable_parquet_bundle",
     "load_segmented_cursor_headers",
+    "load_segmented_cursor_part_window",
     "open_replayable_parquet_parts",
     "open_segmented_parquet_parts",
     "open_segmented_cursor_part",
@@ -1365,6 +1368,114 @@ async def open_segmented_cursor_part(
     except BaseException as exc:
         primary = exc
     await _close_cursor_result(part_rows, primary)
+
+
+@dataclass(frozen=True)
+class CursorPartWindowLimits:
+    """Bounded prefetch caps for one contiguous sealed-part read transaction."""
+
+    max_parts: int
+    max_rows: int
+    max_compressed_bytes: int
+    max_arrow_bytes: int
+
+
+async def _collect_cursor_part_window(
+    part_rows,
+    headers: _SegmentedCursorHeaders,
+    start_part_ordinal: int,
+    end_part_ordinal: int,
+    limits: CursorPartWindowLimits,
+) -> tuple[SegmentedParquetPart, ...]:
+    """Validate and buffer contiguous cursor parts up to the caller's window limits."""
+    fetched_parts: list[SegmentedParquetPart] = []
+    fetched_rows = fetched_compressed = fetched_arrow = 0
+    primary = None
+    try:
+        async for part_row in part_rows:
+            expected_ordinal = start_part_ordinal + len(fetched_parts)
+            if expected_ordinal > end_part_ordinal:
+                raise CaptureBundleConflict("durable cursor has duplicate parts")
+            validated_part = _validated_cursor_part(
+                headers.receipt,
+                part_row,
+                headers.policy,
+                (headers.capture_bundle_id, headers.stream_slot, expected_ordinal),
+            )
+            fetched_parts.append(validated_part)
+            fetched_rows += validated_part.record_count
+            fetched_compressed += len(validated_part.capture.payload)
+            fetched_arrow += validated_part.arrow_byte_count
+            if (
+                fetched_rows >= limits.max_rows
+                or fetched_compressed >= limits.max_compressed_bytes
+                or fetched_arrow >= limits.max_arrow_bytes
+            ):
+                break
+        if not fetched_parts:
+            raise CapturePayloadUnavailable("durable cursor payload part is missing")
+    except BaseException as exc:
+        primary = exc
+    await _close_cursor_result(part_rows, primary)
+    return tuple(fetched_parts)
+
+
+@dataclass(frozen=True)
+class CursorPartWindowRequest:
+    """Bounded identity and cursor coordinates for reading a contiguous window of v2 parts."""
+
+    capture_bundle_id: int
+    dataset_id: int
+    definition_revision_id: int
+    schema_revision_id: int
+    stream_slot: int
+    start_part_ordinal: int
+    limits: CursorPartWindowLimits
+
+
+async def load_segmented_cursor_part_window(
+    session: AsyncSession,
+    window: CursorPartWindowRequest,
+    *,
+    headers: _SegmentedCursorHeaders | None = None,
+) -> tuple[tuple[SegmentedParquetPart, ...], _SegmentedCursorHeaders]:
+    """Read one bounded contiguous window of sealed v2 parts inside one read transaction."""
+
+    identity = _identity(
+        dataset_id=window.dataset_id,
+        definition_revision_id=window.definition_revision_id,
+        schema_revision_id=window.schema_revision_id,
+    )
+    capture_bundle_id = _positive_id(window.capture_bundle_id, "capture_bundle_id")
+    stream_slot = _positive_id(window.stream_slot, "stream_slot")
+    start_part_ordinal = _positive_id(window.start_part_ordinal, "start_part_ordinal")
+    limits = window.limits
+    part_limit = max(1, _positive_id(limits.max_parts, "max_parts"))
+    if headers is None:
+        headers = await load_segmented_cursor_headers(
+            session,
+            capture_bundle_id=capture_bundle_id,
+            dataset_id=window.dataset_id,
+            definition_revision_id=window.definition_revision_id,
+            schema_revision_id=window.schema_revision_id,
+            stream_slot=stream_slot,
+        )
+    _validate_cursor_headers(headers, identity, capture_bundle_id, stream_slot, start_part_ordinal)
+    end_part_ordinal = min(headers.part_count, start_part_ordinal + part_limit - 1)
+    with session.no_autoflush:
+        statement = (
+            _part_statement(capture_bundle_id, True)
+            .where(
+                CustomImportCaptureParquetPart.stream_slot == stream_slot,
+                CustomImportCaptureParquetPart.part_ordinal >= start_part_ordinal,
+                CustomImportCaptureParquetPart.part_ordinal <= end_part_ordinal,
+            )
+            .limit(part_limit + 1)
+            .execution_options(yield_per=min(part_limit, 32))
+        )
+        part_rows = await session.stream(statement)
+    fetched_parts = await _collect_cursor_part_window(part_rows, headers, start_part_ordinal, end_part_ordinal, limits)
+    return fetched_parts, headers
 
 
 def _add_segmented_metadata(accounting, receipt, ordinal, byte_count, payload_digest, metadata):
