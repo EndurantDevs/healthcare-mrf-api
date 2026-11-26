@@ -11,7 +11,8 @@ from decimal import Decimal
 
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import Double, Numeric, and_, func, literal, select, text, true
+from sqlalchemy import Double, Numeric, String, and_, any_, bindparam, func, literal, select, text, true
+from sqlalchemy.dialects.postgresql import ARRAY
 
 from db.models import (
     DoctorClinicianAddress,
@@ -833,6 +834,8 @@ async def get_site_score(request):
             }
         )
 
+    zip_codes_param = bindparam("zip_codes", value=all_zip_codes, type_=ARRAY(String))
+
     medicare_rows = []
     if table_availability_by_name["medicare"]:
         medicare_rows = (
@@ -842,7 +845,7 @@ async def get_site_score(request):
                     MedicareEnrollmentStats.year,
                     MedicareEnrollmentStats.total_beneficiaries,
                     MedicareEnrollmentStats.part_d_beneficiaries,
-                ).where(MedicareEnrollmentStats.zcta_code.in_(all_zip_codes))
+                ).where(MedicareEnrollmentStats.zcta_code == any_(zip_codes_param))
             )
         ).all()
     medicare_by_zip: dict[str, dict] = {}
@@ -865,7 +868,7 @@ async def get_site_score(request):
                     LODESWorkplaceAggregate.zcta_code,
                     LODESWorkplaceAggregate.year,
                     LODESWorkplaceAggregate.total_workers,
-                ).where(LODESWorkplaceAggregate.zcta_code.in_(all_zip_codes))
+                ).where(LODESWorkplaceAggregate.zcta_code == any_(zip_codes_param))
             )
         ).all()
     workers_by_zip: dict[str, dict] = {}
@@ -891,7 +894,7 @@ async def get_site_score(request):
                     PricingPlacesZcta.data_value,
                 ).where(
                     and_(
-                        PricingPlacesZcta.zcta.in_(all_zip_codes),
+                        PricingPlacesZcta.zcta == any_(zip_codes_param),
                         PricingPlacesZcta.measure_id.in_(tuple(CHRONIC_MEASURE_IDS)),
                         PricingPlacesZcta.data_value.isnot(None),
                     )
@@ -931,7 +934,7 @@ async def get_site_score(request):
                     DoctorClinicianAddress.zip_code,
                     DoctorClinicianAddress.npi,
                     DoctorClinicianAddress.provider_type,
-                ).where(DoctorClinicianAddress.zip_code.in_(all_zip_codes))
+                ).where(DoctorClinicianAddress.zip_code == any_(zip_codes_param))
             )
         ).all()
     for provider_zip_row in provider_zip_rows:
@@ -953,7 +956,7 @@ async def get_site_score(request):
                     PartDPharmacyActivity.zip_code,
                     PartDPharmacyActivity.npi,
                     PartDPharmacyActivity.medicare_active,
-                ).where(PartDPharmacyActivity.zip_code.in_(all_zip_codes))
+                ).where(PartDPharmacyActivity.zip_code == any_(zip_codes_param))
             )
         ).all()
     for partd_pharmacy_row in partd_pharmacy_rows:

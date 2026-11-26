@@ -12,11 +12,10 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from api import formulary_fhir_cursor as cursor
-from api import formulary_fhir_drug_values as drug_values
 from api import formulary_fhir_drug_sql as drug_sql
+from api import formulary_fhir_drug_values as drug_values
 from api import formulary_fhir_drugs as drugs
 from api import formulary_fhir_serving as serving
-
 
 FORMULARY_ID = "fhir_at4rcuzsyttz7txu3xtoxsa734"
 ALIAS_ID = "ffa_" + "1" * 48
@@ -126,9 +125,7 @@ class _Transaction:
         return self._session
 
     async def __aexit__(self, exc_type, _exc, _traceback):
-        self._session.events.append(
-            ("exit", None if exc_type is None else exc_type.__name__, None)
-        )
+        self._session.events.append(("exit", None if exc_type is None else exc_type.__name__, None))
         self._session.active = False
         return False
 
@@ -179,20 +176,14 @@ def test_drug_sql_exactly_owns_current_source_medication_and_alias_targets():
     alternative_sql_text = _normalized_sql(drug_sql.ALTERNATIVE_STATEMENT)
 
     for required_fragment in (
-        "fhir_formulary_dataset.source_id = "
-        "mrf.fhir_formulary_current.source_id",
-        "fhir_formulary_dataset.published_at = "
-        "mrf.fhir_formulary_current.published_at",
-        "fhir_formulary_alias_membership.source_id = "
-        "mrf.fhir_formulary_drug_plan_alias_version.source_id",
+        "fhir_formulary_dataset.source_id = mrf.fhir_formulary_current.source_id",
+        "fhir_formulary_dataset.published_at = mrf.fhir_formulary_current.published_at",
+        "fhir_formulary_alias_membership.source_id = mrf.fhir_formulary_drug_plan_alias_version.source_id",
         "fhir_formulary_alias_membership.alias_version_id = "
         "mrf.fhir_formulary_drug_plan_alias_version.alias_version_id",
-        "fhir_formulary_medication.source_id = "
-        "mrf.fhir_formulary_alias_membership.source_id",
-        "fhir_formulary_medication.upstream_medication_id = "
-        "mrf.fhir_formulary_alias_membership.upstream_medication_id",
-        "fhir_formulary_medication.medication_version_id = "
-        "mrf.fhir_formulary_alias_membership.medication_version_id",
+        "fhir_formulary_medication.source_id = mrf.fhir_formulary_alias_membership.source_id",
+        "fhir_formulary_medication.upstream_medication_id = mrf.fhir_formulary_alias_membership.upstream_medication_id",
+        "fhir_formulary_medication.medication_version_id = mrf.fhir_formulary_alias_membership.medication_version_id",
     ):
         assert required_fragment in drug_sql_text
     for filter_bind in (
@@ -205,16 +196,13 @@ def test_drug_sql_exactly_owns_current_source_medication_and_alias_targets():
     ):
         assert filter_bind in drug_sql_text
     assert (
-        "target_membership.alias_version_id = "
-        "mrf.fhir_formulary_alternative.alias_version_id"
+        "target_membership.alias_version_id = mrf.fhir_formulary_alternative.alias_version_id"
     ) in alternative_sql_text
     assert (
-        "target_membership.upstream_medication_id = "
-        "mrf.fhir_formulary_alternative.resolved_medication_id"
+        "target_membership.upstream_medication_id = mrf.fhir_formulary_alternative.resolved_medication_id"
     ) in alternative_sql_text
-    assert "fhir_formulary_drug_plan_alias.alias_id = %(alias_id)s" in (
-        alternative_sql_text
-    )
+    assert "fhir_formulary_drug_plan_alias.alias_id = %(alias_id)s" in (alternative_sql_text)
+    assert "medication_version_id = ANY (%(owner_drug_ids)s::VARCHAR[])" in (alternative_sql_text)
     assert " OFFSET " not in drug_sql_text + alternative_sql_text
     assert " FOR UPDATE" not in drug_sql_text + alternative_sql_text
 
@@ -255,9 +243,7 @@ async def test_filtered_page_hydrates_same_alias_targets_without_private_data():
     _first_session, first_page = await _read_first_filtered_drug_page()
 
     assert first_page.next_cursor is not None
-    response_by_field = drug_values.public_fhir_formulary_drug_page_payload(
-        first_page
-    )
+    response_by_field = drug_values.public_fhir_formulary_drug_page_payload(first_page)
     assert response_by_field["items"] == [
         {
             "formulary_id": FORMULARY_ID,
@@ -311,21 +297,17 @@ async def test_filtered_cursor_continues_after_last_version_scoped_drug():
     )
 
     second_session.assert_exhausted()
-    assert tuple(
-        medication.drug_id for medication in second_page.items
-    ) == (DRUG_B,)
+    assert tuple(medication.drug_id for medication in second_page.items) == (DRUG_B,)
     assert second_page.next_cursor is None
-    assert [event for event in second_session.events if event[0] == "execute"][2][
-        2
-    ] == _expected_filter_params(last_id=DRUG_A)
+    assert [event for event in second_session.events if event[0] == "execute"][2][2] == _expected_filter_params(
+        last_id=DRUG_A
+    )
 
 
 @pytest.mark.asyncio
 async def test_cursor_cannot_cross_filter_scope_and_stale_marker_conflicts():
     _first_session, first_page = await _read_first_filtered_drug_page()
-    changed_filters = drug_values.FHIRFormularyDrugFilters(
-        **{**FILTERS.scope_fields(), "tier": "Other"}
-    )
+    changed_filters = drug_values.FHIRFormularyDrugFilters(**{**FILTERS.scope_fields(), "tier": "Other"})
     no_query_session = _ScriptedSession()
 
     with pytest.raises(serving.FHIRFormularyInvalidRequestError):

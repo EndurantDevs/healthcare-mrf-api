@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import JSON as SQLAlchemyJSON
-from sqlalchemy import Integer, bindparam, false, func, or_, select
+from sqlalchemy import BigInteger, Integer, String, any_, bindparam, false, func, or_, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import literal_column, text, tuple_
@@ -67,7 +67,14 @@ from api.npi_detail_cache_identity import (
 )
 from api.npi_native_cache_identity import npi_canonical_publication_identity
 from api.provider_demographic_filters import normalize_provider_sex_code
-from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
+from api.provider_detail_sql import (
+    _npi_detail_address_filters,
+    _npi_detail_taxonomy_aggregate,
+    _npi_taxonomy_batch_aggregate,
+    _provider_directory_source_detail_statement,
+    any_bigint_filter,
+    any_string_filter,
+)
 from api.provider_directory_dataset_sql import (
     PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
     PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL,
@@ -3802,43 +3809,6 @@ async def _fetch_provider_directory_affiliation_evidence_map(
     return _map_provider_directory_affiliation_evidence(evidence_result.all())
 
 
-def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> Any:
-    table = ProviderDirectorySource.__table__
-    selected_endpoints = (
-        select(
-            table.c.endpoint_id.label("endpoint_id"),
-            table.c.canonical_api_base.label("canonical_api_base"),
-        )
-        .where(table.c.source_id.in_(source_ids))
-        .subquery()
-    )
-    stmt = (
-        select(
-            table.c.source_id,
-            table.c.endpoint_id,
-            table.c.canonical_api_base,
-            table.c.org_name,
-            table.c.plan_name,
-        )
-        .where(
-            or_(
-                table.c.source_id.in_(source_ids),
-                table.c.endpoint_id.in_(
-                    select(selected_endpoints.c.endpoint_id).where(selected_endpoints.c.endpoint_id.is_not(None))
-                ),
-                table.c.canonical_api_base.in_(
-                    select(selected_endpoints.c.canonical_api_base).where(
-                        selected_endpoints.c.endpoint_id.is_(None),
-                        selected_endpoints.c.canonical_api_base.is_not(None),
-                    )
-                ),
-            )
-        )
-        .order_by(table.c.source_id)
-    )
-    return stmt
-
-
 def _map_source_details(
     rows: Sequence[Any],
 ) -> dict[str, dict[str, Any]]:
@@ -4543,7 +4513,7 @@ async def _apply_ffs_related_npi_overrides(
             ProviderEnrollmentFFSAdditionalNPI.enrollment_id,
             ProviderEnrollmentFFSAdditionalNPI.additional_npi,
         )
-        .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id.in_(enrollment_ids))
+        .where(any_string_filter(ProviderEnrollmentFFSAdditionalNPI.enrollment_id, enrollment_ids, "enrollment_ids"))
         .order_by(
             ProviderEnrollmentFFSAdditionalNPI.enrollment_id.asc(),
             ProviderEnrollmentFFSAdditionalNPI.additional_npi.asc(),
@@ -4580,7 +4550,7 @@ async def _apply_ffs_address_overrides(
             ProviderEnrollmentFFSAddress.city,
             ProviderEnrollmentFFSAddress.state,
         )
-        .where(ProviderEnrollmentFFSAddress.enrollment_id.in_(enrollment_ids))
+        .where(any_string_filter(ProviderEnrollmentFFSAddress.enrollment_id, enrollment_ids, "enrollment_ids"))
         .order_by(
             ProviderEnrollmentFFSAddress.enrollment_id.asc(),
             ProviderEnrollmentFFSAddress.state.asc().nullslast(),
@@ -4627,7 +4597,9 @@ async def _apply_ffs_specialty_overrides(
             ProviderEnrollmentFFSSecondarySpecialty.provider_type_code,
             ProviderEnrollmentFFSSecondarySpecialty.provider_type_text,
         )
-        .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(enrollment_ids))
+        .where(
+            any_string_filter(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id, enrollment_ids, "enrollment_ids")
+        )
         .order_by(
             ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.asc(),
             ProviderEnrollmentFFSSecondarySpecialty.provider_type_code.asc(),
@@ -4658,7 +4630,7 @@ async def _fetch_ffs_reassignment_counts(
 ) -> dict[int, int]:
     statement = (
         select(enrollment_column, func.count().label("row_count"))
-        .where(enrollment_column.in_(enrollment_ids))
+        .where(any_string_filter(enrollment_column, enrollment_ids, "enrollment_ids"))
         .group_by(enrollment_column)
     )
     query_result = await _execute_stmt(statement, session=session)
@@ -5676,7 +5648,9 @@ async def _fetch_provider_enrichment_ffs_rows(
             ProviderEnrollmentFFS.provider_type_text,
             ProviderEnrollmentFFS.multiple_npi_flag,
         )
-        .where(ProviderEnrollmentFFS.npi.in_(npis))
+        .where(
+            ProviderEnrollmentFFS.npi == any_(bindparam("npis", value=list(npis), type_=postgresql.ARRAY(BigInteger)))
+        )
         .order_by(
             ProviderEnrollmentFFS.npi.asc(),
             ProviderEnrollmentFFS.reporting_year.desc().nullslast(),
@@ -5949,10 +5923,12 @@ async def _fetch_provider_enrichment_detail(
     if not enrollment_ids:
         return enrichment_detail_map
 
+    enrollment_ids_param = bindparam("enrollment_ids", value=enrollment_ids, type_=postgresql.ARRAY(String))
+
     if await _is_table_available(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
         stmt = (
             select(ProviderEnrollmentFFSAdditionalNPI)
-            .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id.in_(enrollment_ids))
+            .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id == any_(enrollment_ids_param))
             .order_by(
                 ProviderEnrollmentFFSAdditionalNPI.reporting_year.desc().nullslast(),
                 ProviderEnrollmentFFSAdditionalNPI.additional_npi.asc(),
@@ -5967,7 +5943,7 @@ async def _fetch_provider_enrichment_detail(
     if await _is_table_available(ProviderEnrollmentFFSAddress.__tablename__, session=session):
         stmt = (
             select(ProviderEnrollmentFFSAddress)
-            .where(ProviderEnrollmentFFSAddress.enrollment_id.in_(enrollment_ids))
+            .where(ProviderEnrollmentFFSAddress.enrollment_id == any_(enrollment_ids_param))
             .order_by(
                 ProviderEnrollmentFFSAddress.reporting_year.desc().nullslast(),
                 ProviderEnrollmentFFSAddress.state.asc().nullslast(),
@@ -5984,7 +5960,7 @@ async def _fetch_provider_enrichment_detail(
     if await _is_table_available(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
         stmt = (
             select(ProviderEnrollmentFFSSecondarySpecialty)
-            .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(enrollment_ids))
+            .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id == any_(enrollment_ids_param))
             .order_by(
                 ProviderEnrollmentFFSSecondarySpecialty.reporting_year.desc().nullslast(),
                 ProviderEnrollmentFFSSecondarySpecialty.provider_type_code.asc(),
@@ -11270,7 +11246,7 @@ async def get_plans_by_npi(_request, npi):
         .order_by(PlanNPIRaw.issuer_id.desc())
     )
 
-    async for plan_raw, issuer in query.iterate():
+    for plan_raw, issuer in await query.all():
         npi_plan_rows.append({"npi_info": plan_raw.to_json_dict(), "issuer_info": issuer.to_json_dict()})
 
     return response.json({"npi_data": npi_plan_rows, "plan_data": plan_rows, "issuer_data": issuer_rows})
@@ -12481,13 +12457,21 @@ def _address_identity_filter(
         selected_keys = sorted(
             identity.split(":", 1)[1] for identity in selected_identity_set if identity.startswith("location:")
         )
-        return selected_identity_set, (address_table.c.location_key.in_(selected_keys) if selected_keys else false())
+        return selected_identity_set, (
+            any_string_filter(address_table.c.location_key, selected_keys, "selected_location_keys")
+            if selected_keys
+            else false()
+        )
     selected_checksums = sorted(
         int(identity.rsplit(":", 1)[1])
         for identity in selected_identity_set
         if identity.startswith("legacy:") and identity.rsplit(":", 1)[1].lstrip("-").isdigit()
     )
-    return selected_identity_set, (address_table.c.checksum.in_(selected_checksums) if selected_checksums else false())
+    return selected_identity_set, (
+        any_bigint_filter(address_table.c.checksum, selected_checksums, "selected_checksums")
+        if selected_checksums
+        else false()
+    )
 
 
 def _hydrate_address_query_rows(
@@ -12724,23 +12708,6 @@ def _npi_detail_from_result_row(
     return provider_detail_map
 
 
-def _npi_taxonomy_batch_aggregate(
-    taxonomy_model: Any,
-    npis: Sequence[int],
-    alias: str,
-) -> Any:
-    taxonomy_table = taxonomy_model.__table__
-    return (
-        select(
-            taxonomy_table.c.npi,
-            func.json_agg(literal_column(f'distinct "{taxonomy_model.__tablename__}"')).label("rows"),
-        )
-        .where(taxonomy_table.c.npi.in_(npis))
-        .group_by(taxonomy_table.c.npi)
-        .subquery(alias)
-    )
-
-
 async def _build_npi_identity_details_map(
     npis: Sequence[int],
     *,
@@ -12751,15 +12718,18 @@ async def _build_npi_identity_details_map(
     if not unique_npis:
         return {}
     npi_data_table = NPIData.__table__
+    npis_param = bindparam("npis", value=unique_npis, type_=postgresql.ARRAY(BigInteger))
     taxonomy_aggregate = _npi_taxonomy_batch_aggregate(
         NPIDataTaxonomy,
         unique_npis,
         "batch_taxonomy_aggregate",
+        npis_param=npis_param,
     )
     taxonomy_group_aggregate = _npi_taxonomy_batch_aggregate(
         NPIDataTaxonomyGroup,
         unique_npis,
         "batch_taxonomy_group_aggregate",
+        npis_param=npis_param,
     )
     join_clause = npi_data_table.outerjoin(
         taxonomy_aggregate,
@@ -12775,7 +12745,7 @@ async def _build_npi_identity_details_map(
             taxonomy_group_aggregate.c.rows,
         )
         .select_from(join_clause)
-        .where(npi_data_table.c.npi.in_(unique_npis))
+        .where(npi_data_table.c.npi == any_(npis_param))
         .order_by(npi_data_table.c.npi)
     )
     if session is not None:
@@ -13025,7 +12995,7 @@ async def _fetch_other_names_map(
     if not unique_npis:
         return {}
     result = await _execute_stmt(
-        select(NPIDataOtherIdentifier).where(NPIDataOtherIdentifier.npi.in_(unique_npis)),
+        select(NPIDataOtherIdentifier).where(any_bigint_filter(NPIDataOtherIdentifier.npi, unique_npis, "npis")),
         session=session,
     )
     rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)

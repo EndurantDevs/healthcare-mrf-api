@@ -1,12 +1,85 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """SQL builders for provider detail address identity and taxonomy."""
 
+from operator import eq
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import BigInteger, String, any_, bindparam, func, or_, select
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.sql import literal_column
 
-from db.models import EntityAddressUnified
+from db.models import EntityAddressUnified, ProviderDirectorySource
+
+
+def any_bigint_filter(column: Any, values: Sequence[int], param_name: str = "npis") -> Any:
+    """Build a typed PostgreSQL BIGINT[] ANY() predicate for stable prepared plans."""
+    return eq(column, any_(bindparam(param_name, value=list(values), type_=ARRAY(BigInteger))))
+
+
+def any_string_filter(column: Any, values: Sequence[str], param_name: str = "values") -> Any:
+    """Build a typed PostgreSQL VARCHAR[] ANY() predicate for stable prepared plans."""
+    return eq(column, any_(bindparam(param_name, value=list(values), type_=ARRAY(String))))
+
+
+def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> Any:
+    table = ProviderDirectorySource.__table__
+    source_ids_param = bindparam("source_ids", value=list(source_ids), type_=ARRAY(String))
+    selected_endpoints = (
+        select(
+            table.c.endpoint_id.label("endpoint_id"),
+            table.c.canonical_api_base.label("canonical_api_base"),
+        )
+        .where(table.c.source_id == any_(source_ids_param))
+        .subquery()
+    )
+    return (
+        select(
+            table.c.source_id,
+            table.c.endpoint_id,
+            table.c.canonical_api_base,
+            table.c.org_name,
+            table.c.plan_name,
+        )
+        .where(
+            or_(
+                table.c.source_id == any_(source_ids_param),
+                table.c.endpoint_id.in_(
+                    select(selected_endpoints.c.endpoint_id).where(selected_endpoints.c.endpoint_id.is_not(None))
+                ),
+                table.c.canonical_api_base.in_(
+                    select(selected_endpoints.c.canonical_api_base).where(
+                        selected_endpoints.c.endpoint_id.is_(None),
+                        selected_endpoints.c.canonical_api_base.is_not(None),
+                    )
+                ),
+            )
+        )
+        .order_by(table.c.source_id)
+    )
+
+
+def _npi_taxonomy_batch_aggregate(
+    taxonomy_model: Any,
+    npis: Sequence[int],
+    alias: str,
+    *,
+    npis_param: Any = None,
+) -> Any:
+    taxonomy_table = taxonomy_model.__table__
+    target_npis_param = (
+        npis_param
+        if npis_param is not None
+        else bindparam("npis", value=list(npis), type_=ARRAY(BigInteger), unique=True)
+    )
+    return (
+        select(
+            taxonomy_table.c.npi,
+            func.json_agg(literal_column(f'distinct "{taxonomy_model.__tablename__}"')).label("rows"),
+        )
+        .where(taxonomy_table.c.npi == any_(target_npis_param))
+        .group_by(taxonomy_table.c.npi)
+        .subquery(alias)
+    )
 
 
 def _npi_detail_address_filters(
@@ -28,14 +101,20 @@ def _npi_detail_address_filters(
                 for identity in address_row_identities
                 if str(identity).startswith("location:")
             )
-            base_address_filters.append(address_table.c.location_key.in_(selected_location_keys))
+            base_address_filters.append(
+                address_table.c.location_key
+                == any_(bindparam("selected_location_keys", value=selected_location_keys, type_=ARRAY(String)))
+            )
         else:
             selected_checksums = sorted(
                 int(str(identity).rsplit(":", 1)[1])
                 for identity in address_row_identities
                 if str(identity).startswith("legacy:") and str(identity).rsplit(":", 1)[1].lstrip("-").isdigit()
             )
-            base_address_filters.append(address_table.c.checksum.in_(selected_checksums))
+            base_address_filters.append(
+                address_table.c.checksum
+                == any_(bindparam("selected_checksums", value=selected_checksums, type_=ARRAY(BigInteger)))
+            )
     return base_address_filters
 
 
