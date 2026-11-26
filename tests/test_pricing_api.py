@@ -3582,7 +3582,7 @@ async def test_provider_specialties_radius_dedupes_before_page_and_count(monkeyp
     assert len(request.ctx.sa_session.executions) == 2
     page_sql = str(request.ctx.sa_session.executions[0][0][0])
     count_sql = str(request.ctx.sa_session.executions[1][0][0])
-    assert "pricing_provider.zip5 IN" in page_sql
+    assert "pricing_provider.zip5 = ANY (" in page_sql
     assert "lower(mrf.pricing_provider.city)" not in page_sql
     assert page_sql.lower().startswith("select mrf.pricing_provider.provider_type")
     assert count_sql.lower().startswith("select count(")
@@ -8061,7 +8061,7 @@ async def test_prescription_search_filters_before_pagination(minimum):
         "lower(mrf.pricing_provider_prescription.city) LIKE '%example city%'",
         "mrf.pricing_provider_prescription.zip5 = '10001'",
         "lower(mrf.pricing_provider_prescription.provider_type) LIKE '%cardiology%'",
-        "mrf.pricing_provider_prescription.rx_code IN ('RX-DEMO')",
+        "mrf.pricing_provider_prescription.rx_code = ANY (ARRAY['RX-DEMO'])",
         f"mrf.pricing_provider_prescription.total_claims >= {float(minimum)}",
         f"mrf.pricing_provider_prescription.total_drug_cost >= {float(minimum)}",
     ):
@@ -8147,7 +8147,7 @@ async def test_claims_search_resolves_terminology_codes(
     for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-execution_count:]:
         statement = str(execution_args[0].compile(compile_kwargs={"literal_binds": True}))
         expected_code = code if domain == "procedure" else f"'{code}'"
-        assert f".{column} IN ({expected_code})" in statement
+        assert f".{column} = ANY (ARRAY[{expected_code}])" in statement
         assert "LIKE '%synthetic match%'" in statement
 
 

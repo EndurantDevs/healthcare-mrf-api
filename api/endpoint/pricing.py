@@ -104,6 +104,13 @@ from api.provider_demographic_filters import (
     normalize_provider_sex_code,
     provider_sex_exists_sql,
 )
+from api.provider_detail_sql import (
+    any_bigint_filter,
+    any_string_filter,
+    build_external_rx_crosswalk_query,
+    build_provider_cost_profiles_query,
+    build_provider_geography_clauses,
+)
 from api.provider_group_plan_network_read import (
     group_plan_address_source,
     group_plan_arguments,
@@ -1445,7 +1452,9 @@ async def _build_dynamic_zip_peer_stats(
             provider_procedure_cost_profile_table.c.procedure_code == procedure_code,
             provider_procedure_cost_profile_table.c.setting_key == setting_key,
             provider_procedure_cost_profile_table.c.geography_scope == "zip5",
-            provider_procedure_cost_profile_table.c.geography_value.in_(zip_candidates),
+            any_string_filter(
+                provider_procedure_cost_profile_table.c.geography_value, zip_candidates, "geography_value"
+            ),
             provider_procedure_cost_profile_table.c.claim_count >= PROCEDURE_COST_DYNAMIC_MIN_PEER_CLAIMS,
             provider_procedure_cost_profile_table.c.avg_submitted_charge > 0,
         ]
@@ -1679,20 +1688,7 @@ def _provider_cost_geography_clauses(
     geography_values_by_scope: Mapping[str, set[str]],
 ) -> list[Any]:
     """Build the bounded profile-geography predicates."""
-    geography_clauses = []
-    for geography_scope, geography_values in geography_values_by_scope.items():
-        sanitized_values = sorted(
-            {str(geography_value).strip() for geography_value in geography_values if str(geography_value).strip()}
-        )
-        if not sanitized_values:
-            continue
-        geography_clauses.append(
-            and_(
-                provider_procedure_cost_profile_table.c.geography_scope == geography_scope,
-                provider_procedure_cost_profile_table.c.geography_value.in_(sanitized_values),
-            )
-        )
-    return geography_clauses
+    return build_provider_geography_clauses(provider_procedure_cost_profile_table, geography_values_by_scope)
 
 
 async def _load_provider_cost_profiles(
@@ -1705,14 +1701,12 @@ async def _load_provider_cost_profiles(
 ) -> list[dict[str, Any]]:
     """Load provider profiles admitted by the requested geography scope."""
     profile_result = await session.execute(
-        select(provider_procedure_cost_profile_table).where(
-            and_(
-                provider_procedure_cost_profile_table.c.year == year,
-                provider_procedure_cost_profile_table.c.npi.in_(sorted(geography_candidates_by_npi.keys())),
-                provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
-                provider_procedure_cost_profile_table.c.setting_key == "all",
-                or_(*geography_clauses),
-            )
+        build_provider_cost_profiles_query(
+            provider_procedure_cost_profile_table,
+            year=year,
+            npis=sorted(geography_candidates_by_npi.keys()),
+            internal_codes=internal_codes,
+            geography_clauses=geography_clauses,
         ),
     )
     return [_row_to_dict(profile_row) for profile_row in profile_result]
@@ -2107,7 +2101,7 @@ async def _query_terminology(
         )
     if target_systems:
         systems = tuple(system.upper() for system in target_systems)
-        filters.append(func.upper(terminology_synonym_table.c.target_system).in_(systems))
+        filters.append(any_string_filter(func.upper(terminology_synonym_table.c.target_system), systems, "systems"))
     if not include_broad:
         filters.append(terminology_synonym_table.c.is_broad.is_(False))
 
@@ -2430,7 +2424,7 @@ async def _provider_type_filter_clause(
             str(provider_type).strip().lower() for provider_type in provider_types if str(provider_type).strip()
         ]
         return (
-            func.lower(func.trim(provider_type_column)).in_(lowered_provider_types),
+            any_string_filter(func.lower(func.trim(provider_type_column)), lowered_provider_types, "provider_types"),
             resolution,
         )
     if specialty:
@@ -5470,19 +5464,8 @@ async def _resolve_external_rx_codes_for_internal(
         return {}
 
     external_systems = tuple(RX_EXTERNAL_CODE_PRIORITY)
-    query = select(code_crosswalk_table).where(
-        or_(
-            and_(
-                func.upper(code_crosswalk_table.c.from_system) == INTERNAL_RX_CODE_SYSTEM,
-                func.upper(code_crosswalk_table.c.from_code).in_(normalized_codes),
-                func.upper(code_crosswalk_table.c.to_system).in_(external_systems),
-            ),
-            and_(
-                func.upper(code_crosswalk_table.c.to_system) == INTERNAL_RX_CODE_SYSTEM,
-                func.upper(code_crosswalk_table.c.to_code).in_(normalized_codes),
-                func.upper(code_crosswalk_table.c.from_system).in_(external_systems),
-            ),
-        )
+    query = build_external_rx_crosswalk_query(
+        code_crosswalk_table, INTERNAL_RX_CODE_SYSTEM, normalized_codes, external_systems
     )
     crosswalk_result = await session.execute(query)
     crosswalk_rows = [_row_to_dict(crosswalk_row) for crosswalk_row in crosswalk_result]
@@ -7925,7 +7908,7 @@ async def group_plan_providers(request, *, native_args=None):
                     npi_data_table.c.provider_credential_text,
                     npi_data_table.c.entity_type_code,
                     npi_data_table.c.provider_sex_code,
-                ).where(npi_data_table.c.npi.in_(provider_npis)),
+                ).where(any_bigint_filter(npi_data_table.c.npi, provider_npis, "provider_npis")),
             )
         ).fetchall()
         by_npi = {int(enrichment_record.npi): enrichment_record for enrichment_record in enrich_rows}
@@ -8850,7 +8833,7 @@ async def list_provider_procedures(request, npi: str):
             code,
             args,
         )
-        filters.append(provider_procedure_table.c.procedure_code.in_(internal_codes))
+        filters.append(any_bigint_filter(provider_procedure_table.c.procedure_code, internal_codes, "procedure_codes"))
     if min_claims is not None:
         filters.append(provider_procedure_table.c.total_services >= min_claims)
     if min_total_cost is not None:
@@ -8954,7 +8937,7 @@ def _provider_procedure_detail_query(provider_npi, internal_codes, year):
         .where(
             and_(
                 provider_procedure_table.c.npi == provider_npi,
-                provider_procedure_table.c.procedure_code.in_(internal_codes),
+                any_bigint_filter(provider_procedure_table.c.procedure_code, internal_codes, "procedure_codes"),
                 provider_procedure_table.c.year == year,
             )
         )
@@ -9084,7 +9067,7 @@ async def _provider_procedure_cost_level(
     base_profile_filters = [
         provider_procedure_cost_profile_table.c.npi == provider_npi,
         provider_procedure_cost_profile_table.c.year == year,
-        provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
+        any_bigint_filter(provider_procedure_cost_profile_table.c.procedure_code, internal_codes, "procedure_codes"),
         provider_procedure_cost_profile_table.c.setting_key == setting_key,
     ]
     if specialty_key:
@@ -9105,7 +9088,9 @@ async def _provider_procedure_cost_level(
         fallback_profile_filters = [
             provider_procedure_cost_profile_table.c.npi == provider_npi,
             provider_procedure_cost_profile_table.c.year == year,
-            provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
+            any_bigint_filter(
+                provider_procedure_cost_profile_table.c.procedure_code, internal_codes, "procedure_codes"
+            ),
             provider_procedure_cost_profile_table.c.setting_key == setting_key,
         ]
         fallback_profile_result = await session.execute(
@@ -9228,7 +9213,9 @@ async def _provider_procedure_cost_level(
                     procedure_peer_stats_table.c.procedure_code == procedure_internal_code,
                     procedure_peer_stats_table.c.year == year,
                     procedure_peer_stats_table.c.setting_key == setting_key,
-                    procedure_peer_stats_table.c.specialty_key.in_(specialty_candidates),
+                    any_string_filter(
+                        procedure_peer_stats_table.c.specialty_key, specialty_candidates, "specialty_key"
+                    ),
                     or_(*geography_clauses),
                 )
             ),
@@ -9453,7 +9440,7 @@ def _provider_procedure_location_filters(
 ) -> list[Any]:
     filters = [
         location_table.c.npi == provider_npi,
-        location_table.c.procedure_code.in_(internal_codes),
+        any_bigint_filter(location_table.c.procedure_code, internal_codes, "procedure_codes"),
         location_table.c.year == year,
     ]
     if state:
@@ -9621,7 +9608,7 @@ async def list_physician_service_locations(request, npi: str, code_system: str, 
 
 async def _procedure_provider_list_where(session, args, year, internal_codes, list_values_by_name):
     filters = [
-        provider_procedure_table.c.procedure_code.in_(internal_codes),
+        any_bigint_filter(provider_procedure_table.c.procedure_code, internal_codes, "procedure_codes"),
         provider_procedure_table.c.year == year,
         provider_table.c.year == year,
         provider_table.c.npi == provider_procedure_table.c.npi,
@@ -9916,7 +9903,7 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
         default_system=code_system,
     )
     filters = [
-        provider_procedure_table.c.procedure_code.in_(internal_codes),
+        any_bigint_filter(provider_procedure_table.c.procedure_code, internal_codes, "procedure_codes"),
         provider_procedure_table.c.year == year,
         provider_table.c.npi == provider_procedure_table.c.npi,
         provider_table.c.year == provider_procedure_table.c.year,
@@ -9970,7 +9957,7 @@ async def _procedure_geo_scope_benchmark(
 ) -> dict[str, Any] | None:
     filters = [
         procedure_geo_benchmark_table.c.year == year,
-        procedure_geo_benchmark_table.c.procedure_code.in_(internal_codes),
+        any_bigint_filter(procedure_geo_benchmark_table.c.procedure_code, internal_codes, "procedure_code"),
         procedure_geo_benchmark_table.c.geography_scope == scope,
     ]
     if geography_value is not None:
@@ -10682,7 +10669,7 @@ async def _build_provider_specialty_scope(
     if request.city and not (request.zip5 and request.zip_radius_miles > 0):
         filters.append(func.lower(provider_table.c.city).like(f"%{request.city}%"))
     if zip_filter_values:
-        filters.append(provider_table.c.zip5.in_(zip_filter_values))
+        filters.append(any_string_filter(provider_table.c.zip5, zip_filter_values, "zip_filter_values"))
     elif request.zip5:
         filters.append(provider_table.c.zip5 == request.zip5)
     provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
@@ -10740,7 +10727,7 @@ async def _provider_specialty_code_scope(
         filters=(
             *filters,
             provider_procedure_table.c.year == year,
-            provider_procedure_table.c.procedure_code.in_(internal_codes),
+            any_bigint_filter(provider_procedure_table.c.procedure_code, internal_codes, "procedure_codes"),
         ),
         from_clause=from_clause,
         total_services_expression=func.sum(provider_procedure_table.c.total_services),
@@ -10920,7 +10907,7 @@ def _prescription_autocomplete_grouped_subquery(
         func.lower(func.coalesce(source_table.c.rx_code, "")).like(q_like),
     ]
     if terminology_internal_codes:
-        text_or_code_filters.append(source_table.c.rx_code.in_(terminology_internal_codes))
+        text_or_code_filters.append(any_string_filter(source_table.c.rx_code, terminology_internal_codes, "rx_codes"))
     filters = [
         source_table.c.year == year,
         source_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
@@ -12130,7 +12117,9 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         )
         terminology_internal_codes = await _internal_procedure_codes_from_terminology(session, terminology_matches)
         if terminology_internal_codes:
-            q_clauses.append(provider_procedure_table.c.procedure_code.in_(terminology_internal_codes))
+            q_clauses.append(
+                any_bigint_filter(provider_procedure_table.c.procedure_code, terminology_internal_codes, "term_codes")
+            )
         if terminology_matches:
             procedure_resolution_by_field = {
                 "input": query_text,
@@ -12148,7 +12137,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             code,
             args,
         )
-        filters.append(provider_procedure_table.c.procedure_code.in_(internal_codes))
+        filters.append(any_bigint_filter(provider_procedure_table.c.procedure_code, internal_codes, "procedure_codes"))
     if import_context is None:
         if min_claims is not None:
             filters.append(provider_procedure_table.c.total_services >= min_claims)
@@ -12413,7 +12402,9 @@ async def list_providers_by_prescription(request):
         )
         terminology_internal_codes = await _internal_rx_codes_from_terminology(session, terminology_matches)
         if terminology_internal_codes:
-            q_clauses.append(provider_prescription_table.c.rx_code.in_(terminology_internal_codes))
+            q_clauses.append(
+                any_string_filter(provider_prescription_table.c.rx_code, terminology_internal_codes, "term_rx_codes")
+            )
         if terminology_matches:
             medication_resolution_by_field = {
                 "input": query_text,
@@ -12432,7 +12423,7 @@ async def list_providers_by_prescription(request):
             args,
             default_system=args.get("rx_code_system") or INTERNAL_RX_CODE_SYSTEM,
         )
-        filters.append(provider_prescription_table.c.rx_code.in_(internal_rx_codes))
+        filters.append(any_string_filter(provider_prescription_table.c.rx_code, internal_rx_codes, "rx_codes"))
     if min_claims is not None:
         filters.append(provider_prescription_table.c.total_claims >= min_claims)
     if min_total_cost is not None:
@@ -12573,7 +12564,7 @@ async def _provider_prescription_list_where(session, args, provider_npi, year, l
         filters.extend(
             (
                 provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
-                provider_prescription_table.c.rx_code.in_(internal_rx_codes),
+                any_string_filter(provider_prescription_table.c.rx_code, internal_rx_codes, "rx_code"),
             )
         )
     if list_values_by_name["min_claims"] is not None:
@@ -12750,7 +12741,7 @@ async def _provider_prescription_detail(request, npi: str, rx_code_system: str, 
             and_(
                 provider_prescription_table.c.npi == provider_npi,
                 provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
-                provider_prescription_table.c.rx_code.in_(internal_rx_codes),
+                any_string_filter(provider_prescription_table.c.rx_code, internal_rx_codes, "rx_code"),
                 provider_prescription_table.c.year == year,
             )
         )
@@ -12869,7 +12860,7 @@ def _prescription_provider_where_clause(
 
     filters = [
         provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
-        provider_prescription_table.c.rx_code.in_(internal_rx_codes),
+        any_string_filter(provider_prescription_table.c.rx_code, internal_rx_codes, "rx_code"),
         provider_prescription_table.c.year == year,
     ]
     if request_filters.state:
@@ -13164,7 +13155,7 @@ async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str
     )
     filters = [
         provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
-        provider_prescription_table.c.rx_code.in_(internal_rx_codes),
+        any_string_filter(provider_prescription_table.c.rx_code, internal_rx_codes, "rx_code"),
         provider_prescription_table.c.year == year,
     ]
     if state:

@@ -4,7 +4,7 @@
 from operator import eq
 from typing import Any, Sequence
 
-from sqlalchemy import BigInteger, String, any_, bindparam, func, or_, select
+from sqlalchemy import BigInteger, Integer, String, and_, any_, bindparam, func, or_, select
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.sql import literal_column
 
@@ -13,12 +13,81 @@ from db.models import EntityAddressUnified, ProviderDirectorySource
 
 def any_bigint_filter(column: Any, values: Sequence[int], param_name: str = "npis") -> Any:
     """Build a typed PostgreSQL BIGINT[] ANY() predicate for stable prepared plans."""
-    return eq(column, any_(bindparam(param_name, value=list(values), type_=ARRAY(BigInteger))))
+    return eq(column, any_(bindparam(param_name, value=list(values), type_=ARRAY(BigInteger), unique=True)))
+
+
+def any_int_filter(column: Any, values: Sequence[int], param_name: str = "values") -> Any:
+    """Build a typed PostgreSQL INTEGER[] ANY() predicate for stable prepared plans."""
+    return eq(column, any_(bindparam(param_name, value=list(values), type_=ARRAY(Integer), unique=True)))
 
 
 def any_string_filter(column: Any, values: Sequence[str], param_name: str = "values") -> Any:
     """Build a typed PostgreSQL VARCHAR[] ANY() predicate for stable prepared plans."""
-    return eq(column, any_(bindparam(param_name, value=list(values), type_=ARRAY(String))))
+    return eq(column, any_(bindparam(param_name, value=list(values), type_=ARRAY(String), unique=True)))
+
+
+def build_provider_geography_clauses(
+    cost_profile_table: Any,
+    geography_values_by_scope: Any,
+) -> list[Any]:
+    """Build scoped geography filters using typed PostgreSQL ANY() binds."""
+    geography_clauses = []
+    for geography_scope, geography_values in geography_values_by_scope.items():
+        sanitized_values = sorted(
+            {str(geography_value).strip() for geography_value in geography_values if str(geography_value).strip()}
+        )
+        if not sanitized_values:
+            continue
+        geography_clauses.append(
+            and_(
+                cost_profile_table.c.geography_scope == geography_scope,
+                any_string_filter(cost_profile_table.c.geography_value, sanitized_values, "geography_value"),
+            )
+        )
+    return geography_clauses
+
+
+def build_provider_cost_profiles_query(
+    cost_profile_table: Any,
+    *,
+    year: int,
+    npis: Sequence[int],
+    internal_codes: Sequence[int],
+    geography_clauses: Sequence[Any],
+) -> Any:
+    """Build a provider cost-profile lookup query with typed PostgreSQL ANY() binds."""
+    return select(cost_profile_table).where(
+        and_(
+            cost_profile_table.c.year == year,
+            any_bigint_filter(cost_profile_table.c.npi, npis, "npis"),
+            any_bigint_filter(cost_profile_table.c.procedure_code, internal_codes, "procedure_codes"),
+            cost_profile_table.c.setting_key == "all",
+            or_(*geography_clauses),
+        )
+    )
+
+
+def build_external_rx_crosswalk_query(
+    code_crosswalk_table: Any,
+    internal_system: str,
+    normalized_codes: Sequence[str],
+    external_systems: Sequence[str],
+) -> Any:
+    """Build a bidirectional Rx crosswalk query using typed PostgreSQL ANY() array binds."""
+    return select(code_crosswalk_table).where(
+        or_(
+            and_(
+                func.upper(code_crosswalk_table.c.from_system) == internal_system,
+                any_string_filter(func.upper(code_crosswalk_table.c.from_code), normalized_codes, "from_codes"),
+                any_string_filter(func.upper(code_crosswalk_table.c.to_system), external_systems, "to_systems"),
+            ),
+            and_(
+                func.upper(code_crosswalk_table.c.to_system) == internal_system,
+                any_string_filter(func.upper(code_crosswalk_table.c.to_code), normalized_codes, "to_codes"),
+                any_string_filter(func.upper(code_crosswalk_table.c.from_system), external_systems, "from_systems"),
+            ),
+        )
+    )
 
 
 def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> Any:
