@@ -229,15 +229,12 @@ def _common_ctes(
         and import_context.require_match
         and not import_context.prepared.normalized_order_terms,
     )
+    materialize_relation = import_context.require_match or import_context.has_native_scope
     # Keep optional unscoped SQL inlineable, so the join can narrow the import.
-    materialization = " MATERIALIZED" if import_context.require_match or import_context.has_native_scope else ""
+    materialization = " MATERIALIZED" if materialize_relation else ""
     relation_cte = f"{_IMPORT_RELATION} AS{materialization} ({import_context.compiled.sql})"
-    eligible_cte = (
-        f"eligible_geo AS MATERIALIZED (\n    SELECT * FROM {_NATIVE_GEO_RELATION}"
-        f"\n     WHERE TRUE{_membership_clause(import_context)}\n)"
-    )
-    selected_cte = _selected_geo_cte(import_context)
-    return f"{native_cte},\n{relation_cte},\n{eligible_cte},\n{selected_cte}"
+    selected_cte = _selected_geo_cte(import_context, materialize_relation=materialize_relation)
+    return f"{native_cte},\n{relation_cte},\n{selected_cte}"
 
 
 def native_geo_entity_scope():
@@ -322,28 +319,52 @@ def _address_row_key_columns(address_table_sql: str) -> tuple[str, ...]:
     return ("checksum", "type")
 
 
-def _selected_geo_cte(import_context: ProviderImportQuery) -> str:
+def _selected_geo_cte(import_context: ProviderImportQuery, *, materialize_relation: bool | None = None) -> str:
+    if materialize_relation is None:
+        materialize_relation = import_context.require_match or import_context.has_native_scope
     if not import_context.prepared.normalized_order_terms:
-        return "selected_geo AS MATERIALIZED (\n    SELECT * FROM eligible_geo\n)"
+        # Keep membership as a hashable subplan when spatial cardinality is underestimated.
+        return (
+            "selected_geo AS MATERIALIZED (\n"
+            f"    SELECT * FROM {_NATIVE_GEO_RELATION}\n"
+            f"     WHERE ({_NATIVE_GEO_RELATION}.npi_code::text IN ("
+            f"SELECT entity_value FROM {_IMPORT_RELATION})) IS TRUE\n"
+            ")"
+        )
 
-    select_import_columns = ",\n           ".join(
-        [
-            "imported.entity_value AS _custom_import_entity_value",
-            *(
-                f"imported.sort_{ordinal}"
-                for ordinal, _term in enumerate(import_context.prepared.normalized_order_terms)
-            ),
-        ]
+    import_columns = (
+        "imported.entity_value AS _custom_import_entity_value",
+        *(f"imported.sort_{ordinal}" for ordinal, _term in enumerate(import_context.prepared.normalized_order_terms)),
     )
-    require_match_clause = "\n     WHERE imported.entity_value IS NOT NULL" if import_context.require_match else ""
+    if materialize_relation:
+        # Join the two materialized CTEs once via FULL JOIN + OFFSET 0 so PostgreSQL
+        # cannot collapse it to an underestimated Nested Loop join.
+        select_import_columns = ",\n                 ".join(import_columns)
+        require_match_clause = (
+            "\n       AND joined._custom_import_entity_value IS NOT NULL" if import_context.require_match else ""
+        )
+        return (
+            "selected_geo AS MATERIALIZED (\n"
+            "    SELECT joined.*\n"
+            "      FROM (\n"
+            f"          SELECT {_NATIVE_GEO_RELATION}.*,\n"
+            f"                 {select_import_columns}\n"
+            f"            FROM {_NATIVE_GEO_RELATION}\n"
+            f"       FULL JOIN {_IMPORT_RELATION} AS imported\n"
+            f"              ON imported.entity_value = {_NATIVE_GEO_RELATION}.npi_code::text\n"
+            "          OFFSET 0\n"
+            "      ) AS joined\n"
+            f"     WHERE joined.npi_code IS NOT NULL{require_match_clause}\n"
+            ")"
+        )
+    select_import_columns = ",\n           ".join(import_columns)
     return (
         "selected_geo AS MATERIALIZED (\n"
-        "    SELECT eligible_geo.*,\n"
+        f"    SELECT {_NATIVE_GEO_RELATION}.*,\n"
         f"           {select_import_columns}\n"
-        "      FROM eligible_geo\n"
+        f"      FROM {_NATIVE_GEO_RELATION}\n"
         f" LEFT JOIN {_IMPORT_RELATION} AS imported\n"
-        "        ON imported.entity_value = eligible_geo.npi_code::text"
-        f"{require_match_clause}\n"
+        f"        ON imported.entity_value = {_NATIVE_GEO_RELATION}.npi_code::text\n"
         ")"
     )
 
@@ -375,21 +396,6 @@ def _taxonomy_filter_where(nearby: NearbySqlQuery, *, on_search: bool = False, s
             "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
         )
     return taxonomy_where
-
-
-def _membership_clause(import_context: ProviderImportQuery) -> str:
-    if not import_context.require_match:
-        return ""
-    if not import_context.prepared.normalized_order_terms:
-        # Keep membership as a hashable subplan when spatial cardinality is underestimated.
-        return (
-            f"\n       AND ({_NATIVE_GEO_RELATION}.npi_code::text IN ("
-            f"SELECT entity_value FROM {_IMPORT_RELATION})) IS TRUE"
-        )
-    return (
-        f"\n       AND EXISTS (SELECT 1 FROM {_IMPORT_RELATION} AS imported "
-        f"WHERE imported.entity_value = {_NATIVE_GEO_RELATION}.npi_code::text)"
-    )
 
 
 def nearby_row_tiebreaker(address_table_sql: str, *, alias: str = "a") -> str:
@@ -753,6 +759,7 @@ def _page_statement(
     has_anchor: bool,
 ):
     order_clause = _order_clause(import_context, "selected_geo")
+    page_order_clause = _order_clause(import_context, "page_rows")
     anchor_join = "\n      CROSS JOIN cursor_anchor" if has_anchor else ""
     keyset_clause = _keyset_clause(import_context, "selected_geo", "cursor_anchor") if has_anchor else ""
     anchor_count = ", (SELECT COUNT(*) FROM cursor_anchor_rows) AS _geo_anchor_count" if has_anchor else ""
@@ -760,11 +767,14 @@ def _page_statement(
         f"""WITH {common_ctes},
 geo_totals AS (SELECT COUNT(*) AS _geo_total{anchor_count} FROM selected_geo),
 page_geo AS MATERIALIZED (
-    SELECT selected_geo.*,
-           ROW_NUMBER() OVER (ORDER BY {order_clause}) AS _geo_page_position
-      FROM selected_geo{anchor_join}{keyset_clause}
-     ORDER BY {order_clause}
-     LIMIT :{_PAGE_LIMIT_PARAMETER}
+    SELECT page_rows.*,
+           ROW_NUMBER() OVER (ORDER BY {page_order_clause}) AS _geo_page_position
+      FROM (
+          SELECT selected_geo.*
+            FROM selected_geo{anchor_join}{keyset_clause}
+           ORDER BY {order_clause}
+           LIMIT :{_PAGE_LIMIT_PARAMETER}
+      ) AS page_rows
 ),
 {_hydrated_geo_cte(import_context, nearby)}
 SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display, geo_totals.*

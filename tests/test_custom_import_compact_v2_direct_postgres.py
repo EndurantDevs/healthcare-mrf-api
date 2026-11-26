@@ -995,6 +995,7 @@ async def _assert_compiled_relation_queries(case, service, auth, pinned_target):
         )
         sql_scoped, entries_scoped = await _exec_compiled_relation(session, prepared_scoped)
         assert 'COLLATE "C"' in sql_scoped
+        assert "= ANY (ARRAY(SELECT" in sql_scoped
         assert "AS block_family_identity" not in sql_scoped
         assert sql_scoped.count("JOIN ") == 2
         assert sorted((entry[0], entry[1]) for entry in entries_scoped) == [
@@ -1013,7 +1014,93 @@ async def _assert_compiled_relation_queries(case, service, auth, pinned_target):
         )
         sql_null, entries_null = await _exec_compiled_relation(session, prepared_null)
         assert 'COLLATE "C"' in sql_null
+        assert "= ANY (ARRAY(" not in sql_null
         assert [entry[0] for entry in entries_null] == ["1234567893"]
+
+
+def _iter_compact_plan_nodes(node):
+    yield node
+    for child in node.get("Plans") or ():
+        yield from _iter_compact_plan_nodes(child)
+
+
+async def _assert_saop_covering_index_scan(session, snapshot_schema: str, dataset_id: int) -> None:
+    """Confirm PostgreSQL matches COLLATE C SAOP ARRAY(SELECT ...) to the covering index."""
+    assert snapshot_schema.startswith("ci_snapshot_") and snapshot_schema.removeprefix("ci_snapshot_").isdigit()
+    saop_plan = (
+        await session.execute(
+            text(
+                f'EXPLAIN (FORMAT JSON) SELECT entity_binding_id FROM "{snapshot_schema}".custom_import_entity_binding '
+                "WHERE dataset_id = :dataset_id AND adapter_id = 'npi' "
+                'AND (canonical_value COLLATE "C") = ANY (ARRAY(SELECT CAST(v AS VARCHAR) '
+                "FROM (VALUES (1003000126), (1234567893)) AS s(v)))"
+            ),
+            {"dataset_id": dataset_id},
+        )
+    ).scalar_one()
+    saop_scans = [
+        node
+        for node in _iter_compact_plan_nodes(saop_plan[0]["Plan"])
+        if node.get("Index Name") == "custom_import_entity_binding_canonical_order_idx"
+        and node.get("Node Type") == "Index Only Scan"
+        and "= ANY (" in (node.get("Index Cond") or "")
+    ]
+    assert saop_scans
+
+
+async def _assert_scoped_saop_index_edges(case, service, auth, pinned_target):
+    """Verify SAOP ARRAY(SELECT ...) index usage and empty/null/duplicate scope semantics."""
+    order_query = NpiEntityRelationQuery(order_terms=(ReadOrderTerm("score", "asc", "last"),))
+    noisy_scope = values(column("npi", BigInteger), name="noisy_npis").data(
+        [(1003000126,), (1003000126,), (1234567893,), (None,), (1992999874,)]
+    )
+    async with case.sessions() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        prepared_base = await service.prepare_npi_entity_relation(
+            session, authorization=auth, target=pinned_target, query=order_query
+        )
+        prepared_noisy = await service.scope_npi_entity_relation(
+            session,
+            authorization=auth,
+            pinned_target=pinned_target,
+            prepared=prepared_base,
+            query=order_query,
+            native_entity_scope=select(noisy_scope.c.npi),
+        )
+        sql_noisy, entries_noisy = await _exec_compiled_relation(session, prepared_noisy)
+        assert "= ANY (ARRAY(SELECT" in sql_noisy
+        assert sorted((entry[0], entry[1]) for entry in entries_noisy) == [
+            ("1003000126", Decimal("1.500000000000")),
+            ("1234567893", None),
+            ("1992999874", Decimal("3.250000000000")),
+        ]
+
+        await session.execute(text("SET LOCAL enable_seqscan = off"))
+        await session.execute(text("SET LOCAL enable_bitmapscan = off"))
+        namespace = session.get_bind().get_execution_options()["schema_translate_map"]["mrf"]
+        compiled = compile_npi_entity_relation(prepared_noisy.statement)
+        scoped_sql = compiled.sql.replace("mrf.", f"{_quoted_publication_schema(namespace)}.")
+        explain_plan = (
+            await session.execute(text(f"EXPLAIN (FORMAT JSON) {scoped_sql}").bindparams(*compiled.typed_binds))
+        ).scalar_one()
+        plan_nodes = list(_iter_compact_plan_nodes(explain_plan[0]["Plan"]))
+        assert not any(node.get("Node Type") == "Aggregate" for node in plan_nodes)
+        assert any("= ANY (" in f"{node.get('Index Cond', '')} {node.get('Filter', '')}" for node in plan_nodes)
+        snapshot_schema = service._prepared_read_context.context.family_block_binding.tables_by_role["family"].schema
+        await _assert_saop_covering_index_scan(session, snapshot_schema, pinned_target.dataset_id)
+
+        prepared_empty = await service.scope_npi_entity_relation(
+            session,
+            authorization=auth,
+            pinned_target=pinned_target,
+            prepared=await service.prepare_npi_entity_relation(
+                session, authorization=auth, target=pinned_target, query=order_query
+            ),
+            query=order_query,
+            native_entity_scope=select(noisy_scope.c.npi).where(noisy_scope.c.npi < 0),
+        )
+        _, entries_empty = await _exec_compiled_relation(session, prepared_empty)
+        assert entries_empty == []
 
 
 async def _assert_compact_page_and_string_scope(case, service, auth, pinned_target):
@@ -1094,6 +1181,7 @@ async def test_direct_v2_compiled_npi_relation_and_root_detail_parity(monkeypatc
         auth = ExtensionReadAuthorization("synthetic-reader")
 
         await _assert_compiled_relation_queries(case, service, auth, pinned_target)
+        await _assert_scoped_saop_index_edges(case, service, auth, pinned_target)
         await _assert_compact_page_and_string_scope(case, service, auth, pinned_target)
         async with case.sessions() as session:
             detail = await service.root_detail_for_entity(

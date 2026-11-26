@@ -34,12 +34,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import Integer, String, and_, exists, func, not_, select, text, tuple_
+from sqlalchemy import Integer, String, and_, any_, exists, func, not_, select, text, tuple_
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql import Select
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import CTE
+from sqlalchemy.sql.visitors import InternalTraversal
 
 from db.models.custom_import import (
     CustomImportChildCollection,
@@ -1947,11 +1951,35 @@ def _npi_entity_relation_fingerprint(
     return hashlib.sha256(_NPI_ENTITY_RELATION_FINGERPRINT_DOMAIN + _canonical_bytes(query_shape_map)).hexdigest()
 
 
+class _ArraySubquery(ColumnElement[list[str]]):
+    """Render PostgreSQL ``ARRAY(SELECT ...)`` so ``= ANY (...)`` walks one sorted B-tree scan."""
+
+    inherit_cache = True
+    _traverse_internals = [("element", InternalTraversal.dp_clauseelement)]
+
+    def __init__(self, element: Select) -> None:
+        self.element = element
+        self.type = ARRAY(String())
+
+
+@compiles(_ArraySubquery)
+def _compile_array_subquery(element: _ArraySubquery, compiler, **kwargs) -> str:
+    return f"ARRAY({compiler.process(element.element, **kwargs)})"
+
+
 def _canonical_entity_value(context: _ReadContext, entity_model):
     """Match compact entity bindings through their covering COLLATE C unique index."""
     if getattr(context, "family_block_binding", None) is not None:
         return entity_model.canonical_value.collate("C")
     return entity_model.canonical_value
+
+
+def _canonical_entity_value_in(context: _ReadContext, entity_model, entity_values):
+    """Use a single B-tree array scan for SQL scopes and ordinary IN for small Python tuples."""
+    canonical_value = _canonical_entity_value(context, entity_model)
+    if isinstance(entity_values, Select):
+        return canonical_value == any_(_ArraySubquery(entity_values))
+    return canonical_value.in_(entity_values)
 
 
 def _npi_entity_relation_statement(
@@ -1960,7 +1988,7 @@ def _npi_entity_relation_statement(
     order_terms: tuple[ReadOrderTerm, ...],
     *,
     context_filters: tuple[_NormalizedFilter, ...] = (),
-    entity_values: tuple[str, ...] | None = None,
+    entity_values: tuple[str, ...] | Select | None = None,
 ) -> Select:
     """Project exact NPI bindings and optional winner-local typed sort values."""
 
@@ -1989,7 +2017,7 @@ def _npi_entity_relation_statement(
         for predicate in all_filters:
             statement = statement.where(direct_root_scalar_predicate(context, predicate, _has_scalar_comparison))
         if entity_values is not None:
-            statement = statement.where(_canonical_entity_value(context, entity_model).in_(entity_values))
+            statement = statement.where(_canonical_entity_value_in(context, entity_model, entity_values))
         columns: list[object] = [entity_model.canonical_value.label("entity_value")]
         for ordinal, term in enumerate(order_terms):
             field = context.definition.fields_by_id[term.field_id]
@@ -1999,7 +2027,7 @@ def _npi_entity_relation_statement(
 
     statement = _filtered_npi_winner_statement(context, filters, context_filters=context_filters)
     if entity_values is not None:
-        statement = statement.where(_canonical_entity_value(context, entity_model).in_(entity_values))
+        statement = statement.where(_canonical_entity_value_in(context, entity_model, entity_values))
     columns = [entity_model.canonical_value.label("entity_value")]
     for ordinal, term in enumerate(order_terms):
         field = context.definition.fields_by_id[term.field_id]

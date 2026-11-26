@@ -481,7 +481,7 @@ def _native_ctes(context, *, is_geo):
     native_cte = f"native_input(npi_code, address_key, cursor_distance_meters) AS (VALUES {values})"
     relation_cte = f"custom_import_provider_relation AS ({context.compiled.sql})"
     if is_geo:
-        eligible = "eligible_geo AS (SELECT DISTINCT * FROM native_input)"
+        eligible = "native_eligible_geo AS (SELECT DISTINCT * FROM native_input)"
         return f"{relation_cte}, {native_cte}, {eligible}, {provider_geo_sql._selected_geo_cte(context)}"
     membership = provider_list_sql._provider_import_membership_clause(context, "native_input.npi_code")
     selected = "selected_list AS (SELECT native_input.*, imported.* FROM native_input LEFT JOIN custom_import_provider_relation AS imported ON imported.entity_value = native_input.npi_code"
