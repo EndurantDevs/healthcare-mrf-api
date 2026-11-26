@@ -35,6 +35,7 @@ from process.reference_family_result_generation import (
     validate_reference_family_result_generation_authority,
     validate_reference_family_serving_generation,
 )
+from process.registry_aca_source_recipe import STAMP_SQL
 from process.registry_source_recipe_store import _decode_ownership, _unique_document
 
 CONTRACT = "registry-aca-global-epoch/v1"
@@ -300,9 +301,7 @@ async def admit_registry_aca_global_epoch(session, prepared, *, runtime_roles):
     epoch = PinnedACAGlobalEpoch(prepared, validation, runtime_roles)
     await _native_epoch(session, epoch)
     encoded = _PREFIX + _canonical_json(epoch.as_dict()).decode()
-    current = await session.scalar(
-        text("SELECT obj_description(CAST(:oid AS oid),'pg_namespace')"), {"oid": prepared.ownership.schema_oid}
-    )
+    current = await session.scalar(text(STAMP_SQL), {"schema": prepared.ownership.schema_name})
     if current not in (None, encoded):
         _invalid()
     await (await native_driver(session)).execute(
@@ -316,9 +315,7 @@ async def require_registry_aca_global_epoch(session, prepared, *, runtime_roles)
     if not session.in_transaction():
         _invalid()
     _roles(runtime_roles)
-    encoded = await session.scalar(
-        text("SELECT obj_description(CAST(:oid AS oid),'pg_namespace')"), {"oid": prepared.ownership.schema_oid}
-    )
+    encoded = await session.scalar(text(STAMP_SQL), {"schema": prepared.ownership.schema_name})
     if type(encoded) is not str or not encoded.startswith(_PREFIX) or len(encoded.encode()) > MAX_BYTES + len(_PREFIX):
         _invalid()
     epoch = decode_pinned_aca_global_epoch(encoded[len(_PREFIX) :])

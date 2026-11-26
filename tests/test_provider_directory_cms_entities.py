@@ -443,7 +443,6 @@ async def test_new_published_dataset_does_not_inherit_old_coverage(monkeypatch):
         "UPDATE provider_directory_endpoint_dataset SET is_current=false, status='validated'",
         "UPDATE provider_directory_endpoint_dataset SET content_proof_admission_kind='uhc_canonical'",
         "UPDATE provider_directory_endpoint_dataset SET content_proof_admission_version=NULL",
-        "UPDATE provider_directory_endpoint_dataset SET publication_metadata_sha256=repeat('0',64)",
         "UPDATE provider_directory_endpoint_dataset SET content_proof_resource_types=ARRAY['Organization']",
         "UPDATE provider_directory_source SET endpoint_id=NULL",
     ],

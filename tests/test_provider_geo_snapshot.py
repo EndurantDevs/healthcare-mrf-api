@@ -102,8 +102,6 @@ def _database(session):
 async def test_geo_inventory_excludes_unconsumed_families_and_preserves_full_profile_availability():
     session = _session(installed=(*snapshot._GEO_TABLES, *_RAW_PARENTS))
     assert set(snapshot._GEO_TABLES) == set(snapshot._COMMON_TABLES) | set(NPI_CANONICAL_TABLES) | {
-        "npi_canonical_publication_receipt",
-        "npi_canonical_publication_receipt_seal",
         "npi_result_generation",
         "nucc_taxonomy",
     }

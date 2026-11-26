@@ -18,8 +18,6 @@ from process.provider_directory_validated_publication_contract import (
     ProviderDirectoryDatasetIdentity,
 )
 
-_ADMISSION_SCHEMA = ProviderDirectoryEndpointDataset.__table__.schema
-
 
 def named_source_dataset_records(records, editions):
     """Overlay current logical headers while keeping newer validated candidates."""
@@ -53,26 +51,14 @@ def _source_endpoint_id(source_model, *, current_published_only):
 def _catalog_publication_metadata(dataset_model):
     """Return compact admitted metadata without opening the raw proof JSON."""
 
-    digest = getattr(
-        getattr(func, _ADMISSION_SCHEMA),
-        "provider_directory_endpoint_dataset_admission_metadata_sha256",
-    )
-    sealed = and_(
+    admitted = and_(
         dataset_model.content_proof_admission_version == ADMISSION_SEAL_VERSION,
         dataset_model.content_proof_admission_kind.in_((ADMISSION_KIND_GENERIC, ADMISSION_KIND_UHC_CANONICAL)),
         dataset_model.content_proof_admission_sha256.op("~")(r"^[0-9a-f]{64}$"),
         func.jsonb_typeof(dataset_model.publication_metadata_summary_json) == "object",
-        dataset_model.publication_metadata_sha256
-        == digest(
-            dataset_model.publication_metadata_summary_json,
-            dataset_model.content_proof_admission_version,
-            dataset_model.content_proof_admission_kind,
-            dataset_model.content_proof_admission_sha256,
-            dataset_model.content_proof_resource_types,
-        ),
     )
     return case(
-        (sealed, dataset_model.publication_metadata_summary_json),
+        (admitted, dataset_model.publication_metadata_summary_json),
         else_=cast(None, JSONB),
     )
 

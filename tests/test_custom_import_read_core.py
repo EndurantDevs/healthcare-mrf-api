@@ -19,7 +19,7 @@ from sqlalchemy import column
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import operators
 
-from process.custom_import import publication, read_core, read_cursor, read_identity
+from process.custom_import import read_core, read_cursor, read_identity
 from process.custom_import.definition import CustomImportDefinition, Field, load_json_definition
 from process.custom_import.read_core import (
     MAX_PAGE_OFFSET,
@@ -682,51 +682,23 @@ def test_persisted_definition_parse_failure_is_unavailable(document):
 
 
 @pytest.mark.asyncio
-async def test_published_generation_validation_uses_the_pinned_target_and_canonical_event():
+async def test_published_generation_validation_uses_the_pinned_target_and_finality_event():
     pinned_target = _target()
-    details = publication._PublicationEventDetails(
-        dataset_id=pinned_target.dataset_id,
-        definition_revision_id=pinned_target.definition_revision_id,
-        schema_revision_id=pinned_target.schema_revision_id,
-        execution_id=41,
-        event_kind="activated",
-        from_generation_id=None,
-        to_generation_id=pinned_target.generation_id,
-        expected_pointer_version=0,
-        committed_pointer_version=1,
-    )
-    canonical, digest = publication._event_document(details)
-    publication_event = SimpleNamespace(
-        **details.__dict__,
-        finality_contract=publication.FINALITY_EVENT_CONTRACT,
-        canonical_event=canonical,
-        event_sha256=digest,
-    )
 
-    def session_for(event_row):
-        return SimpleNamespace(
-            execute=AsyncMock(
-                side_effect=(
-                    SimpleNamespace(scalar_one_or_none=lambda: pinned_target.generation_id),
-                    SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: event_row)),
-                )
-            )
-        )
+    def session_for(event_id):
+        return SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: event_id)))
 
-    session = session_for(publication_event)
+    session = session_for(41)
     await read_identity.verify_published_generation(session, pinned_target)
 
-    statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert "custom_import_current_generation" not in "\n".join(statements)
-    assert "to_generation_id" in statements[1]
-    assert "finality_contract" in statements[1]
+    statement = str(session.execute.await_args.args[0])
+    assert session.execute.await_count == 1
+    assert "custom_import_generation_seal" not in statement
+    assert "to_generation_id" in statement
+    assert "finality_contract" in statement
 
     with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned generation"):
         await read_identity.verify_published_generation(session_for(None), pinned_target)
-
-    publication_event.canonical_event = "{}"
-    with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned generation"):
-        await read_identity.verify_published_generation(session_for(publication_event), pinned_target)
 
 
 @pytest.fixture

@@ -222,6 +222,9 @@ async def test_admission_orders_native_validation_custody_and_durable_stamp(monk
     assert producer.CONTRACT in statement and recipe.source_pin.validation == validation
     session.scalar.return_value = producer._PREFIX + producer.canonical_registry_source_recipes((recipe,))
     assert await producer.require_registry_aca_source_recipe(session, prepared, runtime_roles=_ROLES) == recipe
+    # A copied database keeps schema names, not object ids.
+    stamp_statement, stamp_params = session.scalar.await_args.args
+    assert stamp_params == {"schema": prepared.ownership.schema_name} and "to_regnamespace" in str(stamp_statement)
 
 
 @pytest.mark.asyncio
