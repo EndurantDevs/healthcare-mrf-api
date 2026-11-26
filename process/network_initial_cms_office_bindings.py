@@ -203,6 +203,17 @@ SELECT NOT EXISTS(SELECT 1 FROM checked WHERE valid IS DISTINCT FROM true)
 
 async def _canonicalize(addresses):
     native = importlib.import_module("ptg2_address_canon")
+    batch_json = getattr(native, "canonicalize_batch_json", None)
+    if batch_json is not None:
+        try:
+            encoded_bytes = await drain_operation(
+                asyncio.to_thread(batch_json, addresses, 2 * MAX_INPUT_BYTES), preserve_cancellation=True
+            )
+        except ValueError as error:
+            if str(error) == "canonical_bound_exceeded":
+                raise InitialCMSOfficeBindingError("initial_cms_office_canonical_bound_exceeded") from None
+            raise
+        return encoded_bytes.decode()
     canonical = await drain_operation(
         asyncio.to_thread(native.canonicalize_batch, addresses), preserve_cancellation=True
     )

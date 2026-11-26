@@ -461,19 +461,33 @@ async def _canonical_bindings(connection, office_records):
     native = importlib.import_module("ptg2_address_canon")
     source_addresses = [tuple(office["evidence_address"]) for office in office_records]
     retained_addresses = [tuple(office["address"]) for office in office_records]
-    canonical_addresses = await drain_operation(
-        asyncio.to_thread(native.canonicalize_batch, source_addresses + retained_addresses), preserve_cancellation=True
-    )
-    canonical_json = json.dumps(canonical_addresses, separators=(",", ":"), allow_nan=False)
-    if len(canonical_json.encode()) > 2 * MAX_INPUT_BYTES:
-        raise InitialACAOfficeBindingError("initial_aca_office_canonical_bound_exceeded")
-    result = await connection.fetchrow(
+    combined_addresses = source_addresses + retained_addresses
+    batch_json = getattr(native, "canonicalize_batch_json", None)
+    if batch_json is not None:
+        try:
+            canonical_json = (
+                await drain_operation(
+                    asyncio.to_thread(batch_json, combined_addresses, 2 * MAX_INPUT_BYTES), preserve_cancellation=True
+                )
+            ).decode()
+        except ValueError as error:
+            if str(error) == "canonical_bound_exceeded":
+                raise InitialACAOfficeBindingError("initial_aca_office_canonical_bound_exceeded") from None
+            raise
+    else:
+        canonical_addresses = await drain_operation(
+            asyncio.to_thread(native.canonicalize_batch, combined_addresses), preserve_cancellation=True
+        )
+        canonical_json = json.dumps(canonical_addresses, separators=(",", ":"), allow_nan=False)
+        if len(canonical_json.encode()) > 2 * MAX_INPUT_BYTES:
+            raise InitialACAOfficeBindingError("initial_aca_office_canonical_bound_exceeded")
+    binding_row = await connection.fetchrow(
         _CANONICAL_BINDINGS_SQL,
         json.dumps(office_records, separators=(",", ":")),
         canonical_json,
         native.canon_version()["identity_version"],
     )
-    if result["valid"] is not True:
+    if binding_row["valid"] is not True:
         raise InitialACAOfficeBindingError("initial_aca_office_canonical_identity_differs")
     return [
         (
@@ -484,7 +498,7 @@ async def _canonical_bindings(connection, office_records):
             binding["entity_type"],
             binding["entity_id"],
         )
-        for binding in json.loads(result["bindings_json"])
+        for binding in json.loads(binding_row["bindings_json"])
     ]
 
 

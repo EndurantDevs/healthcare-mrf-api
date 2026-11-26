@@ -16,7 +16,7 @@ pub const ADDRESS_IDENTITY_VERSION: u8 = 2;
 pub const ADDRESS_IDENTITY_PREFIX: &str = "v2";
 pub const ADDRESS_CANON_RULESET_VERSION: u8 = 4;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CanonicalAddress {
     pub address_key: Option<String>,
     pub identity_key: Option<String>,

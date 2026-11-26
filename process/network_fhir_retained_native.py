@@ -143,27 +143,52 @@ def _validate_native(streams, root, families, count, unsupported, owned, expecte
         raise RetainedFhirNativeError("native_accounting_invalid")
 
 
-def prepare_retained_fhir_batch(rows, context, *, native_encoder, reference_validator, reference_records, location_id):
-    """Validate every fallback row before root use and prepare all COPY bytes before writes.
-
-    Context contains source/release IDs, persisted hash contract, resource types,
-    PostgreSQL timestamp microseconds and the derive flag. The reference callbacks
-    retain ownership of payload validation, UUID authority and evidence semantics.
-    """
-    if len(rows) > 1000:
+def _encode_retained_batch(resource_rows, context, native_encoder, location_id, rows_encoder, native_location_id):
+    if len(resource_rows) > 1000:
         raise RetainedFhirNativeError("row_limit")
-    document_by_field = {**context, "rows": _wire_rows(rows, context, location_id)}
+    if rows_encoder is not None and all(type(resource_row["payload_json"]) is str for resource_row in resource_rows):
+        derive = context["derive"]
+        source_id = context["source_id"]
+        native_rows = [
+            (
+                resource_row["resource_type"],
+                resource_row["resource_id"],
+                resource_row["payload_hash"],
+                resource_row["payload_json"],
+                resource_row["acquired_resource_sha256"],
+                None
+                if (native_location_id or not derive or resource_row["resource_type"] != "Location")
+                else str(location_id(source_id, resource_row["resource_id"])),
+            )
+            for resource_row in resource_rows
+        ]
+        return rows_encoder(context, native_rows)
+    document_by_field = {**context, "rows": _wire_rows(resource_rows, context, location_id)}
     encoded = json.dumps(document_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     if len(encoded) > MAX_INPUT_BYTES:
         raise RetainedFhirNativeError("input_limit")
-    bindings, evidence, plans, root, families, count, unsupported, owned = native_encoder(encoded)
+    return native_encoder(encoded)
+
+
+def prepare_retained_fhir_batch(
+    rows,
+    context,
+    *,
+    native_encoder,
+    reference_validator,
+    reference_records,
+    location_id,
+    rows_encoder=None,
+    native_location_id=False,
+):
+    """Validate fallback rows before root use and prepare all retained COPY bytes before writes."""
+    encoded = _encode_retained_batch(rows, context, native_encoder, location_id, rows_encoder, native_location_id)
+    bindings, evidence, plans, root, families, count, unsupported, owned = encoded
     _validate_native((bindings, evidence, plans), root, families, count, unsupported, owned, len(rows))
     fallback_rows = [rows[index] for index in unsupported]
     if fallback_rows:
         reference_validator(fallback_rows)
     derived = reference_records(fallback_rows) if fallback_rows and context["derive"] else ()
     extra, owned = _fallback_batches(derived, owned)
-    combined_batches = tuple(
-        tuple(native) + additional for native, additional in zip((bindings, evidence, plans), extra)
-    )
-    return PreparedRetainedFhirBatch(combined_batches, root, families, count, tuple(unsupported), owned)
+    batches = tuple(tuple(native) + additional for native, additional in zip((bindings, evidence, plans), extra))
+    return PreparedRetainedFhirBatch(batches, root, families, count, tuple(unsupported), owned)

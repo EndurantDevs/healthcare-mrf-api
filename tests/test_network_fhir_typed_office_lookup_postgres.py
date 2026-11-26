@@ -209,13 +209,18 @@ async def test_mixed_lookup_omits_invalid_and_ambiguous_offices_with_exact_accou
     async with connection.transaction():
         address, mappings = await _fixture(connection)
         await _mixed_offices(connection, mappings[1])
-        original, batch_sizes = native.canonicalize_batch, []
+        target_name = (
+            "canonicalize_address_keys_batch"
+            if hasattr(native, "canonicalize_address_keys_batch")
+            else "canonicalize_batch"
+        )
+        original, batch_sizes = getattr(native, target_name), []
 
         def observed(rows):
             batch_sizes.append(len(rows))
             return original(rows)
 
-        monkeypatch.setattr(native, "canonicalize_batch", observed)
+        monkeypatch.setattr(native, target_name, observed)
         async with lookup.typed_office_lookup(
             connection, [selected.table_names["offices"] for selected in mappings], address
         ) as matches:
