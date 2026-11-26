@@ -166,13 +166,13 @@ def _page_rows(page, origin, counts, after):
     return wire_rows, after
 
 
-def _prepare_typed_page_fast(page, origin, counts, after):
-    """Validate a typed page and build compact projection JSON in one Rust pass when payloads are strings."""
+def _call_typed_page_native(native_name, page, origin, counts, after):
+    """Run one native typed-page helper and translate contract errors into `TypedFHIRGraphError`."""
     require(type(page) is tuple and 0 < len(page) <= 1000, "page_bounds")
     try:
         import ptg2_address_canon as native
 
-        prepare = getattr(native, "prepare_typed_fhir_page", None)
+        prepare = getattr(native, native_name, None)
     except ImportError:
         prepare = None
     if prepare is None:
@@ -187,6 +187,8 @@ def _prepare_typed_page_fast(page, origin, counts, after):
             is_completion_v3,
             8 * 1024**2,
         )
+    except UnicodeError:
+        require(False, "page_bounds")
     except ValueError as error:
         code = str(error)
         if code in {
@@ -203,16 +205,40 @@ def _prepare_typed_page_fast(page, origin, counts, after):
 
             raise RetainedFHIRCaptureError("retained_fhir_capture_unavailable") from None
         raise
-    except UnicodeError:
-        require(False, "page_bounds")
     if prepared is None:
         return None
-    projected_json, projected_count, last_type, last_id, page_counts = prepared
+    encoded_output, projected_count, last_type, last_id, page_counts = prepared
     expected_by_kind = dict(origin.resource_counts)
     for kind, delta in page_counts.items():
         counts[kind] += delta
         require(counts[kind] <= expected_by_kind[kind], "resource_counts")
-    return projected_json, projected_count, (last_type, last_id)
+    return encoded_output, projected_count, (last_type, last_id)
+
+
+def _prepare_typed_copy_page_fast(page, origin, counts, after):
+    """Validate a typed page and build binary COPY bytes for `source_cells` in parallel Rust."""
+    return _call_typed_page_native("prepare_typed_fhir_copy_page", page, origin, counts, after)
+
+
+def _prepare_typed_page_fast(page, origin, counts, after):
+    """Validate a typed page and build compact projection JSON in one Rust pass when payloads are strings."""
+    return _call_typed_page_native("prepare_typed_fhir_page", page, origin, counts, after)
+
+
+async def _copy_projected_page(connection, stage, copy_bytes, row_count):
+    if not row_count:
+        return
+    copied = await drain_operation(
+        connection.copy_to_table(
+            stage.names["cells"],
+            schema_name=stage.schema_name,
+            columns=CELL_COLUMNS,
+            source=memoryview(copy_bytes),
+            format="binary",
+        ),
+        preserve_cancellation=True,
+    )
+    require(copied == "COPY " + str(row_count), "projected_shape")
 
 
 async def _project_page_json(connection, stage, encoded_json, row_count, *, plan_table=None):
@@ -376,6 +402,11 @@ async def _consume_page(connection, stage, page, origin, counts, after, options)
     checker, as_of, plan_tiers, plan_projection = options
     stage.require_ready(complete=False)
     if not checker and plan_projection is None:
+        fast_copy = _prepare_typed_copy_page_fast(page, origin, counts, after)
+        if fast_copy is not None:
+            copy_bytes, projected_count, next_after = fast_copy
+            await _copy_projected_page(connection, stage, copy_bytes, projected_count)
+            return next_after
         fast = _prepare_typed_page_fast(page, origin, counts, after)
         if fast is not None:
             projected_json, projected_count, next_after = fast
@@ -487,11 +518,15 @@ async def _canonical_address_records(connection, stage, address_rows, fields):
     return address_records
 
 
+_CANONICAL_PAGE_LIMIT = 4000
+_CANONICAL_MAX_BYTES = 8 * 1024**2
+
+
 async def _canonicalize(connection, stage):
     """Canonicalize bounded location pages while refusing raw-key and full-identity collisions."""
 
     fields = ",".join(ADDRESS_FIELDS)
-    query = (
+    page_select = (
         "SELECT resource_id,"
         + _raw_key()
         + " AS raw_key,"
@@ -500,19 +535,29 @@ async def _canonicalize(connection, stage):
         + stage.relation("cells")
         + " WHERE resource_type='Location' AND resource_id>$1 ORDER BY resource_id LIMIT $2"
     )
-    after, limit = "", 1000
+    bounded_query = (
+        "WITH page AS MATERIALIZED ("
+        + page_select
+        + "), bounds AS MATERIALIZED ("
+        + "SELECT count(*)::integer AS page_count,"
+        + "coalesce(sum(octet_length(record_send(page))),0)::bigint AS page_bytes FROM page"
+        + ") SELECT page_count,page_bytes,page.* FROM bounds LEFT JOIN LATERAL ("
+        + f"SELECT * FROM page WHERE page_bytes<={_CANONICAL_MAX_BYTES} OFFSET 0"
+        + ") page ON true ORDER BY page.resource_id"
+    )
+    after, limit = "", _CANONICAL_PAGE_LIMIT
     while True:
-        size = await connection.fetchval(
-            "SELECT coalesce(sum(octet_length(record_send(page))),0) FROM (" + query + ") page", after, limit
-        )
-        if size > 8 * 1024**2:
+        address_rows = await connection.fetch(bounded_query, after, limit)
+        page_count, page_bytes = address_rows[0]["page_count"], address_rows[0]["page_bytes"]
+        if page_count == 0:
+            break
+        if page_bytes > _CANONICAL_MAX_BYTES:
             require(limit > 1, "canonical_bounds")
             limit = max(1, limit // 2)
             continue
-        address_rows = await connection.fetch(query, after, limit)
-        if not address_rows:
-            break
         after = address_rows[-1]["resource_id"]
+        if limit < _CANONICAL_PAGE_LIMIT and page_bytes <= (_CANONICAL_MAX_BYTES * 3) // 8:
+            limit = min(_CANONICAL_PAGE_LIMIT, limit * 2)
         address_records = await _canonical_address_records(connection, stage, address_rows, fields)
         if address_records is None:
             continue
@@ -694,7 +739,9 @@ async def produce_typed_source_graph(
         as_of=as_of,
         plan_tiers=has_plan_tiers,
     )
+    await connection.execute("ANALYZE " + stage.relation("cells"))
     await _canonicalize(connection, stage)
+    await connection.execute("ANALYZE " + stage.relation("addresses"))
     await _pairs(connection, stage, origin, as_of, **({"plan_tiers": True} if has_plan_tiers else {}))
     counts = await _counts(connection, stage, total)
     stage.document = graph_document(reviewed_origin, membership_as_of, counts, plan_tiers=has_plan_tiers)

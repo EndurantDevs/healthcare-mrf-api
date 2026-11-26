@@ -89,32 +89,35 @@ fn encode_retained_fhir_capture_rows(
         resource_types,
         derive,
     ) = context;
+    let pool = location_canon_pool()?;
     let batch = py
         .detach(|| {
-            let context = crate::retained_fhir_capture::NativeCaptureContext {
-                source_id,
-                release_id,
-                observed_at_pg_micros,
-                hash_contract,
-                completion_required_version,
-                resource_types: &resource_types,
-                derive,
-            };
-            let borrowed_rows: Vec<crate::retained_fhir_capture::NativeCaptureRow<'_>> = rows
-                .iter()
-                .map(|row| crate::retained_fhir_capture::NativeCaptureRow {
-                    resource_type: &row.0,
-                    resource_id: &row.1,
-                    payload_hash: &row.2,
-                    payload_json: &row.3,
-                    acquired_resource_sha256: row.4.as_deref(),
-                    site_id: row.5.as_deref(),
-                })
-                .collect();
-            crate::retained_fhir_capture::encode_retained_fhir_capture_rows(
-                &context,
-                &borrowed_rows,
-            )
+            pool.install(|| {
+                let context = crate::retained_fhir_capture::NativeCaptureContext {
+                    source_id,
+                    release_id,
+                    observed_at_pg_micros,
+                    hash_contract,
+                    completion_required_version,
+                    resource_types: &resource_types,
+                    derive,
+                };
+                let borrowed_rows: Vec<crate::retained_fhir_capture::NativeCaptureRow<'_>> = rows
+                    .iter()
+                    .map(|row| crate::retained_fhir_capture::NativeCaptureRow {
+                        resource_type: &row.0,
+                        resource_id: &row.1,
+                        payload_hash: &row.2,
+                        payload_json: &row.3,
+                        acquired_resource_sha256: row.4.as_deref(),
+                        site_id: row.5.as_deref(),
+                    })
+                    .collect();
+                crate::retained_fhir_capture::encode_retained_fhir_capture_rows(
+                    &context,
+                    &borrowed_rows,
+                )
+            })
         })
         .map_err(|error| {
             PyValueError::new_err(

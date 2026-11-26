@@ -5,7 +5,8 @@
 use crate::network_membership_codec::{uuid_bytes, write_field, COPY_HEADER};
 #[path = "retained_fhir_capture/hash.rs"]
 pub(crate) mod hash;
-use hash::{json_bytes, object_json_bytes, payload_hash, write_array};
+use hash::{object_json_bytes, payload_hash, payload_hash_owned, write_array, write_string};
+use rayon::prelude::*;
 use serde::de::{self, DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -158,6 +159,185 @@ pub fn encode_retained_fhir_capture_batch(input: &[u8]) -> Result<RetainedFhirCa
     encode(input, None)
 }
 
+const PARALLEL_RETAINED_THRESHOLD: usize = 16;
+
+fn format_root_line(resource_type: &str, resource_id: &str, payload_hash: &str) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(resource_type.len() + resource_id.len() + payload_hash.len() + 10);
+    out.push(b'[');
+    write_string(resource_type, true, &mut out);
+    out.push(b',');
+    write_string(resource_id, true, &mut out);
+    out.push(b',');
+    write_string(payload_hash, true, &mut out);
+    out.push(b']');
+    out
+}
+
+fn is_valid_marker(completion_version: Option<u8>, marker: Option<&str>) -> bool {
+    match (completion_version, marker) {
+        (Some(3), Some(value)) => {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn is_valid_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+struct PreparedNativeOutcome {
+    fallback: bool,
+    root_line: Vec<u8>,
+    derived_payload: Option<Map<String, Value>>,
+}
+
+enum PreparedNativeRow {
+    EarlyError(RetainedFhirCaptureError),
+    AfterSyntax {
+        syntax_items: usize,
+        parse_or_items_error: Option<RetainedFhirCaptureError>,
+        items: usize,
+        outcome: Result<PreparedNativeOutcome>,
+    },
+}
+
+fn prepare_native_row(
+    context: &NativeCaptureContext<'_>,
+    allowed_families: &BTreeSet<&str>,
+    row: &NativeCaptureRow<'_>,
+    row_index: usize,
+) -> PreparedNativeRow {
+    let index = Some(row_index);
+    if !is_valid_marker(
+        context.completion_required_version,
+        row.acquired_resource_sha256,
+    ) {
+        return PreparedNativeRow::EarlyError(failure("invalid_rows", index));
+    }
+    if !allowed_families.contains(row.resource_type)
+        || !source_resource_id(row.resource_id)
+        || !is_valid_hex_64(row.payload_hash)
+    {
+        return PreparedNativeRow::EarlyError(failure("invalid_row", index));
+    }
+    let syntax_items = match scan_payload(row.payload_json, None) {
+        Ok(count) => count,
+        Err(code) => return PreparedNativeRow::EarlyError(failure(code, index)),
+    };
+    let parsed: Option<Value> = serde_json::from_str(row.payload_json).ok();
+    let mut fallback = parsed.is_none();
+    let mut items = 0usize;
+    let mut derived_payload: Option<Map<String, Value>> = None;
+    if let Some(payload) = parsed {
+        let Some(object) = payload.as_object() else {
+            return PreparedNativeRow::AfterSyntax {
+                syntax_items,
+                parse_or_items_error: Some(failure("invalid_payload", index)),
+                items: 0,
+                outcome: Err(failure("invalid_payload", index)),
+            };
+        };
+        if object.get("resource_id").and_then(Value::as_str) != Some(row.resource_id)
+            || object
+                .get("source_id")
+                .is_some_and(|source| source.as_str() != Some(context.source_id))
+        {
+            let err = failure("payload_identity", index);
+            return PreparedNativeRow::AfterSyntax {
+                syntax_items,
+                parse_or_items_error: Some(err),
+                items: 0,
+                outcome: Err(failure("payload_identity", index)),
+            };
+        }
+        match validate_values(&payload, &mut items, None) {
+            Ok(needs_fallback) => fallback = needs_fallback,
+            Err(code) => {
+                return PreparedNativeRow::AfterSyntax {
+                    syntax_items,
+                    parse_or_items_error: Some(failure(code, index)),
+                    items,
+                    outcome: Err(failure(code, index)),
+                };
+            }
+        }
+        let Value::Object(object_owned) = payload else {
+            unreachable!();
+        };
+        if !fallback {
+            let needs_derived = context.derive
+                && matches!(
+                    row.resource_type,
+                    "Organization" | "Location" | "InsurancePlan"
+                );
+            let hash_result = if needs_derived {
+                let res = payload_hash(
+                    &object_owned,
+                    row.payload_json,
+                    context.hash_contract,
+                    row.resource_type,
+                    context.completion_required_version == Some(3),
+                );
+                if res.is_ok() {
+                    derived_payload = Some(object_owned);
+                }
+                res
+            } else {
+                payload_hash_owned(
+                    object_owned,
+                    row.payload_json,
+                    context.hash_contract,
+                    row.resource_type,
+                    context.completion_required_version == Some(3),
+                )
+            };
+            match hash_result {
+                Ok(hash) if hash != row.payload_hash => {
+                    return PreparedNativeRow::AfterSyntax {
+                        syntax_items,
+                        parse_or_items_error: None,
+                        items,
+                        outcome: Err(failure("payload_hash", index)),
+                    };
+                }
+                Ok(_) => {}
+                Err("python_semantics_required" | "unsupported_unicode_semantics") => {
+                    fallback = true;
+                    derived_payload = None;
+                }
+                Err(code) => {
+                    return PreparedNativeRow::AfterSyntax {
+                        syntax_items,
+                        parse_or_items_error: None,
+                        items,
+                        outcome: Err(failure(code, index)),
+                    };
+                }
+            }
+        }
+    }
+    let root_line = format_root_line(row.resource_type, row.resource_id, row.payload_hash);
+    PreparedNativeRow::AfterSyntax {
+        syntax_items,
+        parse_or_items_error: None,
+        items,
+        outcome: Ok(PreparedNativeOutcome {
+            fallback,
+            root_line,
+            derived_payload,
+        }),
+    }
+}
+
 /// Encode pre-extracted rows directly without JSON-serializing the outer batch envelope.
 pub fn encode_retained_fhir_capture_rows(
     context: &NativeCaptureContext<'_>,
@@ -183,9 +363,23 @@ pub fn encode_retained_fhir_capture_rows(
     if estimated_input_bytes > MAX_INPUT_BYTES {
         return Err(failure("input_limit", None));
     }
+    let allowed_families: BTreeSet<&str> =
+        context.resource_types.iter().map(String::as_str).collect();
+    let prepared_rows: Vec<PreparedNativeRow> = if rows.len() >= PARALLEL_RETAINED_THRESHOLD {
+        rows.par_iter()
+            .enumerate()
+            .map(|(row_index, row)| prepare_native_row(context, &allowed_families, row, row_index))
+            .collect()
+    } else {
+        rows.iter()
+            .enumerate()
+            .map(|(row_index, row)| prepare_native_row(context, &allowed_families, row, row_index))
+            .collect()
+    };
     let mut encoder = Encoder::new(context, None);
-    for row in rows {
-        encoder.encode_row(row)?;
+    encoder.output.root_bytes.reserve(rows.len() * 96);
+    for (row, prepared) in rows.iter().zip(prepared_rows) {
+        encoder.commit_prepared_row(row, prepared)?;
     }
     Ok(encoder.finish())
 }
@@ -377,29 +571,15 @@ impl<'a> Encoder<'a> {
         if self.output.row_count == MAX_ROWS {
             return Err(failure("row_limit", index));
         }
-        let marker_valid = match (
+        if !is_valid_marker(
             self.input.completion_required_version,
             row.acquired_resource_sha256,
         ) {
-            (Some(3), Some(value)) => {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            }
-            (None, None) => true,
-            _ => false,
-        };
-        if !marker_valid {
             return Err(failure("invalid_rows", index));
         }
         if !self.output.families.contains_key(row.resource_type)
             || !source_resource_id(row.resource_id)
-            || row.payload_hash.len() != 64
-            || !row
-                .payload_hash
-                .bytes()
-                .all(|c| c.is_ascii_digit() || matches!(c, b'a'..=b'f'))
+            || !is_valid_hex_64(row.payload_hash)
         {
             return Err(failure("invalid_row", index));
         }
@@ -410,7 +590,8 @@ impl<'a> Encoder<'a> {
         }
         let payload: Option<Value> = serde_json::from_str(row.payload_json).ok();
         let mut fallback = payload.is_none();
-        if let Some(payload) = &payload {
+        let mut derived_payload: Option<Map<String, Value>> = None;
+        if let Some(payload) = payload {
             let object = payload
                 .as_object()
                 .ok_or_else(|| failure("invalid_payload", index))?;
@@ -421,52 +602,118 @@ impl<'a> Encoder<'a> {
             {
                 return Err(failure("payload_identity", index));
             }
-            fallback = validate_values(payload, &mut self.items, self.flag)
+            fallback = validate_values(&payload, &mut self.items, self.flag)
                 .map_err(|code| failure(code, index))?;
+            let Value::Object(object_owned) = payload else {
+                unreachable!();
+            };
             if !fallback {
-                match payload_hash(
-                    object,
-                    row.payload_json,
-                    self.input.hash_contract,
-                    row.resource_type,
-                    self.input.completion_required_version == Some(3),
-                ) {
+                let needs_derived = self.input.derive
+                    && matches!(
+                        row.resource_type,
+                        "Organization" | "Location" | "InsurancePlan"
+                    );
+                let hash_result = if needs_derived {
+                    let res = payload_hash(
+                        &object_owned,
+                        row.payload_json,
+                        self.input.hash_contract,
+                        row.resource_type,
+                        self.input.completion_required_version == Some(3),
+                    );
+                    if res.is_ok() {
+                        derived_payload = Some(object_owned);
+                    }
+                    res
+                } else {
+                    payload_hash_owned(
+                        object_owned,
+                        row.payload_json,
+                        self.input.hash_contract,
+                        row.resource_type,
+                        self.input.completion_required_version == Some(3),
+                    )
+                };
+                match hash_result {
                     Ok(hash) if hash != row.payload_hash => {
                         return Err(failure("payload_hash", index))
                     }
                     Ok(_) => {}
                     Err("python_semantics_required" | "unsupported_unicode_semantics") => {
-                        fallback = true
+                        fallback = true;
+                        derived_payload = None;
                     }
                     Err(code) => return Err(failure(code, index)),
                 }
             }
         }
+        cancelled(self.flag, index)?;
+        let root_line = format_root_line(row.resource_type, row.resource_id, row.payload_hash);
+        self.commit_row_output(row, fallback, &root_line, derived_payload.as_ref())
+    }
+
+    fn commit_prepared_row(
+        &mut self,
+        row: &NativeCaptureRow<'_>,
+        prepared: PreparedNativeRow,
+    ) -> Result<()> {
+        let index = Some(self.output.row_count);
+        match prepared {
+            PreparedNativeRow::EarlyError(err) => Err(err),
+            PreparedNativeRow::AfterSyntax {
+                syntax_items,
+                parse_or_items_error,
+                items,
+                outcome,
+            } => {
+                self.syntax_items += syntax_items;
+                if self.syntax_items > 2 * MAX_COLLECTION_ITEMS {
+                    return Err(failure("collection_limit", index));
+                }
+                if let Some(err) = parse_or_items_error {
+                    return Err(err);
+                }
+                self.items += items;
+                if self.items > MAX_COLLECTION_ITEMS {
+                    return Err(failure("collection_limit", index));
+                }
+                let prepared = outcome?;
+                self.commit_row_output(
+                    row,
+                    prepared.fallback,
+                    &prepared.root_line,
+                    prepared.derived_payload.as_ref(),
+                )
+            }
+        }
+    }
+
+    fn commit_row_output(
+        &mut self,
+        row: &NativeCaptureRow<'_>,
+        fallback: bool,
+        root_line: &[u8],
+        derived_payload: Option<&Map<String, Value>>,
+    ) -> Result<()> {
         if fallback {
             self.charge(std::mem::size_of::<usize>())?;
             self.output.fallback_rows.push(self.output.row_count);
         }
-        cancelled(self.flag, index)?;
-        let root = json_bytes(
-            &serde_json::json!([row.resource_type, row.resource_id, row.payload_hash]),
-            false,
-            true,
-        );
         let newline = usize::from(self.output.row_count > 0);
         let family_newline = usize::from(self.output.families[row.resource_type].row_count > 0);
-        self.charge(root.len() * 2 + newline + family_newline)?;
+        self.charge(root_line.len() * 2 + newline + family_newline)?;
         if newline != 0 {
             self.output.root_bytes.push(b'\n');
         }
-        self.output.root_bytes.extend_from_slice(&root);
+        self.output.root_bytes.extend_from_slice(root_line);
         let family = self.output.families.get_mut(row.resource_type).unwrap();
         if family_newline != 0 {
             family.bytes.push(b'\n');
         }
-        family.bytes.extend_from_slice(&root);
+        family.bytes.extend_from_slice(root_line);
         family.row_count += 1;
-        if self.input.derive && !fallback {
-            self.derived(row, payload.as_ref().unwrap().as_object().unwrap())?;
+        if let Some(payload) = derived_payload {
+            self.derived(row, payload)?;
         }
         self.output.row_count += 1;
         Ok(())

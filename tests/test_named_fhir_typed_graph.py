@@ -59,6 +59,12 @@ class GraphConnection:
     async def execute(self, query, *arguments):
         import json
 
+        if query.startswith("ANALYZE "):
+            assert query in {
+                'ANALYZE "candidate_generation"."source_cells"',
+                'ANALYZE "candidate_generation"."source_addresses"',
+            }
+            return "ANALYZE"
         assert query.startswith("WITH raw_page AS MATERIALIZED")
         assert 'INSERT INTO "candidate_generation"."source_cells"' in query
         return "INSERT 0 " + str(len(json.loads(arguments[0])))
