@@ -173,6 +173,21 @@ async def test_bounded_search_matches_full_compact_rows_and_custom_precedence(se
 
 
 @pytest.mark.asyncio
+async def test_search_rows_are_stored_in_spatial_order(search_db):
+    """Neighbouring offices share heap pages: rows are written in geohash order and the staging heap is gone."""
+    db = search_db
+    await search.prepare_network_geo_search(db.connection, db.search_target, db.second_layout)
+    table = f'"{db.search_target.schema_name}".{search.TABLE}'
+    stored_keys = await db.connection.fetchval(f"SELECT array_agg(location_key ORDER BY ctid) FROM {table}")
+    spatial_keys = await db.connection.fetchval(
+        f"SELECT array_agg(location_key ORDER BY ST_GeoHash(geo::geometry),location_key) FROM {table}"
+    )
+    assert stored_keys == spatial_keys and len(stored_keys) == 2
+    assert stored_keys != sorted(stored_keys)
+    assert await db.connection.fetchval("SELECT to_regclass($1)", table + "_staged") is None
+
+
+@pytest.mark.asyncio
 async def test_published_city_search_preserves_inferred_and_non_geocoded_offices(search_db):
     db, layout = search_db, search_db.second_layout
     await db.connection.execute(f"UPDATE {search._qualified(layout.base)} SET city_name='EXAMPLE CITY'")

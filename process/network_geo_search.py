@@ -276,14 +276,21 @@ async def _build_projection(connection, target, layout):
 
     await network_publication_step("Preparing geographic search")
     table = compact_identifier(target.schema_name) + "." + compact_identifier(TABLE)
+    staged = compact_identifier(target.schema_name) + "." + compact_identifier(TABLE + "_staged")
     columns = ",".join("a." + compact_identifier(name) for name in _LOCATION_COLUMNS)
-    await connection.execute(
-        f"CREATE TABLE {table} AS SELECT {columns},{_GEO} AS geo,ARRAY[]::integer[] AS canonical_network_ids FROM ONLY {_qualified(layout.base)} a WITH NO DATA"
-    )
+    shape = f"AS SELECT {columns},{_GEO} AS geo,ARRAY[]::integer[] AS canonical_network_ids FROM ONLY {_qualified(layout.base)} a WITH NO DATA"
+    await connection.execute(f"CREATE UNLOGGED TABLE {staged} {shape}")
+    await connection.execute(f"CREATE TABLE {table} {shape}")
     await connection.execute(
         f"ALTER TABLE {table} ALTER COLUMN canonical_network_ids SET NOT NULL, ADD CHECK(cardinality(canonical_network_ids)>0 AND array_position(canonical_network_ids,NULL) IS NULL)"
     )
-    inserted = await _insert_projection(connection, table, layout)
+    inserted = await _insert_projection(connection, staged, layout)
+    # Store neighbouring offices on the same heap pages: a radius read then touches far fewer of them.
+    stored = await connection.execute(
+        f"INSERT INTO {table} SELECT * FROM {staged} ORDER BY public.ST_GeoHash(geo::public.geometry),location_key"
+    )
+    _require(stored == f"INSERT 0 {inserted}")
+    await connection.execute(f"DROP TABLE {staged}")
     await connection.execute("SET LOCAL max_parallel_maintenance_workers = 4")
     await connection.execute(f"ALTER TABLE {table} ADD PRIMARY KEY(location_key)")
     await _build_geo_search_index(connection, table)
