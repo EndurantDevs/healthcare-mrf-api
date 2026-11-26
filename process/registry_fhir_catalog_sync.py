@@ -268,13 +268,16 @@ async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
             source_connection = await reads.enter_async_context(source_pool.acquire())
             workspace = await reads.enter_async_context(fhir_catalog_reference_workspace(source_connection))
             await reads.enter_async_context(source_connection.transaction(isolation="repeatable_read", readonly=True))
-            await source_connection.execute("SET LOCAL search_path = pg_catalog, pg_temp, public")
+            await source_connection.execute(
+                "SET LOCAL search_path = pg_catalog, pg_temp, public; SET LOCAL idle_in_transaction_session_timeout = '0'"
+            )
         elif source_export is None:
             raise ValueError("registry_fhir_catalog_source_reader_required")
         exports_by_profile = {} if source_export is not None else None
         if profiles_by_key:
             registry_connection = await reads.enter_async_context(sealer_pool.acquire())
             await reads.enter_async_context(registry_connection.transaction(isolation="repeatable_read", readonly=True))
+            await registry_connection.execute("SET LOCAL idle_in_transaction_session_timeout = '0'")
             for key, profile in profiles_by_key.items():
                 exports_by_profile[key] = await reads.enter_async_context(
                     open_source_owned_catalog_export(source_export, profile, registry_connection)
@@ -299,6 +302,7 @@ async def _prepare_fhir_catalog_snapshot(
     async with _catalog_source_reads(source_pool, sealer_pool, config.grant, source_export) as source_reads:
         dispositions = await _preparation_source_inventory(config, source_reads, source_companies_only)
         async with fhir_catalog_registry_reads(loader), loader.transaction(isolation="repeatable_read"):
+            await loader.execute("SET LOCAL idle_in_transaction_session_timeout = '0'")
             snapshot, previous, accounting_by_phase, copy_target = await _stage_catalog_candidate(
                 config, loader, source_reads, staged, dispositions, source_companies_only=source_companies_only
             )

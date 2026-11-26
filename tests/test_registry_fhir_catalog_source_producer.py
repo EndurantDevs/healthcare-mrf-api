@@ -29,7 +29,7 @@ def _boundary():
         "replay": AsyncMock(),
         "legacy_bindings": Mock(side_effect=legacy_bindings),
     }
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={}))
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={}), execute=AsyncMock())
     events = []
 
     @asynccontextmanager

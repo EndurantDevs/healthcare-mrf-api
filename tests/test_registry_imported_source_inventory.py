@@ -605,3 +605,56 @@ async def test_known_families_replace_scans_of_unchanged_datasets(monkeypatch):
         assert scan.await_count == 3
     assert reused == facts_by_family and reused is not facts_by_family
     assert await observed._observed_families(object(), object(), dataset, tables_by_kind, "uri") == {"scanned": True}
+
+
+@pytest.mark.asyncio
+async def test_retained_published_catalog_observations_reuse_older_facts_and_skip_removed_schemas():
+    transactions = []
+
+    @asynccontextmanager
+    async def savepoint():
+        try:
+            yield
+        except UndefinedTableError:
+            transactions.append("rolled back")
+            raise
+
+    retained = observed_descriptor(dataset="retained-edition")
+
+    async def fetch(sql, *_args):
+        if "registry_fhir_catalog_snapshot" in sql:
+            return [{"schema_name": "removed_catalog"}, {"schema_name": "retained_catalog"}]
+        if '"removed_catalog"' in sql:
+            raise UndefinedTableError("retained snapshot removed")
+        assert '"retained_catalog"' in sql
+        return [{"descriptor": json.dumps(retained)}]
+
+    connection = SimpleNamespace(fetch=AsyncMock(side_effect=fetch), transaction=savepoint)
+    assert await inventory._retained_published_catalog_observations(connection, "registry") == (retained,)
+    selection = connection.fetch.call_args_list[0].args[0]
+    assert "c.published_at IS NOT NULL AND s.id IS NULL" in selection
+    assert transactions == ["rolled back"]
+
+
+@pytest.mark.asyncio
+async def test_native_imported_source_reader_disables_idle_in_transaction_timeout(inventory_case, monkeypatch):
+    executed_statements = []
+    driver = SimpleNamespace(execute=AsyncMock(side_effect=executed_statements.append))
+
+    @asynccontextmanager
+    async def session_scope():
+        @asynccontextmanager
+        async def begin():
+            yield
+
+        yield SimpleNamespace(begin=begin)
+
+    monkeypatch.setattr(inventory, "native_driver", AsyncMock(return_value=driver))
+    runtime = inventory.ImportedSourceInventoryRuntime(inventory_case.config, session_scope, inventory_case.factory)
+    with inventory.imported_source_inventory_runtime(runtime):
+        async with inventory.native_imported_source_reader() as connection:
+            assert connection is driver
+    assert executed_statements == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+        "SET LOCAL idle_in_transaction_session_timeout = '0'",
+    ]

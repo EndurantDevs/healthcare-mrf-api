@@ -467,7 +467,9 @@ async def test_native_reader_does_not_open_preparation_sealer_probe(monkeypatch,
     ) as reads:
         assert reads == (connection, workspace, None)
     connection.transaction.assert_called_once_with(isolation="repeatable_read", readonly=True)
-    connection.execute.assert_awaited_once_with("SET LOCAL search_path = pg_catalog, pg_temp, public")
+    connection.execute.assert_awaited_once_with(
+        "SET LOCAL search_path = pg_catalog, pg_temp, public; SET LOCAL idle_in_transaction_session_timeout = '0'"
+    )
     source_case.factory.assert_not_called()
     source_case.sealer_pool.acquire.assert_not_called()
     source_case.identity_probe.fetchrow.assert_not_awaited()
