@@ -775,6 +775,10 @@ mod python_api {
         )?)?;
         m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_batch, m)?)?;
         m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_rows, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            validate_and_encode_retained_fhir_witness_page,
+            m
+        )?)?;
         m.add_function(wrap_pyfunction!(validate_fhir_witness_page, m)?)?;
         m.add_function(wrap_pyfunction!(prepare_typed_fhir_page, m)?)?;
         m.add_function(wrap_pyfunction!(prepare_typed_fhir_copy_page, m)?)?;

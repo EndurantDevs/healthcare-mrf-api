@@ -72,7 +72,15 @@ type RetainedNativeInputRow = (
     Option<pyo3::pybacked::PyBackedStr>,
 );
 
-type RetainedNativeContext<'a> = (&'a str, &'a str, i64, &'a str, Option<u8>, Vec<String>, bool);
+type RetainedNativeContext<'a> = (
+    &'a str,
+    &'a str,
+    i64,
+    &'a str,
+    Option<u8>,
+    Vec<String>,
+    bool,
+);
 
 #[pyfunction]
 fn encode_retained_fhir_capture_rows(
@@ -125,4 +133,92 @@ fn encode_retained_fhir_capture_rows(
             )
         })?;
     Ok(finish_retained_output(py, batch))
+}
+
+type FusedWitnessCaptureOutput = (String, String, RetainedCaptureOutput);
+
+#[pyfunction]
+fn validate_and_encode_retained_fhir_witness_page(
+    py: Python<'_>,
+    rows: &Bound<'_, PyAny>,
+    context: RetainedNativeContext<'_>,
+    dataset_id: &str,
+    after: Option<(&str, &str)>,
+    max_bytes: usize,
+) -> PyResult<Option<FusedWitnessCaptureOutput>> {
+    let extracted = match extract_witness_rows(py, rows)? {
+        ExtractWitnessRows::Extracted(items) => items,
+        ExtractWitnessRows::FallbackRequired => return Ok(None),
+    };
+    let (
+        source_id,
+        release_id,
+        observed_at_pg_micros,
+        hash_contract,
+        completion_required_version,
+        resource_types,
+        derive,
+    ) = context;
+    let pool = location_canon_pool()?;
+    let result = py.detach(|| {
+        pool.install(|| {
+            let witness_rows: Vec<crate::fhir_witness_page::WitnessPageRow<'_>> = extracted
+                .iter()
+                .map(|row| crate::fhir_witness_page::WitnessPageRow {
+                    dataset_id: &row.0,
+                    resource_type: &row.1,
+                    resource_id: &row.2,
+                    payload_hash: &row.3,
+                    payload_json: &row.4,
+                    acquired_resource_sha256: row.5.as_deref(),
+                })
+                .collect();
+            let options = crate::fhir_witness_page::WitnessValidationOptions {
+                dataset_id,
+                allowed_kinds: None,
+                after,
+                check_marker: false,
+                completion_v3: false,
+                validate_ids: false,
+                validate_hashes: false,
+                max_bytes,
+            };
+            let summary = crate::fhir_witness_page::validate_witness_page(&witness_rows, &options)
+                .map_err(|code| code.to_owned())?;
+            let native_context = crate::retained_fhir_capture::NativeCaptureContext {
+                source_id,
+                release_id,
+                observed_at_pg_micros,
+                hash_contract,
+                completion_required_version,
+                resource_types: &resource_types,
+                derive,
+            };
+            let native_rows: Vec<crate::retained_fhir_capture::NativeCaptureRow<'_>> = extracted
+                .iter()
+                .map(|row| crate::retained_fhir_capture::NativeCaptureRow {
+                    resource_type: &row.1,
+                    resource_id: &row.2,
+                    payload_hash: &row.3,
+                    payload_json: &row.4,
+                    acquired_resource_sha256: row.5.as_deref(),
+                    site_id: None,
+                })
+                .collect();
+            let batch = crate::retained_fhir_capture::encode_retained_fhir_capture_rows(
+                &native_context,
+                &native_rows,
+            )
+            .map_err(|error| {
+                serde_json::to_string(&error).unwrap_or_else(|_| error.code.to_owned())
+            })?;
+            Ok::<_, String>((summary, batch))
+        })
+    });
+    let (summary, batch) = result.map_err(PyValueError::new_err)?;
+    Ok(Some((
+        summary.last_type,
+        summary.last_id,
+        finish_retained_output(py, batch),
+    )))
 }

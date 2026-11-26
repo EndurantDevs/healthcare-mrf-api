@@ -429,6 +429,56 @@ async def _consume_page(connection, stage, page, origin, counts, after, options)
     return next_after
 
 
+_STREAM_END = object()
+
+
+async def _next_witness_page(iterator):
+    """Advance the witness iterator and return a sentinel at genuine EOF."""
+    try:
+        return await anext(iterator)
+    except StopAsyncIteration:
+        return _STREAM_END
+
+
+async def _drain_prefetch_task(prefetch_task):
+    """Cancel and drain an in-flight prefetch task without leaking background I/O."""
+    if prefetch_task is None:
+        return
+    if not prefetch_task.done():
+        prefetch_task.cancel()
+
+    async def _settle():
+        try:
+            await prefetch_task
+        except Exception, asyncio.CancelledError:
+            return
+
+    await drain_operation(_settle(), preserve_cancellation=True)
+
+
+async def _consume_pipelined(iterator, connection, stage, origin, counts, options):
+    """Overlap next-page witness fetch/hashing with binary COPY writes after page validation."""
+    after, prefetch_task = None, None
+    try:
+        page = await _next_witness_page(iterator)
+        while page is not _STREAM_END:
+            stage.require_ready(complete=False)
+            fast_copy = _prepare_typed_copy_page_fast(page, origin, counts, after)
+            if fast_copy is not None:
+                copy_bytes, projected_count, next_after = fast_copy
+                prefetch_task = asyncio.create_task(_next_witness_page(iterator))
+                await _copy_projected_page(connection, stage, copy_bytes, projected_count)
+                after = next_after
+                page = await prefetch_task
+                prefetch_task = None
+                continue
+            after = await _consume_page(connection, stage, page, origin, counts, after, options)
+            page = await _next_witness_page(iterator)
+    finally:
+        await _drain_prefetch_task(prefetch_task)
+    return after
+
+
 async def _consume(source_export, connection, stage, profile, reviewed, *, checker, as_of, plan_tiers=False):
     origin = source_origin(reviewed)
     counts, after = dict.fromkeys(dict(origin.resource_counts), 0), None
@@ -452,8 +502,11 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
         iterator = export["resources"]()
         options = (checker, as_of, plan_tiers, plan_projection)
         try:
-            async for page in iterator:
-                after = await _consume_page(connection, stage, page, origin, counts, after, options)
+            if not checker and plan_projection is None:
+                after = await _consume_pipelined(iterator, connection, stage, origin, counts, options)
+            else:
+                async for page in iterator:
+                    after = await _consume_page(connection, stage, page, origin, counts, after, options)
         finally:
             await drain_operation(iterator.aclose(), preserve_cancellation=True)
         require(counts == dict(origin.resource_counts), "source_counts")

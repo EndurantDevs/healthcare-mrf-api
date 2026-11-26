@@ -3,9 +3,11 @@
 //! typed projection serialization and legacy root folding.
 
 use crate::retained_fhir_capture::hash::write_string;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_WITNESS_ROWS: usize = 1_000;
+const PARALLEL_WITNESS_BYTES_THRESHOLD: usize = 16;
 
 /// uuid5(NAMESPACE_URL, "urn:managed-network-registry:retained-fhir-location:v1")
 const SITE_DOMAIN: [u8; 16] = [
@@ -91,14 +93,17 @@ pub fn witness_row_json_bytes(row: &WitnessPageRow<'_>) -> usize {
 
 /// Exact UTF-8 byte length of `json.dumps(rows, ensure_ascii=False, separators=(",", ":"))`.
 pub fn witness_page_json_bytes(rows: &[WitnessPageRow<'_>]) -> usize {
-    let mut total = 2usize;
-    if rows.len() > 1 {
-        total += rows.len() - 1;
-    }
-    for row in rows {
-        total = total.saturating_add(witness_row_json_bytes(row));
-    }
-    total
+    let framing = 2usize + rows.len().saturating_sub(1);
+    let body = if rows.len() >= PARALLEL_WITNESS_BYTES_THRESHOLD {
+        rows.par_iter()
+            .map(witness_row_json_bytes)
+            .reduce(|| 0usize, usize::saturating_add)
+    } else {
+        rows.iter().fold(0usize, |acc, row| {
+            acc.saturating_add(witness_row_json_bytes(row))
+        })
+    };
+    framing.saturating_add(body)
 }
 
 /// RFC 3174 SHA-1 used exclusively for RFC 4122 UUIDv5 deterministic identifiers.
