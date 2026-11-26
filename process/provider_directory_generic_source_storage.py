@@ -223,7 +223,8 @@ def _validate_binding_shape(binding_by_field, identity, *, phases):
     if type(binding_by_field) is dict and binding_by_field.get("contract") == NAMED_COMPACT_CONTRACT:
         keys |= {"payload_format"}
         _require(
-            binding_by_field.get("payload_format") in (compact_payload.FORMAT, compact_payload.SHARED_BODY_FORMAT)
+            binding_by_field.get("payload_format")
+            in (compact_payload.FORMAT, compact_payload.SHARED_BODY_FORMAT, compact_payload.COMPACT_V2_FORMAT)
             and binding_by_field.get("phase") in {"loading", "prepared", "ready_for_freeze", "disposed"},
             "compact_phase_or_format_changed",
         )
@@ -775,7 +776,7 @@ async def _create_source_input_heaps(connection, policy, identity, *, by_name):
 
 
 def _require_shared_payload_format(publisher, payload_format):
-    if payload_format == compact_payload.SHARED_BODY_FORMAT:
+    if payload_format in (compact_payload.SHARED_BODY_FORMAT, compact_payload.COMPACT_V2_FORMAT):
         _require(getattr(publisher.storage_binding, "payload_format", None) == payload_format, "payload_format_changed")
 
 
@@ -791,7 +792,9 @@ async def prepare_generic_source_candidate(database, directory, candidate, *, pa
     """Initialize two unindexed private input heaps, or authenticate exact resume."""
     identity = candidate_identity(directory, candidate)
     _require(
-        payload_format in (None, compact_payload.FORMAT, compact_payload.SHARED_BODY_FORMAT), "payload_format_changed"
+        payload_format
+        in (None, compact_payload.FORMAT, compact_payload.SHARED_BODY_FORMAT, compact_payload.COMPACT_V2_FORMAT),
+        "payload_format_changed",
     )
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
@@ -1179,6 +1182,13 @@ async def _verify_transition_run(
     return {
         "lineage_run_ids": sorted(run_ids),
         "ancestor_run_ids": ancestor_run_ids,
+        "failed_ancestor_run_ids": sorted(
+            run_record["run_id"]
+            for run_record in run_rows
+            if run_record["run_id"] in ancestor_run_ids
+            and run_record["status"] == "failed"
+            and run_record["finished_at"] is not None
+        ),
         "status": run_rows[0]["status"],
         "is_empty_vsp_failure": is_empty_vsp_failure,
         "is_postal_start_failure": is_postal_start_failure,
@@ -1645,7 +1655,7 @@ async def _verify_transition_checkpoints(
     if run_evidence.get("is_stopped_postal_scan"):
         _require(not bulk_checkpoints, "transition_checkpoint_changed")
         await _verify_stopped_postal_checkpoints(
-            connection, policy, checkpoint_rows, identity_by_field, expected_counts, run_status, source_ids
+            connection, policy, checkpoint_rows, identity_by_field, expected_counts, run_evidence, candidate
         )
         return [], []
     if run_evidence.get("require_empty_checkpoints"):
@@ -1718,9 +1728,22 @@ def _valid_postal_transition_leaf(directory, source_record, resource_type, ident
     )
 
 
-def _verify_postal_cursors(directory, checkpoints, identity, expected_counts, run_status, source_ids):
+def _conversion_checkpoint_owner(candidate, checkpoints, identity, run_evidence):
+    """Preserve unanimous ancestor checkpoint ownership when compact conversion interrupted before intake."""
+    conversion = candidate.get("payload_conversion")
+    if type(conversion) is dict and conversion.get("state") == "copying" and checkpoints:
+        owners = {checkpoint["owner_run_id"] for checkpoint in checkpoints}
+        if len(owners) == 1:
+            owner = next(iter(owners))
+            if owner in run_evidence.get("failed_ancestor_run_ids", ()):
+                return owner
+    return identity["failed_run_id"]
+
+
+def _verify_postal_cursors(directory, checkpoints, identity, expected_counts, run_evidence, candidate):
     """Keep the completed plan cursor and validate any other ordinary markers."""
     endpoint = directory.UHC_PROVIDER_DIRECTORY_BASE
+    source_ids = candidate["identity"]["metadata"]["source_ids"]
     ordinary_types = {checkpoint["resource_type"] for checkpoint in checkpoints}
     _require(
         len(source_ids) == 1
@@ -1740,11 +1763,13 @@ def _verify_postal_cursors(directory, checkpoints, identity, expected_counts, ru
         ),
         "transition_checkpoint_changed",
     )
+    owner_run_id = _conversion_checkpoint_owner(candidate, checkpoints, identity, run_evidence)
     _require_rest_transition_checkpoints(
         checkpoints,
         identity,
         {resource: count for resource, count in expected_counts.items() if resource in ordinary_types},
-        run_status,
+        run_evidence["status"],
+        owner_run_id=owner_run_id,
     )
     return ordinary_types
 
@@ -1773,13 +1798,14 @@ def _covered_postal_counts(directory, leaves, identity, source_record, expected_
 
 
 async def _verify_stopped_postal_checkpoints(
-    connection, policy, checkpoints, identity, expected_counts, run_status, source_ids
+    connection, policy, checkpoints, identity, expected_counts, run_evidence, candidate
 ):
     """Preserve finished leaves while allowing partitioned raw intake ahead of its first leaf."""
     from process.provider_directory_postal_checkpoint import ROOT as POSTAL_CHECKPOINT
 
     directory = import_module("process.provider_directory_fhir")
-    ordinary_types = _verify_postal_cursors(directory, checkpoints, identity, expected_counts, run_status, source_ids)
+    source_ids = candidate["identity"]["metadata"]["source_ids"]
+    ordinary_types = _verify_postal_cursors(directory, checkpoints, identity, expected_counts, run_evidence, candidate)
     source_by_field = {"canonical_api_base": directory.UHC_PROVIDER_DIRECTORY_BASE, "source_id": source_ids[0]}
     leaves = await connection.fetch(
         "SELECT dataset_id,acquisition_root_run_id,checkpoint_type,partition_identity,pages_fetched,rows_fetched "

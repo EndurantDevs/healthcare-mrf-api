@@ -92,10 +92,14 @@ def validate_conversion(binding):
         )
 
 
+def _is_fast_compact_format(payload_format):
+    return payload_format in (compact.SHARED_BODY_FORMAT, compact.COMPACT_V2_FORMAT)
+
+
 def _validate_progress(binding, progress_by_field):
     """Require bounded committed coordinates and the original allocation high-water."""
     storage._require(
-        progress_by_field["format"] in (compact.FORMAT, compact.SHARED_BODY_FORMAT)
+        progress_by_field["format"] in (compact.FORMAT, compact.SHARED_BODY_FORMAT, compact.COMPACT_V2_FORMAT)
         and type(progress_by_field["state"]) is str
         and progress_by_field["state"] in {"copying", "retained"}
         and type(progress_by_field["ordinal"]) is int
@@ -212,7 +216,7 @@ async def _begin(connection, policy, previous, directory, payload_format):
     name = previous["tables"]["resource_input"]["name"] + "_conversion_order"
     await connection.execute(f"CREATE UNIQUE INDEX {storage_identifier(name)} ON {relation}(batch_ordinal,row_ordinal)")
     _, sequence = await _sequence(connection, policy.schema, relation)
-    is_deferred_indexes = payload_format == compact.SHARED_BODY_FORMAT
+    is_deferred_indexes = _is_fast_compact_format(payload_format)
     progress_by_field = {
         "format": payload_format,
         "state": "copying",
@@ -458,10 +462,30 @@ async def _check_reconstructed_page(connection, tables, dataset_id, selected, sa
         seen_keys.add(key)
 
 
-async def _verify_shared_chunk(connection, tables, binding, observations):
-    """Check every alias/join row in SQL and full JSON reconstruction on boundary rows."""
-    dataset_id = binding["identity"]["dataset_id"]
-    mismatched = await connection.fetchval(
+def _shared_chunk_mismatch_sql(tables):
+    """Build SQL checking every chunk alias and backing pointer for v14 or v2 layouts."""
+    if tables.is_v2:
+        return (
+            "WITH expected AS MATERIALIZED ("
+            "SELECT * FROM unnest($2::bigint[],$3::integer[],$4::text[],$5::text[],$6::text[],$7::text[]) "
+            "e(batch_ordinal,row_ordinal,resource_type,resource_id,payload_hash,acquired_resource_sha256)) "
+            "SELECT EXISTS(SELECT FROM expected e "
+            f"LEFT JOIN {tables.relation('aliases')} a ON (a.dataset_id,a.batch_ordinal,a.row_ordinal)="
+            "($1,e.batch_ordinal,e.row_ordinal) "
+            f"LEFT JOIN {tables.relation('shared_bodies')} sb "
+            "ON (sb.dataset_id,sb.shared_block_ordinal)=($1,a.shared_block_ordinal) "
+            f"LEFT JOIN {tables.relation('body_blocks')} pb ON a.block_ordinal>=0 "
+            "AND (pb.dataset_id,pb.batch_ordinal,pb.block_ordinal)=($1,a.batch_ordinal,a.block_ordinal) "
+            "WHERE a.batch_ordinal IS NULL OR a.resource_type<>e.resource_type OR a.resource_id<>e.resource_id "
+            "OR a.payload_hash<>e.payload_hash OR a.acquired_resource_sha256 IS DISTINCT FROM e.acquired_resource_sha256 "
+            "OR sb.shared_block_ordinal IS NULL OR a.shared_body_ordinal>=cardinality(sb.bodies) "
+            "OR (a.block_ordinal>=0 AND (pb.block_ordinal IS NULL OR a.body_ordinal>=cardinality(pb.bodies))) "
+            f"OR (a.service_field_state=2 AND NOT EXISTS(SELECT 1 FROM {tables.relation('reference_sets')} s "
+            "WHERE (s.dataset_id,s.set_id)=($1,a.service_set_id))) "
+            f"OR (a.network_field_state=2 AND NOT EXISTS(SELECT 1 FROM {tables.relation('reference_sets')} s "
+            "WHERE (s.dataset_id,s.set_id)=($1,a.network_set_id))))"
+        )
+    return (
         "WITH expected AS MATERIALIZED ("
         "SELECT * FROM unnest($2::bigint[],$3::integer[],$4::text[],$5::text[],$6::text[],$7::text[]) "
         "e(batch_ordinal,row_ordinal,resource_type,resource_id,payload_hash,acquired_resource_sha256)) "
@@ -476,7 +500,15 @@ async def _verify_shared_chunk(connection, tables, binding, observations):
         f"OR NOT EXISTS(SELECT 1 FROM {tables.relation('shared_bodies')} d "
         "WHERE (d.dataset_id,d.body_hash)=($1,decode((b.bodies->a.body_ordinal)->>'body_hash','hex'))) "
         f"OR (a.service_field_state=2 AND NOT EXISTS(SELECT 1 FROM {tables.relation('reference_sets')} s "
-        "WHERE (s.dataset_id,s.set_hash)=($1,a.service_set_hash))))",
+        "WHERE (s.dataset_id,s.set_hash)=($1,a.service_set_hash))))"
+    )
+
+
+async def _verify_shared_chunk(connection, tables, binding, observations):
+    """Check every alias/join row in SQL and full JSON reconstruction on boundary rows."""
+    dataset_id = binding["identity"]["dataset_id"]
+    mismatched = await connection.fetchval(
+        _shared_chunk_mismatch_sql(tables),
         dataset_id,
         [obs["batch_ordinal"] for obs in observations],
         [obs["row_ordinal"] for obs in observations],
@@ -526,6 +558,94 @@ async def _copy_shared_chunk(connection, policy, binding, observations, *, cache
     return current_binding_by_field, pending_cache
 
 
+_V2_LEGACY_VERIFY_CHUNK_ROWS = 25000
+
+
+def _v2_ref_field_mismatch_sql(field_name, state_col, set_alias):
+    """Build exact mismatch predicate for one tokenized string-array field against its set_hash."""
+    return (
+        f"(a.{state_col}=1 AND NOT (c.pj ? '{field_name}' AND jsonb_typeof(c.pj->'{field_name}')='null')) "
+        f"OR (a.{state_col}=0 AND (c.pj ? '{field_name}' AND ("
+        f"jsonb_typeof(c.pj->'{field_name}')='null' OR (jsonb_typeof(c.pj->'{field_name}')='array' "
+        f"AND NOT EXISTS(SELECT FROM jsonb_array_elements(c.pj->'{field_name}') elem "
+        "WHERE jsonb_typeof(elem)<>'string'))))) "
+        f"OR (a.{state_col}=2 AND ("
+        f"jsonb_typeof(c.pj->'{field_name}') IS DISTINCT FROM 'array' "
+        f"OR EXISTS(SELECT FROM jsonb_array_elements(c.pj->'{field_name}') elem WHERE jsonb_typeof(elem)<>'string') "
+        f"OR {set_alias}.set_hash IS DISTINCT FROM sha256(convert_to('['||coalesce(("
+        "SELECT string_agg(elem::text,',' ORDER BY ord) "
+        f"FROM jsonb_array_elements(c.pj->'{field_name}') WITH ORDINALITY t(elem,ord)),'')||']','UTF8'))))"
+    )
+
+
+def _v2_legacy_parity_chunk_sql(legacy_relation, tables):
+    """Exhaustively bind every legacy observation's full payload to its compact-v2 components."""
+    net_mismatch = _v2_ref_field_mismatch_sql("network_refs", "network_field_state", "ns")
+    svc_mismatch = _v2_ref_field_mismatch_sql("healthcare_service_refs", "service_field_state", "ss")
+    stripped_svc = "CASE WHEN a.service_field_state IN (1,2) THEN c.pj-'healthcare_service_refs' ELSE c.pj END"
+    expected_base = (
+        f"CASE WHEN a.network_field_state IN (1,2) THEN ({stripped_svc})-'network_refs' ELSE ({stripped_svc}) END"
+    )
+    reconstructed_base = (
+        "(sb.bodies[a.shared_body_ordinal + 1]::jsonb"
+        "||CASE WHEN a.block_ordinal<0 THEN '{}'::jsonb ELSE pb.bodies[a.body_ordinal + 1]::jsonb END"
+        "||CASE WHEN a.restore_resource_id THEN jsonb_build_object('resource_id',a.resource_id) ELSE '{}'::jsonb END"
+        "||CASE WHEN (a.url_restore_mask & 1)<>0 "
+        "THEN jsonb_build_object('resource_url',up.reference_text||'/'||a.resource_type||'/'||a.resource_id) "
+        "ELSE '{}'::jsonb END"
+        "||CASE WHEN (a.url_restore_mask & 2)<>0 "
+        "THEN jsonb_build_object('fhir_self_url',up.reference_text||'/'||a.resource_type||'/'||a.resource_id) "
+        "ELSE '{}'::jsonb END)"
+    )
+    return (
+        f"WITH chunk AS MATERIALIZED ("
+        f"SELECT batch_ordinal,row_ordinal,dataset_id,resource_type,resource_id,payload_hash,"
+        f"acquired_resource_sha256,payload_json::jsonb AS pj FROM {legacy_relation} "
+        "WHERE ($2::bigint IS NULL OR (batch_ordinal,row_ordinal)>($2::bigint,$3::integer)) "
+        "ORDER BY batch_ordinal,row_ordinal LIMIT $4) "
+        "SELECT count(*) FILTER (WHERE "
+        "a.dataset_id IS NULL OR a.dataset_id<>c.dataset_id OR a.resource_type<>c.resource_type "
+        "OR a.resource_id<>c.resource_id OR a.payload_hash<>c.payload_hash "
+        "OR a.acquired_resource_sha256 IS DISTINCT FROM c.acquired_resource_sha256 "
+        f"OR {net_mismatch} OR {svc_mismatch} "
+        f"OR ({reconstructed_base}) IS DISTINCT FROM ({expected_base})"
+        ") AS mismatch_count,count(*) AS chunk_rows,"
+        "(SELECT batch_ordinal FROM chunk ORDER BY batch_ordinal DESC,row_ordinal DESC LIMIT 1) AS last_batch,"
+        "(SELECT row_ordinal FROM chunk ORDER BY batch_ordinal DESC,row_ordinal DESC LIMIT 1) AS last_row "
+        f"FROM chunk c LEFT JOIN {tables.relation('aliases')} a "
+        "ON (a.dataset_id,a.batch_ordinal,a.row_ordinal)=($1,c.batch_ordinal,c.row_ordinal) "
+        f"LEFT JOIN {tables.relation('shared_bodies')} sb "
+        "ON (sb.dataset_id,sb.shared_block_ordinal)=(a.dataset_id,a.shared_block_ordinal) "
+        f"LEFT JOIN {tables.relation('body_blocks')} pb ON a.block_ordinal>=0 "
+        "AND (pb.dataset_id,pb.batch_ordinal,pb.block_ordinal)=(a.dataset_id,a.batch_ordinal,a.block_ordinal) "
+        f"LEFT JOIN {tables.relation('reference_tokens')} up ON a.url_restore_mask>0 "
+        "AND (up.dataset_id,up.token_id)=(a.dataset_id,a.url_prefix_token_id) "
+        f"LEFT JOIN {tables.relation('reference_sets')} ns ON a.network_field_state=2 "
+        "AND (ns.dataset_id,ns.set_id)=(a.dataset_id,a.network_set_id) "
+        f"LEFT JOIN {tables.relation('reference_sets')} ss ON a.service_field_state=2 "
+        "AND (ss.dataset_id,ss.set_id)=(a.dataset_id,a.service_set_id)"
+    )
+
+
+async def _verify_v2_legacy_parity(connection, policy, binding, tables):
+    """Verify every legacy observation's complete payload matches compact-v2 before dropping legacy."""
+    dataset_id = binding["identity"]["dataset_id"]
+    chunk_sql = _v2_legacy_parity_chunk_sql(_legacy_relation(policy, binding), tables)
+    after_batch, after_row, verified_rows = None, None, 0
+    while True:
+        chunk_check = await connection.fetchrow(
+            chunk_sql, dataset_id, after_batch, after_row, _V2_LEGACY_VERIFY_CHUNK_ROWS
+        )
+        storage._require(
+            chunk_check is not None and chunk_check["mismatch_count"] == 0, "payload_conversion_data_changed"
+        )
+        verified_rows += chunk_check["chunk_rows"]
+        if chunk_check["chunk_rows"] < _V2_LEGACY_VERIFY_CHUNK_ROWS:
+            break
+        after_batch, after_row = chunk_check["last_batch"], chunk_check["last_row"]
+    storage._require(verified_rows == binding[KEY]["total_rows"], "payload_conversion_data_changed")
+
+
 async def _verify_legacy_sample(connection, policy, binding, tables):
     """Compare a repeatable sample of legacy rows against reconstructed compact rows."""
     dataset_id = binding["identity"]["dataset_id"]
@@ -558,6 +678,7 @@ async def _finish_shared_body_indexes(connection, policy, binding, tables):
                 "resource_reference_sets",
                 "resource_body_blocks",
                 layout.SHARED_BODY_ROOT,
+                layout.SHARED_BODY_INDEX_ROOT,
                 layout.REFERENCE_TOKENS_ROOT,
             }
         ],
@@ -572,7 +693,7 @@ async def _finish(connection, policy, binding):
     storage._require(progress_by_field["rows"] == progress_by_field["total_rows"], "payload_conversion_incomplete")
     _, sequence = await _sequence(connection, policy.schema, _legacy_relation(policy, binding))
     storage._require(sequence == progress_by_field["sequence"], "payload_conversion_sequence_changed")
-    is_shared_format = progress_by_field["format"] == compact.SHARED_BODY_FORMAT
+    is_shared_format = _is_fast_compact_format(progress_by_field["format"])
     candidate_binding_by_field = {
         **binding,
         "contract": storage.NAMED_COMPACT_CONTRACT,
@@ -590,6 +711,8 @@ async def _finish(connection, policy, binding):
     storage._require(count == progress_by_field["total_rows"], "payload_conversion_data_changed")
     if is_shared_format:
         await _verify_legacy_sample(connection, policy, binding, tables)
+    if tables.is_v2:
+        await _verify_v2_legacy_parity(connection, policy, binding, tables)
     await connection.fetchval("SELECT setval(pg_get_serial_sequence($1,'batch_ordinal'),$2,$3)", aliases, *sequence)
     if is_shared_format:
         for legacy_table in progress_by_field["legacy_tables"].values():
@@ -609,7 +732,7 @@ async def _advance_conversion_step(connection, policy, directory, binding, paylo
     if KEY not in binding:
         return await _begin(connection, policy, binding, directory, payload_format), None
     storage._require(binding[KEY]["format"] == payload_format, "payload_format_changed")
-    if payload_format == compact.SHARED_BODY_FORMAT:
+    if _is_fast_compact_format(payload_format):
         observations = await _read_shared_chunk(connection, policy, binding)
         if observations:
             return await _copy_shared_chunk(connection, policy, binding, observations, cache=cache)
@@ -631,7 +754,14 @@ async def migrate_source_candidate(database, directory, candidate, *, check_canc
             return None
         payload_format = compact.FORMAT
     storage._require(policy_scope._PUBLISHER.get() is None, "payload_conversion_outer_transaction")
-    cache = compact.MigrationCache() if payload_format == compact.SHARED_BODY_FORMAT else None
+    if payload_format == compact.COMPACT_V2_FORMAT:
+        from process.provider_directory_compact_v2 import CompactV2Cache
+
+        cache = CompactV2Cache()
+    elif payload_format == compact.SHARED_BODY_FORMAT:
+        cache = compact.MigrationCache()
+    else:
+        cache = None
     started_at = time.monotonic()
     while True:
         if check_cancelled is not None:

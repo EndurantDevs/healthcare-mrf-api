@@ -445,11 +445,10 @@ async def _require_pinned_source(connection, source_pin, descriptor=None, retain
         if type(reads) is not RetainedFHIRSuccessorReads:
             raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
         await _require_flat_pinned_source(connection, original, descriptor, reads.original)
-        await _require_flat_pinned_source(connection, physical, None, reads.physical)
-        return
+        return await _require_flat_pinned_source(connection, physical, None, reads.physical)
     await _require_flat_pinned_source(connection, original, descriptor)
     declaration = await _successor_descriptor(connection, physical, descriptor)
-    await _require_flat_pinned_source(connection, physical, declaration)
+    return await _require_flat_pinned_source(connection, physical, declaration)
 
 
 @dataclass(frozen=True)
@@ -560,11 +559,17 @@ async def _require_api_pinned_source(connection, source_pin, descriptor, retaine
     if source_pin.retained_epoch is not None:
         admission = "dataset.status IN ('validated','published','superseded')"
         relations = await _api_epoch_relations(connection, schema, namespace)
+    from process.provider_directory_compact_edition import FORMAT_TABLE, OUTPUT_ALIASES
+
     is_admitted = await connection.fetchval(
         f"""SELECT EXISTS (SELECT 1 FROM {namespace}.provider_directory_endpoint_dataset dataset
           JOIN pg_namespace ns ON ns.nspname=$1
           JOIN pg_class relation ON relation.relnamespace=ns.oid
-            AND relation.relname='provider_directory_dataset_resource' AND relation.relkind='r'
+            AND relation.relkind='r'
+            AND ((NOT EXISTS (SELECT 1 FROM pg_class fmt WHERE fmt.relnamespace=ns.oid AND fmt.relname='{FORMAT_TABLE}')
+                  AND relation.relname='provider_directory_dataset_resource')
+              OR (EXISTS (SELECT 1 FROM pg_class fmt WHERE fmt.relnamespace=ns.oid AND fmt.relname='{FORMAT_TABLE}')
+                  AND relation.relname='{OUTPUT_ALIASES}'))
           WHERE dataset.dataset_id=$2 AND dataset.endpoint_id=$3 AND dataset.dataset_hash=$4
             AND {admission}
             AND dataset.publication_metadata_summary_json->'source_ids'=jsonb_build_array($5::text)
@@ -612,36 +617,56 @@ async def _require_flat_pinned_source(connection, source_pin, descriptor, retain
         if source_pin.retained_epoch is not None
         else "dataset.status IN ('published','superseded') AND dataset.published_at IS NOT NULL"
     )
-    matches = await connection.fetchval(
-        f"SELECT EXISTS(SELECT FROM {namespace}.provider_directory_endpoint_dataset dataset "
+    from process.provider_directory_compact_edition import FORMAT_TABLE, compact_edition_tables
+
+    admission_state = await connection.fetchval(
+        f"SELECT CASE WHEN NOT EXISTS(SELECT FROM {namespace}.provider_directory_endpoint_dataset dataset "
         "WHERE dataset.dataset_id=$1 AND dataset.endpoint_id=$2 AND dataset.dataset_hash=$3 "
         f"AND {admission} "
         "AND dataset.publication_metadata_summary_json->'source_ids'=jsonb_build_array($4::text) "
-        "AND ($5::jsonb IS NULL OR dataset.publication_metadata_summary_json->'network_bindings'=$5::jsonb))",
+        "AND ($5::jsonb IS NULL OR dataset.publication_metadata_summary_json->'network_bindings'=$5::jsonb)) "
+        "THEN NULL "
+        "WHEN EXISTS(SELECT 1 FROM pg_namespace ns JOIN pg_class fmt ON fmt.relnamespace=ns.oid "
+        f"WHERE ns.nspname=$6 AND fmt.relname='{FORMAT_TABLE}') THEN 'compact' ELSE 'flat' END",
         source_pin.dataset_id,
         source_pin.endpoint_id,
         source_pin.dataset_sha256,
         source_pin.source_id,
         json.dumps(descriptor) if descriptor is not None else None,
+        source_pin.read_schema_name,
     )
-    if not matches:
+    if not admission_state:
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
+    return (
+        await compact_edition_tables(connection, source_pin.read_schema_name) if admission_state == "compact" else None
+    )
+
+
+class _AdmittedRecipeParams(tuple):
+    """Approved SQL parameters carrying optional compact edition layout metadata."""
+
+    compact_tables: object
+
+    def __new__(cls, parameters, compact_tables=None):
+        instance = super().__new__(cls, parameters)
+        instance.compact_tables = compact_tables
+        return instance
 
 
 async def _require_source_recipe(
     connection, source_pin, descriptor, approved_source, coordinates, registry_schema, retained_read=None
 ):
     """Recheck admission and the complete approved pin before extracting rows."""
-    await _require_pinned_source(connection, source_pin, descriptor, retained_read)
+    compact_tables = await _require_pinned_source(connection, source_pin, descriptor, retained_read)
     if descriptor is None:
-        return ()
+        return _AdmittedRecipeParams((), compact_tables)
     try:
         await require_approved_network_source_bindings(
             connection, approved_source, coordinates, control_schema=registry_schema
         )
     except ApprovedNetworkSourceBindingError as error:
         raise FHIRMembershipSourceError("Reviewed FHIR bindings are unavailable") from error
-    return (approved_source.approved_revision, *coordinates.sql_parameters)
+    return _AdmittedRecipeParams((approved_source.approved_revision, *coordinates.sql_parameters), compact_tables)
 
 
 _EFFECTIVE_FHIR_NETWORK_BINDINGS_SQL = """fhir_product_plans AS MATERIALIZED (
@@ -1000,17 +1025,207 @@ def _fhir_legacy_joins(source_pin, registry_namespace, reviewed, is_retained):
     )
 
 
-def _extraction_sql(source_pin, registry_namespace, reviewed, approved_only=False, capture_facts=False):
+def _compact_page_body_sql(compact_tables, *, witness):
+    """Build page payload reconstruction SQL (1-pass JSONB for v2, compact view for v1/v14)."""
+    scope_col = ",$7::text AS alias_scope" if witness else ""
+    if compact_tables.is_v2:
+        shared_bodies = compact_tables.relation("shared_bodies")
+        v2_expr = (
+            "(sb.bodies[pa.shared_body_ordinal + 1])::jsonb "
+            "|| CASE WHEN pa.restore_resource_id THEN jsonb_build_object('resource_id',pa.resource_id) "
+            "ELSE '{}'::jsonb END"
+        )
+        return (
+            f"SELECT pa.dataset_id,pa.resource_type,pa.resource_id,pa.payload_hash,pa.acquired_resource_sha256,\n"
+            f"          {v2_expr} AS payload{scope_col},pa.network_field_state,pa.network_set_id\n"
+            f"        FROM page_aliases pa\n"
+            f"        JOIN {shared_bodies} sb ON (sb.dataset_id,sb.shared_block_ordinal)="
+            "(pa.dataset_id,pa.shared_block_ordinal)"
+        )
+    from process import provider_directory_compact_payload as compact
+
+    reconstruct = compact.compact_resource_sql(
+        compact_tables, alias_cte="page_aliases", include_service_refs=False, include_network_refs=True
+    )
+    return (
+        f"SELECT r.dataset_id,r.resource_type,r.resource_id,r.payload_hash,r.acquired_resource_sha256,\n"
+        f"          r.payload_json::jsonb AS payload{scope_col}\n"
+        f"        FROM ({reconstruct}) r\n"
+        "        JOIN page_aliases pa USING (dataset_id,resource_type,resource_id)"
+    )
+
+
+def _compact_v2_network_cte(compact_tables):
+    """Materialize distinct network_set_id arrays once per membership page."""
+    if not compact_tables.is_v2:
+        return ""
+    ref_sets, tokens = compact_tables.relation("reference_sets"), compact_tables.relation("reference_tokens")
+    return (
+        ", page_network_sets AS MATERIALIZED (\n"
+        "        SELECT s.dataset_id,s.set_id,\n"
+        "          ARRAY(SELECT CASE WHEN t.reference_text ~ '^Organization/[A-Za-z0-9.-]{1,64}$'\n"
+        "            THEN split_part(t.reference_text,'/',2) END\n"
+        "            FROM unnest(s.token_ids) WITH ORDINALITY e(token_id,ordinal)\n"
+        f"            JOIN {tokens} t ON (t.dataset_id,t.token_id)=(s.dataset_id,e.token_id)\n"
+        "            ORDER BY e.ordinal) AS network_resource_ids\n"
+        "        FROM (SELECT DISTINCT dataset_id,network_set_id FROM page_aliases WHERE network_field_state=2) used\n"
+        f"        JOIN {ref_sets} s ON (s.dataset_id,s.set_id)=(used.dataset_id,used.network_set_id)\n"
+        "      )"
+    )
+
+
+def _compact_page_anchors(view_rel, aliases, params, *, witness, v2_net_cte, page_body_sql):
+    """Build exact before/after page CTE SQL for batch or witness extraction."""
+    ds_p, ty_p, id_p, lim_p = params
+    if witness:
+        old_page = f"""page AS MATERIALIZED (
+        SELECT dataset_id,resource_type,resource_id,payload_hash,acquired_resource_sha256,payload_json::jsonb AS payload,$7::text AS alias_scope
+        FROM (
+          -- Two branches keep both the cursor and the type list as index keys
+          (SELECT dataset_id,resource_type,resource_id,payload_hash,acquired_resource_sha256,payload_json
+            FROM {view_rel}
+            WHERE dataset_id={ds_p} AND resource_type COLLATE "C"={ty_p}::text
+              AND {ty_p}::text IN ('PractitionerRole','OrganizationAffiliation')
+              AND resource_id COLLATE "C">{id_p}::text COLLATE "C"
+            ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {lim_p})
+          UNION ALL
+          (SELECT dataset_id,resource_type,resource_id,payload_hash,acquired_resource_sha256,payload_json
+            FROM {view_rel}
+            WHERE dataset_id={ds_p} AND resource_type COLLATE "C" IN ('PractitionerRole','OrganizationAffiliation')
+              AND resource_type COLLATE "C">{ty_p}::text COLLATE "C"
+            ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {lim_p})
+        ) cursor_page
+        ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {lim_p}
+      )"""
+        new_page = f"""page_aliases AS MATERIALIZED (
+        SELECT * FROM (
+          (SELECT * FROM {aliases}
+            WHERE dataset_id={ds_p} AND resource_type COLLATE "C"={ty_p}::text
+              AND {ty_p}::text IN ('PractitionerRole','OrganizationAffiliation')
+              AND resource_id COLLATE "C">{id_p}::text COLLATE "C"
+            ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {lim_p})
+          UNION ALL
+          (SELECT * FROM {aliases}
+            WHERE dataset_id={ds_p} AND resource_type COLLATE "C" IN ('PractitionerRole','OrganizationAffiliation')
+              AND resource_type COLLATE "C">{ty_p}::text COLLATE "C"
+            ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {lim_p})
+        ) cursor_page
+        ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {lim_p}
+      ){v2_net_cte}, page AS MATERIALIZED (
+        {page_body_sql}
+      )"""
+        return old_page, new_page
+    old_page = f"""page AS MATERIALIZED (
+        SELECT dataset_id,resource_type,resource_id,payload_hash,acquired_resource_sha256,payload_json::jsonb AS payload
+        FROM {view_rel}
+        WHERE dataset_id={ds_p} AND resource_type IN ('PractitionerRole','OrganizationAffiliation')
+          AND (resource_type,resource_id)>({ty_p}::text,{id_p}::text)
+        ORDER BY resource_type,resource_id LIMIT {lim_p}
+      )"""
+    new_page = f"""page_aliases AS MATERIALIZED (
+        SELECT * FROM {aliases}
+        WHERE dataset_id={ds_p} AND resource_type IN ('PractitionerRole','OrganizationAffiliation')
+          AND (resource_type,resource_id)>({ty_p}::text,{id_p}::text)
+        ORDER BY resource_type,resource_id LIMIT {lim_p}
+      ){v2_net_cte}, page AS MATERIALIZED (
+        {page_body_sql}
+      )"""
+    return old_page, new_page
+
+
+def _rewrite_v2_network_refs_sql(query):
+    """Read v2 network_refs from materialized page_network_sets without JSON array parsing."""
+    replacements = (
+        (
+            "OR EXISTS(SELECT 1 FROM jsonb_array_elements(CASE\n"
+            "            WHEN jsonb_typeof(payload->'network_refs')='array' THEN payload->'network_refs' ELSE '[]'::jsonb END) item\n"
+            "            WHERE jsonb_typeof(item)<>'string')",
+            "OR (page.network_field_state=0 AND EXISTS(SELECT 1 FROM jsonb_array_elements(CASE\n"
+            "            WHEN jsonb_typeof(payload->'network_refs')='array' THEN payload->'network_refs' ELSE '[]'::jsonb END) item\n"
+            "            WHERE jsonb_typeof(item)<>'string'))",
+        ),
+        (
+            "OR jsonb_typeof(coalesce(page.payload->'network_refs','[]'::jsonb))<>'array'",
+            "OR (page.network_field_state=1 OR (page.network_field_state=0 "
+            "AND jsonb_typeof(coalesce(page.payload->'network_refs','[]'::jsonb))<>'array'))",
+        ),
+        (
+            "SELECT CASE WHEN reference ~ '^Organization/[A-Za-z0-9.-]{1,64}$'\n"
+            "            THEN split_part(reference,'/',2) END AS network_resource_id\n"
+            "          FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(payload->'network_refs')='array'\n"
+            "            THEN payload->'network_refs' ELSE '[]'::jsonb END) refs(reference)",
+            "SELECT nid.network_resource_id\n"
+            "          FROM page_network_sets pns\n"
+            "          CROSS JOIN LATERAL unnest(pns.network_resource_ids) nid(network_resource_id)\n"
+            "          WHERE providers.network_field_state=2\n"
+            "            AND (pns.dataset_id,pns.set_id)=(providers.dataset_id,providers.network_set_id)\n"
+            "          UNION ALL\n"
+            "          SELECT CASE WHEN reference ~ '^Organization/[A-Za-z0-9.-]{1,64}$'\n"
+            "            THEN split_part(reference,'/',2) END AS network_resource_id\n"
+            "          FROM jsonb_array_elements_text(CASE WHEN providers.network_field_state=0 "
+            "AND jsonb_typeof(payload->'network_refs')='array'\n"
+            "            THEN payload->'network_refs' ELSE '[]'::jsonb END) refs(reference)",
+        ),
+    )
+    for anchor, replacement in replacements:
+        if query.count(anchor) != 1:
+            raise FHIRMembershipSourceError("FHIR compact-v2 membership network SQL anchor is invalid")
+        query = query.replace(anchor, replacement, 1)
+    return query
+
+
+def _compact_membership_sql(query, source_pin, compact_tables, *, reviewed, witness=False):
+    """Rewrite hot page scans and random point lookups to use compact aliases and int4 token sets directly."""
+    if compact_tables is None:
+        return query
+    view_rel = f"{_identifier(source_pin.read_schema_name)}.provider_directory_dataset_resource"
+    aliases = compact_tables.relation("aliases")
+    params = ("$8", "$9", "$10", "$11") if (reviewed and not witness) else ("$1", "$2", "$3", "$4")
+    old_page, new_page = _compact_page_anchors(
+        view_rel,
+        aliases,
+        params,
+        witness=witness,
+        v2_net_cte=_compact_v2_network_cte(compact_tables),
+        page_body_sql=_compact_page_body_sql(compact_tables, witness=witness),
+    )
+    if query.count(old_page) != 1:
+        raise FHIRMembershipSourceError("FHIR compact membership page SQL anchor is invalid")
+    query = query.replace(old_page, new_page, 1)
+    if source_pin.source_id != "cms-npd":
+        query = query.replace(f"FROM page LEFT JOIN {view_rel} provider", f"FROM page LEFT JOIN {aliases} provider")
+        query = query.replace("provider.payload_json::jsonb->>'npi'", "provider.npi_text")
+    query = query.replace(f"JOIN {view_rel} location ON", f"JOIN {aliases} location ON")
+    query = query.replace(f"LEFT JOIN {view_rel} location\n", f"LEFT JOIN {aliases} location\n")
+    query = query.replace(f"LEFT JOIN {view_rel} network\n", f"LEFT JOIN {aliases} network\n")
+    return _rewrite_v2_network_refs_sql(query) if compact_tables.is_v2 else query
+
+
+def _omitted_summary_sql(is_retained, approved_only, capture_facts):
+    if is_retained and capture_facts:
+        return (
+            "((SELECT count(*) FROM resolved WHERE omitted AND NOT unresolved AND omission_reason IS NULL "
+            "AND NOT permanent_network_omission)+(SELECT count(DISTINCT(resource_type,resource_id,payload_hash)) "
+            "FROM resolved WHERE permanent_network_omission AND NOT unresolved AND omission_reason IS NULL)) AS omitted_rows,"
+        )
+    if approved_only:
+        return "(SELECT count(*) FROM resolved WHERE omitted AND NOT unresolved AND omission_reason IS NULL) AS omitted_rows,"
+    return ""
+
+
+def _extraction_sql(
+    source_pin, registry_namespace, reviewed, approved_only=False, capture_facts=False, *, compact_tables=None
+):
     """Embed the approved CTE while shifting only extraction bind parameters."""
     sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + 7), _BATCH_SQL) if reviewed else _BATCH_SQL
     approved_cte = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=registry_namespace) + "," if reviewed else ""
+    is_retained = fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
     complete_key = (
-        "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL "
+        "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL"
+        if is_retained
+        else "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL "
         "AND legacy.network_id IS NOT NULL AND legacy.resource_type='Organization'"
     )
-    is_retained = fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
-    if is_retained:
-        complete_key = "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL"
     provider_fields = _provider_identity_fields(source_pin, reviewed)
     query = sql.format(
         **_source_witness_fields(source_pin, reviewed),
@@ -1047,19 +1262,12 @@ def _extraction_sql(source_pin, registry_namespace, reviewed, approved_only=Fals
         encoded_distinct="DISTINCT " if is_retained else "",
         resolved_limit="LIMIT 5001 /* reviewed mappings */" if is_retained else "",
         unresolved_filter="",
-        omitted_summary=(
-            "((SELECT count(*) FROM resolved WHERE omitted AND NOT unresolved AND omission_reason IS NULL "
-            "AND NOT permanent_network_omission)+(SELECT count(DISTINCT(resource_type,resource_id,payload_hash)) "
-            "FROM resolved WHERE permanent_network_omission AND NOT unresolved AND omission_reason IS NULL)) AS omitted_rows,"
-        )
-        if is_retained and capture_facts
-        else "(SELECT count(*) FROM resolved WHERE omitted AND NOT unresolved AND omission_reason IS NULL) AS omitted_rows,"
-        if approved_only
-        else "",
+        omitted_summary=_omitted_summary_sql(is_retained, approved_only, capture_facts),
         reviewed_join=_reviewed_network_join(is_retained, reviewed, approved_only),
         legacy_joins=_fhir_legacy_joins(source_pin, registry_namespace, reviewed, is_retained),
     )
-    return _plan_tier_membership_sql(query, source_pin, batch=True, approved_only=approved_only)
+    query = _plan_tier_membership_sql(query, source_pin, batch=True, approved_only=approved_only)
+    return _compact_membership_sql(query, source_pin, compact_tables, reviewed=reviewed, witness=False)
 
 
 def _is_plan_tier_source(source_pin):
@@ -1351,10 +1559,18 @@ async def _read_fhir_membership_page(
     approved_parameters = await _require_source_recipe(
         connection, source_pin, descriptor, approved_source, binding_coordinates, registry_schema, retained_read
     )
+    compact_tables = getattr(approved_parameters, "compact_tables", None)
     after_type, after_id = after_resource or ("", "")
     physical = fhir_physical_source(source_pin)
     batch = await connection.fetchrow(
-        _extraction_sql(source_pin, registry_namespace, descriptor is not None, approved_only, capture_facts),
+        _extraction_sql(
+            source_pin,
+            registry_namespace,
+            descriptor is not None,
+            approved_only,
+            capture_facts,
+            compact_tables=compact_tables,
+        ),
         *approved_parameters,
         physical.dataset_id,
         after_type,
@@ -1686,7 +1902,7 @@ def fhir_source_witness_binding_v2(source_pin):
     }
 
 
-def _source_witness_sql_v2(source_pin):
+def _source_witness_sql_v2(source_pin, *, compact_tables=None):
     """Render native witnesses without consulting approved mappings or mutable aliases."""
     is_retained = fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
     provider_fields = _provider_identity_fields(source_pin, False)
@@ -1722,7 +1938,8 @@ def _source_witness_sql_v2(source_pin):
             provider_fields["provider_evidence"].replace("network_id", "NULL::integer"),
         ).replace("site_id", "binding.site_id"),
     )
-    return _plan_tier_membership_sql(query, source_pin, batch=False)
+    query = _plan_tier_membership_sql(query, source_pin, batch=False)
+    return _compact_membership_sql(query, source_pin, compact_tables, reviewed=False, witness=True)
 
 
 def _validate_witness_cursor(after_resource):
@@ -1797,7 +2014,7 @@ async def read_fhir_witness_page_v2(
     _validate_witness_cursor(after_resource)
     descriptor = _reviewed_descriptor(source_pin, approved_source, binding_coordinates, True)
     _identifier(registry_schema)
-    await _require_source_recipe(
+    admitted = await _require_source_recipe(
         connection,
         source_pin,
         descriptor,
@@ -1806,8 +2023,11 @@ async def read_fhir_witness_page_v2(
         registry_schema,
         retained_read,
     )
+    compact_tables = getattr(admitted, "compact_tables", None)
     arguments = _witness_query_arguments(source_pin, after_resource, limit)
-    witness_page = await connection.fetchrow(_source_witness_sql_v2(source_pin), *arguments)
+    witness_page = await connection.fetchrow(
+        _source_witness_sql_v2(source_pin, compact_tables=compact_tables), *arguments
+    )
     await _require_source_recipe(
         connection,
         source_pin,

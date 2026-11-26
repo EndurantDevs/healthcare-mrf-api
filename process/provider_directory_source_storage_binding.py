@@ -11,6 +11,7 @@ from db.plan_release_storage import storage_identifier
 from process.provider_directory_generic_candidate import GenericCandidateError
 
 SHARED_BODY_FORMAT = "provider-directory-shared-bodies-v1"
+COMPACT_V2_FORMAT = "provider-directory-compact-v2"
 _RELATIONS = ContextVar("provider_directory_isolated_source_relations", default=None)
 _CATALOG_ROOTS = frozenset({"provider_directory_source", "provider_directory_api_endpoint", "import_run"})
 
@@ -45,9 +46,16 @@ class SharedBodyFHIRSourceStorage(FHIRSourceStorageBinding):
     payload_format = SHARED_BODY_FORMAT
 
 
+@dataclass(frozen=True)
+class CompactV2FHIRSourceStorage(FHIRSourceStorageBinding):
+    """Select unified compact-v2 block-packed shared bodies and token sets."""
+
+    payload_format = COMPACT_V2_FORMAT
+
+
 def is_named_source_storage(binding):
-    """Recognize the two issued named storage bindings."""
-    return type(binding) in (FHIRSourceStorageBinding, SharedBodyFHIRSourceStorage)
+    """Recognize the issued named storage bindings."""
+    return type(binding) in (FHIRSourceStorageBinding, SharedBodyFHIRSourceStorage, CompactV2FHIRSourceStorage)
 
 
 @dataclass(frozen=True)
