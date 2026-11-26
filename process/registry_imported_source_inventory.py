@@ -16,6 +16,7 @@ from db.registry_fhir_catalog import AUTOMATIC_NETWORKS_PER_CATALOG, AUTOMATIC_N
 from process.network_cms_registry_address_capture import native_driver
 from process.network_fhir_source_witness_contract import digest
 from process.registry_fhir_catalog_extraction import fhir_source_uri
+from process.registry_fhir_catalog_network_policy import AUTOMATIC_NETWORK_HYGIENE_VERSION
 from process.registry_fhir_catalog_source_producer import open_source_owned_catalog_export
 from process.registry_fhir_catalog_sources import (
     is_delta_positive_catalog_descriptor,
@@ -174,6 +175,7 @@ class ImportedSourceInventory:
                 "automatic_organization_network_policy": {
                     "per_source": AUTOMATIC_NETWORKS_PER_SOURCE,
                     "per_catalog": AUTOMATIC_NETWORKS_PER_CATALOG,
+                    "hygiene_version": AUTOMATIC_NETWORK_HYGIENE_VERSION,
                 },
                 "carried_fhir_semantics": document.get("carried_fhir_semantics", []),
                 "superseded_fhir_endpoints": document.get("superseded_fhir_endpoints", []),

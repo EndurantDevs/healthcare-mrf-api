@@ -506,7 +506,21 @@ async def replace_fhir_catalog_relationships(connection, target, source_generati
     return int(result.rsplit(" ", 1)[-1])
 
 
-def _copy_sql(previous_schema, candidate_schema, table):
+_COPY_TABLE_ORDER = (
+    "registry_fhir_catalog_source",
+    "registry_fhir_catalog_observation",
+    "registry_fhir_catalog_binding",
+    "registry_fhir_catalog_relationship",
+    "registry_fhir_catalog_network",
+)
+_AUTOMATIC_BINDING_FILTER = (
+    "document_json->>'source_system'='fhir' "
+    "AND document_json->'source_scope' ? 'organization_id' "
+    "AND split_part(document_json->>'evidence_id',':',1)=ANY($2::text[])"
+)
+
+
+def _copy_sql(previous_schema, candidate_schema, table, *, skip_automatic_bindings=False):
     columns = TABLE_COLUMNS[table]
     expressions = [
         "$1::text"
@@ -516,10 +530,43 @@ def _copy_sql(previous_schema, candidate_schema, table):
         else name
         for name in columns
     ]
+    if not skip_automatic_bindings or table in {"registry_fhir_catalog_source", "registry_fhir_catalog_observation"}:
+        return (
+            f"INSERT INTO {candidate_schema}.{table} ({','.join(columns)}) "
+            f"SELECT {','.join(expressions)} FROM {previous_schema}.{table} "
+            f"WHERE $1::text IS NOT NULL {_conflict(table, columns, 'preserve')}"
+        )
+    if table == "registry_fhir_catalog_binding":
+        return (
+            f"INSERT INTO {candidate_schema}.{table} ({','.join(columns)}) "
+            f"SELECT {','.join(expressions)} FROM {previous_schema}.{table} "
+            f"WHERE $1::text IS NOT NULL AND NOT ({_AUTOMATIC_BINDING_FILTER}) "
+            f"{_conflict(table, columns, 'preserve')}"
+        )
+    if table == "registry_fhir_catalog_relationship":
+        return (
+            f"INSERT INTO {candidate_schema}.{table} ({','.join(columns)}) "
+            f"SELECT {','.join(expressions)} FROM {previous_schema}.{table} "
+            f"WHERE $1::text IS NOT NULL AND NOT (source_generation=ANY($2::text[])) "
+            f"{_conflict(table, columns, 'preserve')}"
+        )
+    prefixed_expressions = [
+        expression if name == "metadata_generation" else f"prev.{expression}"
+        for name, expression in zip(columns, expressions, strict=True)
+    ]
     return (
+        "WITH skipped_networks AS MATERIALIZED ("
+        f"SELECT DISTINCT network_id FROM {previous_schema}.registry_fhir_catalog_binding "
+        f"WHERE {_AUTOMATIC_BINDING_FILTER}) "
         f"INSERT INTO {candidate_schema}.{table} ({','.join(columns)}) "
-        f"SELECT {','.join(expressions)} FROM {previous_schema}.{table} "
-        f"WHERE $1::text IS NOT NULL {_conflict(table, columns, 'preserve')}"
+        f"SELECT {','.join(prefixed_expressions)} FROM {previous_schema}.{table} prev "
+        "WHERE $1::text IS NOT NULL AND ("
+        "NOT EXISTS(SELECT FROM skipped_networks skipped WHERE skipped.network_id=prev.network_id) "
+        f"OR EXISTS(SELECT FROM {candidate_schema}.registry_fhir_catalog_binding kept_binding "
+        "WHERE kept_binding.network_id=prev.network_id) "
+        f"OR EXISTS(SELECT FROM {candidate_schema}.registry_fhir_catalog_relationship kept_edge "
+        "WHERE kept_edge.network_id=prev.network_id)) "
+        f"{_conflict(table, columns, 'preserve')}"
     )
 
 
@@ -636,21 +683,33 @@ async def copy_fhir_catalog_snapshot(
     *,
     loader_role,
     control_schema,
+    skip_automatic_binding_generations=(),
 ):
     """Carry validated named metadata tables forward set-based while preserving retained generations."""
     _transaction(connection)
     _digest(metadata_generation)
+    skipped_generations = tuple(skip_automatic_binding_generations)
+    for generation in skipped_generations:
+        _digest(generation)
+    if len(skipped_generations) > 10000:
+        _invalid("bounds_invalid")
     namespace = _target(copy_target)
     previous = storage_identifier(previous_snapshot["schema_name"])
     if previous == namespace:
         _invalid("snapshot_immutable")
     await validate_fhir_catalog_snapshot_record(connection, previous_snapshot)
     accounting_by_name = {"input_rows": 0, "affected_rows": 0, "batches": 0, "payload_bytes": 0}
-    table_names = sorted(PHYSICAL_TABLES)
+    table_names = _COPY_TABLE_ORDER if skipped_generations else tuple(sorted(PHYSICAL_TABLES))
     async with connection.transaction():
         await _mutable(connection, copy_target, loader_role, control_schema)
         for table in table_names:
-            command_status = await connection.execute(_copy_sql(previous, namespace, table), metadata_generation)
+            use_skip_filter = bool(skipped_generations) and table not in {
+                "registry_fhir_catalog_source",
+                "registry_fhir_catalog_observation",
+            }
+            copy_query = _copy_sql(previous, namespace, table, skip_automatic_bindings=use_skip_filter)
+            arguments = (metadata_generation, list(skipped_generations)) if use_skip_filter else (metadata_generation,)
+            command_status = await connection.execute(copy_query, *arguments)
             accounting_by_name["affected_rows"] += int(command_status.rsplit(" ", 1)[-1])
         totals_summary = await connection.fetchrow(_previous_totals_sql(previous, table_names))
         for table in table_names:
