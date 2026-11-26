@@ -126,10 +126,15 @@ def reference_sql(expression):
     )
 
 
-_NPI = """CASE WHEN p.npi ~ '^[12][0-9]{9}$' THEN
-(SELECT sum(CASE WHEN ((14-i)%2)=1 THEN ((substr('80840'||p.npi,i+1,1)::int*2)/10)
-+((substr('80840'||p.npi,i+1,1)::int*2)%10) ELSE substr('80840'||p.npi,i+1,1)::int END)
-FROM generate_series(0,14) i)%10=0 ELSE false END"""
+_LUHN_DOUBLE = "(ARRAY[0,2,4,6,8,1,3,5,7,9])"
+_NPI = (
+    "CASE WHEN p.npi ~ '^[12][0-9]{9}$' THEN (24"
+    + "".join(
+        f"+{_LUHN_DOUBLE}[ascii(substr(p.npi,{pos},1))-47]" if pos % 2 == 1 else f"+(ascii(substr(p.npi,{pos},1))-48)"
+        for pos in range(1, 11)
+    )
+    + ")%10=0 ELSE false END"
+)
 
 _ROLE_SCOPE = " AND ".join((_period("r.period_start", "<="), _period("r.period_end", ">=")))
 _ROLE_SCOPE += " AND CASE WHEN r.period_start IS NULL OR r.period_end IS NULL THEN true WHEN pg_input_is_valid(left(r.period_start,10),'date') AND pg_input_is_valid(left(r.period_end,10),'date') THEN left(r.period_start,10)::date<=left(r.period_end,10)::date ELSE false END"
@@ -172,7 +177,7 @@ _NETWORK_LOOKUP = (
     + _reference_predicate("net", "raw.ref", "'Organization'")
     + " AND net.active IS DISTINCT FROM false OFFSET 0) net ON true"
 )
-PAIR_ROLE_PAGE_SIZE = 512
+PAIR_ROLE_PAGE_SIZE = 2048
 
 
 def _role_page_sql(first_parameter, limit=128):

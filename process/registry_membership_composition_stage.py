@@ -168,10 +168,17 @@ async def materialize_registry_composition(connection, copy_target, command_stag
     from process.registry_typed_membership_parity import create_order_index, is_typed_candidate
 
     source_relation = '"' + copy_target.schema_name + '".' + SOURCE_TABLE
-    status = await connection.execute(
-        f"INSERT INTO {table} {_allowed_source(source_relation, command_stage)}"
-        " UNION ALL SELECT * FROM " + _relation(command_stage.add_table)
+    base_query = (
+        f"SELECT * FROM {source_relation}"
+        if command_stage.remove_rows == 0
+        else _allowed_source(source_relation, command_stage)
     )
+    effective_query = (
+        base_query
+        if command_stage.add_rows == 0
+        else base_query + " UNION ALL SELECT * FROM " + _relation(command_stage.add_table)
+    )
+    status = await connection.execute(f"INSERT INTO {table} {effective_query}")
     if status != f"INSERT 0 {receipt['effective_rows']}":
         raise RegistrySourceRetentionError("registry_composition_command_accounting_invalid")
     if is_typed_candidate(candidate):

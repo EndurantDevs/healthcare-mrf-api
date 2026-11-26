@@ -200,6 +200,11 @@ def _batch_ctes(layout, *, has_after=False):
     """Read one ordered key range across the selected edge artifacts."""
     columns = ",".join("a." + compact_identifier(name) for name in _LOCATION_COLUMNS)
     keyset_predicate = "edge.location_key>$1::text" if has_after else "$1::text IS NULL"
+    range_predicate = (
+        f"{keyset_predicate} AND edge.location_key<=bounds.last_key"
+        if has_after
+        else f"{keyset_predicate} AND edge.location_key>=bounds.first_key AND edge.location_key<=bounds.last_key"
+    )
     key_pages, memberships = [], []
     for index, artifact in enumerate(layout.artifacts, 2):
         edge_table = compact_identifier(artifact.schema_name) + ".network_office_edge"
@@ -207,11 +212,24 @@ def _batch_ctes(layout, *, has_after=False):
           WHERE {keyset_predicate} GROUP BY edge.location_key ORDER BY edge.location_key LIMIT {_BATCH_ROWS})""")
         memberships.append(f"""SELECT edge.location_key,ref.network_id FROM bounds
           CROSS JOIN LATERAL (SELECT edge.location_key,edge.slice_id FROM ONLY {edge_table} edge
-            WHERE {keyset_predicate} AND edge.location_key<=bounds.last_key OFFSET 0) edge
+            WHERE {range_predicate} OFFSET 0) edge
+          JOIN key_page kp ON kp.location_key=edge.location_key
           JOIN ONLY {_qualified(layout.ref_map)} ref ON ref.slice_id=edge.slice_id
             AND ref.artifact_candidate_id=${index}::uuid
-            AND ref.office_bucket=(get_byte(sha256(convert_to(edge.location_key,'UTF8')),0)&63)""")
-    key_sql = " UNION ALL ".join(key_pages) or "SELECT NULL::text AS location_key WHERE $1::text IS NULL AND FALSE"
+            AND ref.office_bucket=kp.office_bucket""")
+    if len(layout.artifacts) == 1:
+        edge_table = compact_identifier(layout.artifacts[0].schema_name) + ".network_office_edge"
+        key_page_body = (
+            f"SELECT edge.location_key,(get_byte(sha256(convert_to(edge.location_key,'UTF8')),0)&63)::integer AS office_bucket "
+            f"FROM ONLY {edge_table} edge WHERE {keyset_predicate} "
+            f"GROUP BY edge.location_key ORDER BY edge.location_key LIMIT {_BATCH_ROWS}"
+        )
+    else:
+        key_sql = " UNION ALL ".join(key_pages) or "SELECT NULL::text AS location_key WHERE $1::text IS NULL AND FALSE"
+        key_page_body = (
+            f"SELECT location_key,(get_byte(sha256(convert_to(location_key,'UTF8')),0)&63)::integer AS office_bucket "
+            f"FROM ({key_sql}) selected_keys GROUP BY location_key ORDER BY location_key LIMIT {_BATCH_ROWS}"
+        )
     membership_sql = (
         " UNION ALL ".join(memberships) or "SELECT NULL::text AS location_key,NULL::integer AS network_id WHERE FALSE"
     )
@@ -222,9 +240,8 @@ def _batch_ctes(layout, *, has_after=False):
         offices += f""" AND NOT EXISTS(SELECT FROM ONLY {custom} custom WHERE custom.location_key=a.location_key)
           UNION ALL SELECT {columns} FROM ONLY {custom} a WHERE a.location_key=networks.location_key"""
     return f"""key_page AS MATERIALIZED (
-      SELECT location_key FROM ({key_sql}) selected_keys
-      GROUP BY location_key ORDER BY location_key LIMIT {_BATCH_ROWS}
-    ), bounds AS MATERIALIZED (SELECT max(location_key) AS last_key FROM key_page),
+      {key_page_body}
+    ), bounds AS MATERIALIZED (SELECT min(location_key) AS first_key, max(location_key) AS last_key FROM key_page),
     memberships AS ({membership_sql}), networks AS (
       SELECT location_key,array_agg(DISTINCT network_id ORDER BY network_id) AS canonical_network_ids
       FROM memberships GROUP BY location_key

@@ -26,14 +26,21 @@ async def create_order_index(connection, relation, name, *, allow_populated=Fals
     await connection.execute("CREATE INDEX IF NOT EXISTS " + _identifier(name) + " ON " + relation + "(" + ORDER + ")")
 
 
+async def has_order_index(connection, relation):
+    """Check whether the native bounded-range order index is ready on this relation."""
+    return (
+        await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam WHERE i.indrelid=to_regclass($1) AND i.indisvalid AND i.indisready AND i.indislive AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts=5 AND i.indnatts=5 AND am.amname='btree' AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum,n) JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum ORDER BY k.n)=$2::text[] AND ARRAY(SELECT coalesce(c.collname::text,'') FROM unnest(i.indcollation) WITH ORDINALITY v(oid,n) LEFT JOIN pg_collation c ON c.oid=v.oid ORDER BY v.n)=ARRAY['','C','C','','C']::text[] AND NOT EXISTS(SELECT FROM unnest(i.indoption) option WHERE option<>0))",
+            relation,
+            list(FIELDS),
+        )
+        is True
+    )
+
+
 async def require_order_index(connection, relation):
     """Require the native bounded-range path without rebuilding a closed or historical heap."""
-    valid = await connection.fetchval(
-        "SELECT EXISTS(SELECT FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam WHERE i.indrelid=to_regclass($1) AND i.indisvalid AND i.indisready AND i.indislive AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts=5 AND i.indnatts=5 AND am.amname='btree' AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum,n) JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum ORDER BY k.n)=$2::text[] AND ARRAY(SELECT coalesce(c.collname::text,'') FROM unnest(i.indcollation) WITH ORDINALITY v(oid,n) LEFT JOIN pg_collation c ON c.oid=v.oid ORDER BY v.n)=ARRAY['','C','C','','C']::text[] AND NOT EXISTS(SELECT FROM unnest(i.indoption) option WHERE option<>0))",
-        relation,
-        list(FIELDS),
-    )
-    if valid is not True:
+    if not await has_order_index(connection, relation):
         raise ValueError("registry_typed_parity_index_required")
 
 

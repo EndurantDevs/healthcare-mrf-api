@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Bounded native preparation and content checks for typed membership slices."""
 
+from uuid import UUID
+
 from process.network_address_projection import _identifier
 from process.registry_typed_membership_parity import (
     COLUMNS,
@@ -11,8 +13,8 @@ from process.registry_typed_membership_parity import (
 )
 
 _DOMAIN = b"network-office-slice-v1\0"
-_METADATA_ROWS = 256
-_MATCH_ROWS = 250_000
+_METADATA_ROWS = 4096
+_MATCH_ROWS = 100_000
 
 
 def _parameters(start):
@@ -27,48 +29,66 @@ def _page_range(after, upper):
     return columns + ">" + _parameters(1) + " AND " + columns + "<=" + _parameters(6), (*after, *upper)
 
 
-def _matched_page_sql(tables, condition, affected):
+def _matched_page_sql(tables, condition, affected, *, bindings_verified=False):
     membership, bindings, addresses, work, locations = tables
     affected_filter = (
         "TRUE"
         if affected is None
         else f"EXISTS(SELECT FROM {affected} changed WHERE changed.network_id=m.network_id AND changed.office_bucket=(get_byte(sha256(convert_to(b.location_key,'UTF8')),0)&63))"
     )
-    ordered_fields = ",".join("m." + term for term in ORDER.split(","))
-    return f"""WITH source_page AS NOT MATERIALIZED (
-      SELECT m.* FROM {membership} m WHERE {condition} ORDER BY {ordered_fields} FETCH FIRST {_MATCH_ROWS} ROWS WITH TIES
-    ), subjects AS NOT MATERIALIZED (
-      SELECT network_id,provider_system,provider_id,location_id,count(*)::bigint AS membership_rows
-      FROM source_page GROUP BY network_id,provider_system,provider_id,location_id
+    if bindings_verified:
+        key_expr = "b.location_key"
+        address_join = ""
+        binding_cols = "location_key"
+    else:
+        key_expr = "a.location_key"
+        address_join = f"\n      LEFT JOIN {addresses} a ON a.location_key=b.location_key AND a.entity_type=b.entity_type AND a.entity_id=b.entity_id"
+        binding_cols = "location_key,entity_type,entity_id"
+    return f"""WITH subjects AS NOT MATERIALIZED (
+      SELECT m.network_id,
+        m.provider_system COLLATE "C" AS provider_system,
+        m.provider_id COLLATE "C" AS provider_id,
+        m.location_id,
+        count(*)::bigint AS membership_rows
+      FROM {membership} m WHERE {condition}
+      GROUP BY m.network_id,m.provider_system COLLATE "C",m.provider_id COLLATE "C",m.location_id
     ), matched AS NOT MATERIALIZED (
-      SELECT m.network_id,a.location_key,m.membership_rows
+      SELECT m.network_id,
+        {key_expr}::text COLLATE "C" AS location_key,
+        (get_byte(sha256(convert_to({key_expr},'UTF8')),0)&63)::integer AS office_bucket,
+        m.membership_rows
       FROM subjects m LEFT JOIN LATERAL (
-        SELECT location_key,entity_type,entity_id FROM {bindings} binding
-        WHERE (binding.provider_system,binding.provider_id,binding.location_id)=(m.provider_system,m.provider_id,m.location_id)
+        SELECT {binding_cols} FROM {bindings} binding
+        WHERE (binding.provider_system,binding.provider_id,binding.location_id)=(m.provider_system COLLATE "default",m.provider_id COLLATE "default",m.location_id)
         OFFSET 0
-      ) b ON TRUE
-      LEFT JOIN {addresses} a ON a.location_key=b.location_key AND a.entity_type=b.entity_type AND a.entity_id=b.entity_id
+      ) b ON TRUE{address_join}
       WHERE {affected_filter}
     ), accumulated AS (
-      INSERT INTO {work} AS prior SELECT network_id,location_key,
-        (get_byte(sha256(convert_to(location_key,'UTF8')),0)&63)::integer,sum(membership_rows)::bigint
-      FROM matched GROUP BY network_id,location_key
+      INSERT INTO {work} AS prior
+      SELECT network_id,location_key,office_bucket,sum(membership_rows)::bigint
+      FROM matched
+      GROUP BY network_id,office_bucket,location_key
+      ORDER BY network_id,office_bucket,location_key
       ON CONFLICT(network_id,office_bucket,location_key) DO UPDATE SET membership_rows=prior.membership_rows+excluded.membership_rows
       RETURNING location_key
     ) INSERT INTO {locations} SELECT DISTINCT location_key FROM accumulated WHERE location_key IS NOT NULL ON CONFLICT DO NOTHING"""
 
 
-async def _insert_matched_page(connection, tables, bounds, affected, *, statements_by_condition=None):
+async def _insert_matched_page(
+    connection, tables, bounds, affected, *, statements_by_condition=None, bindings_verified=False
+):
     condition, arguments = bounds
     statement = statements_by_condition.get(condition) if statements_by_condition is not None else None
     if statement is None:
-        statement = await connection.prepare(_matched_page_sql(tables, condition, affected))
+        statement = await connection.prepare(
+            _matched_page_sql(tables, condition, affected, bindings_verified=bindings_verified)
+        )
         if statements_by_condition is not None:
             statements_by_condition[condition] = statement
     await statement.fetch(*arguments)
 
 
-async def build_matched_facts(connection, schema, addresses, work, affected):
+async def build_matched_facts(connection, schema, addresses, work, affected, *, bindings_verified=False):
     """Count every duplicate in indexed inclusive ranges; aggregate only one key page."""
     membership = schema + ".network_membership"
     await require_order_index(connection, membership)
@@ -92,6 +112,7 @@ async def build_matched_facts(connection, schema, addresses, work, affected):
             _page_range(after, upper_keys),
             affected,
             statements_by_condition=statements_by_condition,
+            bindings_verified=bindings_verified,
         )
         after = upper_keys
     accounting_by_field = dict(
@@ -125,10 +146,10 @@ async def matched_facts(connection, schema, addresses, work, candidate, affected
     return accounting_by_field
 
 
-def _content_aggregate(key):
+def _content_aggregate(key, domain_param="$3"):
     encoded = f"convert_to({key},'UTF8')"
     frame = f"int4send(octet_length({encoded}))||{encoded}"
-    return f"encode(sha256($3::bytea||coalesce(string_agg({frame},''::bytea ORDER BY {key} COLLATE \"C\"),''::bytea)),'hex')"
+    return f"encode(sha256({domain_param}::bytea||coalesce(string_agg({frame},''::bytea ORDER BY {key} COLLATE \"C\"),''::bytea)),'hex')"
 
 
 async def _ref_metadata_page(connection, work, after):
@@ -146,6 +167,19 @@ async def _ref_metadata_page(connection, work, after):
 
 async def prepare_refs(connection, target, work, previous):
     """Hash C-ordered int4-framed keys in PostgreSQL, returning only slice metadata."""
+    if previous is None:
+        refs = _identifier(target.schema_name) + ".network_slice_ref"
+        status = await connection.execute(
+            f"""INSERT INTO {refs}(network_id,office_bucket,artifact_candidate_id,slice_id,row_count,content_sha256)
+            SELECT network_id,office_bucket,$1::uuid,gen_random_uuid(),count(*)::bigint,
+              {_content_aggregate("location_key", "$2")}
+            FROM {work}
+            GROUP BY network_id,office_bucket
+            ORDER BY network_id,office_bucket""",
+            UUID(target.candidate_id),
+            _DOMAIN,
+        )
+        return int(status.removeprefix("INSERT 0 ")), 0
     from process.network_membership_slices import _copy_ref_page
 
     after, total, reused = (0, -1), 0, 0
