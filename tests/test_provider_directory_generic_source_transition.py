@@ -423,6 +423,111 @@ async def test_stopped_postal_scan_preserves_complete_cursors_leaves_and_uncover
     assert all(sql.startswith('UPDATE "source_schema"."provider_directory_endpoint_dataset"') for sql, _ in case.writes)
 
 
+def _attach_copying_conversion(case, total_rows):
+    """Attach an active legacy-to-compact conversion state matching the retained candidate."""
+    document = case.header["candidate_storage_json"]
+    legacy_prefix = "pdgs_" + "1" * 32
+    compact_prefix = "pdgs_" + "2" * 32
+    legacy_table_by_root = {
+        "resource_input": {"schema": "source_schema", "name": legacy_prefix + "_ri"},
+        "witness_input": {"schema": "source_schema", "name": legacy_prefix + "_wi"},
+    }
+    compact_table_by_root = {
+        "resource_input": {"schema": "source_schema", "name": compact_prefix + "_ri"},
+        "witness_input": {"schema": "source_schema", "name": compact_prefix + "_wi"},
+        "resource_aliases": {"schema": "source_schema", "name": compact_prefix + "_ra"},
+        "resource_body_blocks": {"schema": "source_schema", "name": compact_prefix + "_rb"},
+        "resource_reference_sets": {"schema": "source_schema", "name": compact_prefix + "_rs"},
+        "resource_shared_bodies": {"schema": "source_schema", "name": compact_prefix + "_sb"},
+        "resource_reference_tokens": {"schema": "source_schema", "name": compact_prefix + "_rt"},
+    }
+    ordinal = max(1, document["ordinal"])
+    document.update(
+        contract=storage.NAMED_ISOLATED_CONTRACT,
+        ordinal=ordinal,
+        storage={"catalog_schema": "catalog_schema", "storage_schema": "source_schema"},
+        tables=legacy_table_by_root,
+        payload_conversion={
+            "format": binding.SHARED_BODY_FORMAT,
+            "state": "copying",
+            "ordinal": ordinal,
+            "resets": deepcopy(document["resets"]),
+            "rows": total_rows,
+            "total_rows": total_rows,
+            "after": [ordinal, 0],
+            "sequence": [ordinal + 1, True],
+            "legacy_tables": deepcopy(legacy_table_by_root),
+            "compact_tables": compact_table_by_root,
+        },
+    )
+    case.allowed_tables.update(legacy_table["name"] for legacy_table in legacy_table_by_root.values())
+    for input_row in case.input_rows:
+        input_row.setdefault("invalid", 0)
+
+
+@pytest.mark.asyncio
+async def test_stopped_postal_scan_preserves_ancestor_plan_owner_during_compact_conversion(case):
+    counts = _attach_interrupted_postal_scan(case)
+    _attach_copying_conversion(case, sum(counts.values()))
+    for checkpoint in case.checkpoints:
+        checkpoint["owner_run_id"] = ROOT
+    expected_conversion = deepcopy(case.header["candidate_storage_json"]["payload_conversion"])
+
+    transition = await _transition(case, counts)
+
+    assert transition["rows"] == sum(counts.values())
+    assert case.header["candidate_storage_json"]["payload_conversion"] == expected_conversion
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_conversion,owner", [(True, "run_" + "f" * 32), (False, ROOT)])
+async def test_stopped_postal_scan_rejects_unproven_checkpoint_owner(case, with_conversion, owner):
+    counts = _attach_interrupted_postal_scan(case)
+    if with_conversion:
+        _attach_copying_conversion(case, sum(counts.values()))
+    for checkpoint in case.checkpoints:
+        checkpoint["owner_run_id"] = owner
+
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await _transition(case, counts)
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
+async def test_ordinary_rest_conversion_interruption_preserves_ancestor_checkpoint_owner(case):
+    document = case.header["candidate_storage_json"]
+    document["identity"]["metadata"]["source_ids"] = ["synthetic-rest-source"]
+    case.header["publication_metadata_json"]["source_ids"] = ["synthetic-rest-source"]
+    for run in case.runs:
+        run["source_ids"] = ["synthetic-rest-source"]
+    _attach_copying_conversion(case, 3)
+    case.checkpoints[0]["owner_run_id"] = ROOT
+    expected_conversion = deepcopy(document["payload_conversion"])
+
+    transition = await _transition(case, {"Organization": 3})
+
+    assert transition["rows"] == 3
+    assert case.header["candidate_storage_json"]["payload_conversion"] == expected_conversion
+
+
+@pytest.mark.asyncio
+async def test_ordinary_rest_conversion_interruption_rejects_non_failed_ancestor_owner(case):
+    document = case.header["candidate_storage_json"]
+    document["identity"]["metadata"]["source_ids"] = ["synthetic-rest-source"]
+    case.header["publication_metadata_json"]["source_ids"] = ["synthetic-rest-source"]
+    for run in case.runs:
+        run["source_ids"] = ["synthetic-rest-source"]
+    case.runs[1]["status"] = "canceled"
+    _attach_copying_conversion(case, 3)
+    case.checkpoints[0]["owner_run_id"] = ROOT
+
+    with pytest.raises(
+        GenericCandidateError, match="transition_completion_lineage_changed|transition_checkpoint_changed"
+    ):
+        await _transition(case, {"Organization": 3})
+    assert case.writes == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_message",

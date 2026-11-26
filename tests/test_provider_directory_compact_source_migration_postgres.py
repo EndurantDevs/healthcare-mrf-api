@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
-from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,7 +20,11 @@ from process import provider_directory_generic_source_completion as completion
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_partition_successor as partition_successor
-from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage, SharedBodyFHIRSourceStorage
+from process.provider_directory_source_storage_binding import (
+    CompactV2FHIRSourceStorage,
+    NamedFHIRSourceStorage,
+    SharedBodyFHIRSourceStorage,
+)
 from tests.test_provider_directory_compact_intake_postgres import (
     _append_checkpoint,
     _binding,
@@ -521,9 +524,131 @@ async def test_shared_body_conversion_atomically_reclaims_legacy_tables_on_finis
     assert index_count == 3
     prepared = await _complete(case)
     assert await _observations(case, prepared) == observed_before
-    await case.connection.execute(f"UPDATE {tokens_table} SET reference_text='Organization/tampered'")
+    await case.connection.execute(f"UPDATE {tokens_table} SET reference_text=reference_text||'-tampered'")
     with pytest.raises(ValueError, match="compact_shared_body_changed"):
         await _complete(case)
+
+
+async def test_compact_v2_conversion_reclaims_legacy_tables_and_completes(intake_case, monkeypatch):
+    from tests.test_provider_directory_compact_completion_postgres import _append, _candidate, _complete, _payloads
+
+    case = await _candidate(intake_case, "compact_v2_release")
+    case.directory.anthem = directory.anthem
+    case.directory._stable_source_id = directory._stable_source_id
+    case.directory._last_updated_partition_fingerprint_resource_type = (
+        directory._last_updated_partition_fingerprint_resource_type
+    )
+    original = await _prepare(case)
+    await _append(case, _payloads())
+    observed_before = await _observations(case, original)
+    monkeypatch.setattr(
+        case.factory, "storage_binding", CompactV2FHIRSourceStorage(**asdict(case.factory.storage_binding))
+    )
+    converted = await _migrate(case, payload_format=compact.COMPACT_V2_FORMAT)
+    assert converted["contract"] == storage.NAMED_COMPACT_CONTRACT and migration.KEY not in converted
+    assert converted["payload_format"] == compact.COMPACT_V2_FORMAT
+    for table in original["tables"].values():
+        assert not await case.connection.fetchval(
+            "SELECT to_regclass($1)::text IS NOT NULL", storage_relation("source_schema", table["name"])
+        )
+    assert await _observations(case, converted) == observed_before
+    # Append a fresh live batch directly into compact-v2 after migration, then complete candidate
+    await _append(case, _payloads())
+    observed_after_live = await _observations(case, await _binding_for(case))
+    assert len(observed_after_live) == len(observed_before) * 2
+    prepared = await _complete(case)
+    assert await _observations(case, prepared) == observed_after_live
+    tokens_table = storage_relation("source_schema", converted["tables"]["resource_reference_tokens"]["name"])
+    await case.connection.execute(f"UPDATE {tokens_table} SET reference_text=reference_text||'-tampered'")
+    with pytest.raises(ValueError, match="compact_reference_changed"):
+        await _complete(case)
+
+
+async def test_shared_body_chunked_validation(intake_case, monkeypatch):
+    """Verify keyset-chunked shared-body validation covers every chunk and rejects tampered hashes."""
+    from process import provider_directory_compact_source_completion as completion
+    from tests.test_provider_directory_compact_completion_postgres import _append, _candidate, _complete, _payloads
+
+    case = await _candidate(intake_case, "shared_chunked_release")
+    case.directory.anthem = directory.anthem
+    case.directory._stable_source_id = directory._stable_source_id
+    case.directory._last_updated_partition_fingerprint_resource_type = (
+        directory._last_updated_partition_fingerprint_resource_type
+    )
+    monkeypatch.setattr(completion, "_SHARED_BODY_VALIDATION_CHUNK_ROWS", 1)
+    monkeypatch.setattr(
+        case.factory,
+        "storage_binding",
+        SharedBodyFHIRSourceStorage(**asdict(case.factory.storage_binding)),
+    )
+    await _prepare(case)
+    await _append(case, _payloads())
+    converted = await _migrate(case, payload_format=compact.SHARED_BODY_FORMAT)
+    assert converted["payload_format"] == compact.SHARED_BODY_FORMAT
+    shared_table = storage_relation("source_schema", converted["tables"]["resource_shared_bodies"]["name"])
+    last_hash = await case.connection.fetchval(f"SELECT max(body_hash) FROM {shared_table}")
+    await case.connection.execute(
+        f"UPDATE {shared_table} SET payload='{{}}'::json WHERE body_hash=$1",
+        last_hash,
+    )
+    with pytest.raises(ValueError, match="compact_shared_body_changed"):
+        await _complete(case)
+
+
+@pytest.mark.parametrize("column", ["network_set_id", "service_set_id"])
+async def test_compact_v2_swapped_set_rejected(intake_case, monkeypatch, column):
+    """Fail compact-v2 finish before dropping legacy tables if aliases swap valid ref sets."""
+    from tests.test_provider_directory_compact_completion_postgres import _append, _candidate, _payloads
+
+    case = await _candidate(intake_case, f"compact_v2_swapped_{column}")
+    case.directory.anthem = directory.anthem
+    case.directory._stable_source_id = directory._stable_source_id
+    case.directory._last_updated_partition_fingerprint_resource_type = (
+        directory._last_updated_partition_fingerprint_resource_type
+    )
+    original = await _prepare(case)
+    await _append(case, _payloads())
+    second_by_family = _payloads()
+    second_by_family["PractitionerRole"].update(
+        resource_id="role-b",
+        network_refs=["Organization/network-two"],
+        healthcare_service_refs=["HealthcareService/" + "b" * 32],
+    )
+    await _append(case, second_by_family)
+    monkeypatch.setattr(
+        case.factory, "storage_binding", CompactV2FHIRSourceStorage(**asdict(case.factory.storage_binding))
+    )
+    original_finish = migration._finish
+
+    async def swap_sets_before_finish(connection, policy, binding):
+        aliases_rel = storage_relation(
+            "source_schema", binding[migration.KEY]["compact_tables"]["resource_aliases"]["name"]
+        )
+        alias_entries = await connection.fetch(
+            f"SELECT batch_ordinal,row_ordinal,{column} FROM {aliases_rel} "
+            "WHERE resource_type='PractitionerRole' ORDER BY batch_ordinal,row_ordinal"
+        )
+        assert len(alias_entries) == 2 and alias_entries[0][column] != alias_entries[1][column]
+        await connection.execute(
+            f"UPDATE {aliases_rel} SET {column}=$1 WHERE batch_ordinal=$2 AND row_ordinal=$3",
+            alias_entries[1][column],
+            alias_entries[0]["batch_ordinal"],
+            alias_entries[0]["row_ordinal"],
+        )
+        await connection.execute(
+            f"UPDATE {aliases_rel} SET {column}=$1 WHERE batch_ordinal=$2 AND row_ordinal=$3",
+            alias_entries[0][column],
+            alias_entries[1]["batch_ordinal"],
+            alias_entries[1]["row_ordinal"],
+        )
+        return await original_finish(connection, policy, binding)
+
+    monkeypatch.setattr(migration, "_LEGACY_VERIFY_SAMPLE_ROWS", 0)
+    monkeypatch.setattr(migration, "_finish", swap_sets_before_finish)
+    with pytest.raises(ValueError, match="payload_conversion_data_changed"):
+        await _migrate(case, payload_format=compact.COMPACT_V2_FORMAT)
+    legacy_rel = storage_relation("source_schema", original["tables"]["resource_input"]["name"])
+    assert await case.connection.fetchval("SELECT to_regclass($1)::text IS NOT NULL", legacy_rel)
 
 
 async def _binding_for(case):

@@ -10,7 +10,12 @@ from db.plan_release_storage import storage_relation
 from process import provider_directory_import_completion as completion
 from process.import_completion_policy import validate_completion_request
 from process.provider_directory_generic_candidate import GenericCandidateError
-from process.provider_directory_generic_source_storage import _json, _require, _require_rest_transition_checkpoints
+from process.provider_directory_generic_source_storage import (
+    _conversion_checkpoint_owner,
+    _json,
+    _require,
+    _require_rest_transition_checkpoints,
+)
 
 
 def _checkpoint_candidate(directory, candidate, checkpoints):
@@ -71,6 +76,9 @@ async def checkpoint_owner(connection, candidate_by_field, identity, checkpoints
     owners = {checkpoint["owner_run_id"] for checkpoint in checkpoints}
     if owners == {identity["failed_run_id"]}:
         return identity["failed_run_id"]
+    conversion_owner = _conversion_checkpoint_owner(candidate_by_field, checkpoints, identity, run_evidence)
+    if owners == {conversion_owner}:
+        return conversion_owner
     _require(len(owners) == 1 and bool(checkpoints), "transition_checkpoint_changed")
     directory = import_module("process.provider_directory_fhir")
     candidate = _checkpoint_candidate(directory, candidate_by_field, checkpoints)

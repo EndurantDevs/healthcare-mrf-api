@@ -28,6 +28,8 @@ def _output_tables(policy, binding):
         tables.body_blocks,
         tables.shared_bodies,
         tables.reference_tokens,
+        shared_body_index=tables.shared_body_index,
+        is_v2=tables.is_v2,
     )
 
 
@@ -66,7 +68,8 @@ async def _prepare_relations(connection, policy, previous):
 async def _select_latest_aliases(connection, policy, previous, tables_by_root):
     aliases = storage_relation(policy.schema, previous["tables"]["resource_aliases"]["name"])
     output = storage_relation(policy.schema, tables_by_root["resource_output_aliases"]["name"])
-    columns = ",".join((*compact._ALIAS_COLUMNS, "npi_text"))
+    tables = layout.payload_tables(policy, previous["tables"])
+    columns = ",".join((*tables.alias_columns, "npi_text"))
     await connection.execute(
         f"INSERT INTO {output} ({columns}) SELECT DISTINCT ON "
         f'(resource_type COLLATE "C",resource_id COLLATE "C") {columns} FROM {aliases} '
@@ -159,12 +162,13 @@ async def _write_overrides(connection, policy, binding, resource_rows, *, sessio
         [resource["resource_type"] for resource in resource_rows],
         [resource["resource_id"] for resource in resource_rows],
     )
-    matched = await _reusable_aliases(connection, policy, binding, resource_rows)
-    try:
-        await compact._copy(connection, tables, "aliases", (*compact._ALIAS_COLUMNS, "npi_text"), matched)
-    except (asyncio.CancelledError, TimeoutError) as interruption:
-        await cleanup_interrupted_copy(session, connection, interruption)
-        raise
+    matched = [] if tables.is_v2 else await _reusable_aliases(connection, policy, binding, resource_rows)
+    if matched:
+        try:
+            await compact._copy(connection, tables, "aliases", (*tables.alias_columns, "npi_text"), matched)
+        except (asyncio.CancelledError, TimeoutError) as interruption:
+            await cleanup_interrupted_copy(session, connection, interruption)
+            raise
     reused_keys = {(resource[3], resource[4]) for resource in matched}
     resource_rows = [
         resource
@@ -277,6 +281,7 @@ async def _finish_indexes(connection, policy, binding):
                 "resource_reference_sets",
                 "resource_body_blocks",
                 layout.SHARED_BODY_ROOT,
+                layout.SHARED_BODY_INDEX_ROOT,
                 layout.REFERENCE_TOKENS_ROOT,
             }
         ],
@@ -347,6 +352,43 @@ async def _validate_reference_sets(connection, tables, alias_sql, dataset_id):
     storage._require(not invalid, "compact_reference_changed")
 
 
+_SHARED_BODY_VALIDATION_CHUNK_ROWS = 10000
+
+
+def _shared_body_validation_chunk_sql(tokens, shared):
+    """Validate one bounded PK keyset chunk in RAM without an EXISTS nested-loop spill."""
+    return (
+        f"WITH chunk AS MATERIALIZED ("
+        f"SELECT body_hash,payload,network_field_state,network_token_ids FROM {shared} "
+        "WHERE dataset_id=$1 AND ($2::bytea IS NULL OR body_hash>$2::bytea) "
+        "ORDER BY body_hash LIMIT $3), "
+        "distinct_lists AS MATERIALIZED ("
+        "SELECT DISTINCT network_token_ids FROM chunk WHERE network_field_state=2), "
+        "needed_tokens AS ("
+        "SELECT DISTINCT token_id FROM distinct_lists,unnest(network_token_ids) AS token_id), "
+        "token_map AS MATERIALIZED ("
+        "SELECT coalesce(jsonb_object_agg(t.token_id::text,t.reference_text),'{}'::jsonb) AS refs "
+        f"FROM needed_tokens nt JOIN {tokens} t ON (t.dataset_id,t.token_id)=($1,nt.token_id)), "
+        "list_encoded AS (SELECT l.network_token_ids,enc.matched,enc.net_bytes "
+        "FROM distinct_lists l CROSS JOIN token_map tm CROSS JOIN LATERAL ("
+        "SELECT count(ref) AS matched,"
+        "convert_to('['||coalesce(string_agg(ref::text,',' ORDER BY ordinal),'')||']','UTF8') AS net_bytes "
+        "FROM (SELECT e.ordinal,tm.refs->(e.token_id::text) AS ref "
+        "FROM unnest(l.network_token_ids) WITH ORDINALITY e(token_id,ordinal)) looked_up) enc) "
+        "SELECT count(*) FILTER (WHERE "
+        "(d.network_field_state=0 AND d.body_hash<>sha256(convert_to(d.payload::text,'UTF8'))) "
+        "OR (d.network_field_state=1 AND d.body_hash<>sha256(convert_to(d.payload::text,'UTF8')||decode('01','hex'))) "
+        "OR (d.network_field_state=2 AND ("
+        "coalesce(array_ndims(d.network_token_ids),1)<>1 "
+        "OR array_position(d.network_token_ids,NULL) IS NOT NULL "
+        "OR le.matched IS DISTINCT FROM cardinality(d.network_token_ids) "
+        "OR d.body_hash<>sha256(convert_to(d.payload::text,'UTF8')||decode('02','hex')||le.net_bytes)))) "
+        "AS invalid_count,max(d.body_hash) AS last_hash,count(*) AS chunk_rows "
+        "FROM chunk d LEFT JOIN list_encoded le "
+        "ON d.network_field_state=2 AND le.network_token_ids=d.network_token_ids"
+    )
+
+
 async def _validate_shared_bodies(connection, tables, dataset_id):
     if tables.shared_bodies is None:
         return
@@ -360,31 +402,20 @@ async def _validate_shared_bodies(connection, tables, dataset_id):
         return
     tokens = tables.relation("reference_tokens")
     shared = tables.relation("shared_bodies")
-    is_invalid_body = await connection.fetchval(
-        f"WITH token_map AS MATERIALIZED ("
-        f"SELECT coalesce(jsonb_object_agg(token_id::text,reference_text),'{{}}'::jsonb) AS refs "
-        f"FROM {tokens} WHERE dataset_id=$1), "
-        f"distinct_lists AS (SELECT DISTINCT network_token_ids FROM {shared} "
-        "WHERE dataset_id=$1 AND network_field_state=2), "
-        "list_encoded AS (SELECT l.network_token_ids,"
-        "(SELECT count(tm.refs->(e.token_id::text)) FROM unnest(l.network_token_ids) e(token_id)) AS matched,"
-        "convert_to('['||coalesce((SELECT string_agg((tm.refs->(e.token_id::text))::text,',' ORDER BY e.ordinal) "
-        "FROM unnest(l.network_token_ids) WITH ORDINALITY e(token_id,ordinal)),'')||']','UTF8') AS net_bytes "
-        "FROM distinct_lists l,token_map tm) "
-        f"SELECT EXISTS(SELECT FROM {tokens} WHERE dataset_id<>$1) OR EXISTS("
-        f"SELECT FROM {shared} d LEFT JOIN list_encoded le "
-        "ON d.network_field_state=2 AND le.network_token_ids=d.network_token_ids "
-        "WHERE d.dataset_id<>$1 "
-        "OR (d.network_field_state=0 AND d.body_hash<>sha256(convert_to(d.payload::text,'UTF8'))) "
-        "OR (d.network_field_state=1 AND d.body_hash<>sha256(convert_to(d.payload::text,'UTF8')||decode('01','hex'))) "
-        "OR (d.network_field_state=2 AND ("
-        "coalesce(array_ndims(d.network_token_ids),1)<>1 "
-        "OR array_position(d.network_token_ids,NULL) IS NOT NULL "
-        "OR le.matched IS DISTINCT FROM cardinality(d.network_token_ids) "
-        "OR d.body_hash<>sha256(convert_to(d.payload::text,'UTF8')||decode('02','hex')||le.net_bytes))))",
+    has_foreign_dataset = await connection.fetchval(
+        f"SELECT EXISTS(SELECT FROM {tokens} WHERE dataset_id<>$1) "
+        f"OR EXISTS(SELECT FROM {shared} WHERE dataset_id<>$1)",
         dataset_id,
     )
-    storage._require(not is_invalid_body, "compact_shared_body_changed")
+    storage._require(not has_foreign_dataset, "compact_shared_body_changed")
+    chunk_sql = _shared_body_validation_chunk_sql(tokens, shared)
+    after_hash = None
+    while True:
+        chunk_check = await connection.fetchrow(chunk_sql, dataset_id, after_hash, _SHARED_BODY_VALIDATION_CHUNK_ROWS)
+        storage._require(chunk_check is not None and chunk_check["invalid_count"] == 0, "compact_shared_body_changed")
+        if chunk_check["chunk_rows"] < _SHARED_BODY_VALIDATION_CHUNK_ROWS:
+            break
+        after_hash = chunk_check["last_hash"]
 
 
 async def validate_storage(connection, policy, binding):
@@ -392,10 +423,15 @@ async def validate_storage(connection, policy, binding):
     tables = layout.payload_tables(policy, binding["tables"])
     alias_sql = _all_aliases_sql(policy, binding)
     dataset_id = binding["identity"]["dataset_id"]
-    await _validate_aliases(connection, tables, alias_sql, dataset_id)
-    await _validate_blocks(connection, tables, alias_sql, dataset_id)
-    await _validate_reference_sets(connection, tables, alias_sql, dataset_id)
-    await _validate_shared_bodies(connection, tables, dataset_id)
+    if tables.is_v2:
+        from process.provider_directory_compact_v2 import validate_v2_storage
+
+        await validate_v2_storage(connection, tables, alias_sql, dataset_id)
+    else:
+        await _validate_aliases(connection, tables, alias_sql, dataset_id)
+        await _validate_blocks(connection, tables, alias_sql, dataset_id)
+        await _validate_reference_sets(connection, tables, alias_sql, dataset_id)
+        await _validate_shared_bodies(connection, tables, dataset_id)
     invalid = await connection.fetchval(
         f"SELECT coalesce(max(batch_ordinal),0)<>$1 OR EXISTS(SELECT FROM {tables.relation('aliases')} "
         "GROUP BY batch_ordinal HAVING min(row_ordinal)<>0 OR max(row_ordinal)<>count(*)-1) "
@@ -425,8 +461,9 @@ async def _validate_output_keys(connection, policy, binding):
 
 async def _validate_selected_aliases(connection, policy, binding):
     source = storage_relation(policy.schema, binding["tables"]["resource_aliases"]["name"])
-    output = _output_tables(policy, binding).relation("aliases")
-    columns = (*compact._ALIAS_COLUMNS, "npi_text")
+    output_tables = _output_tables(policy, binding)
+    output = output_tables.relation("aliases")
+    columns = (*output_tables.alias_columns, "npi_text")
     expected = ",".join("a." + name for name in columns)
     selected = ",".join("o." + name for name in columns)
     invalid = await connection.fetchval(

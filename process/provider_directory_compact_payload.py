@@ -22,7 +22,12 @@ except ImportError:
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_candidate as candidate
 from process.provider_directory_resource_hash import RESOURCE_TRANSPORT_PAYLOAD_FIELDS
-from process.provider_directory_source_storage_binding import SHARED_BODY_FORMAT as SHARED_BODY_FORMAT
+from process.provider_directory_source_storage_binding import (
+    COMPACT_V2_FORMAT as COMPACT_V2_FORMAT,
+)
+from process.provider_directory_source_storage_binding import (
+    SHARED_BODY_FORMAT as SHARED_BODY_FORMAT,
+)
 
 FORMAT = "provider-directory-uuid-body-blocks-v1"
 BLOCK_ROWS = 64
@@ -86,6 +91,8 @@ class CompactPayloadTables:
     body_blocks: str
     shared_bodies: str | None = None
     reference_tokens: str | None = None
+    shared_body_index: str | None = None
+    is_v2: bool = False
 
     def __post_init__(self):
         names = (self.aliases, self.reference_sets, self.body_blocks)
@@ -94,6 +101,13 @@ class CompactPayloadTables:
         if self.reference_tokens is not None:
             _require(self.shared_bodies is not None, "relation_names")
             names += (self.reference_tokens,)
+        if self.shared_body_index is not None:
+            _require(
+                self.is_v2 and self.shared_bodies is not None and self.reference_tokens is not None, "relation_names"
+            )
+            names += (self.shared_body_index,)
+        if self.is_v2:
+            _require(self.shared_bodies is not None and self.reference_tokens is not None, "relation_names")
         storage_identifier(self.schema_name)
         for name in names:
             storage_identifier(name)
@@ -102,7 +116,18 @@ class CompactPayloadTables:
     @property
     def format(self):
         """Return the layout selected by the backing table inventory."""
+        if self.is_v2:
+            return COMPACT_V2_FORMAT
         return SHARED_BODY_FORMAT if self.shared_bodies is not None else FORMAT
+
+    @property
+    def alias_columns(self):
+        """Return non-derived alias columns for this compact layout."""
+        if self.is_v2:
+            from process.provider_directory_compact_v2 import V2_ALIAS_COLUMNS
+
+            return V2_ALIAS_COLUMNS
+        return _ALIAS_COLUMNS
 
     def relation(self, name):
         """Quote a relation in the caller-selected logical schema."""
@@ -243,6 +268,10 @@ def compact_payload_secondary_index_ddl(tables, *, if_not_exists=False):
 
 def compact_payload_ddl(tables, *, defer_secondary_indexes=False):
     """Create candidate-local storage only; application grants stay caller-owned."""
+    if tables.is_v2:
+        from process.provider_directory_compact_v2 import compact_v2_ddl
+
+        return compact_v2_ddl(tables, defer_secondary_indexes=defer_secondary_indexes)
     aliases, sets, blocks = (tables.relation(name) for name in ("aliases", "reference_sets", "body_blocks"))
     statements = (
         f"CREATE TABLE {sets}(dataset_id varchar(96) NOT NULL,set_hash bytea NOT NULL,canonical_refs uuid[],"
@@ -327,32 +356,59 @@ def _network_read_sql(tables):
     return token_join, network_addition, network_where
 
 
-def compact_resource_sql(tables, *, observations=False, alias_cte=None):
+def compact_resource_sql(
+    tables,
+    *,
+    observations=False,
+    alias_cte=None,
+    include_service_refs=True,
+    include_network_refs=True,
+):
     """Expose exact six columns without normalizing float sign or representation."""
+    if tables.is_v2:
+        from process.provider_directory_compact_v2 import compact_v2_resource_sql
+
+        return compact_v2_resource_sql(
+            tables,
+            observations=observations,
+            alias_cte=alias_cte,
+            include_service_refs=include_service_refs,
+            include_network_refs=include_network_refs,
+        )
     extra = ",a.batch_ordinal,a.row_ordinal" if observations else ""
     aliases = tables.relation("aliases") if alias_cte is None else storage_identifier(alias_cte)
     shared_join, body_sql = _body_read_sql(tables)
-    token_join, network_addition, network_where = _network_read_sql(tables)
+    token_join, network_addition, network_where = _network_read_sql(tables) if include_network_refs else ("", "", "")
+    service_join = (
+        f"LEFT JOIN {tables.relation('reference_sets')} s "
+        "ON (s.dataset_id,s.set_hash)=(a.dataset_id,a.service_set_hash)"
+        if include_service_refs
+        else ""
+    )
+    service_addition = (
+        " || CASE a.service_field_state WHEN 0 THEN '{}'::jsonb "
+        "WHEN 1 THEN jsonb_build_object('healthcare_service_refs',NULL) "
+        "ELSE jsonb_build_object('healthcare_service_refs',CASE WHEN s.canonical_refs IS NOT NULL THEN "
+        "ARRAY(SELECT 'HealthcareService/'||replace(e.reference::text,'-','') "
+        "FROM unnest(s.canonical_refs) WITH ORDINALITY e(reference,ordinal) ORDER BY e.ordinal) "
+        "ELSE s.fallback_refs END) END"
+        if include_service_refs
+        else ""
+    )
+    service_where = " AND (a.service_field_state<>2 OR s.set_hash IS NOT NULL)" if include_service_refs else ""
     return f"""SELECT a.dataset_id,a.resource_type,a.resource_id,a.payload_hash,
       (CASE WHEN additions.text='{{}}' THEN body.text ELSE left(body.text,-1) ||
        CASE WHEN body.text='{{}}' THEN '' ELSE ',' END || substring(additions.text FROM 2) END)::json
        AS payload_json,a.acquired_resource_sha256{extra}
       FROM {aliases} a JOIN {tables.relation("body_blocks")} b
        ON (b.dataset_id,b.batch_ordinal,b.block_ordinal)=(a.dataset_id,a.batch_ordinal,a.block_ordinal)
-      LEFT JOIN {tables.relation("reference_sets")} s
-       ON (s.dataset_id,s.set_hash)=(a.dataset_id,a.service_set_hash)
+      {service_join}
       {shared_join}
       {token_join}
       CROSS JOIN LATERAL (SELECT {body_sql} AS text) body
       CROSS JOIN LATERAL (SELECT (CASE WHEN a.restore_resource_id
-       THEN jsonb_build_object('resource_id',a.resource_id) ELSE '{{}}'::jsonb END ||
-       CASE a.service_field_state WHEN 0 THEN '{{}}'::jsonb
-        WHEN 1 THEN jsonb_build_object('healthcare_service_refs',NULL)
-        ELSE jsonb_build_object('healthcare_service_refs',CASE WHEN s.canonical_refs IS NOT NULL THEN
-         ARRAY(SELECT 'HealthcareService/'||replace(e.reference::text,'-','')
-          FROM unnest(s.canonical_refs) WITH ORDINALITY e(reference,ordinal) ORDER BY e.ordinal)
-         ELSE s.fallback_refs END) END{network_addition})::text AS text) additions
-      WHERE body.text IS NOT NULL AND (a.service_field_state<>2 OR s.set_hash IS NOT NULL){network_where}"""
+       THEN jsonb_build_object('resource_id',a.resource_id) ELSE '{{}}'::jsonb END{service_addition}{network_addition})::text AS text) additions
+      WHERE body.text IS NOT NULL{service_where}{network_where}"""
 
 
 def _reference_digest(references):
@@ -424,16 +480,17 @@ def _normalized_rows(resource_rows, dataset_id):
             set(resource_by_field) == set(candidate.RESOURCE_COLUMNS) and resource_by_field["dataset_id"] == dataset_id,
             "columns",
         )
-        for field, maximum in (("resource_type", 64), ("resource_id", 256)):
+        for column_name, maximum in (("resource_type", 64), ("resource_id", 256)):
             _require(
-                type(resource_by_field[field]) is str and 1 <= len(resource_by_field[field]) <= maximum, "resource_key"
+                type(resource_by_field[column_name]) is str and 1 <= len(resource_by_field[column_name]) <= maximum,
+                "resource_key",
             )
-        for field in ("payload_hash", "acquired_resource_sha256"):
+        for column_name in ("payload_hash", "acquired_resource_sha256"):
             _require(
-                field == "acquired_resource_sha256"
-                and resource_by_field[field] is None
-                or type(resource_by_field[field]) is str
-                and _HASH.fullmatch(resource_by_field[field]),
+                column_name == "acquired_resource_sha256"
+                and resource_by_field[column_name] is None
+                or type(resource_by_field[column_name]) is str
+                and _HASH.fullmatch(resource_by_field[column_name]),
                 "stored_hash",
             )
         payload_by_field, compact_bytes, rendered_bytes, has_float = _decode_with_metrics(
@@ -914,12 +971,20 @@ class _PreparedWriteBundle:
     needs_npi_update: bool = False
 
 
-async def append_compact_payload_batch(connection, tables, rows, *, dataset_id, batch_ordinal, format_id):
-    """Append under the caller's transaction and existing dataset/family lock."""
-    _require(connection.is_in_transaction(), "transaction_required")
+async def _append_v2_batch(connection, tables, batch_rows, *, dataset_id, batch_ordinal, format_id, cache):
+    from process.provider_directory_compact_v2 import append_compact_v2_segments
+
+    _require(format_id == COMPACT_V2_FORMAT, "format_or_ordinal")
+    v2_outcome = await append_compact_v2_segments(
+        connection, tables, ((batch_ordinal, 0, batch_rows),), dataset_id=dataset_id, check_replay=True, cache=cache
+    )
+    return {"rows": v2_outcome["rows"], "is_replay": v2_outcome["is_replay"]} if cache is None else v2_outcome
+
+
+async def _append_legacy_batch(connection, tables, batch_rows, *, dataset_id, batch_ordinal, format_id):
     body_by_hash = {} if tables.shared_bodies is not None else None
     aliases, blocks, desired_by_hash, npi_texts, needs_npi_update = _prepare_batch_payloads(
-        rows,
+        batch_rows,
         dataset_id=dataset_id,
         batch_ordinal=batch_ordinal,
         format_id=format_id,
@@ -931,12 +996,34 @@ async def append_compact_payload_batch(connection, tables, rows, *, dataset_id, 
     shared_bodies, _ = await _new_shared_bodies(connection, tables, dataset_id, body_by_hash, token_by_ref=token_by_ref)
     if await _is_replayed_batch(connection, tables, dataset_id, batch_ordinal, aliases, blocks):
         _require(not references and not shared_bodies and not new_tokens, "replay_reference_missing")
-        return {"rows": len(rows), "is_replay": True}
-    bundle = _PreparedWriteBundle(
-        (batch_ordinal,), aliases, npi_texts, blocks, references, shared_bodies, new_tokens, needs_npi_update
+        return {"rows": len(batch_rows), "is_replay": True}
+    await _append_prepared(
+        connection,
+        tables,
+        dataset_id,
+        _PreparedWriteBundle(
+            (batch_ordinal,), aliases, npi_texts, blocks, references, shared_bodies, new_tokens, needs_npi_update
+        ),
     )
-    await _append_prepared(connection, tables, dataset_id, bundle)
-    return {"rows": len(rows), "is_replay": False}
+    return {"rows": len(batch_rows), "is_replay": False}
+
+
+async def append_compact_payload_batch(connection, tables, rows, *, dataset_id, batch_ordinal, format_id, cache=None):
+    """Append under the caller's transaction and existing dataset/family lock."""
+    _require(connection.is_in_transaction(), "transaction_required")
+    if tables.is_v2:
+        return await _append_v2_batch(
+            connection,
+            tables,
+            rows,
+            dataset_id=dataset_id,
+            batch_ordinal=batch_ordinal,
+            format_id=format_id,
+            cache=cache,
+        )
+    return await _append_legacy_batch(
+        connection, tables, rows, dataset_id=dataset_id, batch_ordinal=batch_ordinal, format_id=format_id
+    )
 
 
 def _prepare_segment_groups(tables, dataset_id, segment_items):
@@ -976,12 +1063,16 @@ def _prepare_segment_groups(tables, dataset_id, segment_items):
     )
 
 
-async def append_compact_payload_segment(
-    connection, tables, rows, *, dataset_id, batch_ordinal, row_start, segments=None, cache=None
-):
-    """Copy original batch segment(s) under their header/progress transaction."""
-    _require(connection.is_in_transaction(), "transaction_required")
-    segment_items = ((batch_ordinal, row_start, rows),) if segments is None else segments
+async def _append_v2_segment_group(connection, tables, segment_items, *, dataset_id, cache):
+    from process.provider_directory_compact_v2 import append_compact_v2_segments
+
+    v2_outcome = await append_compact_v2_segments(
+        connection, tables, segment_items, dataset_id=dataset_id, check_replay=False, cache=cache
+    )
+    return v2_outcome["pending_cache"]
+
+
+async def _append_legacy_segment_group(connection, tables, segment_items, *, dataset_id, cache):
     aliases, npi_texts, blocks, desired_by_hash, body_by_hash, batch_ordinals, needs_npi_update = (
         _prepare_segment_groups(tables, dataset_id, segment_items)
     )
@@ -994,10 +1085,10 @@ async def append_compact_payload_segment(
     shared_bodies, verified_bodies_by_hash = await _new_shared_bodies(
         connection, tables, dataset_id, body_by_hash, token_by_ref=token_by_ref, cache=cache
     )
-    bundle = _PreparedWriteBundle(
+    prepared_write = _PreparedWriteBundle(
         batch_ordinals, aliases, npi_texts, blocks, references, shared_bodies, new_tokens, needs_npi_update
     )
-    await _append_prepared(connection, tables, dataset_id, bundle)
+    await _append_prepared(connection, tables, dataset_id, prepared_write)
     if cache is None:
         return None
     return {
@@ -1005,6 +1096,17 @@ async def append_compact_payload_segment(
         "body_digest_by_hash": verified_bodies_by_hash,
         "ref_digest_by_hash": verified_refs_by_hash,
     }
+
+
+async def append_compact_payload_segment(
+    connection, tables, rows, *, dataset_id, batch_ordinal, row_start, segments=None, cache=None
+):
+    """Copy original batch segment(s) under their header/progress transaction."""
+    _require(connection.is_in_transaction(), "transaction_required")
+    segment_items = ((batch_ordinal, row_start, rows),) if segments is None else segments
+    if tables.is_v2:
+        return await _append_v2_segment_group(connection, tables, segment_items, dataset_id=dataset_id, cache=cache)
+    return await _append_legacy_segment_group(connection, tables, segment_items, dataset_id=dataset_id, cache=cache)
 
 
 async def _append_prepared(connection, tables, dataset_id, bundle):

@@ -16,6 +16,7 @@ TABLE_SUFFIXES = {
     "resource_body_blocks": "rb",
 }
 SHARED_BODY_ROOT = "resource_shared_bodies"
+SHARED_BODY_INDEX_ROOT = "resource_shared_body_index"
 REFERENCE_TOKENS_ROOT = "resource_reference_tokens"
 
 
@@ -27,7 +28,7 @@ def require_source_identity(identity, *, payload_format=compact_payload.FORMAT):
     directory = import_module("process.provider_directory_fhir")
     source_ids = identity["metadata"]["source_ids"]
     storage._require(
-        payload_format == compact_payload.SHARED_BODY_FORMAT
+        payload_format in (compact_payload.SHARED_BODY_FORMAT, compact_payload.COMPACT_V2_FORMAT)
         or (
             payload_format == compact_payload.FORMAT
             and source_ids == [directory._stable_source_id(directory.anthem.seed_rows()[0])]
@@ -76,6 +77,12 @@ def validate_tables(binding):
 
 
 def _input_suffixes(payload_format):
+    if payload_format == compact_payload.COMPACT_V2_FORMAT:
+        return TABLE_SUFFIXES | {
+            SHARED_BODY_ROOT: "sb",
+            SHARED_BODY_INDEX_ROOT: "si",
+            REFERENCE_TOKENS_ROOT: "rt",
+        }
     if payload_format == compact_payload.SHARED_BODY_FORMAT:
         return TABLE_SUFFIXES | {SHARED_BODY_ROOT: "sb", REFERENCE_TOKENS_ROOT: "rt"}
     return dict(TABLE_SUFFIXES)
@@ -83,6 +90,7 @@ def _input_suffixes(payload_format):
 
 def payload_tables(policy, tables):
     """Resolve codec relations from the validated logical loading inventory."""
+    shared_index = tables.get(SHARED_BODY_INDEX_ROOT, {}).get("name")
     return compact_payload.CompactPayloadTables(
         policy.schema,
         tables["resource_aliases"]["name"],
@@ -90,6 +98,8 @@ def payload_tables(policy, tables):
         tables["resource_body_blocks"]["name"],
         tables.get(SHARED_BODY_ROOT, {}).get("name"),
         tables.get(REFERENCE_TOKENS_ROOT, {}).get("name"),
+        shared_body_index=shared_index,
+        is_v2=shared_index is not None,
     )
 
 
@@ -115,6 +125,8 @@ async def create_inputs(connection, policy, *, payload_format=compact_payload.FO
         roots += ("reference_tokens",)
     if compact.shared_bodies is not None:
         roots += ("shared_bodies",)
+    if compact.shared_body_index is not None:
+        roots += ("shared_body_index",)
     for root in roots:
         await connection.execute(f"ALTER TABLE {compact.relation(root)} SET (autovacuum_enabled=false)")
     aliases = compact.relation("aliases")

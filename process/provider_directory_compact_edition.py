@@ -10,6 +10,8 @@ OBSERVATION_ALIASES = "provider_directory_resource_aliases"
 OUTPUT_ALIASES = "provider_directory_resource_output_aliases"
 REFERENCE_SETS = "provider_directory_resource_reference_sets"
 BODY_BLOCKS = "provider_directory_resource_body_blocks"
+SHARED_BODIES = "provider_directory_resource_shared_bodies"
+REFERENCE_TOKENS = "provider_directory_resource_reference_tokens"
 
 
 def _require(condition, code):
@@ -32,9 +34,33 @@ async def compact_edition_tables(connection, schema):
         _require(not presence["aliases_present"], "format_missing")
         return None
     formats = await connection.fetch(f"SELECT * FROM {layout} LIMIT 2")
-    _require(len(formats) == 1 and dict(formats[0]) == {"format_id": compact.FORMAT}, "format_changed")
+    _require(len(formats) == 1 and set(dict(formats[0])) == {"format_id"}, "format_changed")
+    format_id = formats[0]["format_id"]
+    _require(format_id in (compact.FORMAT, compact.SHARED_BODY_FORMAT, compact.COMPACT_V2_FORMAT), "format_changed")
     _require(presence["aliases_present"], "aliases_missing")
-    return compact.CompactPayloadTables(schema, OUTPUT_ALIASES, REFERENCE_SETS, BODY_BLOCKS)
+    if format_id == compact.FORMAT:
+        return compact.CompactPayloadTables(schema, OUTPUT_ALIASES, REFERENCE_SETS, BODY_BLOCKS)
+    if format_id == compact.SHARED_BODY_FORMAT:
+        has_tokens = await connection.fetchval(
+            "SELECT to_regclass($1)::text IS NOT NULL", storage_relation(schema, REFERENCE_TOKENS)
+        )
+        return compact.CompactPayloadTables(
+            schema,
+            OUTPUT_ALIASES,
+            REFERENCE_SETS,
+            BODY_BLOCKS,
+            SHARED_BODIES,
+            REFERENCE_TOKENS if has_tokens else None,
+        )
+    return compact.CompactPayloadTables(
+        schema,
+        OUTPUT_ALIASES,
+        REFERENCE_SETS,
+        BODY_BLOCKS,
+        SHARED_BODIES,
+        REFERENCE_TOKENS,
+        is_v2=True,
+    )
 
 
 async def _edition_page_keys(
