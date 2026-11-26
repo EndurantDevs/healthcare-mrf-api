@@ -119,6 +119,145 @@ def test_encode_retained_fhir_capture_rows_matches_batch_json_encoder():
     assert actual == expected
 
 
+def _parallel_retained_rows(resource_types, *, derive):
+    """Build 32 mixed-family rows exercising parallel Rust validation and hashing."""
+    from process.provider_directory_resource_hash import resource_payload_sha256_for_contract
+
+    raw_rows = []
+    for index in range(32):
+        kind = resource_types[index % len(resource_types)]
+        resource_id = f"{kind.lower()}-{index:03d}"
+        if kind == "InsurancePlan":
+            resource_by_field = {
+                "resource_id": resource_id,
+                "source_id": "src-1",
+                "network_refs": ["Organization/organization-002"],
+            }
+        elif kind == "Location":
+            resource_by_field = {
+                "resource_id": resource_id,
+                "source_id": "src-1",
+                "status": "active",
+                "first_line": f"{index} Main",
+            }
+        elif kind == "Organization":
+            resource_by_field = {
+                "resource_id": resource_id,
+                "source_id": "src-1",
+                "name": f"Org {index}",
+                "active": True,
+            }
+        else:
+            resource_by_field = {
+                "resource_id": resource_id,
+                "source_id": "src-1",
+                "active": True,
+                "practitioner_ref": "Practitioner/p1",
+                "network_refs": ["Organization/organization-002"],
+                "location_refs": ["Location/location-001"],
+            }
+        payload_hash = resource_payload_sha256_for_contract(
+            resource_by_field, "transport_neutral_v2", resource_type=kind
+        )
+        raw_rows.append(
+            {
+                "resource_type": kind,
+                "resource_id": resource_id,
+                "payload_hash": payload_hash,
+                "payload_json": json.dumps(
+                    resource_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ),
+                "acquired_resource_sha256": None,
+                "site_id": str(registry_location_id("src-1", resource_id)) if derive and kind == "Location" else None,
+            }
+        )
+    return raw_rows
+
+
+@pytest.mark.parametrize("derive", [False, True])
+def test_encode_retained_fhir_capture_rows_parallel_batch_matches_json_encoder(derive):
+    """Verify parallel row encoding matches sequential JSON encoding and first-error index."""
+    native = _native()
+    observed_at = postgres_micros(datetime(2026, 6, 1, 12, 0, tzinfo=UTC))
+    resource_types = ["InsurancePlan", "Location", "Organization", "PractitionerRole"]
+    raw_rows = _parallel_retained_rows(resource_types, derive=derive)
+    batch_input_by_field = {
+        "source_id": "src-1",
+        "release_id": "rel-1",
+        "observed_at_pg_micros": observed_at,
+        "hash_contract": "transport_neutral_v2",
+        "resource_types": resource_types,
+        "derive": derive,
+        "rows": raw_rows,
+    }
+    expected = native.encode_retained_fhir_capture_batch(
+        json.dumps(batch_input_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    )
+    direct_rows = [
+        (
+            raw_row["resource_type"],
+            raw_row["resource_id"],
+            raw_row["payload_hash"],
+            raw_row["payload_json"],
+            None,
+            None,
+        )
+        for raw_row in raw_rows
+    ]
+    actual = native.encode_retained_fhir_capture_rows(
+        ("src-1", "rel-1", observed_at, "transport_neutral_v2", None, resource_types, derive),
+        direct_rows,
+    )
+    assert actual == expected
+
+    bad_rows = list(direct_rows)
+    bad_rows[19] = (bad_rows[19][0], bad_rows[19][1], "0" * 64, bad_rows[19][3], None, None)
+    bad_rows[27] = (bad_rows[27][0], "bad/id", bad_rows[27][2], bad_rows[27][3], None, None)
+    with pytest.raises(ValueError, match=r'"code":"payload_hash","row_index":19'):
+        native.encode_retained_fhir_capture_rows(
+            ("src-1", "rel-1", observed_at, "transport_neutral_v2", None, resource_types, derive),
+            bad_rows,
+        )
+
+
+def test_prepare_typed_fhir_copy_page_encodes_binary_copy():
+    """Verify binary COPY encoding for typed FHIR pages and SQL fallback on malformed shapes."""
+    native = _native()
+    witness_rows = _sample_rows()
+    exact_bytes = len(json.dumps(witness_rows, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode())
+    prepared = native.prepare_typed_fhir_copy_page(
+        witness_rows,
+        ("ds-1", "src-1"),
+        (["InsurancePlan", "Location", "Organization"], ["Location", "Organization"]),
+        None,
+        False,
+        exact_bytes,
+    )
+    assert prepared is not None
+    copy_bytes, projected_count, last_type, last_id, counts_by_kind = prepared
+    assert copy_bytes.startswith(b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0")
+    assert copy_bytes.endswith(b"\xff\xff")
+    assert projected_count == 2
+    assert (last_type, last_id) == ("Organization", "org-1")
+    assert counts_by_kind == {"InsurancePlan": 1, "Location": 1, "Organization": 1}
+
+    bad_shape_by_field = {
+        **witness_rows[2],
+        "payload_json": json.dumps({"resource_id": "org-1", "active": "yes"}),
+    }
+    assert (
+        native.prepare_typed_fhir_copy_page(
+            (bad_shape_by_field,),
+            ("ds-1", "src-1"),
+            (["Organization"], ["Organization"]),
+            None,
+            False,
+            65536,
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("completion_v3", [False, True])
 def test_validate_and_prepare_typed_fhir_page_match_python_semantics(completion_v3):
     native = _native()

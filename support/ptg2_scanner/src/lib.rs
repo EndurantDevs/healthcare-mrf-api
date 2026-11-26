@@ -22,6 +22,7 @@ pub mod custom_import_v2_family;
 pub mod dedupe;
 pub mod entity_address_rows;
 pub mod fhir_network_identity;
+pub mod fhir_typed_copy;
 pub mod fhir_witness_page;
 pub mod hashing;
 pub mod hospital_mrf;
@@ -776,6 +777,7 @@ mod python_api {
         m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_rows, m)?)?;
         m.add_function(wrap_pyfunction!(validate_fhir_witness_page, m)?)?;
         m.add_function(wrap_pyfunction!(prepare_typed_fhir_page, m)?)?;
+        m.add_function(wrap_pyfunction!(prepare_typed_fhir_copy_page, m)?)?;
         m.add_function(wrap_pyfunction!(fold_stored_resource_roots_page, m)?)?;
         m.add_function(wrap_pyfunction!(compact_json_utf8_len_fits, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;

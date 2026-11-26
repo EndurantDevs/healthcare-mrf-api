@@ -101,6 +101,7 @@ fn extract_witness_rows(py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<Ext
 
 type ValidatedWitnessResult = (String, String, BTreeMap<String, usize>);
 type PreparedTypedPageResult = (String, usize, String, String, BTreeMap<String, usize>);
+type PreparedTypedCopyResult = (Py<PyBytes>, usize, String, String, BTreeMap<String, usize>);
 
 #[pyfunction]
 fn validate_fhir_witness_page(
@@ -198,6 +199,70 @@ fn prepare_typed_fhir_page(
         .map_err(PyValueError::new_err)?;
     Ok(Some((
         json_text,
+        projected_count,
+        summary.last_type,
+        summary.last_id,
+        summary.counts,
+    )))
+}
+
+#[pyfunction]
+fn prepare_typed_fhir_copy_page(
+    py: Python<'_>,
+    rows: &Bound<'_, PyAny>,
+    scope: (&str, &str),
+    kinds: (Vec<String>, Vec<String>),
+    after: Option<(&str, &str)>,
+    completion_v3: bool,
+    max_bytes: usize,
+) -> PyResult<Option<PreparedTypedCopyResult>> {
+    let extracted = match extract_witness_rows(py, rows)? {
+        ExtractWitnessRows::Extracted(items) => items,
+        ExtractWitnessRows::FallbackRequired => return Ok(None),
+    };
+    let (dataset_id, source_id) = scope;
+    let (allowed_kinds, project_kinds) = kinds;
+    let allowed_set: BTreeSet<String> = allowed_kinds.into_iter().collect();
+    let project_set: BTreeSet<String> = project_kinds.into_iter().collect();
+    let pool = location_canon_pool()?;
+    let prepared = py
+        .detach(|| {
+            pool.install(|| {
+                let borrowed: Vec<crate::fhir_witness_page::WitnessPageRow<'_>> = extracted
+                    .iter()
+                    .map(|row| crate::fhir_witness_page::WitnessPageRow {
+                        dataset_id: &row.0,
+                        resource_type: &row.1,
+                        resource_id: &row.2,
+                        payload_hash: &row.3,
+                        payload_json: &row.4,
+                        acquired_resource_sha256: row.5.as_deref(),
+                    })
+                    .collect();
+                let options = crate::fhir_witness_page::WitnessValidationOptions {
+                    dataset_id,
+                    allowed_kinds: Some(&allowed_set),
+                    after,
+                    check_marker: true,
+                    completion_v3,
+                    validate_ids: true,
+                    validate_hashes: true,
+                    max_bytes,
+                };
+                crate::fhir_typed_copy::prepare_typed_page_copy(
+                    &borrowed,
+                    &options,
+                    source_id,
+                    &project_set,
+                )
+            })
+        })
+        .map_err(PyValueError::new_err)?;
+    let Some((copy_bytes, projected_count, summary)) = prepared else {
+        return Ok(None);
+    };
+    Ok(Some((
+        PyBytes::new(py, &copy_bytes).unbind(),
         projected_count,
         summary.last_type,
         summary.last_id,

@@ -844,24 +844,34 @@ async def test_canonicalization_bounds_pages_and_reuses_exact_existing_addresses
     native = Mock(side_effect=AssertionError("known address was recanonicalized"))
     monkeypatch.setitem(sys.modules, "ptg2_address_canon", SimpleNamespace(canonicalize_batch=native))
     address_by_field = {"resource_id": "location-one", "raw_key": "raw-one", **dict.fromkeys(ADDRESS_FIELDS)}
-    sizes = [9 * 1024**2] * 11 if oversized else [9 * 1024**2, 1, 0]
+    oversized_rows = [{"page_count": 1, "page_bytes": 9 * 1024**2}]
+    bounded_pages = (
+        [oversized_rows] * 12
+        if oversized
+        else [
+            oversized_rows,
+            [{**address_by_field, "page_count": 1, "page_bytes": 1}],
+            [address_by_field],
+            [{"page_count": 0, "page_bytes": 0}],
+        ]
+    )
     connection = SimpleNamespace(
-        fetchval=AsyncMock(side_effect=sizes),
-        fetch=AsyncMock(side_effect=[[address_by_field], [address_by_field], []]),
+        fetch=AsyncMock(side_effect=bounded_pages),
         copy_records_to_table=AsyncMock(),
     )
     stage = SimpleNamespace(relation=lambda kind: "pg_temp." + kind, names={"addresses": "addresses"})
     if oversized:
         with pytest.raises(TypedFHIRGraphError, match="canonical_bounds"):
             await _canonicalize(connection, stage)
-        connection.fetch.assert_not_awaited()
-        assert connection.fetchval.await_args.args[-1] == 1
+        assert connection.fetch.await_count == 12
+        assert connection.fetch.await_args.args[-1] == 1
     else:
         await _canonicalize(connection, stage)
-        assert [call.args[-2:] for call in connection.fetchval.await_args_list] == [
-            ("", 1000),
-            ("", 500),
-            ("location-one", 500),
+        page_calls = [call.args[-2:] for call in connection.fetch.await_args_list if "page_bytes" in call.args[0]]
+        assert page_calls == [
+            ("", 4000),
+            ("", 2000),
+            ("location-one", 4000),
         ]
     native.assert_not_called()
     connection.copy_records_to_table.assert_not_awaited()

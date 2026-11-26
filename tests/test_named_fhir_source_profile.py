@@ -114,7 +114,7 @@ async def test_typed_graph_accepts_named_payload(named_source, monkeypatch):
         assert document["origin"]["resource_relation"] == case.origin.resource_relation
         assert document["counts"]["source_rows"] == 2
         assert case.events == ["source.open", "source.eof", "source.closed", "source.exit"]
-        assert connection.execute.await_count == 1
+        assert connection.execute.await_count == 3
         canonicalize.assert_awaited_once_with(connection, stage)
         counts.assert_awaited_once_with(connection, stage, 2)
     else:

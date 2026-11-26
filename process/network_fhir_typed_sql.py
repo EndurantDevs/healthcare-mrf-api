@@ -177,7 +177,7 @@ _NETWORK_LOOKUP = (
     + _reference_predicate("net", "raw.ref", "'Organization'")
     + " AND net.active IS DISTINCT FROM false OFFSET 0) net ON true"
 )
-PAIR_ROLE_PAGE_SIZE = 2048
+PAIR_ROLE_PAGE_SIZE = 8192
 
 
 def _role_page_sql(first_parameter, limit=128):

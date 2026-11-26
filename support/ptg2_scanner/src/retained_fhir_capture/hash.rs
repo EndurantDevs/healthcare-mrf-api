@@ -24,6 +24,12 @@ fn sha256(value: &Value) -> String {
     digest(&encoded)
 }
 
+fn sha256_object(value: &Map<String, Value>, capacity: usize) -> String {
+    let mut encoded = Vec::with_capacity(capacity);
+    write_object(value, true, true, &mut encoded);
+    digest(&encoded)
+}
+
 pub(super) fn payload_hash(
     payload: &Map<String, Value>,
     raw_payload: &str,
@@ -31,6 +37,47 @@ pub(super) fn payload_hash(
     resource_type: &str,
     completion_v3: bool,
 ) -> std::result::Result<String, &'static str> {
+    if let Some(hash) =
+        merged_or_transport_bound_hash(payload, raw_payload, contract, resource_type)?
+    {
+        return Ok(hash);
+    }
+    payload_hash_content(
+        payload.clone(),
+        raw_payload.len(),
+        contract,
+        resource_type,
+        completion_v3,
+    )
+}
+
+pub(super) fn payload_hash_owned(
+    payload: Map<String, Value>,
+    raw_payload: &str,
+    contract: &str,
+    resource_type: &str,
+    completion_v3: bool,
+) -> std::result::Result<String, &'static str> {
+    if let Some(hash) =
+        merged_or_transport_bound_hash(&payload, raw_payload, contract, resource_type)?
+    {
+        return Ok(hash);
+    }
+    payload_hash_content(
+        payload,
+        raw_payload.len(),
+        contract,
+        resource_type,
+        completion_v3,
+    )
+}
+
+fn merged_or_transport_bound_hash(
+    payload: &Map<String, Value>,
+    raw_payload: &str,
+    contract: &str,
+    resource_type: &str,
+) -> std::result::Result<Option<String>, &'static str> {
     if matches!(contract, "semantic_content_v3" | "semantic_content_v4")
         && resource_type == "PractitionerRole"
         && let Some(id) = payload
@@ -40,12 +87,21 @@ pub(super) fn payload_hash(
         && let Some(hash) =
             stored_merged_role_hash(id, raw_payload).map_err(|_| "python_semantics_required")?
     {
-        return Ok(hash);
+        return Ok(Some(hash));
     }
     if contract == "transport_bound_v1" {
-        return Ok(digest(&object_json_bytes(payload, true, true)));
+        return Ok(Some(sha256_object(payload, raw_payload.len())));
     }
-    let mut content = payload.clone();
+    Ok(None)
+}
+
+fn payload_hash_content(
+    mut content: Map<String, Value>,
+    raw_len: usize,
+    contract: &str,
+    resource_type: &str,
+    completion_v3: bool,
+) -> std::result::Result<String, &'static str> {
     for field in [
         "resource_url",
         "fhir_self_url",
@@ -55,10 +111,12 @@ pub(super) fn payload_hash(
         content.remove(field);
     }
     if completion_v3 {
-        return Ok(digest(&object_json_bytes(&content, false, false)));
+        let mut encoded = Vec::with_capacity(raw_len);
+        write_object(&content, false, false, &mut encoded);
+        return Ok(digest(&encoded));
     }
     if contract == "transport_neutral_v2" {
-        return Ok(sha256(&Value::Object(content)));
+        return Ok(sha256_object(&content, raw_len));
     }
     if let Some(Value::Object(metadata)) = content.get_mut("fhir_meta") {
         metadata.remove("lastUpdated");
@@ -75,7 +133,7 @@ pub(super) fn payload_hash(
     {
         return practitioner_hash(&content);
     }
-    Ok(sha256(&Value::Object(content)))
+    Ok(sha256_object(&content, raw_len))
 }
 
 fn composed_hash(base: Map<String, Value>, hashes: BTreeSet<String>) -> String {
