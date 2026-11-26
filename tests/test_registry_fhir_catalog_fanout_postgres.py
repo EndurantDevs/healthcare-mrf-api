@@ -118,13 +118,13 @@ async def test_large_plan_page_observes_and_stages_every_edge_in_order(observati
     )
 
 
-async def test_single_resource_overflow_refuses_observation_and_staging(observation_case):
+async def test_single_resource_overflow_refuses_staging(observation_case):
     case = observation_case
     await _replace_plan_resources(case, 1, 11)
     admitted = await _observe(case)
     await _replace_plan_resources(case, 1, MAX_EDGES + 1)
-    with pytest.raises(ValueError, match="output_bounds"):
-        await _observe(case)
+    overflowed = await _observe(case)
+    assert overflowed.descriptor["admission"]["families"]["InsurancePlan"]["rows"] == 1
     emitted = AsyncMock()
     async with (
         case.source_pool.acquire() as reader,

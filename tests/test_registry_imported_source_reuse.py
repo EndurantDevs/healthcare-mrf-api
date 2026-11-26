@@ -178,6 +178,30 @@ def test_source_semantic_date_remains_effective_across_later_requests():
     assert recipe.source_pin.capture["graph"]["membership_as_of"] == "2026-10-01"
 
 
+def test_count_only_descriptor_reuses_legacy_family_recipe():
+    recipe = _recipe()
+    legacy_descriptor = deepcopy(recipe.source_pin.catalog_descriptor)
+    for family in legacy_descriptor["admission"]["families"].values():
+        family["sha256"] = "c" * 64
+    refresh_receipt(legacy_descriptor)
+    legacy_capture = deepcopy(recipe.source_pin.capture)
+    legacy_capture["catalog_descriptor"] = legacy_descriptor
+    legacy_capture["capture_sha256"] = digest(
+        {key: value for key, value in legacy_capture.items() if key != "capture_sha256"}
+    )
+    legacy_pin = replace(recipe.source_pin, capture=legacy_capture, catalog_descriptor=legacy_descriptor)
+    legacy_recipe = replace(recipe, source_pin=legacy_pin)
+    count_only_descriptor = recipe.source_pin.catalog_descriptor
+    assert legacy_descriptor["accepted_receipt_sha256"] != count_only_descriptor["accepted_receipt_sha256"]
+    assert reuse.is_compatible_typed_recipe(legacy_recipe, count_only_descriptor, "2026-11-01")
+    assert reuse.is_compatible_typed_recipe(recipe, legacy_descriptor, "2026-11-01")
+
+    changed = deepcopy(count_only_descriptor)
+    changed["admission"]["families"]["Organization"]["rows"] = 1
+    refresh_receipt(changed)
+    assert not reuse.is_compatible_typed_recipe(legacy_recipe, changed, "2026-11-01")
+
+
 @pytest.mark.asyncio
 async def test_failed_new_source_keeps_completed_and_predecessor_schemas(prepared_case, monkeypatch):
     case = prepared_case

@@ -45,28 +45,19 @@ from tests.test_registry_fhir_catalog_sources import descriptor as catalog_descr
 
 def _recipe(*, capture_id=5, tables=None):
     from process.network_fhir_typed_capture import TABLES
-    from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+    from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
     from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
     from tests.test_registry_fhir_catalog_sources import published_row, read_profile
 
-    observed = FHIRCatalogObservationDigests()
-    observed.add(
-        {
-            "resource_type": "PractitionerRole",
-            "resource_id": "role-one",
-            "payload_hash": "e" * 64,
-            "payload_json": {"resourceType": "PractitionerRole", "id": "role-one"},
-        }
-    )
-    families = observed.document()
+    families_by_type = {kind: {"rows": 1 if kind == "PractitionerRole" else 0} for kind in RESOURCE_TYPES}
     catalog = build_fhir_catalog_observation_descriptor(
         read_profile(),
         published_row(resource_count=1),
         catalog_descriptor()["tables"] if tables is None else tables,
         ("https://directory.example.test/fhir/", ["alias-a", "alias-b"]),
-        families,
+        families_by_type,
     )
-    counts = tuple(sorted((kind, family["rows"]) for kind, family in families.items()))
+    counts = tuple(sorted((kind, family["rows"]) for kind, family in families_by_type.items()))
     origin = origin_fields() | {
         "schema_name": catalog["coordinates"]["dataset_schema"],
         "source_id": catalog["coordinates"]["source_id"],
@@ -76,7 +67,7 @@ def _recipe(*, capture_id=5, tables=None):
         "resource_relation": catalog["tables"]["resource"],
         "semantic_projection_as_of": "2026-10-01",
         "resource_counts": counts,
-        "resource_hashes": tuple(sorted((kind, family["sha256"]) for kind, family in families.items())),
+        "resource_hashes": tuple((kind, "e" * 64) for kind, _ in counts),
         "descriptor_counts": counts,
     }
     graph = graph_document(

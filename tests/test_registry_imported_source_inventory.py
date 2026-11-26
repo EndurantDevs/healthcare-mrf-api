@@ -526,7 +526,7 @@ async def test_automatic_network_limit_change_invalidates_inventory_token(
 
 
 @pytest.mark.asyncio
-async def test_published_catalog_families_key_complete_observations_by_dataset_and_digest():
+async def test_serving_catalog_observations_returns_only_complete_observations():
     admitted = observed_descriptor()
     incomplete_by_field = {**observed_descriptor(dataset="other-dataset"), "complete": False}
     connection = SimpleNamespace(
@@ -535,105 +535,21 @@ async def test_published_catalog_families_key_complete_observations_by_dataset_a
             return_value=[{"descriptor": json.dumps(admitted)}, {"descriptor": json.dumps(incomplete_by_field)}]
         ),
     )
-    descriptors = await inventory._serving_catalog_observations(connection, "registry")
-    key = (
-        admitted["coordinates"]["dataset_id"],
-        admitted["dataset_sha256"],
-        admitted["tables"]["resource"]["schema"],
-        admitted["tables"]["resource"]["name"],
-        admitted["source_uri"],
-    )
-    assert inventory.catalog_observation_families(descriptors) == {key: admitted["admission"]["families"]}
+    assert await inventory._serving_catalog_observations(connection, "registry") == (admitted,)
     assert "network_serving_control" in connection.fetchval.call_args.args[0]
     connection.fetchval.return_value = None
     assert await inventory._serving_catalog_observations(connection, "registry") == ()
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_family_cache_is_optional_when_retention_removes_the_table():
-    transactions = []
-
-    @asynccontextmanager
-    async def savepoint():
-        try:
-            yield
-        except UndefinedTableError:
-            transactions.append("rolled back")
-            raise
-
-    descriptor = observed_descriptor(dataset="checkpoint-edition")
-    checkpoint_by_field = {"schema_name": "checkpoint_catalog", "checkpoint_date": date(2026, 11, 17)}
-    connection = SimpleNamespace(
-        fetchrow=AsyncMock(return_value=checkpoint_by_field),
-        fetch=AsyncMock(return_value=[{"descriptor": json.dumps(descriptor)}]),
-        transaction=savepoint,
-    )
-    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((descriptor,), "2026-11-17")
-    selection = connection.fetchrow.call_args.args[0]
+async def test_checkpoint_catalog_date_recovers_serving_predecessor_date():
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=date(2026, 11, 17)))
+    assert await inventory._checkpoint_catalog_date(connection, "registry") == "2026-11-17"
+    selection = connection.fetchval.call_args.args[0]
     assert "published_at IS NULL" in selection and "accounting_json ? 'registry_fhir_catalog_source'" in selection
     assert "s.generation_id IS NOT DISTINCT FROM c.network_generation" in selection
-    checkpoint_by_field["checkpoint_date"] = None
-    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((descriptor,), None)
-
-    connection.fetch.side_effect = UndefinedTableError("test checkpoint was removed")
-    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((), None)
-    assert transactions == ["rolled back"]
-    connection.fetchrow.return_value = None
-    assert await inventory._checkpoint_catalog_observations(connection, "registry") == ((), None)
-
-
-@pytest.mark.asyncio
-async def test_known_families_replace_scans_of_unchanged_datasets(monkeypatch):
-    from process import registry_fhir_catalog_observed_source as observed
-
-    scan = AsyncMock(return_value={"scanned": True})
-    monkeypatch.setattr(observed, "_facts", scan)
-    dataset = ("dataset", "a" * 64)
-    tables_by_kind = {"resource": {"schema": "sample", "name": "resource"}}
-    facts_by_family = {"InsurancePlan": {"rows": 1}}
-    key = observed.fhir_catalog_family_key(dataset, tables_by_kind, "uri")
-    with observed.known_fhir_catalog_families({key: facts_by_family}):
-        reused = await observed._observed_families(object(), object(), dataset, tables_by_kind, "uri")
-        for updated_dataset, updated_tables, uri in (
-            (("dataset", "b" * 64), tables_by_kind, "uri"),
-            (dataset, {"resource": {"schema": "other", "name": "resource"}}, "uri"),
-            (dataset, tables_by_kind, "changed-uri"),
-        ):
-            assert await observed._observed_families(object(), object(), updated_dataset, updated_tables, uri) == {
-                "scanned": True
-            }
-        assert scan.await_count == 3
-    assert reused == facts_by_family and reused is not facts_by_family
-    assert await observed._observed_families(object(), object(), dataset, tables_by_kind, "uri") == {"scanned": True}
-
-
-@pytest.mark.asyncio
-async def test_retained_published_catalog_observations_reuse_older_facts_and_skip_removed_schemas():
-    transactions = []
-
-    @asynccontextmanager
-    async def savepoint():
-        try:
-            yield
-        except UndefinedTableError:
-            transactions.append("rolled back")
-            raise
-
-    retained = observed_descriptor(dataset="retained-edition")
-
-    async def fetch(sql, *_args):
-        if "registry_fhir_catalog_snapshot" in sql:
-            return [{"schema_name": "removed_catalog"}, {"schema_name": "retained_catalog"}]
-        if '"removed_catalog"' in sql:
-            raise UndefinedTableError("retained snapshot removed")
-        assert '"retained_catalog"' in sql
-        return [{"descriptor": json.dumps(retained)}]
-
-    connection = SimpleNamespace(fetch=AsyncMock(side_effect=fetch), transaction=savepoint)
-    assert await inventory._retained_published_catalog_observations(connection, "registry") == (retained,)
-    selection = connection.fetch.call_args_list[0].args[0]
-    assert "c.published_at IS NOT NULL AND s.id IS NULL" in selection
-    assert transactions == ["rolled back"]
+    connection.fetchval.return_value = None
+    assert await inventory._checkpoint_catalog_date(connection, "registry") is None
 
 
 @pytest.mark.asyncio

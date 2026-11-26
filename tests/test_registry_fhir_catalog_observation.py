@@ -1,39 +1,33 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Observation digests bind actual normalized bytes without inventing old proofs."""
+"""Observation receipts bind logical publication counts without inventing old proofs."""
 
 import hashlib
 from copy import deepcopy
 
 import pytest
 
-from process.registry_fhir_catalog_extraction import MAX_BYTES, RESOURCE_TYPES, fhir_catalog_json_bytes
+from process.registry_fhir_catalog_extraction import RESOURCE_TYPES, fhir_catalog_json_bytes
 from process.registry_fhir_catalog_observation import (
     CATALOG_OBSERVATION_CONTRACT,
-    FHIRCatalogObservationDigests,
     FHIRCatalogObservationError,
     catalog_observation_descriptor_digest,
     validate_catalog_observation_receipt,
 )
 
 
-def _row(resource_type="Organization", resource_id="example", **changes):
+def _families(counts=None, *, with_sha256=False):
+    counts_by_type = counts or {}
     return {
-        "resource_type": resource_type,
-        "resource_id": resource_id,
-        "payload_hash": "a" * 64,
-        "payload_json": {"name": "Example", "nested": {"active": True, "aliases": [None, "Example"]}},
-        **changes,
+        resource_type: (
+            {"rows": counts_by_type.get(resource_type, 0), "sha256": "a" * 64}
+            if with_sha256
+            else {"rows": counts_by_type.get(resource_type, 0)}
+        )
+        for resource_type in RESOURCE_TYPES
     }
 
 
-def _families(rows=()):
-    digests = FHIRCatalogObservationDigests()
-    for row in rows:
-        digests.add(row)
-    return digests.document()
-
-
-def _receipt():
+def _receipt(*, with_sha256=False):
     return {
         "version": 1,
         "kind": "catalog_observation",
@@ -44,112 +38,23 @@ def _receipt():
             "resource_hash_contract": "historical-hash-v1",
             "claimed_resource_count": 75,
         },
-        "families": _families([_row()]),
+        "families": _families({"Organization": 1}, with_sha256=with_sha256),
     }
 
 
-def test_family_hashes_match_framed_canonical_rows_including_empty_families():
-    rows = [_row("Organization", "A"), _row("Organization", "a")]
-    observed = _families(rows)
-    for resource_type in RESOURCE_TYPES:
-        framed = fhir_catalog_json_bytes({"contract": CATALOG_OBSERVATION_CONTRACT, "resource_type": resource_type})
-        selected_rows = [row for row in rows if row["resource_type"] == resource_type]
-        expected = framed + b"\n" + b"".join(fhir_catalog_json_bytes(row) + b"\n" for row in selected_rows)
-        assert observed[resource_type] == {"rows": len(selected_rows), "sha256": hashlib.sha256(expected).hexdigest()}
-
-
-@pytest.mark.parametrize("chunk_size", [1, 3, 8])
-def test_page_boundaries_and_repeated_documents_do_not_change_identity(chunk_size):
-    rows = [_row(resource_type, resource_id) for resource_type in RESOURCE_TYPES for resource_id in ("A", "a")]
-    expected = _families(rows)
-    digests = FHIRCatalogObservationDigests()
-    for offset in range(0, len(rows), chunk_size):
-        for row in rows[offset : offset + chunk_size]:
-            digests.add(dict(reversed(tuple(row.items()))))
-        checkpoint = digests.document()
-        assert checkpoint == digests.document()
-        checkpoint["Organization"]["rows"] = -1
-    assert digests.document() == expected
-    assert _families(deepcopy(rows)) == expected
-
-
-@pytest.mark.parametrize("resource_type", RESOURCE_TYPES)
-def test_each_family_binds_actual_payload_even_when_historical_hash_is_unchanged(resource_type):
-    rows = [_row(family) for family in RESOURCE_TYPES]
-    baseline = _families(rows)
-    changed = deepcopy(rows)
-    selected = next(row for row in changed if row["resource_type"] == resource_type)
-    selected["payload_json"]["unconsumed_normalized_field"] = "changed"
-    assert selected["payload_hash"] == rows[0]["payload_hash"]
-    observed = _families(changed)
-    assert [family for family in RESOURCE_TYPES if observed[family] != baseline[family]] == [resource_type]
-    selected["payload_json"].pop("unconsumed_normalized_field")
-    selected["payload_hash"] = "d" * 64
-    assert _families(changed)[resource_type] != baseline[resource_type]
-
-
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"extra": None},
-        {"resource_type": "Practitioner"},
-        {"resource_type": None},
-        {"resource_id": "bad/id"},
-        {"resource_id": ""},
-        {"resource_id": "x" * 257},
-        {"resource_id": 1},
-        {"payload_hash": "A" * 64},
-        {"payload_hash": "a" * 63},
-        {"payload_json": []},
-        {"payload_json": {"value": float("nan")}},
-        {"payload_json": {"value": float("inf")}},
-        {"payload_json": {"value": float("-inf")}},
-        {"payload_json": {"value": (1, 2)}},
-        {"payload_json": {1: "non-JSON key"}},
-        {"payload_json": {"value": b"bytes"}},
-        {"payload_json": {"value": "\ud800"}},
-    ],
-)
-def test_malformed_rows_are_rejected_without_advancing_the_stream(changes):
-    digests = FHIRCatalogObservationDigests()
-    before = digests.document()
+def test_receipt_accepts_count_only_and_legacy_families():
+    count_only = _receipt()
+    legacy = _receipt(with_sha256=True)
+    assert validate_catalog_observation_receipt(count_only) == count_only
+    assert validate_catalog_observation_receipt(legacy) == legacy
+    mixed = _receipt(with_sha256=True)
+    del mixed["families"]["Organization"]["sha256"]
     with pytest.raises(FHIRCatalogObservationError):
-        digests.add(_row(**changes))
-    assert digests.document() == before
-    digests.add(_row())
-    assert digests.document() == _families([_row()])
-
-
-@pytest.mark.parametrize("row", [None, {}, {"resource_type": "Organization"}])
-def test_missing_row_fields_are_rejected(row):
+        validate_catalog_observation_receipt(mixed)
+    bad_digest = _receipt(with_sha256=True)
+    bad_digest["families"]["Organization"]["sha256"] = "invalid"
     with pytest.raises(FHIRCatalogObservationError):
-        FHIRCatalogObservationDigests().add(row)
-
-
-@pytest.mark.parametrize(
-    "rows",
-    [
-        [_row(), _row()],
-        [_row("Organization", "a"), _row("Organization", "A")],
-        [_row("Organization"), _row("InsurancePlan")],
-    ],
-)
-def test_duplicates_and_out_of_order_rows_cannot_be_hashed(rows):
-    digests = FHIRCatalogObservationDigests()
-    digests.add(rows[0])
-    before = digests.document()
-    with pytest.raises(FHIRCatalogObservationError, match="order_invalid"):
-        digests.add(rows[1])
-    assert digests.document() == before
-
-
-def test_row_bound_applies_to_canonical_utf8_bytes():
-    prefix = _row(payload_json={"value": ""})
-    budget = MAX_BYTES - len(fhir_catalog_json_bytes(prefix))
-    accepted = _row(payload_json={"value": "x" * budget})
-    assert _families([accepted])["Organization"]["rows"] == 1
-    with pytest.raises(FHIRCatalogObservationError, match="bounds_invalid"):
-        _families([_row(payload_json={"value": "x" * (budget + 1)})])
+        validate_catalog_observation_receipt(bad_digest)
 
 
 @pytest.mark.parametrize(
@@ -192,10 +97,9 @@ def test_missing_historical_proofs_remain_missing_independently(missing_field):
         (("families", "Organization", "rows"), 1.0),
         (("families", "Organization", "rows"), -1),
         (("families", "Organization", "rows"), 2**63),
-        (("families", "Organization", "sha256"), "invalid"),
     ],
 )
-def test_receipt_rejects_invalid_provenance_counts_and_family_digests(path, value):
+def test_receipt_rejects_invalid_provenance_and_family_counts(path, value):
     receipt = _receipt()
     target = receipt
     for field in path[:-1]:

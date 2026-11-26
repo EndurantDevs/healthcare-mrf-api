@@ -222,7 +222,7 @@ def _delta_catalog_observation_args(tmp_path):
         DeltaObservedSourceScope,
         _receipt_for_capture,
     )
-    from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+    from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
     from tests.test_registry_fhir_catalog_sources import descriptor, published_row, read_profile
 
     database = _capture(tmp_path)
@@ -235,9 +235,7 @@ def _delta_catalog_observation_args(tmp_path):
     ) as capture:
         coverage_by_field = _receipt_for_capture(capture, scope)
         family_counts = capture.resource_counts
-    families_by_name = FHIRCatalogObservationDigests().document()
-    for family in families_by_name:
-        families_by_name[family]["rows"] = family_counts.get(family, 0)
+    families_by_name = {family: {"rows": family_counts.get(family, 0)} for family in RESOURCE_TYPES}
     header_by_field = published_row(
         resource_count=sum(family_counts.values()),
         endpoint_id=DELTA_OBSERVED_ENDPOINT_ID,

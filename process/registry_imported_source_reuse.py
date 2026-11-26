@@ -100,6 +100,23 @@ def has_imported_capture_policy_date(capture):
     return capture["capture_id"] == str(expected)
 
 
+def compatible_source_edition(descriptor):
+    """Normalize logical edition identity across legacy per-family digests and count-only observations."""
+    logical_by_field = source_edition(descriptor)
+    admission = logical_by_field.get("admission")
+    if type(admission) is dict and admission.get("kind") == "catalog_observation":
+        logical_by_field = {
+            **logical_by_field,
+            "admission": {
+                **admission,
+                "families": {family: {"rows": counts["rows"]} for family, counts in admission["families"].items()},
+            },
+        }
+        logical_by_field.pop("accepted_receipt_id", None)
+        logical_by_field.pop("accepted_receipt_sha256", None)
+    return logical_by_field
+
+
 def is_compatible_typed_recipe(recipe, descriptor, observed_date):
     """Reuse only exact data semantics; without a date, a retained capture keeps its own membership date."""
     if type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource:
@@ -108,7 +125,7 @@ def is_compatible_typed_recipe(recipe, descriptor, observed_date):
     graph = pin.capture["graph"]
     membership_as_of = graph["origin"]["semantic_projection_as_of"] or observed_date
     return (
-        source_edition(pin.catalog_descriptor) == source_edition(descriptor)
+        compatible_source_edition(pin.catalog_descriptor) == compatible_source_edition(descriptor)
         and (observed_date is None or graph["membership_as_of"] == membership_as_of)
         and {name: graph.get(name) for name in graph_policy(descriptor["coordinates"]["source_id"])}
         == graph_policy(descriptor["coordinates"]["source_id"])

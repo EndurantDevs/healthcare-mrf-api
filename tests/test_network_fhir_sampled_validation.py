@@ -87,7 +87,7 @@ def _graph():
 
 
 def _capture(graph):
-    from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+    from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
     from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
     from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 
@@ -107,7 +107,7 @@ def _capture(graph):
         header_by_field,
         {"header": origin.header_relation, "resource": origin.resource_relation},
         (origin.source_uri, list(origin.source_aliases)),
-        FHIRCatalogObservationDigests().document(),
+        {kind: {"rows": 0} for kind in RESOURCE_TYPES},
     )
     capture_id = str(UUID(int=1))
     schema = capture.PREFIX + UUID(capture_id).hex
