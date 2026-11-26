@@ -111,9 +111,13 @@ def test_imported_geo_builder_dedupes_before_ordering_and_uses_typed_binds(direc
     assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
     assert page_sql.index("LEFT JOIN custom_import_provider_relation AS imported") < page_sql.index("LIMIT")
     assert "ROW_NUMBER() OVER" in page_sql
+    assert ") AS page_rows" in page_sql
+    assert page_sql.index("ROW_NUMBER() OVER") < page_sql.index("LIMIT :__custom_import_geo_page_limit")
     assert f"selected_geo.sort_0 {direction.upper()} NULLS LAST" in page_sql
+    assert f"page_rows.sort_0 {direction.upper()} NULLS LAST" in page_sql
     assert "(selected_geo._custom_import_entity_value IS NULL) ASC" in page_sql
     assert "cursor_distance_meters ASC, selected_geo.npi_code ASC, selected_geo.address_key ASC" in page_sql
+    assert "\neligible_geo AS MATERIALIZED" not in page_sql
     assert "candidate_limit" not in page_sql
     assert "LIMIT" not in count_sql
     assert "a.*, d.*" not in count_sql and "ST_Distance(" not in count_sql
@@ -149,19 +153,21 @@ def test_required_linked_geo_preserves_projected_entity_filter_when_composing_me
 
 
 @pytest.mark.parametrize("direction", ("asc", "desc"))
-def test_imported_geo_filter_uses_one_correlated_membership_predicate(direction):
+def test_imported_geo_required_order_uses_one_guarded_full_join(direction):
     statements = _statements(direction=direction, require_match=True)
     count_sql = str(statements.count)
     page_sql = str(statements.page)
-    membership = "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported"
+    guarded_join = "FULL JOIN custom_import_provider_relation AS imported"
 
-    assert count_sql.count(membership) == 1
-    assert page_sql.count(membership) == 1
-    assert "WHERE imported.entity_value = native_eligible_geo.npi_code::text" in page_sql
-    native_eligibility = page_sql.split("custom_import_provider_relation AS", 1)[0]
-    assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" not in native_eligibility
+    assert count_sql.count(guarded_join) == 1
+    assert page_sql.count(guarded_join) == 1
+    assert "OFFSET 0" in page_sql and "OFFSET 0" in count_sql
+    assert "WHERE joined.npi_code IS NOT NULL\n       AND joined._custom_import_entity_value IS NOT NULL" in page_sql
+    assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" not in page_sql
+    assert "LEFT JOIN custom_import_provider_relation AS imported" not in page_sql
+    assert "\neligible_geo AS MATERIALIZED" not in page_sql
+    native_eligibility = page_sql.split("custom_import_provider_relation AS MATERIALIZED (", 1)[0]
     assert "LIMIT" not in native_eligibility
-    assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
 
 
 def test_imported_geo_without_order_keeps_membership_as_a_subplan():
@@ -212,7 +218,16 @@ def test_imported_geo_optional_order_keeps_unmatched_native_providers(direction,
     expected_cte = "AS MATERIALIZED (" if has_native_scope else "AS ("
     assert f"custom_import_provider_relation {expected_cte}" in page_sql
     assert "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported" not in page_sql
-    assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
+    assert "\neligible_geo AS MATERIALIZED" not in page_sql
+    if has_native_scope:
+        assert "FULL JOIN custom_import_provider_relation AS imported" in page_sql
+        assert "OFFSET 0" in page_sql
+        assert "WHERE joined.npi_code IS NOT NULL" in page_sql
+        assert "joined._custom_import_entity_value IS NOT NULL" not in page_sql
+        assert "LEFT JOIN custom_import_provider_relation AS imported" not in page_sql
+    else:
+        assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
+        assert "FULL JOIN custom_import_provider_relation AS imported" not in page_sql
     assert "WHERE imported.entity_value IS NOT NULL" not in page_sql
 
 
@@ -1092,3 +1107,150 @@ async def test_postgres_imported_geo_hydrates_mixed_sort_fields_across_null_curs
             geo_row._mapping["_geo_total"] == 4 and geo_row._mapping["_geo_anchor_count"] == 1
             for geo_row in second_rows
         )
+
+
+def _iter_plan_nodes(node: Mapping[str, Any]):
+    yield node
+    for child in node.get("Plans") or ():
+        yield from _iter_plan_nodes(child)
+
+
+async def _seed_bulk_boolean_geo_fixture(session) -> None:
+    await _seed_geo_tables(session, address_table_sql="mrf.entity_address_unified")
+    await session.execute(
+        text("INSERT INTO mrf.npi (npi) SELECT 1000001000 + ordinal FROM generate_series(1, 240) AS ordinal")
+    )
+    await session.execute(
+        text(
+            "INSERT INTO mrf.entity_address_unified "
+            "(npi, type, checksum, lat, long, address_key, first_line, telephone_number, location_key, address_sources) "
+            "SELECT 1000001000 + ordinal, 'primary', 1000 + ordinal, "
+            "       (ordinal::double precision) * 0.0001, 0, "
+            "       CAST('00000000-0000-0000-0000-' || lpad(ordinal::text, 12, '0') AS uuid), "
+            "       format('%s primary Example Street', ordinal), '555-0100', "
+            "       format('bulk-location-%s', ordinal), ARRAY['synthetic'] "
+            "  FROM generate_series(1, 240) AS ordinal"
+        )
+    )
+    await session.execute(text("CREATE TABLE mrf.fixture_import_flags (entity_value text, flag boolean)"))
+    await session.execute(
+        text(
+            "INSERT INTO mrf.fixture_import_flags (entity_value, flag) "
+            "SELECT (1000001000 + ordinal)::text, "
+            "       CASE WHEN ordinal <= 40 THEN TRUE WHEN ordinal <= 100 THEN FALSE ELSE NULL END "
+            "  FROM generate_series(1, 120) AS ordinal "
+            "UNION ALL "
+            "SELECT (1000009000 + ordinal)::text, TRUE FROM generate_series(1, 20) AS ordinal "
+            "UNION ALL SELECT NULL, TRUE"
+        )
+    )
+    await session.execute(text("ANALYZE mrf.npi"))
+    await session.execute(text("ANALYZE mrf.entity_address_unified"))
+    await session.execute(text("ANALYZE mrf.fixture_import_flags"))
+
+
+def _boolean_flag_import_context(*, direction: str | None, require_match: bool) -> ProviderImportQuery:
+    from sqlalchemy import table
+
+    flags = table("fixture_import_flags", column("entity_value", String), column("flag", Boolean), schema="mrf")
+    if direction is None:
+        relation = select(flags.c.entity_value.label("entity_value")).where(flags.c.flag.is_(True))
+        order_terms: tuple[ReadOrderTerm, ...] = ()
+    else:
+        relation = select(flags.c.entity_value.label("entity_value"), flags.c.flag.label("sort_0"))
+        order_terms = (ReadOrderTerm("synthetic_flag", direction, "last"),)
+    prepared = PreparedNpiEntityRelation(relation, order_terms, "a" * 64, "b" * 64)
+    return ProviderImportQuery(prepared, compile_npi_entity_relation(relation), require_match, has_native_scope=True)
+
+
+async def _explain_and_fetch_page(session, statements: geo_sql.ImportedGeoStatements):
+    explain_sql = text(f"EXPLAIN (ANALYZE, FORMAT JSON) {statements.page.text}").bindparams(
+        *statements.page._bindparams.values()
+    )
+    plan_json = (await session.execute(explain_sql, statements.parameters)).scalar_one()
+    plan_nodes = list(_iter_plan_nodes(plan_json[0]["Plan"]))
+    rows = (await session.execute(statements.page, statements.parameters)).all()
+    return plan_nodes, rows
+
+
+def _assert_guarded_join_and_heapsort(plan_nodes: list[Mapping[str, Any]], *, expect_full_join: bool) -> None:
+    if expect_full_join:
+        full_joins = [
+            node
+            for node in plan_nodes
+            if node.get("Node Type") in {"Hash Join", "Merge Join"} and node.get("Join Type") == "Full"
+        ]
+        nested_import_loops = [
+            node
+            for node in plan_nodes
+            if node.get("Node Type") == "Nested Loop"
+            and any(child.get("CTE Name") == "custom_import_provider_relation" for child in _iter_plan_nodes(node))
+        ]
+        assert full_joins and not nested_import_loops
+    heapsorts = [
+        node for node in plan_nodes if node.get("Node Type") == "Sort" and node.get("Sort Method") == "top-N heapsort"
+    ]
+    assert heapsorts
+
+
+@pytest.mark.asyncio
+async def test_postgres_geo_plan_uses_guarded_full_join_and_top_n_heapsort():
+    """Required and scoped optional ordered geo queries avoid Nested Loop joins and full quicksorts."""
+    async with transaction_session() as session:
+        try:
+            await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        except DBAPIError:
+            pytest.skip("PostGIS is unavailable for the native geo execution proof")
+        await _seed_bulk_boolean_geo_fixture(session)
+        geo_query = replace(_imported_geo_query(address_table_sql="mrf.entity_address_unified"), limit=5)
+
+        req_plan, req_rows = await _explain_and_fetch_page(
+            session,
+            geo_sql.build_imported_geo_statements(
+                _boolean_flag_import_context(direction="desc", require_match=True), geo_query
+            ),
+        )
+        opt_plan, opt_rows = await _explain_and_fetch_page(
+            session,
+            geo_sql.build_imported_geo_statements(
+                _boolean_flag_import_context(direction="desc", require_match=False), geo_query
+            ),
+        )
+        flt_plan, flt_rows = await _explain_and_fetch_page(
+            session,
+            geo_sql.build_imported_geo_statements(
+                _boolean_flag_import_context(direction=None, require_match=True), geo_query
+            ),
+        )
+
+        _assert_guarded_join_and_heapsort(req_plan, expect_full_join=True)
+        _assert_guarded_join_and_heapsort(opt_plan, expect_full_join=True)
+        _assert_guarded_join_and_heapsort(flt_plan, expect_full_join=False)
+
+        expected_top_npis = [1000001001, 1000001002, 1000001003, 1000001004, 1000001005]
+        assert [geo_row._mapping["npi_code"] for geo_row in req_rows[:5]] == expected_top_npis
+        assert [geo_row._mapping["npi_code"] for geo_row in opt_rows[:5]] == expected_top_npis
+        assert [geo_row._mapping["npi_code"] for geo_row in flt_rows[:5]] == expected_top_npis
+        assert all(geo_row._mapping["sort_0"] is True for geo_row in req_rows[:5])
+        assert (
+            req_rows[0]._mapping["_geo_total"],
+            opt_rows[0]._mapping["_geo_total"],
+            flt_rows[0]._mapping["_geo_total"],
+        ) == (120, 246, 40)
+
+        page2 = geo_sql.build_imported_geo_statements(
+            _boolean_flag_import_context(direction="desc", require_match=True),
+            replace(
+                geo_query,
+                cursor_anchor=(str(req_rows[4]._mapping["npi_code"]), str(req_rows[4]._mapping["address_key"])),
+            ),
+        )
+        page2_rows = (await session.execute(page2.page, page2.parameters)).all()
+        assert [geo_row._mapping["npi_code"] for geo_row in page2_rows[:5]] == [
+            1000001006,
+            1000001007,
+            1000001008,
+            1000001009,
+            1000001010,
+        ]
+        assert page2_rows[0]._mapping["_geo_total"] == 120 and page2_rows[0]._mapping["_geo_anchor_count"] == 1

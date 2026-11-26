@@ -225,10 +225,15 @@ def test_imported_search_keeps_eligible_scope_before_score_filter_and_order(monk
         unordered_membership = (
             "native_eligible_geo.npi_code::text IN (SELECT entity_value FROM custom_import_provider_relation)) IS TRUE"
         )
-        ranked_membership = "WHERE imported.entity_value = native_eligible_geo.npi_code::text"
+        guarded_full_join = "FULL JOIN custom_import_provider_relation AS imported"
+        required_match_filter = "AND joined._custom_import_entity_value IS NOT NULL"
         assert (unordered_membership in sql) is (required and direction is None)
-        assert (ranked_membership in sql) is (required and direction is not None)
-        assert ("LEFT JOIN custom_import_provider_relation AS imported" in sql) is (direction is not None)
+        assert (guarded_full_join in sql) is (required and direction is not None)
+        assert (required_match_filter in sql) is (required and direction is not None)
+        assert ("LEFT JOIN custom_import_provider_relation AS imported" in sql) is (
+            not required and direction is not None
+        )
+        assert "\neligible_geo AS MATERIALIZED" not in sql
 
 
 def test_search_binding_is_idempotent_and_cannot_be_replaced_or_cleared():

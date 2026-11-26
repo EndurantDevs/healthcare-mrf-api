@@ -222,3 +222,29 @@ def test_compiler_preserves_orm_aliased_subquery_identities_and_values_binds():
     assert relation.sql.count("AS block_family_identity") == 1
     assert relation.sql.count("AS block_root_identity") == 1
     assert {1001, 1002, 1003, 7} <= set(relation.values.values())
+
+
+def test_compiler_renders_native_scope_as_array_subquery_saop():
+    """SQL scopes compile to = ANY (ARRAY(SELECT ...)) while preserving nested binds and expanding lists."""
+    from types import SimpleNamespace
+
+    from sqlalchemy import BigInteger, column, values
+
+    from process.custom_import import read_core
+
+    scope_values = values(column("npi", BigInteger), name="native_npis").data([(1000000001,), (1000000002,)])
+    entity_scope = read_core._native_entity_values(select(scope_values.c.npi), ("1000000001", "1000000002"))
+    entity_model = SimpleNamespace(canonical_value=_SAMPLE.c.code)
+    context = SimpleNamespace(family_block_binding=object())
+    predicate = read_core._canonical_entity_value_in(context, entity_model, entity_scope)
+
+    relation = compile_npi_entity_relation(select(_SAMPLE.c.id).where(predicate))
+
+    assert "= ANY (ARRAY(SELECT CAST(native_score_entities.npi AS VARCHAR) AS entity_value" in relation.sql
+    assert 'COLLATE "C"' in relation.sql
+    assert {1000000001, 1000000002, "1000000001", "1000000002"} == set(relation.values.values())
+
+    tuple_predicate = read_core._canonical_entity_value_in(context, entity_model, ("1000000001",))
+    tuple_relation = compile_npi_entity_relation(select(_SAMPLE.c.id).where(tuple_predicate))
+    assert "IN (:__custom_import_0_1)" in tuple_relation.sql
+    assert "= ANY (ARRAY(" not in tuple_relation.sql

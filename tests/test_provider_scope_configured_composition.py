@@ -90,7 +90,9 @@ def test_configured_geo_keeps_typed_membership_scope_before_total_rank_and_curso
     assert "a.location_key AS _geo_address_location_key" in page
     assert "a.location_key = page_geo._geo_address_location_key" in page
     assert "_geo_address_checksum" not in page and "_geo_address_type" not in page
-    assert "EXISTS (SELECT 1 FROM custom_import_provider_relation" in page
+    assert "FULL JOIN custom_import_provider_relation AS imported" in page
+    assert "OFFSET 0" in page
+    assert "AND joined._custom_import_entity_value IS NOT NULL" in page
     assert "AS _geo_total" in page and "AS _geo_anchor_count" in page
 
 
