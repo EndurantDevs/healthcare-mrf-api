@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from process import network_compact_validation as compact_validation
 from process.network_compact_dependencies import compact_slice_ref_digest
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
 from process.network_compact_readiness import NetworkCompactReadinessError, compact_index_digest
@@ -331,3 +332,109 @@ async def test_independent_work_checks_empty_reference_domain(slice_db):
     )
     with pytest.raises(NetworkCompactReadinessError):
         await verify_work_refs(db.connection, target, work)
+
+
+def test_validation_chunks_partition_entire_network_domain(monkeypatch):
+    """Bounded network ranges and mega-network bucket slices partition all IDs without overlap."""
+    monkeypatch.setattr(compact_validation, "_VALIDATION_CHUNK_ROWS", 10)
+    monkeypatch.setattr(compact_validation, "_VALIDATION_MEGA_NETWORK_ROWS", 20)
+    assert compact_validation._validation_chunks([]) == [(None, None, None)]
+    chunks = compact_validation._validation_chunks([(1, 6), (2, 6), (5, 40), (6, 25), (10, 4)])
+    normal_chunks = [(lo, hi) for lo, hi, bucket in chunks if bucket is None]
+    buckets_by_mega_id = {}
+    for lo, hi, bucket in chunks:
+        if bucket is not None:
+            assert lo == hi
+            buckets_by_mega_id.setdefault(lo, []).append(bucket)
+    assert normal_chunks == [(None, 1), (1, 2), (2, 4), (6, None)]
+    for mega_id in (5, 6):
+        covered_buckets = set()
+        first_flags = []
+        for start, end, is_first in buckets_by_mega_id[mega_id]:
+            assert start <= end
+            first_flags.append(is_first)
+            covered_buckets.update(range(start, end + 1))
+        assert covered_buckets == set(range(64)) and first_flags == [True] + [False] * (len(first_flags) - 1)
+
+
+async def _apply_chunked_corruption(db, namespace, selected, corruption, expected_rows):
+    """Apply one compact-slice or membership mutation for chunked validation tests."""
+    edge_table = namespace + ".network_office_edge"
+    ref_table = namespace + ".network_slice_ref"
+    statement_by_corruption = {
+        "missing": (f"DELETE FROM {edge_table} WHERE slice_id=$1", (selected["slice_id"],)),
+        "extra": (f"INSERT INTO {edge_table} VALUES($1,'extra-office')", (selected["slice_id"],)),
+        "wrong-network": (f"UPDATE {ref_table} SET network_id=43 WHERE network_id=88", ()),
+        "same-count": (
+            f"UPDATE {edge_table} SET location_key='wrong-office' WHERE slice_id=$1",
+            (selected["slice_id"],),
+        ),
+        "unbound-alias": (
+            f"DELETE FROM {namespace}.provider_location_binding WHERE location_id=$1",
+            (db.location_ids[1],),
+        ),
+    }
+    if corruption in statement_by_corruption:
+        statement, arguments = statement_by_corruption[corruption]
+        await db.connection.execute(statement, *arguments)
+        return expected_rows
+    if corruption == "wrong-bucket":
+        wrong_bucket = (selected["office_bucket"] + 1) % 64
+        await db.connection.execute(f"DELETE FROM {ref_table} WHERE network_id=42 AND office_bucket=$1", wrong_bucket)
+        await db.connection.execute(
+            f"UPDATE {ref_table} SET office_bucket=$1 WHERE network_id=42 AND office_bucket=$2",
+            wrong_bucket,
+            selected["office_bucket"],
+        )
+        return expected_rows
+    membership_by_corruption = {"extra-high-network": (500, "extra-ev"), "nonpositive-network": (0, "zero-ev")}
+    if corruption in membership_by_corruption:
+        network_id, evidence_id = membership_by_corruption[corruption]
+        await db.connection.execute(
+            f"INSERT INTO {namespace}.network_membership VALUES($1,'npi','1000000004',$2,$3)",
+            network_id,
+            db.location_ids[0],
+            evidence_id,
+        )
+        return expected_rows + 1
+    return expected_rows + int(corruption == "wrong-expected-rows")
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        None,
+        "missing",
+        "extra",
+        "wrong-bucket",
+        "wrong-network",
+        "same-count",
+        "unbound-alias",
+        "wrong-expected-rows",
+        "extra-high-network",
+        "nonpositive-network",
+    ],
+)
+async def test_chunked_typed_compact_validation_handles_mega_networks_and_corruptions(
+    slice_db, monkeypatch, corruption
+):
+    """Chunked order-indexed validation accepts valid mega-networks and rejects every corruption."""
+    db = slice_db
+    monkeypatch.setattr(compact_validation, "_VALIDATION_CHUNK_ROWS", 2)
+    monkeypatch.setattr(compact_validation, "_VALIDATION_MEGA_NETWORK_ROWS", 3)
+    pairs = [(7, 0), (42, 0), (42, 1), (42, 2), (42, 3), (88, 2), (99, 3)]
+    copy_target = await _candidate(db, pairs)
+    namespace = '"' + copy_target.schema_name + '"'
+    await db.connection.execute(
+        f"CREATE INDEX typed_effective_membership_order_idx ON {namespace}.network_membership({ORDER})"
+    )
+    async with db.connection.transaction():
+        receipt = await _prepare(db, copy_target)
+        layout = await _layout(db, copy_target, receipt)
+        await verify_compact_slice_contents(db.connection, copy_target, layout)
+    selected = await db.connection.fetchrow(
+        f"SELECT slice_id,office_bucket FROM {namespace}.network_slice_ref WHERE network_id=42 ORDER BY office_bucket LIMIT 1"
+    )
+    expected_rows = await _apply_chunked_corruption(db, namespace, selected, corruption, len(pairs))
+    async with db.connection.transaction(isolation="repeatable_read", readonly=True):
+        assert await _typed_memberships_match(db.connection, namespace, layout, expected_rows) is (corruption is None)

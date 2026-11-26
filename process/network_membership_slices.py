@@ -194,7 +194,6 @@ async def _create_slice_relations(connection, candidate_schema, *, typed=False, 
         await connection.execute(
             f'CREATE INDEX network_office_edge_c_order_idx ON {candidate_schema}.network_office_edge(slice_id,location_key COLLATE "C")'
         )
-    if typed:
         await connection.execute(
             f"CREATE INDEX network_slice_ref_slice_lookup_idx ON {candidate_schema}.network_slice_ref(slice_id,artifact_candidate_id) INCLUDE(network_id)"
         )
@@ -269,9 +268,8 @@ async def _copy_changed_edges(connection, copy_target, work_table, *, independen
     if independent:
         status = await connection.execute(
             f"INSERT INTO {schema}.network_office_edge (slice_id,location_key) "
-            f"SELECT r.slice_id,f.location_key FROM {ref_table} r CROSS JOIN LATERAL ("
-            f"SELECT f.location_key FROM {work_table} f WHERE "
-            "(f.network_id,f.office_bucket)=(r.network_id,r.office_bucket) OFFSET 0) f "
+            f"SELECT r.slice_id,f.location_key FROM {ref_table} r "
+            f"JOIN {work_table} f ON (f.network_id,f.office_bucket)=(r.network_id,r.office_bucket) "
             "WHERE r.artifact_candidate_id=$1",
             UUID(copy_target.candidate_id),
         )
@@ -341,9 +339,9 @@ async def _finish_slice_relations(connection, copy_target, work_table, *, typed=
         await connection.execute(
             f"CREATE INDEX network_office_edge_location_idx ON {schema}.network_office_edge(location_key,slice_id)"
         )
-    if not typed:
+    if independent or not typed:
         await connection.execute(
-            f"CREATE INDEX network_slice_ref_slice_lookup_idx ON {schema}.network_slice_ref "
+            f"CREATE INDEX IF NOT EXISTS network_slice_ref_slice_lookup_idx ON {schema}.network_slice_ref "
             "(slice_id,artifact_candidate_id) INCLUDE(network_id)"
         )
     await connection.execute(f"ANALYZE {schema}.network_slice_ref")
