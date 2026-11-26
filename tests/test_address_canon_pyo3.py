@@ -1321,10 +1321,13 @@ async def test_actual_native_aca_batch_runs_once_during_loading(monkeypatch):
     )
     monkeypatch.setattr(carry, "_source_documents", AsyncMock(return_value=[]))
     monkeypatch.setattr(carry, "_office_records", AsyncMock(return_value=office_records))
-    canonicalize = Mock(wraps=native.canonicalize_batch)
-    monkeypatch.setattr(native, "canonicalize_batch", canonicalize)
+    is_batch_json = hasattr(native, "canonicalize_batch_json")
+    canonicalize_attr = "canonicalize_batch_json" if is_batch_json else "canonicalize_batch"
+    canonicalize = Mock(wraps=getattr(native, canonicalize_attr))
+    monkeypatch.setattr(native, canonicalize_attr, canonicalize)
     written = await carry._page(connection, _batch(recipe), "target_fixture", writing=True)
-    canonicalize.assert_called_once_with([tuple(raw_address), tuple(raw_address)])
+    canonicalize.assert_called_once()
+    assert canonicalize.call_args.args[0] == [tuple(raw_address), tuple(raw_address)]
     assert connection.fetchrow.await_count == 2
     canonicalize.reset_mock()
     connection.fetchrow.reset_mock()

@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import importlib
+import inspect
 import json
 import re
 from contextlib import asynccontextmanager
@@ -593,6 +594,17 @@ def _require_roots(origin, hash_by_family, counts, root):
     require({kind: value.hexdigest() for kind, value in hash_by_family.items()} == dict(origin.resource_hashes))
 
 
+def _raise_native_encoder_error(error):
+    try:
+        failure_by_field = json.loads(str(error))
+    except ValueError, TypeError:
+        failure_by_field = None
+    code = failure_by_field.get("code") if type(failure_by_field) is dict else None
+    if code in {"input_limit", "output_limit", "row_limit", "collection_limit"}:
+        raise _CopyBatchTooLarge() from None
+    require(False)
+
+
 def _native_payload_encoder(input_bytes):
     """Retry only explicit resource bounds; semantic failures remain terminal."""
     try:
@@ -602,14 +614,45 @@ def _native_payload_encoder(input_bytes):
     try:
         return encoder(input_bytes)
     except ValueError as error:
-        try:
-            failure_by_field = json.loads(str(error))
-        except ValueError, TypeError:
-            failure_by_field = None
-        code = failure_by_field.get("code") if type(failure_by_field) is dict else None
-        if code in {"input_limit", "output_limit", "row_limit", "collection_limit"}:
-            raise _CopyBatchTooLarge() from None
+        _raise_native_encoder_error(error)
+
+
+def _native_rows_encoder(context, native_rows):
+    """Encode pre-extracted rows directly in Rust without outer JSON serialization."""
+    try:
+        encoder = importlib.import_module("ptg2_address_canon").encode_retained_fhir_capture_rows
+    except ImportError, AttributeError:
         require(False)
+    try:
+        return encoder(
+            (
+                context["source_id"],
+                context["release_id"],
+                context["observed_at_pg_micros"],
+                context["hash_contract"],
+                context.get("completion_required_version"),
+                context["resource_types"],
+                context["derive"],
+            ),
+            native_rows,
+        )
+    except ValueError as error:
+        _raise_native_encoder_error(error)
+
+
+_DEFAULT_NATIVE_PAYLOAD_ENCODER = _native_payload_encoder
+
+
+def _has_native_rows_encoder():
+    if _native_payload_encoder is not _DEFAULT_NATIVE_PAYLOAD_ENCODER:
+        return False
+    try:
+        module = importlib.import_module("ptg2_address_canon")
+    except ImportError:
+        return False
+    rows_encoder = getattr(module, "encode_retained_fhir_capture_rows", None)
+    batch_encoder = getattr(module, "encode_retained_fhir_capture_batch", None)
+    return callable(rows_encoder) and (batch_encoder is None or inspect.isbuiltin(batch_encoder))
 
 
 def _validate_reference_rows(resource_rows, origin):
@@ -632,6 +675,7 @@ def _prepare_native_resources(resource_rows, origin, release_id, observed_at, de
     }
     if is_completion_v3_origin(origin):
         context_by_field["completion_required_version"] = origin.completion_required_version
+    use_rows_encoder = _has_native_rows_encoder()
     try:
         return prepare_retained_fhir_batch(
             resource_rows,
@@ -640,6 +684,8 @@ def _prepare_native_resources(resource_rows, origin, release_id, observed_at, de
             reference_validator=lambda rows: _validate_reference_rows(rows, origin),
             reference_records=lambda rows: _derived_records(origin, release_id, rows, observed_at),
             location_id=registry_location_id,
+            rows_encoder=_native_rows_encoder if use_rows_encoder else None,
+            native_location_id=use_rows_encoder,
         )
     except RetainedFhirNativeError as error:
         if str(error) in {"input_limit", "output_limit", "row_limit"}:

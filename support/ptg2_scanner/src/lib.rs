@@ -22,6 +22,7 @@ pub mod custom_import_v2_family;
 pub mod dedupe;
 pub mod entity_address_rows;
 pub mod fhir_network_identity;
+pub mod fhir_witness_page;
 pub mod hashing;
 pub mod hospital_mrf;
 pub mod hospital_price_block;
@@ -134,6 +135,7 @@ mod python_api {
     include!("python_provider_directory_rows.rs");
     include!("python_address_batch.rs");
     include!("python_retained_fhir_capture.rs");
+    include!("python_fhir_witness_page.rs");
 
     #[pyfunction]
     fn encode_network_membership_batch(
@@ -280,6 +282,63 @@ mod python_api {
                     .collect()
             })
         }))
+    }
+
+    #[pyfunction]
+    fn canonicalize_address_keys_batch(
+        py: Python<'_>,
+        rows: Vec<AddressRow>,
+    ) -> PyResult<Vec<(Option<String>, Option<String>)>> {
+        let pool = location_canon_pool()?;
+        Ok(py.detach(|| {
+            pool.install(|| {
+                rows.par_iter()
+                    .map(|row| {
+                        let canonical = canonicalize_address(
+                            row.0.as_deref(),
+                            row.1.as_deref(),
+                            row.2.as_deref(),
+                            row.3.as_deref(),
+                            row.4.as_deref(),
+                            row.5.as_deref(),
+                        );
+                        (canonical.address_key, canonical.identity_key)
+                    })
+                    .collect()
+            })
+        }))
+    }
+
+    #[pyfunction]
+    fn canonicalize_batch_json(
+        py: Python<'_>,
+        rows: Vec<AddressRow>,
+        max_bytes: usize,
+    ) -> PyResult<Py<PyBytes>> {
+        let pool = location_canon_pool()?;
+        let encoded = py.detach(|| {
+            let results: Vec<CanonicalAddress> = pool.install(|| {
+                rows.par_iter()
+                    .map(|row| {
+                        canonicalize_address(
+                            row.0.as_deref(),
+                            row.1.as_deref(),
+                            row.2.as_deref(),
+                            row.3.as_deref(),
+                            row.4.as_deref(),
+                            row.5.as_deref(),
+                        )
+                    })
+                    .collect()
+            });
+            let bytes = serde_json::to_vec(&results)
+                .map_err(|_| PyRuntimeError::new_err("Canonical address JSON encoding failed"))?;
+            if bytes.len() > max_bytes {
+                return Err(PyValueError::new_err("canonical_bound_exceeded"));
+            }
+            Ok::<_, PyErr>(bytes)
+        })?;
+        Ok(PyBytes::new(py, &encoded).unbind())
     }
 
     #[pyfunction]
@@ -696,6 +755,8 @@ mod python_api {
         m.add_function(wrap_pyfunction!(encode_fhir_network_identity_batch, m)?)?;
         m.add_function(wrap_pyfunction!(validate_network_catalog_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(canonicalize_address_keys_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(canonicalize_batch_json, m)?)?;
         m.add_function(wrap_pyfunction!(prepare_address_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_location_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;
@@ -712,6 +773,11 @@ mod python_api {
             m
         )?)?;
         m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_rows, m)?)?;
+        m.add_function(wrap_pyfunction!(validate_fhir_witness_page, m)?)?;
+        m.add_function(wrap_pyfunction!(prepare_typed_fhir_page, m)?)?;
+        m.add_function(wrap_pyfunction!(fold_stored_resource_roots_page, m)?)?;
+        m.add_function(wrap_pyfunction!(compact_json_utf8_len_fits, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         m.add_function(wrap_pyfunction!(intersect_sorted_u32_py, m)?)?;
         m.add_function(wrap_pyfunction!(decode_u32_le_py, m)?)?;

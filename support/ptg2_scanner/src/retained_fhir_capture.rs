@@ -131,10 +131,63 @@ struct Row<'a> {
     site_id: Option<Cow<'a, str>>,
 }
 
+/// Borrowed batch context for direct row-slice encoding without outer JSON serialization.
+pub struct NativeCaptureContext<'a> {
+    pub source_id: &'a str,
+    pub release_id: &'a str,
+    pub observed_at_pg_micros: i64,
+    pub hash_contract: &'a str,
+    pub completion_required_version: Option<u8>,
+    pub resource_types: &'a [String],
+    pub derive: bool,
+}
+
+/// Borrowed row fields for direct row-slice encoding without outer JSON serialization.
+pub struct NativeCaptureRow<'a> {
+    pub resource_type: &'a str,
+    pub resource_id: &'a str,
+    pub payload_hash: &'a str,
+    pub payload_json: &'a str,
+    pub acquired_resource_sha256: Option<&'a str>,
+    pub site_id: Option<&'a str>,
+}
+
 /// The caller must validate every fallback row before consuming roots or publishing COPY.
 /// `derive=false` validates independently without preparing derived tables.
 pub fn encode_retained_fhir_capture_batch(input: &[u8]) -> Result<RetainedFhirCaptureBatch> {
     encode(input, None)
+}
+
+/// Encode pre-extracted rows directly without JSON-serializing the outer batch envelope.
+pub fn encode_retained_fhir_capture_rows(
+    context: &NativeCaptureContext<'_>,
+    rows: &[NativeCaptureRow<'_>],
+) -> Result<RetainedFhirCaptureBatch> {
+    validate_context(context)?;
+    if rows.len() > MAX_ROWS {
+        return Err(failure("row_limit", Some(MAX_ROWS)));
+    }
+    let estimated_input_bytes: usize = context.source_id.len()
+        + context.release_id.len()
+        + rows
+            .iter()
+            .map(|row| {
+                128 + row.resource_type.len()
+                    + row.resource_id.len()
+                    + row.payload_hash.len()
+                    + row.payload_json.len()
+                    + row.acquired_resource_sha256.map_or(4, str::len)
+                    + row.site_id.map_or(4, str::len)
+            })
+            .sum::<usize>();
+    if estimated_input_bytes > MAX_INPUT_BYTES {
+        return Err(failure("input_limit", None));
+    }
+    let mut encoder = Encoder::new(context, None);
+    for row in rows {
+        encoder.encode_row(row)?;
+    }
+    Ok(encoder.finish())
 }
 
 /// Cancellation discards every private output buffer, including completed COPY chunks.
@@ -177,6 +230,33 @@ fn id_bytes(text: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
 }
 
+fn validate_context(context: &NativeCaptureContext<'_>) -> Result<()> {
+    if !exact_text(context.source_id, 64)
+        || !exact_text(context.release_id, 256)
+        || context.resource_types.is_empty()
+        || context.resource_types.len() > 64
+        || context
+            .resource_types
+            .iter()
+            .any(|kind| !exact_text(kind, 64))
+        || context.resource_types.iter().collect::<BTreeSet<_>>().len()
+            != context.resource_types.len()
+        || !matches!(
+            context.hash_contract,
+            "transport_bound_v1"
+                | "transport_neutral_v2"
+                | "semantic_content_v3"
+                | "semantic_content_v4"
+        )
+        || context
+            .completion_required_version
+            .is_some_and(|version| version != 3 || context.hash_contract != "transport_neutral_v2")
+    {
+        return Err(failure("invalid_context", None));
+    }
+    Ok(())
+}
+
 fn encode(bytes: &[u8], flag: Option<&AtomicBool>) -> Result<RetainedFhirCaptureBatch> {
     cancelled(flag, None)?;
     if bytes.len() > MAX_INPUT_BYTES {
@@ -184,58 +264,17 @@ fn encode(bytes: &[u8], flag: Option<&AtomicBool>) -> Result<RetainedFhirCapture
     }
     let input: Input<'_> =
         serde_json::from_slice(bytes).map_err(|_| failure("invalid_input", None))?;
-    if !exact_text(&input.source_id, 64)
-        || !exact_text(&input.release_id, 256)
-        || input.resource_types.is_empty()
-        || input.resource_types.len() > 64
-        || input
-            .resource_types
-            .iter()
-            .any(|kind| !exact_text(kind, 64))
-        || input.resource_types.iter().collect::<BTreeSet<_>>().len() != input.resource_types.len()
-        || !matches!(
-            input.hash_contract.as_ref(),
-            "transport_bound_v1"
-                | "transport_neutral_v2"
-                | "semantic_content_v3"
-                | "semantic_content_v4"
-        )
-        || input
-            .completion_required_version
-            .is_some_and(|version| version != 3 || input.hash_contract != "transport_neutral_v2")
-    {
-        return Err(failure("invalid_context", None));
-    }
-    let mut encoder = Encoder {
-        input: &input,
-        flag,
-        output: RetainedFhirCaptureBatch {
-            binding_batches: Vec::new(),
-            evidence_batches: Vec::new(),
-            plan_batches: Vec::new(),
-            root_bytes: Vec::new(),
-            families: input
-                .resource_types
-                .iter()
-                .map(|kind| {
-                    (
-                        kind.clone(),
-                        RootFamily {
-                            bytes: Vec::new(),
-                            row_count: 0,
-                        },
-                    )
-                })
-                .collect(),
-            row_count: 0,
-            fallback_rows: Vec::new(),
-            owned_output_bytes: 0,
-        },
-        bytes: 0,
-        items: 0,
-        syntax_items: 0,
-        failure: None,
+    let context = NativeCaptureContext {
+        source_id: input.source_id.as_ref(),
+        release_id: input.release_id.as_ref(),
+        observed_at_pg_micros: input.observed_at_pg_micros,
+        hash_contract: input.hash_contract.as_ref(),
+        completion_required_version: input.completion_required_version,
+        resource_types: &input.resource_types,
+        derive: input.derive,
     };
+    validate_context(&context)?;
+    let mut encoder = Encoder::new(&context, flag);
     let mut decoder = serde_json::Deserializer::from_str(input.rows.get());
     if (&mut encoder).deserialize(&mut decoder).is_err() {
         return Err(encoder
@@ -244,21 +283,11 @@ fn encode(bytes: &[u8], flag: Option<&AtomicBool>) -> Result<RetainedFhirCapture
     }
     decoder.end().map_err(|_| failure("invalid_rows", None))?;
     cancelled(flag, None)?;
-    for batches in [
-        &mut encoder.output.binding_batches,
-        &mut encoder.output.evidence_batches,
-        &mut encoder.output.plan_batches,
-    ] {
-        if let Some(last) = batches.last_mut() {
-            last.bytes.extend_from_slice(&(-1i16).to_be_bytes());
-        }
-    }
-    encoder.output.owned_output_bytes = encoder.bytes;
-    Ok(encoder.output)
+    Ok(encoder.finish())
 }
 
-struct Encoder<'a, 'input> {
-    input: &'a Input<'input>,
+struct Encoder<'a> {
+    input: &'a NativeCaptureContext<'a>,
     flag: Option<&'a AtomicBool>,
     output: RetainedFhirCaptureBatch,
     bytes: usize,
@@ -267,7 +296,54 @@ struct Encoder<'a, 'input> {
     failure: Option<RetainedFhirCaptureError>,
 }
 
-impl Encoder<'_, '_> {
+impl<'a> Encoder<'a> {
+    fn new(input: &'a NativeCaptureContext<'a>, flag: Option<&'a AtomicBool>) -> Self {
+        Self {
+            input,
+            flag,
+            output: RetainedFhirCaptureBatch {
+                binding_batches: Vec::new(),
+                evidence_batches: Vec::new(),
+                plan_batches: Vec::new(),
+                root_bytes: Vec::new(),
+                families: input
+                    .resource_types
+                    .iter()
+                    .map(|kind| {
+                        (
+                            kind.clone(),
+                            RootFamily {
+                                bytes: Vec::new(),
+                                row_count: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+                row_count: 0,
+                fallback_rows: Vec::new(),
+                owned_output_bytes: 0,
+            },
+            bytes: 0,
+            items: 0,
+            syntax_items: 0,
+            failure: None,
+        }
+    }
+
+    fn finish(mut self) -> RetainedFhirCaptureBatch {
+        for batches in [
+            &mut self.output.binding_batches,
+            &mut self.output.evidence_batches,
+            &mut self.output.plan_batches,
+        ] {
+            if let Some(last) = batches.last_mut() {
+                last.bytes.extend_from_slice(&(-1i16).to_be_bytes());
+            }
+        }
+        self.output.owned_output_bytes = self.bytes;
+        self.output
+    }
+
     fn charge(&mut self, bytes: usize) -> Result<()> {
         self.bytes = self
             .bytes
@@ -281,14 +357,30 @@ impl Encoder<'_, '_> {
 
     fn row(&mut self, row: Row<'_>) -> Result<()> {
         let index = Some(self.output.row_count);
+        let acquired: Option<Cow<'_, str>> =
+            serde_json::from_str(row.acquired_resource_sha256.get())
+                .map_err(|_| failure("invalid_rows", index))?;
+        let native = NativeCaptureRow {
+            resource_type: row.resource_type.as_ref(),
+            resource_id: row.resource_id.as_ref(),
+            payload_hash: row.payload_hash.as_ref(),
+            payload_json: row.payload_json.as_ref(),
+            acquired_resource_sha256: acquired.as_deref(),
+            site_id: row.site_id.as_deref(),
+        };
+        self.encode_row(&native)
+    }
+
+    fn encode_row(&mut self, row: &NativeCaptureRow<'_>) -> Result<()> {
+        let index = Some(self.output.row_count);
         cancelled(self.flag, index)?;
         if self.output.row_count == MAX_ROWS {
             return Err(failure("row_limit", index));
         }
-        let acquired: Option<Cow<'_, str>> =
-            serde_json::from_str(row.acquired_resource_sha256.get())
-                .map_err(|_| failure("invalid_rows", index))?;
-        let marker_valid = match (self.input.completion_required_version, acquired) {
+        let marker_valid = match (
+            self.input.completion_required_version,
+            row.acquired_resource_sha256,
+        ) {
             (Some(3), Some(value)) => {
                 value.len() == 64
                     && value
@@ -301,11 +393,8 @@ impl Encoder<'_, '_> {
         if !marker_valid {
             return Err(failure("invalid_rows", index));
         }
-        if !self
-            .output
-            .families
-            .contains_key(row.resource_type.as_ref())
-            || !source_resource_id(&row.resource_id)
+        if !self.output.families.contains_key(row.resource_type)
+            || !source_resource_id(row.resource_id)
             || row.payload_hash.len() != 64
             || !row
                 .payload_hash
@@ -315,20 +404,20 @@ impl Encoder<'_, '_> {
             return Err(failure("invalid_row", index));
         }
         self.syntax_items +=
-            scan_payload(&row.payload_json, self.flag).map_err(|code| failure(code, index))?;
+            scan_payload(row.payload_json, self.flag).map_err(|code| failure(code, index))?;
         if self.syntax_items > 2 * MAX_COLLECTION_ITEMS {
             return Err(failure("collection_limit", index));
         }
-        let payload: Option<Value> = serde_json::from_str(&row.payload_json).ok();
+        let payload: Option<Value> = serde_json::from_str(row.payload_json).ok();
         let mut fallback = payload.is_none();
         if let Some(payload) = &payload {
             let object = payload
                 .as_object()
                 .ok_or_else(|| failure("invalid_payload", index))?;
-            if object.get("resource_id").and_then(Value::as_str) != Some(row.resource_id.as_ref())
+            if object.get("resource_id").and_then(Value::as_str) != Some(row.resource_id)
                 || object
                     .get("source_id")
-                    .is_some_and(|source| source.as_str() != Some(self.input.source_id.as_ref()))
+                    .is_some_and(|source| source.as_str() != Some(self.input.source_id))
             {
                 return Err(failure("payload_identity", index));
             }
@@ -337,9 +426,9 @@ impl Encoder<'_, '_> {
             if !fallback {
                 match payload_hash(
                     object,
-                    &row.payload_json,
-                    &self.input.hash_contract,
-                    &row.resource_type,
+                    row.payload_json,
+                    self.input.hash_contract,
+                    row.resource_type,
                     self.input.completion_required_version == Some(3),
                 ) {
                     Ok(hash) if hash != row.payload_hash => {
@@ -364,25 +453,20 @@ impl Encoder<'_, '_> {
             true,
         );
         let newline = usize::from(self.output.row_count > 0);
-        let family_newline =
-            usize::from(self.output.families[row.resource_type.as_ref()].row_count > 0);
+        let family_newline = usize::from(self.output.families[row.resource_type].row_count > 0);
         self.charge(root.len() * 2 + newline + family_newline)?;
         if newline != 0 {
             self.output.root_bytes.push(b'\n');
         }
         self.output.root_bytes.extend_from_slice(&root);
-        let family = self
-            .output
-            .families
-            .get_mut(row.resource_type.as_ref())
-            .unwrap();
+        let family = self.output.families.get_mut(row.resource_type).unwrap();
         if family_newline != 0 {
             family.bytes.push(b'\n');
         }
         family.bytes.extend_from_slice(&root);
         family.row_count += 1;
         if self.input.derive && !fallback {
-            self.derived(&row, payload.as_ref().unwrap().as_object().unwrap())?;
+            self.derived(row, payload.as_ref().unwrap().as_object().unwrap())?;
         }
         self.output.row_count += 1;
         Ok(())
@@ -430,8 +514,8 @@ impl Encoder<'_, '_> {
         Ok(())
     }
 
-    fn derived(&mut self, row: &Row<'_>, payload: &Map<String, Value>) -> Result<()> {
-        let kind = row.resource_type.as_ref();
+    fn derived(&mut self, row: &NativeCaptureRow<'_>, payload: &Map<String, Value>) -> Result<()> {
+        let kind = row.resource_type;
         let source = self.input.source_id.as_bytes();
         let release = self.input.release_id.as_bytes();
         let time = self.input.observed_at_pg_micros.to_be_bytes();
@@ -452,11 +536,15 @@ impl Encoder<'_, '_> {
             )?;
         }
         if kind == "Location" {
-            let site = row
-                .site_id
-                .as_deref()
-                .and_then(uuid_bytes)
-                .ok_or_else(|| failure("invalid_site_id", Some(self.output.row_count)))?;
+            let site = match row.site_id {
+                Some(explicit) => uuid_bytes(explicit)
+                    .ok_or_else(|| failure("invalid_site_id", Some(self.output.row_count)))?,
+                None => crate::fhir_witness_page::registry_location_uuid_bytes(
+                    self.input.source_id,
+                    row.resource_id,
+                )
+                .map_err(|code| failure(code, Some(self.output.row_count)))?,
+            };
             self.append(
                 0,
                 &[
@@ -517,7 +605,7 @@ impl Encoder<'_, '_> {
     }
 }
 
-impl<'de> DeserializeSeed<'de> for &mut Encoder<'_, '_> {
+impl<'de> DeserializeSeed<'de> for &mut Encoder<'_> {
     type Value = ();
     fn deserialize<D: de::Deserializer<'de>>(
         self,
@@ -526,7 +614,7 @@ impl<'de> DeserializeSeed<'de> for &mut Encoder<'_, '_> {
         decoder.deserialize_seq(self)
     }
 }
-impl<'de> Visitor<'de> for &mut Encoder<'_, '_> {
+impl<'de> Visitor<'de> for &mut Encoder<'_> {
     type Value = ();
     fn expecting(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         output.write_str("bounded retained rows")

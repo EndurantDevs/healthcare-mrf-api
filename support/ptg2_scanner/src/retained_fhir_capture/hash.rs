@@ -296,7 +296,7 @@ fn write_object(values: &Map<String, Value>, spaced: bool, ascii: bool, output: 
     output.push(b'}');
 }
 
-fn write_string(text: &str, ascii: bool, output: &mut Vec<u8>) {
+pub(crate) fn write_string(text: &str, ascii: bool, output: &mut Vec<u8>) {
     output.push(b'"');
     for character in text.chars() {
         match character {

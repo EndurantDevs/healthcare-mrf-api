@@ -166,16 +166,77 @@ def _page_rows(page, origin, counts, after):
     return wire_rows, after
 
 
-async def _project_page(connection, stage, rows, *, plan_table=None):
-    if not rows:
+def _prepare_typed_page_fast(page, origin, counts, after):
+    """Validate a typed page and build compact projection JSON in one Rust pass when payloads are strings."""
+    require(type(page) is tuple and 0 < len(page) <= 1000, "page_bounds")
+    try:
+        import ptg2_address_canon as native
+
+        prepare = getattr(native, "prepare_typed_fhir_page", None)
+    except ImportError:
+        prepare = None
+    if prepare is None:
+        return None
+    is_completion_v3 = is_completion_v3_origin(origin)
+    try:
+        prepared = prepare(
+            page,
+            (origin.dataset_id, origin.source_id),
+            (list(counts), list(KINDS)),
+            after,
+            is_completion_v3,
+            8 * 1024**2,
+        )
+    except ValueError as error:
+        code = str(error)
+        if code in {
+            "page_bounds",
+            "resource_shape",
+            "resource_scope",
+            "resource_identity",
+            "resource_order",
+            "resource_hash",
+        }:
+            require(False, code)
+        if code == "invalid_site_id":
+            from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
+
+            raise RetainedFHIRCaptureError("retained_fhir_capture_unavailable") from None
+        raise
+    except UnicodeError:
+        require(False, "page_bounds")
+    if prepared is None:
+        return None
+    projected_json, projected_count, last_type, last_id, page_counts = prepared
+    expected_by_kind = dict(origin.resource_counts)
+    for kind, delta in page_counts.items():
+        counts[kind] += delta
+        require(counts[kind] <= expected_by_kind[kind], "resource_counts")
+    return projected_json, projected_count, (last_type, last_id)
+
+
+async def _project_page_json(connection, stage, encoded_json, row_count, *, plan_table=None):
+    if not row_count:
         return
     query = PLAN_TIER_PROJECT_SQL if plan_table else PROJECT_SQL
     inserted = await connection.execute(
         query.format(cells=stage.relation("cells"), plans="pg_temp." + _identifier(plan_table) if plan_table else None),
-        json.dumps(rows, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+        encoded_json,
         list(KINDS),
     )
-    require(inserted == "INSERT 0 " + str(len(rows)), "projected_shape")
+    require(inserted == "INSERT 0 " + str(row_count), "projected_shape")
+
+
+async def _project_page(connection, stage, rows, *, plan_table=None):
+    if not rows:
+        return
+    await _project_page_json(
+        connection,
+        stage,
+        json.dumps(rows, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+        len(rows),
+        plan_table=plan_table,
+    )
 
 
 def _text(payload, field):
@@ -311,6 +372,32 @@ async def _check_page(connection, stage, rows, base, as_of, *, plan_tiers=False)
             require(copied == "COPY " + str(len(rows)), "copy_count")
 
 
+async def _consume_page(connection, stage, page, origin, counts, after, options):
+    checker, as_of, plan_tiers, plan_projection = options
+    stage.require_ready(complete=False)
+    if not checker and plan_projection is None:
+        fast = _prepare_typed_page_fast(page, origin, counts, after)
+        if fast is not None:
+            projected_json, projected_count, next_after = fast
+            await _project_page_json(connection, stage, projected_json, projected_count)
+            return next_after
+    source_rows, next_after = _page_rows(page, origin, counts, after)
+    if plan_projection is not None:
+        source_rows = await plan_projection.prepare(page, source_rows, include_references=checker)
+    if checker:
+        await _check_page(
+            connection,
+            stage,
+            source_rows,
+            origin.source_uri.rstrip("/"),
+            as_of,
+            **({"plan_tiers": True} if plan_tiers else {}),
+        )
+        return next_after
+    await _project_page(connection, stage, source_rows, **({"plan_table": plan_projection.table} if plan_tiers else {}))
+    return next_after
+
+
 async def _consume(source_export, connection, stage, profile, reviewed, *, checker, as_of, plan_tiers=False):
     origin = source_origin(reviewed)
     counts, after = dict.fromkeys(dict(origin.resource_counts), 0), None
@@ -332,25 +419,10 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
         require(export["contract"] == contract and source_origin(export["origin"]) == origin, "source_origin")
         require(callable(export["resources"]), "source_export")
         iterator = export["resources"]()
+        options = (checker, as_of, plan_tiers, plan_projection)
         try:
             async for page in iterator:
-                stage.require_ready(complete=False)
-                source_rows, after = _page_rows(page, origin, counts, after)
-                if plan_projection is not None:
-                    source_rows = await plan_projection.prepare(page, source_rows, include_references=checker)
-                if checker:
-                    await _check_page(
-                        connection,
-                        stage,
-                        source_rows,
-                        origin.source_uri.rstrip("/"),
-                        as_of,
-                        **({"plan_tiers": True} if plan_tiers else {}),
-                    )
-                else:
-                    await _project_page(
-                        connection, stage, source_rows, **({"plan_table": plan_projection.table} if plan_tiers else {})
-                    )
+                after = await _consume_page(connection, stage, page, origin, counts, after, options)
         finally:
             await drain_operation(iterator.aclose(), preserve_cancellation=True)
         require(counts == dict(origin.resource_counts), "source_counts")
@@ -359,11 +431,12 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
 
 
 def _valid_canonical_address_records(pending_by_key, canonical):
-    return [
-        (raw_key, *address_values, UUID(result["address_key"]), result["identity_key"])
-        for (raw_key, address_values), result in zip(pending_by_key.items(), canonical, strict=True)
-        if result["address_key"] is not None and result["identity_key"] is not None
-    ]
+    records = []
+    for (raw_key, address_values), result in zip(pending_by_key.items(), canonical, strict=True):
+        address_key, identity_key = result if type(result) is tuple else (result["address_key"], result["identity_key"])
+        if address_key is not None and identity_key is not None:
+            records.append((raw_key, *address_values, UUID(address_key), identity_key))
+    return records
 
 
 async def _canonical_address_records(connection, stage, address_rows, fields):
@@ -389,9 +462,8 @@ async def _canonical_address_records(connection, stage, address_rows, fields):
     if not pending_by_key:
         return None
     address_values = list(pending_by_key.values())
-    canonical = await drain_operation(
-        asyncio.to_thread(native.canonicalize_batch, address_values), preserve_cancellation=True
-    )
+    canonicalizer = getattr(native, "canonicalize_address_keys_batch", native.canonicalize_batch)
+    canonical = await drain_operation(asyncio.to_thread(canonicalizer, address_values), preserve_cancellation=True)
     require(len(canonical) == len(pending_by_key), "canonical_count")
     address_records = _valid_canonical_address_records(pending_by_key, canonical)
     identities_by_key = {}

@@ -174,6 +174,45 @@ async def _store_resource_batch(copy_state, resource_rows, prepared):
     )
 
 
+def _validate_witness_page(page, origin, after, *, is_completion_v3):
+    """Validate page bounds, scope, marker and strict ASCII cursor order via shared Rust fast path."""
+    require(type(page) in {tuple, list} and 0 < len(page) <= 1000)
+    try:
+        import ptg2_address_canon as native
+
+        validator = getattr(native, "validate_fhir_witness_page", None)
+    except ImportError:
+        validator = None
+    if validator is not None:
+        try:
+            summary = validator(
+                page,
+                origin.dataset_id,
+                None,
+                after,
+                (True, is_completion_v3, False, False),
+                _MAX_PAGE_BYTES,
+            )
+        except ValueError, UnicodeError:
+            require(False)
+        if summary is not None:
+            return summary[0], summary[1]
+    require(len(canonical(page).encode()) <= _MAX_PAGE_BYTES)
+    for resource_record in page:
+        require(type(resource_record) is dict and set(resource_record) == set(_RESOURCE_FIELDS))
+        require(
+            resource_record["dataset_id"] == origin.dataset_id
+            and source_resource_marker_valid(
+                resource_record["acquired_resource_sha256"], completion_v3=is_completion_v3
+            )
+        )
+        key = resource_record["resource_type"], resource_record["resource_id"]
+        require(all(type(key_part) is str and key_part.isascii() for key_part in key))
+        require(after is None or after < key)
+        after = key
+    return after
+
+
 async def _copy_resources(writer, schema, origin, export, release_id, observed_at):
     """Consume one real Source iterator to EOF; validate complete batches before bounded COPY."""
     is_completion_v3 = is_completion_v3_origin(origin)
@@ -192,20 +231,7 @@ async def _copy_resources(writer, schema, origin, export, release_id, observed_a
     iterator = export["resources"]()
     try:
         async for page in iterator:
-            require(type(page) in {tuple, list} and 0 < len(page) <= 1000)
-            require(len(canonical(page).encode()) <= _MAX_PAGE_BYTES)
-            for resource_record in page:
-                require(type(resource_record) is dict and set(resource_record) == set(_RESOURCE_FIELDS))
-                require(
-                    resource_record["dataset_id"] == origin.dataset_id
-                    and source_resource_marker_valid(
-                        resource_record["acquired_resource_sha256"], completion_v3=is_completion_v3
-                    )
-                )
-                key = resource_record["resource_type"], resource_record["resource_id"]
-                require(all(type(key_part) is str and key_part.isascii() for key_part in key))
-                require(after is None or after < key)
-                after = key
+            after = _validate_witness_page(page, origin, after, is_completion_v3=is_completion_v3)
             copy_state.total = await _copy_batch(copy_state, page)
             require(copy_state.total <= sum(count for _, count in origin.resource_counts))
     finally:
@@ -351,24 +377,30 @@ class _SourceReplay:
     after: tuple | None = None
 
 
+def _fold_native_batch(replay, resource_rows):
+    try:
+        prepared = retained._prepare_native_resources(
+            resource_rows, replay.origin, replay.release_id, replay.observed_at, False
+        )
+    except retained._CopyBatchTooLarge:
+        if len(resource_rows) > 1:
+            middle = len(resource_rows) // 2
+            for batch in (resource_rows[:middle], resource_rows[middle:]):
+                replay.total = _fold_native_batch(replay, batch)
+            return replay.total
+        return retained._fold_rows(
+            resource_rows, replay.origin, replay.hashes_by_family, replay.counts_by_family, replay.root, replay.total
+        )
+    return retained._fold_prepared(
+        prepared, replay.hashes_by_family, replay.counts_by_family, replay.root, replay.total
+    )
+
+
 def _fold_source_page(replay, resource_rows):
     """Validate actual second-stream payload commitments independently of retained rows or receipts."""
-    require(type(resource_rows) in {tuple, list} and 0 < len(resource_rows) <= 1000)
-    require(len(canonical(resource_rows).encode()) <= _MAX_PAGE_BYTES)
     is_completion_v3 = is_completion_v3_origin(replay.origin)
-    for resource_row in resource_rows:
-        require(type(resource_row) is dict and set(resource_row) == set(_RESOURCE_FIELDS))
-        require(
-            resource_row["dataset_id"] == replay.origin.dataset_id
-            and source_resource_marker_valid(resource_row["acquired_resource_sha256"], completion_v3=is_completion_v3)
-        )
-        cursor = resource_row["resource_type"], resource_row["resource_id"]
-        require(all(type(part) is str and part.isascii() for part in cursor))
-        require(replay.after is None or replay.after < cursor)
-        replay.after = cursor
-    replay.total = retained._fold_rows(
-        resource_rows, replay.origin, replay.hashes_by_family, replay.counts_by_family, replay.root, replay.total
-    )
+    replay.after = _validate_witness_page(resource_rows, replay.origin, replay.after, is_completion_v3=is_completion_v3)
+    replay.total = _fold_native_batch(replay, resource_rows)
     require(replay.total <= sum(count for _, count in replay.origin.resource_counts))
 
 
