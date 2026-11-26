@@ -370,7 +370,7 @@ def capture_preparation(monkeypatch):
     from process import registry_membership_refresh_runtime as runtime
     from process.registry_imported_source_reuse import ImportedSourcePreparation
 
-    stage = SimpleNamespace(active=False, fail_commit=False, repeatable_read=False)
+    stage = SimpleNamespace(active=False, fail_commit=False, repeatable_read=False, idle_timeout_disabled=False)
     connection = object()
 
     @asynccontextmanager
@@ -383,15 +383,21 @@ def capture_preparation(monkeypatch):
         finally:
             stage.active = False
             stage.repeatable_read = False
+            stage.idle_timeout_disabled = False
 
     async def execute(statement):
         assert stage.active
-        assert str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
-        stage.repeatable_read = True
+        sql = str(statement)
+        if not stage.repeatable_read:
+            assert sql == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            stage.repeatable_read = True
+        else:
+            assert sql == "SET LOCAL idle_in_transaction_session_timeout = '0'"
+            stage.idle_timeout_disabled = True
 
     async def prepare(capture_transaction, **inputs):
         async with capture_transaction() as driver:
-            assert driver is connection and stage.active and stage.repeatable_read
+            assert driver is connection and stage.active and stage.repeatable_read and stage.idle_timeout_disabled
             assert inputs["source_runtime"] is resolver.source_runtime and inputs["control_schema"] == "registry"
         return prepared_sources
 

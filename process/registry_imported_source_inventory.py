@@ -274,12 +274,13 @@ async def _observe_current_inventory(runtime):
         await lock_aca_source_tables(
             connection, runtime.config.aca_source_schema, ("plan_npi_raw", "plan", "plan_networktier", "issuer")
         )
-        prior = checkpoint = ()
+        prior = checkpoint = retained = ()
         checkpoint_date = None
         if runtime.control_schema is not None:
             prior = await _serving_catalog_observations(connection, runtime.control_schema)
             checkpoint, checkpoint_date = await _checkpoint_catalog_observations(connection, runtime.control_schema)
-        with known_fhir_catalog_families(catalog_observation_families(checkpoint + prior)):
+            retained = await _retained_published_catalog_observations(connection, runtime.control_schema)
+        with known_fhir_catalog_families(catalog_observation_families(retained + checkpoint + prior)):
             observed = await observe_imported_source_inventory(
                 connection,
                 config=runtime.config,
@@ -332,6 +333,25 @@ async def _checkpoint_catalog_observations(connection, control_schema):
         return (), None
 
 
+async def _retained_published_catalog_observations(connection, control_schema):
+    """Reuse admitted family facts from retained published catalog snapshots."""
+    control = storage_identifier(control_schema)
+    rows = await connection.fetch(
+        f"SELECT c.schema_name FROM {control}.registry_fhir_catalog_snapshot c "
+        f"LEFT JOIN {control}.network_serving_control s ON s.id=1 AND s.metadata_generation=c.metadata_generation "
+        "WHERE c.published_at IS NOT NULL AND s.id IS NULL "
+        "ORDER BY c.published_at DESC, c.metadata_generation DESC LIMIT 8"
+    )
+    observations = []
+    for row in rows:
+        try:
+            async with connection.transaction():
+                observations.extend(await _catalog_observations(connection, row["schema_name"]))
+        except UndefinedTableError, InvalidSchemaNameError, InsufficientPrivilegeError:
+            continue
+    return tuple(observations)
+
+
 async def _catalog_observations(connection, schema):
     rows = await connection.fetch(
         f"SELECT descriptor_json::text AS descriptor FROM {storage_identifier(schema)}.registry_fhir_catalog_source "
@@ -375,6 +395,7 @@ async def native_imported_source_reader():
     async with runtime.source_reader_sessions() as session, session.begin():
         connection = await native_driver(session)
         await connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        await connection.execute("SET LOCAL idle_in_transaction_session_timeout = '0'")
         yield connection
 
 

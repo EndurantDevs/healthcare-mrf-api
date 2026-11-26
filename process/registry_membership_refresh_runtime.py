@@ -360,6 +360,7 @@ class _Resources:
         """Open a fresh independent RO snapshot only after the caller owns source fences."""
         async with self.address_sessions() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = '0'"))
             driver = await _driver(session)
             authority, _legacy_key = await address._current_authority(driver, self.settings.address_profile.schema_name)
             generation = address._digest(authority)
@@ -532,6 +533,7 @@ class _SourceResolver:
             """Open a fresh repeatable-read transaction for one capture."""
             async with self.capture_sessions() as session, session.begin():
                 await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = '0'"))
                 yield await _driver(session)
 
         prepared = await prepare_imported_source_recipes(

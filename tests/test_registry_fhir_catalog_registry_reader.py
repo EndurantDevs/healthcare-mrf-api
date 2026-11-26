@@ -111,13 +111,18 @@ async def test_reader_starts_snapshot_before_obtaining_native_driver(reader_case
     events = []
 
     async def begin(statement):
-        assert str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
-        events.append("begin")
+        sql = str(statement)
+        if not events:
+            assert sql == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            events.append("begin")
+        else:
+            assert sql == "SET LOCAL idle_in_transaction_session_timeout = '0'"
+            events.append("idle_timeout")
 
     connection = case.session.connection.return_value
 
     async def raw_connection():
-        assert events == ["begin"]
+        assert events == ["begin", "idle_timeout"]
         events.append("driver")
         return SimpleNamespace(driver_connection=case.reader)
 
@@ -125,7 +130,7 @@ async def test_reader_starts_snapshot_before_obtaining_native_driver(reader_case
     connection.get_raw_connection.side_effect = raw_connection
     async with readers.fhir_catalog_registry_reads(case.writer):
         assert await readers.fhir_catalog_registry_connection(case.writer) is case.reader
-    assert events == ["begin", "driver"]
+    assert events == ["begin", "idle_timeout", "driver"]
 
 
 async def test_reader_begin_failure_keeps_original_error_and_cleans_session(reader_case):

@@ -671,7 +671,9 @@ async def test_named_source_export_pins_source_and_registry_reads(monkeypatch, s
             sync._source_catalog_export(selected, {})
     reference.assert_called_once_with(reader)
     reader.transaction.assert_called_once_with(isolation="repeatable_read", readonly=True)
-    reader.execute.assert_awaited_once_with("SET LOCAL search_path = pg_catalog, pg_temp, public")
+    reader.execute.assert_awaited_once_with(
+        "SET LOCAL search_path = pg_catalog, pg_temp, public; SET LOCAL idle_in_transaction_session_timeout = '0'"
+    )
     source_case.factory.assert_called_once_with(source_profile=profile)
     source_case.sealer_pool.acquire.assert_called_once_with()
     assert source_case.identity_probe.transaction.call_args.kwargs == {"isolation": "repeatable_read", "readonly": True}

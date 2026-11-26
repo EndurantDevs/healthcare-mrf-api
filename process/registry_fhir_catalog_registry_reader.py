@@ -31,6 +31,7 @@ async def _open_reader(binding):
     session = binding.session = database.session_factory()
     # A raw driver read does not start SQLAlchemy's lazy transaction.
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+    await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = '0'"))
     reader = (await (await session.connection()).get_raw_connection()).driver_connection
     binding.reader, binding.transaction = reader, session.get_transaction()
 
