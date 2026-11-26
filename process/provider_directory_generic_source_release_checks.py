@@ -101,7 +101,7 @@ _LEGACY_FUNCTIONS = {
         False,
         "u",
         True,
-        "83da651b105792f6ece471f3edc5e8f179bf6ce8cd87087a2a78b28e634f3afd",
+        "b650f25f78cf718d2fc1b4cf1c52ead77f5c5b8799c09ea1f8a52332ede38a5c",
     ),
     "prepare_pd_dataset_candidate(text,text)": (
         (("requested_dataset", "text"), ("kind", "text")),
@@ -123,7 +123,7 @@ _LEGACY_FUNCTIONS = {
         False,
         "u",
         False,
-        "51e3cdea671cf0edfa8d2ee0ba9ee5796ad4f4f865e5acf41e69b824ea2fab76",
+        "cd22587b8bba848b25e949b64194c1938a17e7e316b4fc65b0697d54609d9470",
     ),
     "guard_pd_generic_dataset_finalization()": (
         (),

@@ -86,7 +86,8 @@ BEGIN
     IF parent_name<>'provider_directory_dataset_resource' AND image_kind='NEW' THEN
         SELECT string_agg('NOT (' || pg_get_expr(conbin,conrelid) || ')',' OR ') INTO check_predicate
           FROM pg_constraint,__SCHEMA__.pd_dataset_migration_plan
-         WHERE singleton AND conrelid=(plan#>>ARRAY['tables',parent_name,'original_oid'])::oid
+         WHERE singleton AND conrelid=to_regclass(format('%I.%I',__SCHEMA_LITERAL__,
+               'pd_dataset_history_' || (plan#>>ARRAY['tables',parent_name,'original_oid'])))
            AND contype='c' AND conname<>'pd_dataset_history_bound';
         IF check_predicate IS NOT NULL THEN
             EXECUTE 'SELECT EXISTS(SELECT FROM affected_rows WHERE ' || check_predicate || ')' INTO invalid;
@@ -180,7 +181,8 @@ BEGIN
     FOREACH parent_name IN ARRAY __SCHEMA__.pd_dataset_candidate_tables(kind) LOOP
         candidate_name := CASE WHEN kind='generic' THEN parent_name ELSE 'pd_ds_' || md5(parent_name || ':' || requested_dataset) END;
         SELECT string_agg('NOT (' || pg_get_expr(conbin,conrelid) || ')',' OR ') INTO check_predicate
-          FROM pg_constraint WHERE conrelid=(migration_plan#>>ARRAY['tables',parent_name,'original_oid'])::oid
+          FROM pg_constraint WHERE conrelid=to_regclass(format('%I.%I',__SCHEMA_LITERAL__,
+               'pd_dataset_history_' || (migration_plan#>>ARRAY['tables',parent_name,'original_oid'])))
             AND contype='c' AND conname<>'pd_dataset_history_bound';
         IF check_predicate IS NOT NULL THEN
             EXECUTE format('SELECT EXISTS(SELECT FROM __SCHEMA__.%I WHERE dataset_id=$1 AND (%s))',candidate_name,check_predicate) INTO invalid USING requested_dataset;

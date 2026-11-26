@@ -123,6 +123,7 @@ _SEALED_APPEND_UPGRADE_TAIL = (
     "20261121050000_custom_import_rooted_text",
     "20261123182000_custom_import_root_boolean_index",
     "20261104020000_custom_import_family_blocks",
+    "20261126120000_stored_id_lookups_by_name",
 )
 
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"

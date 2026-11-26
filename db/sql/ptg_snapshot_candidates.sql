@@ -17,7 +17,8 @@ BEGIN
       INTO trusted FROM pg_class t,pg_proc p
       WHERE t.oid=p_relation AND p.oid='__Q__.begin_ptg_snapshot_candidate(text,bigint,text)'::regprocedure;
     IF trusted THEN RETURN; END IF;
-    SELECT * INTO candidate FROM __S__.ptg2_snapshot_candidate WHERE table_oid=p_relation;
+    SELECT * INTO candidate FROM __S__.ptg2_snapshot_candidate
+      WHERE table_name=(SELECT relname FROM pg_class WHERE oid=p_relation);
     IF p_operation<>'INSERT' OR candidate.table_oid IS NULL OR candidate.prepared OR candidate.published
        OR candidate.writer_name<>p_actor
        OR NOT __S__.ptg_snapshot_writer_authorized(candidate.parent_name,p_actor) THEN
@@ -80,9 +81,6 @@ BEGIN
       WHERE parent_name=p_parent AND snapshot_key=p_snapshot AND build_token=p_token
         AND prepared AND NOT published ORDER BY table_oid LIMIT 1;
     IF candidate.table_oid IS NOT NULL THEN
-        IF to_regclass(format('__Q__.%I',candidate.table_name)) IS DISTINCT FROM candidate.table_oid THEN
-            RAISE EXCEPTION 'ptg_snapshot_candidate_identity' USING ERRCODE='55000';
-        END IF;
         RETURN format('__Q__.%I',candidate.table_name);
     END IF;
     RETURN format('__Q__.%I',p_parent);
@@ -147,9 +145,6 @@ BEGIN
         AND l.generation='shared_blocks_v4' AND r.state='building' FOR UPDATE OF l,r;
     IF NOT FOUND THEN RAISE EXCEPTION 'ptg_snapshot_candidate_authority' USING ERRCODE='42501'; END IF;
     EXECUTE format('LOCK TABLE __Q__.%I IN ACCESS EXCLUSIVE MODE',p_candidate);
-    IF to_regclass(format('__Q__.%I',p_candidate))<>c.table_oid THEN
-        RAISE EXCEPTION 'ptg_snapshot_candidate_identity' USING ERRCODE='55000';
-    END IF;
     EXECUTE format('REVOKE INSERT ON __Q__.%I FROM %I',p_candidate,caller);
     PERFORM pg_advisory_xact_lock_shared(hashtext('ptg2_source_pointer_gc_v1'));
     -- Finish isolated indexes before indexed relationship and semantic checks.
@@ -272,9 +267,6 @@ BEGIN
     -- Acquire every parent before the first attach, with no queued lock waiter.
     FOR candidate IN SELECT * FROM __S__.ptg2_snapshot_candidate
       WHERE snapshot_key=p_snapshot AND NOT published ORDER BY parent_name FOR UPDATE LOOP
-        IF to_regclass(format('__Q__.%I',candidate.table_name)) IS DISTINCT FROM candidate.table_oid THEN
-            RAISE EXCEPTION 'ptg_snapshot_candidate_identity' USING ERRCODE='55000';
-        END IF;
         EXECUTE format('LOCK TABLE ONLY __Q__.%I IN SHARE UPDATE EXCLUSIVE MODE NOWAIT',candidate.parent_name);
     END LOOP;
     FOR candidate IN SELECT * FROM __S__.ptg2_snapshot_candidate
@@ -292,9 +284,6 @@ RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog SET
 DECLARE candidate record; parent text; history record; has_rows boolean;
 BEGIN
     FOR history IN SELECT table_name,plan,parent_oid FROM __S__.ptg2_snapshot_partition_preparation LOOP
-        IF to_regclass(format('__Q__.%I',history.table_name||'_history'))::oid IS DISTINCT FROM (history.plan->>'oid')::oid THEN
-            RAISE EXCEPTION 'ptg_snapshot_candidate_identity' USING ERRCODE='55000';
-        END IF;
         EXECUTE format('SELECT EXISTS(SELECT 1 FROM ONLY __Q__.%I WHERE snapshot_key=$1)',history.table_name||'_history')
           INTO has_rows USING OLD.snapshot_key;
         IF has_rows THEN RAISE EXCEPTION 'ptg_snapshot_history_cleanup_pending' USING ERRCODE='55000'; END IF;
@@ -307,9 +296,6 @@ BEGIN
     END LOOP;
     FOR candidate IN SELECT c.* FROM __S__.ptg2_snapshot_candidate c
       WHERE c.snapshot_key=OLD.snapshot_key ORDER BY c.table_oid FOR UPDATE OF c LOOP
-        IF to_regclass(format('__Q__.%I',candidate.table_name)) IS DISTINCT FROM candidate.table_oid THEN
-            RAISE EXCEPTION 'ptg_snapshot_candidate_identity' USING ERRCODE='55000';
-        END IF;
         IF candidate.published THEN
             -- Eligibility is established by layout GC; this exact private leaf may be dropped whole.
             EXECUTE format('ALTER TABLE __Q__.%I DETACH PARTITION __Q__.%I',candidate.parent_name,candidate.table_name);

@@ -38,6 +38,7 @@ def test_catalog_membership_and_inventory_extend_the_existing_target_head():
         "20261121050000_custom_import_rooted_text",
         "20261123182000_custom_import_root_boolean_index",
         "20261104020000_custom_import_family_blocks",
+        "20261126120000_stored_id_lookups_by_name",
     )
     assert scripts.get_heads() == [chain[-1]]
     for predecessor, successor in zip(chain, chain[1:]):

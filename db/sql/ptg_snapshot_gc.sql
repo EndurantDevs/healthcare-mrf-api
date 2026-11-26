@@ -48,10 +48,6 @@ BEGIN
       ORDER BY (table_name='ptg2_provider_group_tax_identity_source') DESC, ordinal LOOP
         history_name:=history.table_name||'_history';
         EXECUTE format('LOCK TABLE __Q__.%I IN ROW EXCLUSIVE MODE',history_name);
-        IF to_regclass(format('__Q__.%I',history_name)) IS DISTINCT FROM history.table_oid
-           OR to_regclass(format('__Q__.%I',history.table_name)) IS DISTINCT FROM history.parent_oid THEN
-            RAISE EXCEPTION 'ptg_snapshot_gc_identity' USING ERRCODE='55000';
-        END IF;
         EXECUTE format($sql$
             WITH selected AS MATERIALIZED (
                 SELECT ctid FROM ONLY __Q__.%I WHERE snapshot_key=$1 LIMIT $2
