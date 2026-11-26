@@ -722,8 +722,8 @@ def require_fresh_ordinary_profile_launch(spec, launch_request):
     )
 
 
-def _require_delta_observation_route(params, route, policy):
-    """Require exact dedicated admission before accepting any Delta worker task."""
+def _require_selected_directory_route(params, route, policy):
+    """Require dedicated routes for the selected publisher JSON workers."""
     from process.delta_dental_directory_json import SOURCE_ENDPOINT, SOURCE_ID
     from process.delta_dental_directory_producer import REVIEW_FIELD, TASK_FLAG, require_delta_observed_task
     from process.delta_dental_directory_worker import is_delta_observation, require_observation_task
@@ -735,6 +735,17 @@ def _require_delta_observation_route(params, route, policy):
         require_observation_task(params)
         if route is None or not policy.use_proxy(SOURCE_ID, SOURCE_ENDPOINT):
             raise ValueError("delta_dental_finder_source_proxy_required")
+
+    from process import nomi_directory_integration as nomi_directory
+
+    if (
+        _uses_source_http(params)
+        and isinstance(params, dict)
+        and nomi_directory.is_explicit_selection(params.get("source_ids"))
+    ):
+        nomi_directory.require_task(params, test_mode=bool(params.get("test_mode")))
+        if route is None or not policy.use_proxy(nomi_directory.SOURCE_ID, nomi_directory.ENDPOINT_SCOPE):
+            raise ValueError("nomi_directory_worker_proxy_route_required")
 
 
 def admit_fhir_source_worker_launch(admitted_run):
@@ -770,7 +781,7 @@ def admit_fhir_source_worker_launch(admitted_run):
     policy = SourceProxyConfig.from_environment()
     _require_source_proxy_scope(policy, params_by_name)
     route = _source_route(admitted_run)
-    _require_delta_observation_route(params_by_name, route, policy)
+    _require_selected_directory_route(params_by_name, route, policy)
     image = route["image"] if route is not None else image
     if _IMAGE.fullmatch(image) is None:
         raise ValueError("fhir_source_worker_admission_unavailable")

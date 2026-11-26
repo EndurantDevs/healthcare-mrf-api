@@ -14,6 +14,7 @@ from api.provider_directory_rooted_fhir_publication import (
     unavailable_rooted_fhir_publication,
 )
 from api.provider_directory_source_worker import has_fresh_source_route, is_delta_route_available
+from process import nomi_directory_integration as nomi_directory
 from process import provider_directory_profile as profile_artifact
 from process.delta_dental_directory_json import SOURCE_ENDPOINT as DELTA_DENTAL_ENDPOINT
 from process.delta_dental_directory_json import SOURCE_ID as DELTA_DENTAL_SOURCE_ID
@@ -193,6 +194,25 @@ def provider_directory_source_catalog(
         NETWORK_SNAPSHOT_SOURCE_ID, NETWORK_SNAPSHOT_API_BASE
     ):
         catalog_items = [entry for entry in catalog_items if entry["source_ids"] != [NETWORK_SNAPSHOT_SOURCE_ID]]
+    if manifest_path == DEFAULT_MANIFEST and has_fresh_source_route(
+        nomi_directory.SOURCE_ID, nomi_directory.ENDPOINT_SCOPE
+    ):
+        catalog_items.append(
+            {
+                "entry_id": nomi_directory.ENTRY_ID,
+                "display_name": "Nomi Health Provider Directory",
+                "owner_id": "nomi-health",
+                "source_ids": [nomi_directory.SOURCE_ID],
+                "canonical_base": nomi_directory.ENDPOINT_SCOPE,
+                "classification": "acquisition",
+                "resource_profile": "M5",
+                "resources": list(nomi_directory.RESOURCE_TYPES),
+                "supported_resources": list(nomi_directory.RESOURCE_TYPES),
+                "profile_enabled": False,
+                "runnable": True,
+                "coverage_warning": "Provider and facility results are scoped to the configured group and searches.",
+            }
+        )
     _append_observation_entries(catalog_items, manifest.get("observation_entries", []))
     return {
         "schema_version": 1,

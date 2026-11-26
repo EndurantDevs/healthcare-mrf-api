@@ -465,7 +465,7 @@ class FinderAdmission:
             _write_destination_state(self.root, _RATE_NAME, [time(), self.interval])
             self.next_start = self.loop.time() + self.interval
 
-    async def report_hold(self, binding, pause):
+    async def report_hold(self, binding, pause, *, access_error="delta_dental_finder_access_denied"):
         """Report one final hold after all admitted work drains."""
         if not self.held.is_set():
             return
@@ -473,7 +473,7 @@ class FinderAdmission:
             raise self.hold_error
         await pause(self.boundary, binding.cooldown_snapshot())
         if self.has_access_denial:
-            raise SourceProxyError("delta_dental_finder_access_denied") from None
+            raise SourceProxyError(access_error) from None
         raise SourceProxyUnavailable(self.boundary) from None
 
 

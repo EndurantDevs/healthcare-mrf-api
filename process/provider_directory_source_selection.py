@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from process import nomi_directory_integration as nomi_directory
 from process import provider_directory_bcbs_minnesota as bcbs_minnesota
 from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_highmark as highmark
@@ -445,16 +446,68 @@ def probe_flush_every():
         return 50
 
 
+DIRECTORY_SOURCE_IDS = frozenset({vsp_directory.SOURCE_ID, nomi_directory.SOURCE_ID})
+DIRECTORY_FETCH_MODES = frozenset({vsp_directory.TRANSPORT, nomi_directory.TRANSPORT})
+
+
+def search_directory_adapter(source_record):
+    """Match one supported publisher JSON adapter by its registered identity."""
+    if vsp_directory.is_source(source_record):
+        return vsp_directory
+    if nomi_directory.is_source(source_record):
+        return nomi_directory
+    return None
+
+
+def requested_directory_adapter(source_ids, source_query, census_request):
+    """Resolve explicit selectors outside the FHIR census path."""
+    if census_request is not None:
+        return None
+    if vsp_directory.explicit_selection(source_ids, source_query):
+        return vsp_directory
+    if nomi_directory.is_explicit_selection(source_ids):
+        return nomi_directory
+    return None
+
+
+def require_directory_task(adapter, task, *, test_mode):
+    """Enforce source-specific restrictions before acquisition."""
+    if adapter is vsp_directory:
+        vsp_directory.require(not test_mode, "vsp_test_capture_forbidden")
+    else:
+        nomi_directory.require_task(task, test_mode=test_mode)
+
+
+def is_anonymous_directory_source(directory, source_record):
+    """Keep browser-backed sources independent of origin credentials."""
+    adapter = search_directory_adapter(source_record)
+    if adapter is None:
+        return False
+    if directory._credential_spec_for_source(source_record):
+        if adapter is vsp_directory:
+            vsp_directory.require(False, "vsp_source_credentials_forbidden")
+        raise ValueError("nomi_directory_origin_credentials_forbidden")
+    return True
+
+
+def require_directory_acquisition(source_record, source_ids, resources, is_unbounded_deferred):
+    """Require the full normalized resource profile and existing candidate writer."""
+    adapter = search_directory_adapter(source_record)
+    if source_ids != [adapter.SOURCE_ID] or set(resources) != set(adapter.RESOURCE_TYPES) or not is_unbounded_deferred:
+        if adapter is vsp_directory:
+            vsp_directory.require(False, "vsp_full_deferred_acquisition_required")
+        raise ValueError("nomi_directory_full_deferred_acquisition_required")
+
+
 def resource_endpoint_signature(directory, source_record):
     """Keep ordinary endpoint identities stable and strict aliases in separate scans."""
     signature_items = tuple(
         (field, directory._clean_text(source_record.get(field)) or "")
         for field in sorted(directory.RESOURCE_ENDPOINT_FIELDS.values())
     )
+    adapter = search_directory_adapter(source_record)
     connector_contract = (
-        vsp_directory.endpoint_contract()
-        if vsp_directory.is_source(source_record)
-        else directory._alohr_graphql_acquisition_contract(source_record)
+        adapter.endpoint_contract() if adapter else directory._alohr_graphql_acquisition_contract(source_record)
     )
     if connector_contract is not None:
         signature_items += (
@@ -968,6 +1021,7 @@ async def qualify_stale_isolated_source(directory, source_rows, task, *, timeout
         or directory._uses_alohr_graphql_connector(source_record)
         or directory._uses_uhc_official_file_connector(source_record)
         or vsp_directory.is_source(source_record)
+        or nomi_directory.is_source(source_record)
     ):
         return source_rows
     decision = directory._resource_import_source_decision(

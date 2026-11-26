@@ -30,9 +30,9 @@ def _remaining_cooldown(binding):
         raise SourceProxyUnavailable(retry_not_before)
 
 
-def _selection(binding, url, cursor=_CURSOR, exclude_ids=frozenset()):
+def _selection(binding, url, cursor=_CURSOR, exclude_ids=frozenset(), *, error="delta_dental_finder_proxy_required"):
     if binding is None:
-        raise SourceProxyError("delta_dental_finder_proxy_required")
+        raise SourceProxyError(error)
     _remaining_cooldown(binding)
     route = (
         binding.select_random_https(url, exclude_ids) if cursor is None else binding.select(url, cursor, exclude_ids)
@@ -46,7 +46,7 @@ def _selection(binding, url, cursor=_CURSOR, exclude_ids=frozenset()):
         and trust.check_hostname
         and trust.verify_mode == ssl.CERT_REQUIRED
     ):
-        raise SourceProxyError("delta_dental_finder_proxy_required")
+        raise SourceProxyError(error)
     return route
 
 
@@ -86,20 +86,22 @@ async def _check_status(response, binding, route, pause, on_hold, allow_retry):
         raise SourceProxyError("delta_dental_finder_response_status_invalid")
 
 
-async def _json_body(response):
+async def _json_body(response, *, max_bytes=None, error_prefix="delta_dental_finder"):
     """Bound the wire response before giving retained bytes to the parser."""
+    if max_bytes is None:
+        max_bytes = MAX_PAGE_BYTES
     if (
         response.content_type != "application/json"
         or response.headers.get("Content-Encoding", "identity") != "identity"
     ):
-        raise SourceProxyError("delta_dental_finder_response_content_invalid")
-    if response.content_length is not None and response.content_length > MAX_PAGE_BYTES:
-        raise SourceProxyError("delta_dental_finder_response_too_large")
+        raise SourceProxyError(f"{error_prefix}_response_content_invalid")
+    if response.content_length is not None and response.content_length > max_bytes:
+        raise SourceProxyError(f"{error_prefix}_response_too_large")
     raw = bytearray()
     async for part in response.content.iter_chunked(65536):
         raw.extend(part)
-        if len(raw) > MAX_PAGE_BYTES:
-            raise SourceProxyError("delta_dental_finder_response_too_large")
+        if len(raw) > max_bytes:
+            raise SourceProxyError(f"{error_prefix}_response_too_large")
     return bytes(raw)
 
 
