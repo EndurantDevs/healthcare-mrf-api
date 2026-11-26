@@ -45,13 +45,27 @@ _LEGACY_ASSOCIATIONS = {
     "network_memberships",
 }
 _FACT_FIELDS = {"npi", "address_key", "network_id", "provider_system", "provider_id", "location_id", "evidence_id"}
-_APPROVED_NETWORK_JOIN = """JOIN {control}.registry_approved_record network ON network.approved_revision=:metadata_revision
+_APPROVED_FACT_ROWS = """fact_rows AS MATERIALIZED (
+ SELECT member.* FROM member_rows member
+ JOIN {control}.registry_approved_record network ON network.approved_revision=:metadata_revision
  AND network.record_kind='network' AND network.record_key=member.network_id::text
  AND network.record_json->'archived'='false'::jsonb
  AND jsonb_typeof(network.record_json->'network_id')='number'
- AND network.record_json->>'network_id'=member.network_id::text"""
-_PINNED_NETWORK_JOIN = """JOIN {networks} network ON network.approved_revision=:metadata_revision
- AND network.network_id=member.network_id AND NOT network.archived"""
+ AND network.record_json->>'network_id'=member.network_id::text
+ LIMIT :metadata_fact_limit
+)"""
+# Probe the pinned catalogue once for this page's networks; joining the relation scans every catalogue network.
+_PINNED_FACT_ROWS = """active_networks AS MATERIALIZED (
+ SELECT network.network_id
+ FROM (SELECT coalesce(array_agg(DISTINCT network_id),CAST('{{}}' AS integer[])) AS ids FROM member_rows) needed
+ JOIN LATERAL (SELECT network_id,archived,approved_revision FROM {networks} selected
+   WHERE selected.network_id=ANY(needed.ids) OFFSET 0) network
+ ON network.approved_revision=:metadata_revision AND NOT network.archived
+), fact_rows AS MATERIALIZED (
+ SELECT member.* FROM member_rows member
+ WHERE member.network_id IN (SELECT network_id FROM active_networks)
+ LIMIT :metadata_fact_limit
+)"""
 _READ_SQL = """WITH requested_offices AS MATERIALIZED (
  SELECT * FROM unnest(CAST(:metadata_npis AS bigint[]),CAST(:metadata_address_keys AS uuid[]))
  AS requested(npi,address_key)
@@ -62,17 +76,15 @@ _READ_SQL = """WITH requested_offices AS MATERIALIZED (
  JOIN {candidate}.provider_location_binding binding
  ON (binding.location_key,binding.entity_type,binding.entity_id)=
     (address.location_key,address.entity_type,address.entity_id)
-), fact_rows AS MATERIALIZED (
- SELECT DISTINCT office.npi,office.address_key::text,member.network_id,member.provider_system,
-   member.provider_id,member.location_id::text,member.evidence_id
+), member_rows AS MATERIALIZED (
+ SELECT DISTINCT office.npi,office.address_key::text AS address_key,member.network_id,member.provider_system,
+   member.provider_id,member.location_id::text AS location_id,member.evidence_id
  FROM offices office JOIN {candidate}.network_membership member
  ON (member.provider_system,member.provider_id,member.location_id)=
     (office.provider_system,office.provider_id,office.location_id)
- {network_join}
  WHERE NOT member.network_id=ANY(CAST(:metadata_excluded AS integer[]))
  AND (CAST(:metadata_selected AS integer[]) IS NULL OR member.network_id=ANY(CAST(:metadata_selected AS integer[])))
- LIMIT :metadata_fact_limit
-), documents AS MATERIALIZED (SELECT to_jsonb(fact_rows) AS document FROM fact_rows), bounds AS (
+), {fact_rows}, documents AS MATERIALIZED (SELECT to_jsonb(fact_rows) AS document FROM fact_rows), bounds AS (
  SELECT count(*)<=:metadata_max_facts AND
  coalesce(sum(octet_length(document::text)+2),0)+2<=:metadata_max_bytes AS bounded FROM documents
 )
@@ -218,15 +230,15 @@ async def _read_memberships(session, manifest, copies_by_office, scope, include_
             }
         )
         networks = current_catalog_networks_sql()
-        network_join = (
-            _PINNED_NETWORK_JOIN.format(networks=networks)
+        fact_rows = (
+            _PINNED_FACT_ROWS.format(networks=networks)
             if networks is not None
-            else _APPROVED_NETWORK_JOIN.format(control=_identifier(registry_schema()))
+            else _APPROVED_FACT_ROWS.format(control=_identifier(registry_schema()))
         )
         statement = _READ_SQL.format(
             addresses=scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True),
             candidate=_identifier(manifest.schema_name),
-            network_join=network_join,
+            fact_rows=fact_rows,
         )
         summary_by_field = (await session.execute(text(statement), parameters_by_name)).mappings().one_or_none()
         if summary_by_field is None or summary_by_field["bounded"] is not True:

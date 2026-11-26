@@ -161,8 +161,11 @@ async def test_membership_joins_the_effective_networks_of_the_pinned_catalog():
 
     statement, parameters = session.execute.await_args.args
     sql = str(statement)
-    assert "JOIN test_catalog_networks network ON network.approved_revision=:metadata_revision" in sql
-    assert "network.network_id=member.network_id AND NOT network.archived" in sql
+    # The catalogue is probed for this page's network ids, never joined as a whole relation.
+    assert "FROM test_catalog_networks selected\n   WHERE selected.network_id=ANY(needed.ids) OFFSET 0" in sql
+    assert "ON network.approved_revision=:metadata_revision AND NOT network.archived" in sql
+    assert "WHERE member.network_id IN (SELECT network_id FROM active_networks)" in sql
+    assert "JOIN test_catalog_networks" not in sql
     assert "registry_approved_record" not in sql
     assert parameters["metadata_selected"] == [42]
     assert projected["address_list"][0]["network_memberships"][0]["location_id"] == _SITE
