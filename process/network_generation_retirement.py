@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import re
+from dataclasses import dataclass
 from uuid import UUID
 
 import asyncpg
@@ -12,7 +13,12 @@ import asyncpg
 from db.plan_release_storage import storage_identifier, storage_relation
 from db.registry_schema import registry_schema
 from process.network_compact_layout import INDEPENDENT_STORAGE, INDEPENDENT_STORAGE_KEY
-from process.network_compact_retention import _walk_references
+from process.network_compact_retention import _MAX_METADATA_BYTES, _candidate_dependencies, _page_sql, _walk_references
+
+_TYPED_SCHEMA_PATTERN = re.compile(r"registry_fhir_typed_([0-9a-f]{32})")
+_BOOTSTRAP_SCHEMA_PATTERN = re.compile(r"network_bootstrap_([0-9a-f]{32})")
+_TYPED_COMMENT_PREFIXES = ("registry_fhir_typed_capture:5:", "registry_fhir_typed_capture:4:")
+_MAX_TYPED_COMMENT_BYTES = 262144
 
 
 class NetworkGenerationRetirementError(ValueError):
@@ -32,6 +38,8 @@ async def _control_versions(connection, control):
         UNION ALL SELECT 'manifest',generation_id::text,xmin::text FROM {control}.network_serving_manifest
         UNION ALL SELECT 'catalog',metadata_generation,xmin::text FROM {control}.registry_fhir_catalog_snapshot
         UNION ALL SELECT 'head',id::text,xmin::text FROM {control}.network_serving_control
+        UNION ALL SELECT 'request',request_id::text,xmin::text FROM {control}.registry_publication_request
+        WHERE state IN ('queued','running')
         ORDER BY source,key"""
     )
 
@@ -262,7 +270,212 @@ def _composition_schemas(networks):
     return list(dict.fromkeys(schemas))
 
 
-def _retirement_report(execute, generations, network_schemas, metadata, catalog_schemas, composition_schemas):
+def _classify_optional_schema(schema_name):
+    if schema_name.startswith("registry_fhir_typed_"):
+        _require(_TYPED_SCHEMA_PATTERN.fullmatch(schema_name) is not None, "schema_invalid")
+        return "typed"
+    if schema_name.startswith("network_bootstrap_"):
+        _require(_BOOTSTRAP_SCHEMA_PATTERN.fullmatch(schema_name) is not None, "schema_invalid")
+        return "bootstrap"
+    return None
+
+
+def _address_schema_from_candidate(candidate_row):
+    raw_validation = candidate_row.get("validation_json")
+    validation = json.loads(raw_validation) if type(raw_validation) is str else raw_validation
+    if type(validation) is not dict:
+        return None
+    address_source = validation.get("address_source")
+    return address_source.get("schema_name") if type(address_source) is dict else None
+
+
+def _record_candidate_schemas(
+    candidate_by_field,
+    row_schemas,
+    *,
+    is_retiring,
+    retiring_typed,
+    retiring_bootstrap,
+    surviving_schemas,
+):
+    """Classify candidate schemas into retiring vs surviving dependency sets."""
+    if not is_retiring:
+        surviving_schemas.update(row_schemas)
+        return
+    for candidate_schema in sorted(row_schemas):
+        kind = _classify_optional_schema(candidate_schema)
+        if kind == "typed":
+            retiring_typed.add(candidate_schema)
+        elif kind == "bootstrap":
+            retiring_bootstrap.add(candidate_schema)
+
+
+async def _collect_candidate_schema_sets(connection, control, schema, retiring_candidates, retiring_generations):
+    """Collect typed and bootstrap schemas referenced only by retiring generations."""
+    retiring_typed, retiring_bootstrap, surviving_schemas = set(), set(), set()
+    after = None
+    while True:
+        candidate_rows = await connection.fetch(_page_sql(control), after, _MAX_METADATA_BYTES)
+        if not candidate_rows:
+            return retiring_typed - surviving_schemas, retiring_bootstrap - surviving_schemas
+        for candidate_row in candidate_rows:
+            _require(candidate_row["bounded"] is True, "schema_invalid")
+            candidate_by_field = dict(candidate_row)
+            is_retiring = candidate_row["candidate_id"] in retiring_candidates
+            dependencies = await _candidate_dependencies(
+                connection,
+                candidate_by_field,
+                schema,
+                () if is_retiring else retiring_generations,
+            )
+            row_schemas = {dep_schema for dep_schema, _ in dependencies}
+            addr_schema = _address_schema_from_candidate(candidate_by_field)
+            if type(addr_schema) is str:
+                row_schemas.add(addr_schema)
+            _record_candidate_schemas(
+                candidate_by_field,
+                row_schemas,
+                is_retiring=is_retiring,
+                retiring_typed=retiring_typed,
+                retiring_bootstrap=retiring_bootstrap,
+                surviving_schemas=surviving_schemas,
+            )
+        after = candidate_rows[-1]["candidate_id"]
+
+
+async def _unrequested_existing_schemas(connection, control, candidate_schemas):
+    """Return existing schemas that are not referenced by queued or running publication requests."""
+    if not candidate_schemas:
+        return []
+    existing_schemas = [
+        namespace_row["nspname"]
+        for namespace_row in await connection.fetch(
+            "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname=ANY($1::text[]) ORDER BY nspname",
+            sorted(candidate_schemas),
+        )
+    ]
+    if not existing_schemas:
+        return []
+    request_rows = await connection.fetch(
+        f"""SELECT q.command_json::text AS cmd,preview.command_json::text AS preview_cmd
+        FROM {control}.registry_publication_request q
+        LEFT JOIN {control}.registry_publication_request preview
+          ON preview.request_id::text=q.command_json->>'preview_request_id'
+        WHERE q.state IN ('queued','running')"""
+    )
+    active_blobs = [
+        blob.lower()
+        for request_row in request_rows
+        for blob in (request_row["cmd"], request_row["preview_cmd"])
+        if blob
+    ]
+    kept_schemas = []
+    for candidate_schema in existing_schemas:
+        capture_uuid = str(UUID(candidate_schema.rsplit("_", 1)[1]))
+        if not any(candidate_schema in blob or capture_uuid in blob for blob in active_blobs):
+            kept_schemas.append(candidate_schema)
+    return kept_schemas
+
+
+def _typed_source_key(metadata):
+    if type(metadata) is not str:
+        return None
+    for prefix in _TYPED_COMMENT_PREFIXES:
+        if metadata.startswith(prefix):
+            try:
+                document = json.loads(metadata[len(prefix) :])
+            except ValueError:
+                return None
+            break
+    else:
+        return None
+    descriptor = document.get("catalog_descriptor") if type(document) is dict else None
+    coords = descriptor.get("coordinates") if type(descriptor) is dict else None
+    if type(descriptor) is not dict or type(coords) is not dict:
+        return None
+    key_parts = (
+        coords.get("source_id"),
+        coords.get("dataset_schema"),
+        coords.get("dataset_id"),
+        descriptor.get("dataset_sha256"),
+    )
+    return key_parts if all(type(part) is str for part in key_parts) else None
+
+
+async def _filter_reusable_typed_schemas(connection, control, retired_metadata, typed_schemas):
+    """Exclude typed schemas whose source edition still matches a surviving catalog snapshot."""
+    if not typed_schemas:
+        return []
+    comment_rows = await connection.fetch(
+        """SELECT n.nspname,
+          CASE WHEN pg_catalog.octet_length(pg_catalog.obj_description(n.oid,'pg_namespace'))<=$2
+               THEN pg_catalog.obj_description(n.oid,'pg_namespace') END AS metadata
+        FROM pg_catalog.pg_namespace n WHERE n.nspname=ANY($1::text[]) ORDER BY n.nspname""",
+        typed_schemas,
+        _MAX_TYPED_COMMENT_BYTES,
+    )
+    key_by_schema = {comment_row["nspname"]: _typed_source_key(comment_row["metadata"]) for comment_row in comment_rows}
+    valid_schemas = [schema_item for schema_item in typed_schemas if key_by_schema.get(schema_item) is not None]
+    if not valid_schemas:
+        return []
+    survivors = await connection.fetch(
+        f"SELECT schema_name FROM {control}.registry_fhir_catalog_snapshot WHERE NOT(metadata_generation=ANY($1::text[]))",
+        retired_metadata,
+    )
+    if not survivors:
+        return valid_schemas
+    distinct_keys = sorted({key_by_schema[schema_item] for schema_item in valid_schemas})
+    reusable_keys = set()
+    for survivor in survivors:
+        catalog_table = storage_relation(survivor["schema_name"], "registry_fhir_catalog_source")
+        matched_entries = await connection.fetch(
+            f"""SELECT k.source_id,k.dataset_schema,k.dataset_id,k.dataset_sha256
+            FROM unnest($1::text[],$2::text[],$3::text[],$4::text[])
+              AS k(source_id,dataset_schema,dataset_id,dataset_sha256)
+            WHERE EXISTS(SELECT FROM {catalog_table} s
+              WHERE s.descriptor_json#>>'{{coordinates,source_id}}'=k.source_id
+                AND s.descriptor_json#>>'{{coordinates,dataset_schema}}'=k.dataset_schema
+                AND s.descriptor_json#>>'{{coordinates,dataset_id}}'=k.dataset_id
+                AND s.descriptor_json->>'dataset_sha256'=k.dataset_sha256)""",
+            [entry[0] for entry in distinct_keys],
+            [entry[1] for entry in distinct_keys],
+            [entry[2] for entry in distinct_keys],
+            [entry[3] for entry in distinct_keys],
+        )
+        for match_entry in matched_entries:
+            reusable_keys.add(
+                (
+                    match_entry["source_id"],
+                    match_entry["dataset_schema"],
+                    match_entry["dataset_id"],
+                    match_entry["dataset_sha256"],
+                )
+            )
+    return [schema_item for schema_item in valid_schemas if key_by_schema[schema_item] not in reusable_keys]
+
+
+async def _retirable_dependency_schemas(
+    connection, control, schema, retiring_candidates, retiring_generations, metadata
+):
+    raw_typed, raw_bootstrap = await _collect_candidate_schema_sets(
+        connection, control, schema, retiring_candidates, retiring_generations
+    )
+    typed_existing = await _unrequested_existing_schemas(connection, control, raw_typed)
+    typed_schemas = await _filter_reusable_typed_schemas(connection, control, metadata, typed_existing)
+    bootstrap_schemas = await _unrequested_existing_schemas(connection, control, raw_bootstrap)
+    return typed_schemas, bootstrap_schemas
+
+
+def _retirement_report(
+    execute,
+    generations,
+    network_schemas,
+    metadata,
+    catalog_schemas,
+    composition_schemas,
+    typed_schemas=(),
+    bootstrap_schemas=(),
+):
     return {
         "state": "retired" if execute else "listed",
         "generation_ids": generations,
@@ -270,7 +483,91 @@ def _retirement_report(execute, generations, network_schemas, metadata, catalog_
         "metadata_generations": metadata,
         "catalog_schemas": catalog_schemas,
         **({"composition_schemas": composition_schemas} if composition_schemas else {}),
+        **({"typed_schemas": list(typed_schemas)} if typed_schemas else {}),
+        **({"bootstrap_schemas": list(bootstrap_schemas)} if bootstrap_schemas else {}),
     }
+
+
+@dataclass(frozen=True)
+class _RetirementTargets:
+    """Resolved generation schemas and dependent artifacts for one retirement batch."""
+
+    networks: list
+    catalogs: list
+    candidates: list
+    manifests: list
+    metadata: list
+    network_schemas: list
+    catalog_schemas: list
+    composition_schemas: list
+    typed_schemas: list
+    bootstrap_schemas: list
+    schemas: list
+
+
+async def _retirement_targets(connection, control, schema, generations, expected_head):
+    networks, catalogs = await _selection(connection, control, generations, expected_head)
+    candidates = [network["candidate_id"] for network in networks]
+    manifests = [network["manifest_sha256"] for network in networks]
+    metadata = [catalog["metadata_generation"] for catalog in catalogs]
+    network_schemas = [network["schema_name"] for network in networks]
+    catalog_schemas = [catalog["schema_name"] for catalog in catalogs]
+    composition_schemas = _composition_schemas(networks)
+    typed_schemas, bootstrap_schemas = await _retirable_dependency_schemas(
+        connection, control, schema, set(candidates), set(generations), metadata
+    )
+    schemas = network_schemas + catalog_schemas + composition_schemas + typed_schemas + bootstrap_schemas
+    return _RetirementTargets(
+        networks=networks,
+        catalogs=catalogs,
+        candidates=candidates,
+        manifests=manifests,
+        metadata=metadata,
+        network_schemas=network_schemas,
+        catalog_schemas=catalog_schemas,
+        composition_schemas=composition_schemas,
+        typed_schemas=typed_schemas,
+        bootstrap_schemas=bootstrap_schemas,
+        schemas=schemas,
+    )
+
+
+async def _verify_and_execute_retirement(connection, control, schema, generations, versions, selection, execute):
+    """Verify catalog, reader, and consumer invariants, then retire selected generations."""
+    _require(schema not in selection.schemas, "schema_invalid")
+    relations = await _target_relations(connection, selection.schemas)
+    await _walk_references(
+        connection,
+        relations,
+        schema,
+        retiring_candidates=set(selection.candidates),
+        retiring_generations=set(generations),
+    )
+    await _require_catalog_sources(connection, control, selection.metadata, generations, selection.schemas)
+    if execute:
+        _require(
+            await connection.fetchval(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))", "registry-fhir-catalog:" + schema
+            ),
+            "catalog_build_active",
+        )
+        await _lock_retirement(connection, control, relations)
+    _require(await _control_versions(connection, control) == versions, "controls_changed")
+    _require(await _target_relations(connection, selection.schemas) == relations, "storage_changed")
+    await _require_consumers(
+        connection, control, generations, selection.candidates, selection.manifests, selection.metadata
+    )
+    preparation_ids = await _preparations(connection, schema, selection.networks, selection.catalogs, selection.schemas)
+    if execute:
+        await _retire(
+            connection,
+            control,
+            preparation_ids,
+            selection.candidates,
+            selection.metadata,
+            relations,
+            selection.schemas,
+        )
 
 
 async def retire_network_generations(connection, *, generation_ids, expected_head, control_schema=None, execute=False):
@@ -290,41 +587,20 @@ async def retire_network_generations(connection, *, generation_ids, expected_hea
     try:
         async with connection.transaction(isolation="read_committed"):
             versions = await _control_versions(connection, control)
-            networks, catalogs = await _selection(connection, control, generations, expected_head)
-            candidates = [network["candidate_id"] for network in networks]
-            manifests = [network["manifest_sha256"] for network in networks]
-            metadata = [catalog["metadata_generation"] for catalog in catalogs]
-            network_schemas = [network["schema_name"] for network in networks]
-            catalog_schemas = [catalog["schema_name"] for catalog in catalogs]
-            composition_schemas = _composition_schemas(networks)
-            schemas = network_schemas + catalog_schemas + composition_schemas
-            _require(schema not in schemas, "schema_invalid")
-            relations = await _target_relations(connection, schemas)
-            await _walk_references(
-                connection,
-                relations,
-                schema,
-                retiring_candidates=set(candidates),
-                retiring_generations=set(generations),
-            )
-            await _require_catalog_sources(connection, control, metadata, generations, schemas)
-            if execute:
-                _require(
-                    await connection.fetchval(
-                        "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))", "registry-fhir-catalog:" + schema
-                    ),
-                    "catalog_build_active",
-                )
-                await _lock_retirement(connection, control, relations)
-            _require(await _control_versions(connection, control) == versions, "controls_changed")
-            _require(await _target_relations(connection, schemas) == relations, "storage_changed")
-            await _require_consumers(connection, control, generations, candidates, manifests, metadata)
-            preparation_ids = await _preparations(connection, schema, networks, catalogs, schemas)
-            if execute:
-                await _retire(connection, control, preparation_ids, candidates, metadata, relations, schemas)
+            selection = await _retirement_targets(connection, control, schema, generations, expected_head)
+            await _verify_and_execute_retirement(connection, control, schema, generations, versions, selection, execute)
     except asyncpg.LockNotAvailableError as error:
         raise NetworkGenerationRetirementError("network_retirement_pin_or_writer_active") from error
-    return _retirement_report(execute, generations, network_schemas, metadata, catalog_schemas, composition_schemas)
+    return _retirement_report(
+        execute,
+        generations,
+        selection.network_schemas,
+        selection.metadata,
+        selection.catalog_schemas,
+        selection.composition_schemas,
+        selection.typed_schemas,
+        selection.bootstrap_schemas,
+    )
 
 
 async def _main(arguments):
