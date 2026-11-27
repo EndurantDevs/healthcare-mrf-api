@@ -790,24 +790,6 @@ async def test_approved_mapping_cannot_claim_another_capture_or_organization(
         assert batch.membership_rows == 0 and batch.omitted_rows == 1 and batch.unresolved_rows == 0
 
 
-@pytest.mark.parametrize("damage", ["payload", "metadata_bytes"])
-async def test_capture_read_refuses_changed_content(legacy_capture_db, damage):
-    fixture = legacy_capture_db
-    capture = await _capture(fixture)
-    if damage == "payload":
-        await fixture.admin.execute(
-            f"UPDATE \"{capture.schema_name}\".provider_directory_dataset_resource SET payload_json='{{}}'::json WHERE resource_type='Location'"
-        )
-    else:
-        await fixture.admin.execute(
-            f"UPDATE \"{capture.schema_name}\".provider_directory_endpoint_dataset SET publication_metadata_json=(publication_metadata_json::text||' ')::json"
-        )
-    reader = await fixture.connect("reader")
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises((RetainedFHIRCaptureError, ValueError)):
-            await pin_retained_fhir_read(reader, capture)
-
-
 @pytest.mark.parametrize("profile", ["read_committed"])
 async def test_capture_requires_genuine_reader_and_readonly_repeatable_read(legacy_capture_db, profile):
     fixture = legacy_capture_db

@@ -56,7 +56,7 @@ async def test_choices_resolve_allowed_role_without_negotiated_archive_fallback(
     assert page["published_plan"]["selection_mode"] == "complete_allowed_snapshot_source_set"
     assert page["published_plan"]["published_identity"] == inventory_by_field["identity"]
     assert page["items"] == [] and page["next_cursor"] is None
-    protected.assert_awaited_once_with(None, "synthetic_ptg", pin_writer=False)
+    protected.assert_awaited_once_with(None, "synthetic_ptg")
     negotiated.assert_not_awaited()
 
 

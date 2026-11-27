@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import json
+import re
 import sqlite3
 from copy import deepcopy
 from dataclasses import replace
@@ -1024,7 +1025,7 @@ async def _verified_batch_fixture(monkeypatch):
     encoded = producer._BATCH_PREFIX + producer.canonical_registry_source_recipes(recipes)
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetch=AsyncMock(return_value=[("4/23", "reader", "reader", "repeatable read")]),
+        fetch=AsyncMock(return_value=[("4/23", "repeatable read")]),
         fetchval=AsyncMock(return_value=encoded),
     )
     decode = AsyncMock(return_value=producer.decode_registry_source_recipes(encoded[len(producer._BATCH_PREFIX) :]))
@@ -1044,20 +1045,20 @@ async def test_verified_batch_shares_one_decode_and_keeps_every_page_native_chec
         )
     assert decode.await_count == 1 and native.await_count == 4
     assert connection.fetchval.await_count == 4 and connection.fetch.await_count == 6
+    assert not {"current_user", "session_user"} & set(re.findall(r"\w+", producer._READ_TRANSACTION_SQL))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "damage", ["transaction", "role", "stamp", "metadata", "roles", "connection", "inactive", "isolation", "ambiguous"]
+    "damage", ["transaction", "stamp", "metadata", "roles", "connection", "inactive", "isolation", "ambiguous"]
 )
 async def test_verified_batch_refuses_changes_without_falling_back_to_decode(monkeypatch, damage):
     connection, recipes, decode, native = await _verified_batch_fixture(monkeypatch)
     source = recipes[0].source_pin
     verified = await producer.prepare_registry_aca_batch_read(connection, source)
     transactions_by_damage = {
-        "transaction": [("4/24", "reader", "reader", "repeatable read")],
-        "role": [("4/23", "other", "reader", "repeatable read")],
-        "isolation": [("4/23", "reader", "reader", "read committed")],
+        "transaction": [("4/24", "repeatable read")],
+        "isolation": [("4/23", "read committed")],
         "ambiguous": connection.fetch.return_value * 2,
     }
     if damage in transactions_by_damage:
@@ -1082,8 +1083,8 @@ async def test_verified_batch_refuses_changes_without_falling_back_to_decode(mon
 async def test_verified_batch_refuses_preflight_transaction_change(monkeypatch):
     connection, recipes, decode, native = await _verified_batch_fixture(monkeypatch)
     connection.fetch.side_effect = [
-        [("4/23", "reader", "reader", "repeatable read")],
-        [("4/24", "reader", "reader", "repeatable read")],
+        [("4/23", "repeatable read")],
+        [("4/24", "repeatable read")],
     ]
     with pytest.raises(ValueError, match="registry_aca_source_recipe_invalid"):
         await producer.prepare_registry_aca_batch_read(connection, recipes[0].source_pin)

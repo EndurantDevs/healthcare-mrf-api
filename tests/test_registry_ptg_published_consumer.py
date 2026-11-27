@@ -25,7 +25,7 @@ def test_operator_plan_grants_only_constant_lock_and_original_pin_insert_columns
 
 @pytest.mark.parametrize("mode", ["missing", "unsafe", "duplicate"])
 @pytest.mark.asyncio
-async def test_immutable_privilege_verifier_refuses_incomplete_or_inherited_write_coverage(mode):
+async def test_lock_column_check_refuses_missing_unsafe_or_duplicate_headers(mode):
     headers = [{"relname": table, "protected": True} for table in provisioning.HEADER_TABLES]
     if mode == "missing":
         headers.pop()
@@ -41,9 +41,8 @@ async def test_immutable_privilege_verifier_refuses_incomplete_or_inherited_writ
         await provisioning.require_published_lock_privileges(session, "synthetic_ptg")
 
 
-def test_privilege_guard_covers_all_source_and_graph_facts_without_runtime_grants():
-    assert "fact.relnamespace=n.oid" in provisioning._PERMISSION_SQL
-    assert "fact.relkind IN('r','p')" in provisioning._PERMISSION_SQL
-    assert "field.attname=:lock_column" in provisioning._PERMISSION_SQL
-    assert "fact.relname='ptg2_snapshot_pin'" in provisioning._PERMISSION_SQL
-    assert "GRANT" not in provisioning._PERMISSION_SQL
+def test_lock_column_check_reads_shape_without_a_privilege_census():
+    assert "convalidated" in provisioning._LOCK_COLUMN_SQL
+    assert "privilege" not in provisioning._LOCK_COLUMN_SQL
+    assert "current_user" not in provisioning._LOCK_COLUMN_SQL
+    assert "GRANT" not in provisioning._LOCK_COLUMN_SQL

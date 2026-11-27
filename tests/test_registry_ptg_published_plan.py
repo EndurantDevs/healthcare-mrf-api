@@ -73,7 +73,7 @@ async def test_resolver_uses_actual_plan_and_complete_files(monkeypatch):
     prepared = AsyncMock(return_value=inventory_by_field)
     monkeypatch.setattr(review, "published_plan_inventory", prepared)
     full, authority, evidence = await review.resolve_published_plan(None, "synthetic_ptg", intent(), _ownership(), {})
-    privileges.assert_awaited_once_with(None, "synthetic_ptg", pin_writer=False)
+    privileges.assert_awaited_once_with(None, "synthetic_ptg")
     assert engine._full(full) == full
     assert "company_key" not in full and "cohort_id" not in full
     assert evidence["selected_source_keys"] == [1]
@@ -101,7 +101,7 @@ async def test_full_command_refuses_cross_snapshot_and_file_omission(monkeypatch
         ),
     )
     full, _, _ = await review.resolve_published_plan(None, "synthetic_ptg", intent(), _ownership(), {})
-    privileges.assert_awaited_once_with(None, "synthetic_ptg", pin_writer=False)
+    privileges.assert_awaited_once_with(None, "synthetic_ptg")
     for field, value in [("snapshot_id", "other_snapshot"), ("source_count", 2)]:
         changed = copy.deepcopy(full)
         changed["published_identity"][field] = value

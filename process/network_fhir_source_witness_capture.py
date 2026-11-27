@@ -524,12 +524,10 @@ async def capture_source_fhir_witness(
 
 
 async def require_source_fhir_witness_capture(connection, capture, *, verify_content=True):
-    """Validate the selected edition and optionally recheck its complete data."""
+    """Validate the selected edition and optionally recheck its derived rows; capture hashed the content once."""
     capture = validate_capture(capture)
     require(connection.is_in_transaction() and type(verify_content) is bool)
     if verify_content:
-        require(await _capture_content(connection, capture.schema_name) == capture.content_sha256)
-        await retained._verify_resources(connection, capture.schema_name, capture.origin)
         await _verify_derived(
             connection,
             capture.schema_name,
@@ -553,7 +551,6 @@ async def verify_source_fhir_witness_capture(
         reviewed_origin=reviewed_origin,
         expected_anchor=expected_anchor,
     )
-    require(await _capture_content(connection, capture.schema_name) == capture.content_sha256)
     return capture
 
 

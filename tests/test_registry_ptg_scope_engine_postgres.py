@@ -1135,7 +1135,7 @@ async def _published_role_probe(fixture, ownership, sessions, pin_writer):
     from process.registry_ptg_published_provisioning import require_published_lock_privileges
 
     async with sessions() as session, session.begin():
-        await require_published_lock_privileges(session, fixture.service.schema_name, pin_writer=pin_writer)
+        await require_published_lock_privileges(session, fixture.service.schema_name)
         before = await published_plan_inventory(
             session,
             fixture.service.schema_name,

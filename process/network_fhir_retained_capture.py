@@ -114,7 +114,7 @@ class RetainedFHIRRead:
 
 
 async def pin_retained_fhir_read(connection, capture):
-    """Validate copied metadata bytes and complete content before reading retained rows."""
+    """Validate the selected logical edition before reading retained rows."""
     return RetainedFHIRRead(await require_retained_fhir_capture(connection, capture))
 
 
@@ -967,12 +967,8 @@ async def capture_retained_fhir_source(
         return capture
 
 
-async def require_retained_fhir_capture(connection, capture, *, verify_content=True):
-    """Validate the selected named edition and its complete content accounting."""
+async def require_retained_fhir_capture(connection, capture):
+    """Validate the selected named edition; capture validated its content once."""
     capture = validate_capture(capture)
     await _require_transaction(connection)
-    require(type(verify_content) is bool)
-    if verify_content:
-        await _copied_header_bytes(connection, capture.schema_name, capture.origin)
-        require(await _content_tables(connection, capture.schema_name) == capture.content_sha256)
     return capture

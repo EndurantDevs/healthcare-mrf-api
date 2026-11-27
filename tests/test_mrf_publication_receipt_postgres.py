@@ -1515,7 +1515,7 @@ async def test_native_initial_batch_verified_pages_refuse_authority_drift(servin
 
     async with _native_initial_batch_source(serving_schema, monkeypatch) as fixture:
         prepared, recipes, _copied = await _prepare_initial_batch(fixture)
-        for damage in ("stamp", "actor", "privilege", "oid", "metadata", "source"):
+        for damage in ("stamp", "privilege", "oid", "metadata", "source"):
             with subtests.test(damage=damage):
                 await _assert_verified_batch_drift(fixture, prepared, recipes, damage, producer)
 
@@ -1539,7 +1539,6 @@ async def _assert_verified_batch_drift(fixture, prepared, recipes, damage, produ
             await fixture.connection.execute(
                 {
                     "stamp": f"COMMENT ON SCHEMA \"{schema}\" IS 'changed'",
-                    "actor": f'SET LOCAL ROLE "{fixture.reader}"',
                     "privilege": f'GRANT UPDATE ON "{schema}".mrf_address_evidence TO "{fixture.reader}"',
                     "oid": f'ALTER TABLE "{schema}".mrf_address_evidence RENAME TO changed_evidence',
                 }[damage]

@@ -4,6 +4,7 @@
 from dataclasses import FrozenInstanceError, asdict, make_dataclass, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -283,6 +284,32 @@ def expected_anchor():
     return witness.SourceWitnessCaptureAnchor(
         CAPTURE_ID, "registry-source-witness:" + CAPTURE_ID, "2026-01-02T00:00:00.000000+00:00"
     )
+
+
+async def test_witness_reads_skip_content_rehash(monkeypatch, expected_anchor):
+    from process import network_fhir_source_witness_capture as capture_module
+
+    capture = captured()
+    mock_by_name = {name: AsyncMock() for name in ("_capture_content", "_verify_derived", "_verify_source_rows")}
+    for name, mock in mock_by_name.items():
+        monkeypatch.setattr(capture_module, name, mock)
+    resources = AsyncMock()
+    monkeypatch.setattr(capture_module.retained, "_verify_resources", resources)
+    connection = SimpleNamespace(is_in_transaction=lambda: True)
+    assert await capture_module.require_source_fhir_witness_capture(connection, capture) == capture
+    verified = await capture_module.verify_source_fhir_witness_capture(
+        object(),
+        connection,
+        source_profile=object(),
+        reviewed_origin=origin_fields(),
+        capture=capture,
+        expected_anchor=expected_anchor,
+    )
+    assert verified == capture
+    mock_by_name["_verify_derived"].assert_awaited_once()
+    mock_by_name["_verify_source_rows"].assert_awaited_once()
+    mock_by_name["_capture_content"].assert_not_awaited()
+    resources.assert_not_awaited()
 
 
 def test_independent_anchor_is_required_and_immutable(expected_anchor):

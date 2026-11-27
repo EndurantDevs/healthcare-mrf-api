@@ -551,7 +551,7 @@ _require_recipe_custody = require_registry_source_recipe_custody
 
 
 async def _retained_recipe_read(connection, capture, retained_fhir_reads):
-    """Share one full content validation for the selected immutable named edition."""
+    """Share one validated read for the selected immutable named edition."""
     from process.network_fhir_retained_capture import RetainedFHIRRead, pin_retained_fhir_read
     from process.network_fhir_retained_capture_contract import validate_capture
 

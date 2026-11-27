@@ -63,9 +63,9 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
     original = captures.require_retained_fhir_capture
     admissions = []
 
-    async def verify(connection, selected, *, verify_content=True):
-        admissions.append(verify_content)
-        return await original(connection, selected, verify_content=verify_content)
+    async def verify(connection, selected):
+        admissions.append(selected)
+        return await original(connection, selected)
 
     monkeypatch.setattr(captures, "require_retained_fhir_capture", verify)
     async with reader.transaction(isolation="repeatable_read", readonly=True):
@@ -85,8 +85,7 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
         assert resource_rows and any(resource_row["resource_type"] == "Organization" for resource_row in resource_rows)
         batch = extract_fhir_catalog_batch(tuple(resource_rows), profile="retained_normalized")
         assert batch.organizations and batch.edges
-        assert admissions.count(True) == 1
-        assert admissions == [True]
+        assert admissions == [capture]
         with pytest.raises(FHIRCatalogExtractionError):
             async for _ in iter_fhir_catalog_pages(
                 reader,
