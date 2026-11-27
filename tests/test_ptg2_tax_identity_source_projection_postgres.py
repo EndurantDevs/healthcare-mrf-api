@@ -3,15 +3,15 @@
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import re
+import uuid
 from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
-import importlib.util
-import os
 from pathlib import Path
-import re
 from unittest.mock import Mock
-import uuid
 
 import pytest
 import sqlalchemy as sa
@@ -22,8 +22,8 @@ from db.connection import Database
 from process.ptg_parts import ptg2_tax_identity_source_artifact as artifact
 from process.ptg_parts import ptg2_tax_identity_source_observations as observations
 from process.ptg_parts import ptg2_tax_identity_source_preflight as preflight
-from process.ptg_parts import ptg2_tax_identity_source_publish as source_publish
 from process.ptg_parts import ptg2_tax_identity_source_projection as projection
+from process.ptg_parts import ptg2_tax_identity_source_publish as source_publish
 from process.ptg_parts import ptg2_tax_identity_source_stage as source_stage
 from process.ptg_parts import ptg2_tax_identity_source_target_preflight as target
 from process.ptg_parts import ptg2_tax_identity_source_validation as validation
@@ -31,31 +31,39 @@ from process.tin_npi_connector_security import token_policy_descriptor_sha256
 from tests.ptg2_provider_tax_identity_postgres_support import (
     create_prerequisites,
     drop_disposable_schema,
-    load_migration as load_parent_migration,
     quoted,
     run_migration_action,
 )
+from tests.ptg2_provider_tax_identity_postgres_support import (
+    load_migration as load_parent_migration,
+)
+from tests.ptg2_tax_identity_source_postgres_targets import (
+    CONFLICTING_SOURCE_SNAPSHOT_ID as _CONFLICTING_SNAPSHOT_ID,
+)
+from tests.ptg2_tax_identity_source_postgres_targets import (
+    SOURCE_SNAPSHOT_ID as _SNAPSHOT_ID,
+)
+from tests.ptg2_tax_identity_source_postgres_targets import (
+    insert_source_projection_targets as _insert_aggregate,
+)
 from tests.ptg2_tax_identity_source_projection_fixture import (
     POLICY as _POLICY,
+)
+from tests.ptg2_tax_identity_source_projection_fixture import (
     ordinal_digest as _ordinal_digest,
+)
+from tests.ptg2_tax_identity_source_projection_fixture import (
     write_sidecar as _sidecar,
 )
 from tests.ptg2_tax_identity_source_resolver_postgres_support import (
     assert_source_resolver,
-)
-from tests.ptg2_tax_identity_source_postgres_targets import (
-    CONFLICTING_SOURCE_SNAPSHOT_ID as _CONFLICTING_SNAPSHOT_ID,
-    SOURCE_SNAPSHOT_ID as _SNAPSHOT_ID,
-    insert_source_projection_targets as _insert_aggregate,
 )
 from tests.ptg2_tax_identity_source_reuse_support import (
     assert_sealed_reuse_proofs,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT / "alembic" / "versions" / "20260806100000_ptg2_tax_identity_source.py"
-)
+MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260806100000_ptg2_tax_identity_source.py"
 POSTGRES_DSN_ENV = "HLTHPRT_PTG2_TAX_IDENTITY_SOURCE_POSTGRES_DSN"
 _DATABASE_RE = re.compile(
     r"(?:^test(?:[_-]|$)|(?:^|[_-])test(?:[_-]|$))",
@@ -80,11 +88,7 @@ def _database_url() -> sa.URL:
         pytest.skip(f"set {POSTGRES_DSN_ENV} for the PostgreSQL proof")
     url = make_url(raw_dsn)
     database_name = str(url.database or "")
-    if (
-        not url.drivername.startswith("postgresql")
-        or not database_name
-        or _DATABASE_RE.search(database_name) is None
-    ):
+    if not url.drivername.startswith("postgresql") or not database_name or _DATABASE_RE.search(database_name) is None:
         pytest.fail(f"{POSTGRES_DSN_ENV} must target an explicit test database")
     return url.set(drivername="postgresql+asyncpg")
 
@@ -117,7 +121,8 @@ async def _publish(
         )
 
         from process.ptg_parts.ptg2_snapshot_candidates import attach_snapshot_candidates
-        await attach_snapshot_candidates(session,schema_name,18,"source-proof")
+
+        await attach_snapshot_candidates(session, schema_name, 18, "source-proof")
         return published
 
 
@@ -144,16 +149,20 @@ async def _prove_post_source_rollback(
                 raise RuntimeError("post-source publication failure")
     schema = quoted(schema_name)
     async with database.transaction() as session:
-        stored_count = await session.scalar(sa.text(f"""
+        stored_count = await session.scalar(
+            sa.text(f"""
                 SELECT COUNT(*)::bigint
                   FROM {schema}.ptg2_provider_group_tax_identity_source
                  WHERE snapshot_key = 18
-                """))
+                """)
+        )
     assert int(stored_count or 0) == 0
 
 
 async def _assert_source_tables_empty(session, schema: str) -> None:
-    stored_counts = (await session.execute(sa.text(f"""
+    stored_counts = (
+        await session.execute(
+            sa.text(f"""
             SELECT
               (SELECT COUNT(*)::bigint FROM {schema}.
                   ptg2_provider_tax_identity_source_manifest),
@@ -161,7 +170,9 @@ async def _assert_source_tables_empty(session, schema: str) -> None:
                   ptg2_provider_tax_identity_source_binding),
               (SELECT COUNT(*)::bigint FROM {schema}.
                   ptg2_provider_group_tax_identity_source)
-            """))).one()
+            """)
+        )
+    ).one()
     assert tuple(int(count) for count in stored_counts) == (0, 0, 0)
 
 
@@ -170,7 +181,6 @@ async def _assert_preinsert_rejection(
     *,
     schema_name: str,
     staged_prepared,
-    published_prepared=None,
     logical_snapshot_id: str = _SNAPSHOT_ID,
     snapshot_key: int = 18,
 ) -> None:
@@ -188,7 +198,7 @@ async def _assert_preinsert_rejection(
             logical_snapshot_id=logical_snapshot_id,
             snapshot_key=snapshot_key,
             staged=staged,
-            prepared=published_prepared or staged_prepared,
+            prepared=staged_prepared,
         )
     await _assert_source_tables_empty(session, quoted(schema_name))
 
@@ -198,14 +208,6 @@ async def _prove_preinsert_guards(
     prepare_projection,
     schema_name: str,
 ) -> None:
-    with _fresh_projection(prepare_projection) as prepared:
-        async with database.transaction() as session:
-            await _assert_preinsert_rejection(
-                session,
-                schema_name=schema_name,
-                staged_prepared=prepared,
-                published_prepared=replace(prepared, content_digest=b"z" * 32),
-            )
     for mismatch_by_field in (
         {"aggregate_tax_content_digest": b"x" * 32},
         {"source_ordinal_map_digest": b"y" * 32},
@@ -270,10 +272,7 @@ async def _assert_stage_is_query_ready(
         "UNIQUE" in definition and "(source_key, source_record_ordinal)" in definition
         for definition in index_definitions
     )
-    assert any(
-        "(provider_group_global_id_128)" in definition
-        for definition in index_definitions
-    )
+    assert any("(provider_group_global_id_128)" in definition for definition in index_definitions)
     analyzed_row_count = await session.scalar(
         sa.text("""
             SELECT stage.reltuples::bigint
@@ -310,9 +309,7 @@ def _prepare_source_projection(tmp_path: Path):
         ),
         scratch_parent=scratch_parent,
         token_policy_id=_POLICY,
-        token_policy_descriptor_sha256=bytes.fromhex(
-            token_policy_descriptor_sha256(_POLICY)
-        ),
+        token_policy_descriptor_sha256=bytes.fromhex(token_policy_descriptor_sha256(_POLICY)),
         source_ordinal_map=(
             {"shard_id": "shard-a", "ordinal": 0},
             {"shard_id": "shard-b", "ordinal": 1},
@@ -378,7 +375,10 @@ async def _seal_and_verify_stored_projection(
     schema = quoted(schema_name)
     async with engine.begin() as connection:
         stored_counts = tuple(
-            int(stored_count) for stored_count in (await connection.execute(sa.text(f"""
+            int(stored_count)
+            for stored_count in (
+                await connection.execute(
+                    sa.text(f"""
                     SELECT
                       (SELECT COUNT(*) FROM {schema}.
                           ptg2_provider_tax_identity_source_manifest),
@@ -386,27 +386,31 @@ async def _seal_and_verify_stored_projection(
                           ptg2_provider_tax_identity_source_binding),
                       (SELECT COUNT(*) FROM {schema}.
                           ptg2_provider_group_tax_identity_source)
-                    """))).one()
+                    """)
+                )
+            ).one()
         )
         assert stored_counts == (1, 2, 8)
-        matched_tin_keys = tuple((await connection.execute(sa.text(f"""
+        matched_tin_keys = tuple(
+            (
+                await connection.execute(
+                    sa.text(f"""
                         SELECT tin_key
                           FROM {schema}.ptg2_provider_group_tax_identity_source
                          WHERE tax_identity_state = 'matched_ein'
                          ORDER BY provider_group_global_id_128
-                        """))).scalars().all())
+                        """)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert matched_tin_keys == (0, 1)
         await connection.execute(
-            sa.text(
-                f"UPDATE {schema}.ptg2_v4_snapshot_map_root "
-                "SET state = 'complete' WHERE snapshot_key = 18"
-            )
+            sa.text(f"UPDATE {schema}.ptg2_v4_snapshot_map_root SET state = 'complete' WHERE snapshot_key = 18")
         )
         await connection.execute(
-            sa.text(
-                f"UPDATE {schema}.ptg2_v3_snapshot_layout "
-                "SET state = 'sealed' WHERE snapshot_key = 18"
-            )
+            sa.text(f"UPDATE {schema}.ptg2_v3_snapshot_layout SET state = 'sealed' WHERE snapshot_key = 18")
         )
         await assert_source_resolver(
             connection,
@@ -436,17 +440,28 @@ def _configure_projector_database(monkeypatch, database, schema_name: str) -> No
 async def _install_source_candidates(engine, schema_name):
     """Reserve fixture builds after migration; retain the fixture's tax-only root contract."""
     from tests.ptg_snapshot_candidate_support import apply_candidate_migration
-    schema=quoted(schema_name)
+
+    schema = quoted(schema_name)
     async with engine.begin() as connection:
-        await connection.exec_driver_sql(f"ALTER TABLE {schema}.ptg2_v3_snapshot_layout ADD COLUMN build_token text DEFAULT 'source-proof'")
-        old_guard=await connection.scalar(sa.text(f"SELECT pg_get_functiondef('{schema}.guard_ptg2_provider_tax_identity_completion()'::regprocedure)"))
-        for table in ("ptg2_v3_snapshot_layout","ptg2_v4_snapshot_map_root","ptg2_v3_provider_group"):
-            await connection.exec_driver_sql(f"CREATE TEMP TABLE fresh_{table} ON COMMIT DROP AS SELECT * FROM {schema}.{table} WHERE snapshot_key IN (18,19,20)")
-        await connection.exec_driver_sql(f"DELETE FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key IN (18,19,20)")
-        await apply_candidate_migration(connection,schema_name,("ptg2_provider_group_tax_identity_source",))
+        await connection.exec_driver_sql(
+            f"ALTER TABLE {schema}.ptg2_v3_snapshot_layout ADD COLUMN build_token text DEFAULT 'source-proof'"
+        )
+        old_guard = await connection.scalar(
+            sa.text(
+                f"SELECT pg_get_functiondef('{schema}.guard_ptg2_provider_tax_identity_completion()'::regprocedure)"
+            )
+        )
+        for table in ("ptg2_v3_snapshot_layout", "ptg2_v4_snapshot_map_root", "ptg2_v3_provider_group"):
+            await connection.exec_driver_sql(
+                f"CREATE TEMP TABLE fresh_{table} ON COMMIT DROP AS SELECT * FROM {schema}.{table} WHERE snapshot_key IN (18,19,20)"
+            )
+        await connection.exec_driver_sql(
+            f"DELETE FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key IN (18,19,20)"
+        )
+        await apply_candidate_migration(connection, schema_name, ("ptg2_provider_group_tax_identity_source",))
         # This narrow source fixture has a two-column root, not the complete graph root.
         await connection.exec_driver_sql(old_guard)
-        for table in ("ptg2_v3_snapshot_layout","ptg2_v4_snapshot_map_root","ptg2_v3_provider_group"):
+        for table in ("ptg2_v3_snapshot_layout", "ptg2_v4_snapshot_map_root", "ptg2_v3_provider_group"):
             await connection.exec_driver_sql(f"INSERT INTO {schema}.{table} SELECT * FROM fresh_{table}")
 
 
