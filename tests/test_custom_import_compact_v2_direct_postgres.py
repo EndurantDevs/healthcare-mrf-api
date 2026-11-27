@@ -1540,3 +1540,103 @@ async def test_direct_v2_nonmonotonic_slots_and_child_membership_parity(monkeypa
                 leg_proj.root_count,
                 leg_proj.child_count,
             )
+
+
+async def _load_direct_projection_context(session, request, outcome):
+    """Load the snapshot schema, binding, and direct roots for bijection checks."""
+    from process.custom_import import family_block_direct_finalize as direct_finalize
+
+    family_id = await _snapshot_family_id_for_generation(session, outcome.generation_id)
+    build = await session.scalar(
+        select(CustomImportBuildAttempt).where(CustomImportBuildAttempt.generation_id == outcome.generation_id)
+    )
+    assert build is not None
+    registry = await direct_finalize.load_registry(
+        session,
+        SimpleNamespace(
+            dataset_id=build.dataset_id,
+            definition_revision_id=build.definition_revision_id,
+            schema_revision_id=build.schema_revision_id,
+            definition=request.definition,
+        ),
+    )
+    binding = direct_finalize.checked_binding(family_id, request.definition, registry.child_collection_slots)
+    session.info[direct_finalize.staging._WINDOW] = direct_finalize.staging._PageWindow(
+        direct_finalize.staging.time.monotonic() + 60.0, 60_000
+    )
+    roots, _ = direct_finalize._direct_root_sources(binding, build, outcome.generation_id)
+    return snapshot_schema(family_id), binding, roots
+
+
+async def _assert_corrupt_key_dictionary_rejected(case, request, outcome) -> None:
+    """Confirm duplicate canonical keys and synthetic hash collisions both raise FamilyBlockUnavailable."""
+    from process.custom_import import family_block_direct_finalize as direct_finalize
+    from process.custom_import.family_block_binding import FamilyBlockUnavailable
+
+    async with case.sessions() as session:
+        schema_name, binding, roots = await _load_direct_projection_context(session, request, outcome)
+        await direct_finalize._verify_key_dictionary_bijection(session, binding, roots)
+
+        with pytest.raises(FamilyBlockUnavailable):
+            async with session.begin_nested():
+                await session.execute(
+                    text(
+                        f'INSERT INTO "{schema_name}".custom_import_block_key '
+                        "(key_rank, key_variant, child_key_sha256, canonical_child_key) "
+                        "SELECT key_rank + 100, 1, decode(repeat('aa', 32), 'hex'), canonical_child_key "
+                        f'FROM "{schema_name}".custom_import_block_key LIMIT 1'
+                    )
+                )
+                await direct_finalize._verify_key_dictionary_bijection(session, binding, roots)
+
+        with pytest.raises(FamilyBlockUnavailable):
+            async with session.begin_nested():
+                await session.execute(
+                    text(
+                        f'INSERT INTO "{schema_name}".custom_import_block_key '
+                        "(key_rank, key_variant, child_key_sha256, canonical_child_key) "
+                        "SELECT key_rank + 100, 1, child_key_sha256, canonical_child_key || '-collide' "
+                        f'FROM "{schema_name}".custom_import_block_key ORDER BY key_rank LIMIT 1'
+                    )
+                )
+                qr_columns = [col.name for col in binding.tables_by_role["query_record"].c]
+                qr_select = ", ".join(
+                    "child_revision_id + 100000"
+                    if col == "child_revision_id"
+                    else "key_rank + 100"
+                    if col == "key_rank"
+                    else col
+                    for col in qr_columns
+                )
+                await session.execute(
+                    text(
+                        f'INSERT INTO "{schema_name}".custom_import_block_query_record ({", ".join(qr_columns)}) '
+                        f'SELECT {qr_select} FROM "{schema_name}".custom_import_block_query_record '
+                        "ORDER BY child_revision_id LIMIT 1"
+                    )
+                )
+                await direct_finalize._verify_key_dictionary_bijection(session, binding, roots)
+
+
+@pytest.mark.asyncio
+async def test_direct_v2_f3_bounded_stages_and_key_dictionary_guards(monkeypatch):
+    """Direct finalize steps through bounded f3 sub-stages and rejects corrupt key dictionaries."""
+    from process.custom_import import family_block_direct_finalize as direct_finalize
+
+    visited_stages: list[str] = []
+    original_dispatch = direct_finalize._dispatch_finalize_stage
+
+    async def _recording_dispatch(session, request, build, registry, binding, progress_by_col, *, limits):
+        visited_stages.append(str(progress_by_col["finalize_stage"]))
+        await original_dispatch(session, request, build, registry, binding, progress_by_col, limits=limits)
+
+    monkeypatch.setattr(direct_finalize, "_dispatch_finalize_stage", _recording_dispatch)
+    async with _source_case() as case:
+        await _install_compact_schema(case)
+        connector, request, policy = await _registered_nonmonotonic_capture(case, monkeypatch, idempotency_key="nm-f3")
+        outcome = await runner.run_segmented_snowflake_candidate(
+            case.sessions, connector, request, processing_policy=policy, direct_compact=True
+        )
+        assert outcome.status == "activated"
+        assert visited_stages == ["f1", "f2", "f3", "f3_child", "f3_idx", "f3_digest", "f4a"]
+        await _assert_corrupt_key_dictionary_rejected(case, request, outcome)
