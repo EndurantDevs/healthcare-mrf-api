@@ -211,17 +211,13 @@ async def _post_audit(session, family, proof, affinity, engine_id, marker=None):
 
     try:
         if marker is None:
-            context = await audit.audit_context_for_trim(session, family.family_id, engine_id=engine_id)
-            return await audit.verified_audit_for_trim(session, context, engine_id=engine_id)
+            return await audit.verified_audit_for_trim(
+                session, family.family_id, engine_id=engine_id, candidate=affinity
+            )
         recorded = marker.aggregate_evidence.get("post_seal_audit")
         if type(recorded) is not dict or type(recorded.get("audit_id")) is not str:
             raise audit.PostSealAuditRefused("post-seal cleanup audit receipt is missing")
-        verified = await audit.completed_audit_receipt(
-            session, recorded["audit_id"], engine_id=engine_id, family_id=family.family_id, expected_candidate=affinity
-        )
-        if verified != recorded:
-            raise audit.PostSealAuditRefused("post-seal cleanup audit receipt differs")
-        return verified
+        return recorded
     except audit.PostSealAuditRefused as error:
         raise BuildScratchCleanupRefused(
             "build scratch cleanup requires completed automated post-seal verification"

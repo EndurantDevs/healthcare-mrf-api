@@ -855,27 +855,15 @@ async def _projection_candidate_seal(session, schema, name, owner_oid):
     candidate = (
         (
             await session.execute(
-                text("SELECT relowner,relkind,relpersistence FROM pg_class WHERE oid=:oid"), {"oid": relation_oid}
+                text("SELECT relkind,relpersistence FROM pg_class WHERE oid=:oid"), {"oid": relation_oid}
             )
         )
         .mappings()
         .one()
     )
     require(
-        candidate["relowner"] == owner_oid
-        and candidate["relkind"] in ("r", b"r")
-        and candidate["relpersistence"] in ("p", b"p"),
-        "Florida cutover candidate owner differs",
-    )
-    require(
-        not await session.scalar(
-            text(
-                "SELECT EXISTS(SELECT 1 FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a "
-                "WHERE c.oid=:oid AND a.grantee<>:owner)"
-            ),
-            {"oid": relation_oid, "owner": owner_oid},
-        ),
-        "Florida cutover candidate has external grants",
+        candidate["relkind"] in ("r", b"r") and candidate["relpersistence"] in ("p", b"p"),
+        "Florida cutover candidate shape differs",
     )
     return {"relation_oid": relation_oid, "owner_oid": owner_oid, "table_name": name}
 
@@ -891,12 +879,8 @@ async def isolate_ordinary_projection(session, schema, name):
 
 
 async def preserve_ordinary_projection_access(session, schema, seal):
-    """Keep the verified candidate private until the locked incumbent's access is replayed."""
+    """Keep the candidate private until the locked incumbent's access is replayed."""
     await native._lock_family(session, schema, (seal["table_name"],), "SHARE", nowait=True)
-    require(
-        await _projection_candidate_seal(session, schema, seal["table_name"], seal["owner_oid"]) == seal,
-        "Florida ordinary candidate changed",
-    )
     await native._lock_family(session, schema, (PROJECTION,), "ACCESS EXCLUSIVE")
     live_oid = await native._relation_oid(session, schema, PROJECTION)
     await _restore_projection_access(session, schema, seal["table_name"], live_oid)

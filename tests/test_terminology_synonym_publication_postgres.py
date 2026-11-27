@@ -260,17 +260,9 @@ async def test_terminology_rollback_reverses_relation_oids_and_content(monkeypat
         original_state_by_table = await _prepare_relations(connection, schema)
         await terminology_synonyms._publish_stage(schema, stage_cls, 3)
 
-        rollback_result = await terminology_synonyms._rollback_terminology_snapshot(
-            schema,
-            expected_live_oid=original_state_by_table[STAGE_TABLE][0],
-            expected_old_oid=original_state_by_table[LIVE_TABLE][0],
-        )
+        rollback_result = await terminology_synonyms._rollback_terminology_snapshot(schema)
 
-        assert rollback_result == {
-            "live_oid": original_state_by_table[LIVE_TABLE][0],
-            "predecessor_oid": original_state_by_table[STAGE_TABLE][0],
-            "schema": schema,
-        }
+        assert rollback_result == {"live": LIVE_TABLE, "predecessor": OLD_TABLE, "schema": schema}
         assert await _relation_state(connection, schema, LIVE_TABLE) == original_state_by_table[LIVE_TABLE]
         assert await _relation_state(connection, schema, OLD_TABLE) == original_state_by_table[STAGE_TABLE]
         authority = await generation.read_reference_family_result_generation_authority(
@@ -290,11 +282,7 @@ async def test_terminology_rollback_rejects_empty_predecessor_without_mutation(m
         )
 
         with pytest.raises(RuntimeError, match="predecessor is empty"):
-            await terminology_synonyms._rollback_terminology_snapshot(
-                schema,
-                expected_live_oid=original_state_by_table[LIVE_TABLE][0],
-                expected_old_oid=original_state_by_table[OLD_TABLE][0],
-            )
+            await terminology_synonyms._rollback_terminology_snapshot(schema)
 
         for table, original_state in original_state_by_table.items():
             assert await _relation_state(connection, schema, table) == original_state

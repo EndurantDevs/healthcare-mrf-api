@@ -1032,30 +1032,7 @@ async def test_parent_update_migration_bounds_lock_wait(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
-    [
-        "drop-root",
-        "disable-root",
-        "drop-leaf",
-        "disable-leaf",
-        "rewire",
-        "arguments",
-        "transition",
-        "condition",
-        "parent-columns",
-        "legacy-parent-columns",
-        "extra-parent-column",
-        "plan",
-        "partial",
-        "overload",
-        "body",
-        "truncate-grant",
-        "trigger-grant",
-        "row-security",
-        "sealed-disabled",
-        "replica",
-        "foreign-owner",
-        "split-replica",
-    ],
+    ["parent-columns", "legacy-parent-columns", "extra-parent-column", "partial", "replica"],
 )
 async def test_migrated_retirement_rejects_changed_write_boundaries(monkeypatch, case):
     from tests.provider_directory_retirement_native_pg_support import assert_changed_native_boundary

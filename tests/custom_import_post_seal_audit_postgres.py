@@ -861,8 +861,11 @@ async def test_audit_reads_trimmed_retained_base_and_preserves_immutable_manifes
                         ),
                         {"generation": first.generation_id},
                     )
-            context = await audit.audit_context_for_trim(session, family_id, engine_id="synthetic_engine")
-            await audit.verified_audit_for_trim(session, context, engine_id="synthetic_engine")
+            context = await audit._context(session, family_id, "synthetic_engine")
+            candidate = cleanup._affinity(
+                context.family, context.build, context.generation, context.proof, context.seal
+            )
+            await audit.verified_audit_for_trim(session, family_id, engine_id="synthetic_engine", candidate=candidate)
 
 
 async def _assert_portable_audit_identity(session, context):
@@ -906,7 +909,7 @@ async def test_audit_binds_completed_projection_manifest():
             header = await session.get(Audit, progress.audit_id)
             assert set(header.binding) == {"contract", "identity", "root_page_rows"}
             assert "custom_import_query_projection" in header.binding["identity"]["candidate_rows"]
-            context = await audit.audit_context_for_trim(session, family_id, engine_id="synthetic_engine")
+            context = await audit._context(session, family_id, "synthetic_engine")
             await _assert_portable_audit_identity(session, context)
             with pytest.raises(audit.PostSealAuditRefused, match="binding changed"):
                 async with session.begin_nested():

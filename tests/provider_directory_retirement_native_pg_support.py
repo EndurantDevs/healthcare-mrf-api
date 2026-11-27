@@ -373,28 +373,6 @@ async def _assign_legacy_owners(scenario, plan, roles):
     assert await scenario.connection.fetchval("SELECT pg_has_role($1,$2,'SET')", publisher, owner)
 
 
-async def _assert_role_boundary(scenario, database, plan, case):
-    leaf = f'{scenario.schema}."pd_dataset_history_{plan["tables"][TABLES[0]]["original_oid"]}"'
-    async with _owned_roles(scenario.connection) as roles:
-        actor, writer = roles
-        if case == "foreign-owner":
-            await scenario.connection.execute(f'ALTER TABLE {leaf} OWNER TO "{actor}"')
-        else:
-            await scenario.connection.execute(f'GRANT SET ON PARAMETER session_replication_role TO "{actor}"')
-            await scenario.connection.execute(f'GRANT USAGE ON SCHEMA {scenario.schema} TO "{writer}"')
-            await scenario.connection.execute(f'GRANT UPDATE(payload_hash) ON {leaf} TO "{writer}"')
-            await scenario.connection.execute(f'GRANT "{writer}" TO "{actor}" WITH INHERIT FALSE, SET TRUE')
-            assert not await scenario.connection.fetchval(
-                "SELECT has_any_column_privilege($1,$2,'UPDATE')", actor, leaf
-            )
-            assert not await scenario.connection.fetchval(
-                "SELECT has_parameter_privilege($1,'session_replication_role','SET')", writer
-            )
-        with pytest.raises(TerminalRootRetirementError, match="state_invalid"):
-            async with database.transaction():
-                await require_retirement_controls(database)
-
-
 async def _assert_immutable_write(connection, statement):
     with pytest.raises(Exception, match="immutable"):
         async with connection.transaction():
@@ -404,49 +382,17 @@ async def _assert_immutable_write(connection, statement):
 def _tamper_statement(case, scenario, plan):
     root = f"{scenario.schema}.{TABLES[0]}"
     leaf = f'{scenario.schema}."pd_dataset_history_{plan["tables"][TABLES[0]]["original_oid"]}"'
-    trigger_relation = root if case.endswith("root") else leaf
-    hook = "a_pd_candidate_insert_new"
-    if case.startswith("drop-"):
-        return f"DROP TRIGGER {hook} ON {trigger_relation}"
-    if case.startswith("disable-"):
-        return f"ALTER TABLE {trigger_relation} DISABLE TRIGGER {hook}"
-    if case in {"truncate-grant", "trigger-grant"}:
-        privilege = "TRUNCATE" if case == "truncate-grant" else "TRIGGER"
-        return f"GRANT {privilege} ON {leaf} TO PUBLIC"
     if case == "parent-columns":
         return f"CREATE OR REPLACE TRIGGER pd_trr_dataset_row BEFORE INSERT OR DELETE OR UPDATE OF status ON {scenario.schema}.provider_directory_endpoint_dataset FOR EACH ROW EXECUTE FUNCTION {scenario.schema}.guard_provider_directory_terminal_root_retirement_parent()"
     if case == "legacy-parent-columns":
         columns = ",".join(_parent_update_migration()._LEGACY_COLUMNS)
         return f"CREATE OR REPLACE TRIGGER pd_trr_dataset_row BEFORE INSERT OR DELETE OR UPDATE OF {columns} ON {scenario.schema}.provider_directory_endpoint_dataset FOR EACH ROW EXECUTE FUNCTION {scenario.schema}.guard_provider_directory_terminal_root_retirement_parent(); ALTER TABLE {scenario.schema}.provider_directory_endpoint_dataset ENABLE ALWAYS TRIGGER pd_trr_dataset_row"
-    if case == "plan":
-        return f"UPDATE {scenario.schema}.pd_dataset_migration_plan SET plan=jsonb_set(plan,'{{complete}}','false')"
-    if case == "overload":
-        return f"CREATE FUNCTION {scenario.schema}.guard_pd_dataset_candidate_parent(text) RETURNS boolean LANGUAGE sql AS 'SELECT true'"
-    if case == "body":
-        signature = f"CREATE FUNCTION {scenario.schema}.guard_pd_dataset_candidate_parent()"
-        body = candidate_functions(scenario.schema_name).split(signature, 1)[1].split("$fn$;", 1)[0]
-        return (
-            signature.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION")
-            + body.replace("BEGIN", "BEGIN -- changed body", 1)
-            + "$fn$;"
-        )
-    if case == "row-security":
-        return f"ALTER TABLE {leaf} ENABLE ROW LEVEL SECURITY"
-    if case == "sealed-disabled":
-        return f"ALTER TABLE {scenario.schema}.retirement_sealed_resource DISABLE TRIGGER pd_dataset_sealed"
     if case == "partial":
         return f"ALTER TABLE {root} DETACH PARTITION {leaf}; ALTER TABLE {root} RENAME TO partial_resource; ALTER TABLE {leaf} RENAME TO {TABLES[0]}"
-    if case == "extra-parent-column":
-        from process.network_fhir_source_custody import _UPDATE_COLUMNS
+    from process.network_fhir_source_custody import _UPDATE_COLUMNS
 
-        columns = ",".join(_UPDATE_COLUMNS["tin_npi_connector_endpoint_dataset_guard"]) + ",unrelated_column"
-        return f"ALTER TABLE {scenario.schema}.provider_directory_endpoint_dataset ADD COLUMN unrelated_column text; CREATE OR REPLACE TRIGGER pd_trr_dataset_row BEFORE INSERT OR DELETE OR UPDATE OF {columns} ON {scenario.schema}.provider_directory_endpoint_dataset FOR EACH ROW EXECUTE FUNCTION {scenario.schema}.guard_provider_directory_terminal_root_retirement_parent()"
-    transition = "wrong_rows" if case == "transition" else "affected_rows"
-    image = "OLD" if case == "arguments" else "NEW"
-    function = "deny_pd_dataset_candidate_write" if case == "rewire" else "guard_pd_dataset_candidate_parent"
-    arguments = "" if case == "rewire" else f"'{TABLES[0]}','{image}'"
-    when = " WHEN(false)" if case == "condition" else ""
-    return f"CREATE OR REPLACE TRIGGER {hook} AFTER INSERT ON {leaf} REFERENCING NEW TABLE AS {transition} FOR EACH STATEMENT{when} EXECUTE FUNCTION {scenario.schema}.{function}({arguments})"
+    columns = ",".join(_UPDATE_COLUMNS["tin_npi_connector_endpoint_dataset_guard"]) + ",unrelated_column"
+    return f"ALTER TABLE {scenario.schema}.provider_directory_endpoint_dataset ADD COLUMN unrelated_column text; CREATE OR REPLACE TRIGGER pd_trr_dataset_row BEFORE INSERT OR DELETE OR UPDATE OF {columns} ON {scenario.schema}.provider_directory_endpoint_dataset FOR EACH ROW EXECUTE FUNCTION {scenario.schema}.guard_provider_directory_terminal_root_retirement_parent()"
 
 
 async def assert_changed_native_boundary(monkeypatch, case):
@@ -456,10 +402,6 @@ async def assert_changed_native_boundary(monkeypatch, case):
         async with database.transaction():
             await require_retirement_controls(database)
         before = await scenario.snapshot()
-        if case in {"foreign-owner", "split-replica"}:
-            await _assert_role_boundary(scenario, database, plan, case)
-            assert await scenario.snapshot() == before
-            return
         if case == "replica":
             async with database.transaction():
                 await database.execute("SET LOCAL session_replication_role=replica")

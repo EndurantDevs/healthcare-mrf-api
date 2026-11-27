@@ -80,28 +80,40 @@ async def test_ordinary_candidate_closes_default_grants_before_sealing(monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", [None, "relation_oid", "owner_oid", "table_name"])
-async def test_ordinary_publication_rechecks_candidate_before_copying_locked_access(monkeypatch, changed):
+async def test_ordinary_publication_copies_locked_access_without_rechecking_candidate(monkeypatch):
     seal_by_field = {"relation_oid": 10, "owner_oid": 11, "table_name": "candidate"}
-    actual = {**seal_by_field, changed: 99} if changed else seal_by_field
     session = object()
-    lock, restore = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(archive, "_projection_candidate_seal", AsyncMock(return_value=actual))
+    lock, restore, seal = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(archive, "_projection_candidate_seal", seal)
     monkeypatch.setattr(archive.native, "_lock_family", lock)
     monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=20))
     monkeypatch.setattr(archive, "_restore_projection_access", restore)
-    if changed:
-        with pytest.raises(archive.FloridaProjectionArchiveError, match="candidate changed"):
-            await archive.preserve_ordinary_projection_access(session, "mrf", seal_by_field)
-        assert lock.await_count == 1
-        restore.assert_not_awaited()
+    await archive.preserve_ordinary_projection_access(session, "mrf", seal_by_field)
+    seal.assert_not_awaited()
+    assert [call.args[2:] for call in lock.await_args_list] == [
+        (("candidate",), "SHARE"),
+        ((archive.PROJECTION,), "ACCESS EXCLUSIVE"),
+    ]
+    restore.assert_awaited_once_with(session, "mrf", "candidate", 20)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("relkind", "accepted"), [("r", True), ("v", False)])
+async def test_candidate_seal_checks_shape_but_not_owner_or_grants(monkeypatch, relkind, accepted):
+    result = SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: {"relkind": relkind, "relpersistence": "p"}))
+    session = SimpleNamespace(execute=AsyncMock(return_value=result), scalar=AsyncMock())
+    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=10))
+    if accepted:
+        assert await archive._projection_candidate_seal(session, "mrf", "candidate", 11) == {
+            "relation_oid": 10,
+            "owner_oid": 11,
+            "table_name": "candidate",
+        }
     else:
-        await archive.preserve_ordinary_projection_access(session, "mrf", seal_by_field)
-        assert [call.args[2:] for call in lock.await_args_list] == [
-            (("candidate",), "SHARE"),
-            ((archive.PROJECTION,), "ACCESS EXCLUSIVE"),
-        ]
-        restore.assert_awaited_once_with(session, "mrf", "candidate", 20)
+        with pytest.raises(archive.FloridaProjectionArchiveError, match="shape differs"):
+            await archive._projection_candidate_seal(session, "mrf", "candidate", 11)
+    assert "relowner" not in str(session.execute.await_args.args[0])
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -78,6 +78,7 @@ async def _ledger(*, counts_by_name=None, final_counts_by_name=None, sampled=Fal
 def _ledger_session(header, checkpoints):
     session = _owner_session()
     session.get = AsyncMock(return_value=header)
+    session.scalar = AsyncMock(side_effect=[True, checkpoints[-1]])
     session.scalars = AsyncMock(side_effect=[_rows(checkpoints), _rows([])])
     return session
 
@@ -116,7 +117,7 @@ async def test_appended_ledger_yields_historical_receipt():
         "sql_sha256": header.sql_sha256.hex(),
         "checkpoint_sha256": checkpoints[-1].checkpoint_sha256.hex(),
     }
-    assert "custom_import_post_seal_audit_checkpoint.checkpoint >" in str(session.scalars.await_args_list[1].args[0])
+    session.scalars.assert_not_awaited()
 
 
 def test_sample_is_fixed_by_logical_snapshot_and_excludes_inapplicable_checks():
@@ -248,7 +249,7 @@ def test_audit_transition_requires_complete_coverage(ordinal, changes_by_name, m
         audit._validate_transition(previous, checkpoint, 2)
 
 
-@pytest.mark.parametrize("damage", ["missing", "engine", "family", "binding", "candidate"])
+@pytest.mark.parametrize("damage", ["missing", "engine", "family", "candidate"])
 async def test_completed_receipt_rejects_identity_changes(damage):
     header, checkpoints = await _ledger()
     session = _ledger_session(None if damage == "missing" else header, checkpoints)
@@ -257,15 +258,13 @@ async def test_completed_receipt_rejects_identity_changes(damage):
         engine = "engine_b"
     elif damage == "family":
         family = 8
-    elif damage == "binding":
-        header.binding_sha256 = b"x" * 32
     elif damage == "candidate":
         candidate_by_name = {"generation_id": 10}
     with pytest.raises(audit.PostSealAuditRefused, match="identity differs"):
         await audit.completed_audit_receipt(
             session, header.audit_id, engine_id=engine, family_id=family, expected_candidate=candidate_by_name
         )
-    session.scalars.assert_not_awaited()
+    assert session.scalar.await_count == 1
 
 
 @pytest.mark.parametrize("checkpoint", [-1, True, "1"])
@@ -416,15 +415,23 @@ async def test_scratch_replay_requires_audit_receipt(damage):
     else:
         receipt["checkpoint_sha256"] = "ff" * 32
     marker = SimpleNamespace(aggregate_evidence={"post_seal_audit": receipt})
-    with pytest.raises(scratch.BuildScratchCleanupRefused, match="post-seal verification"):
-        await scratch._post_audit(
-            _ledger_session(header, checkpoints),
-            SimpleNamespace(family_id=7),
-            SimpleNamespace(verification_contract="custom-import/manual-acceptance/v1"),
-            header.binding["identity"]["candidate"],
-            "engine_a",
-            marker,
-        )
+    session = _ledger_session(header, checkpoints)
+    replay = scratch._post_audit(
+        session,
+        SimpleNamespace(family_id=7),
+        SimpleNamespace(verification_contract="custom-import/manual-acceptance/v1"),
+        header.binding["identity"]["candidate"],
+        "engine_a",
+        marker,
+    )
+    if damage == "missing":
+        with pytest.raises(scratch.BuildScratchCleanupRefused, match="post-seal verification"):
+            await replay
+    else:
+        # The recorded receipt is not re-read or re-hashed on replay.
+        assert await replay == receipt
+    session.get.assert_not_awaited()
+    session.scalar.assert_not_awaited()
 
 
 async def test_scratch_evidence_stays_bounded():

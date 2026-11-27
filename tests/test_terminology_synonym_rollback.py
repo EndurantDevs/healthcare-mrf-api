@@ -9,175 +9,88 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from click.testing import CliRunner
 import pytest
+from click.testing import CliRunner
 
 import main
 
-
 terminology_synonyms = importlib.import_module("process.terminology_synonyms")
 COMMAND = "rollback-terminology-synonyms"
-ARGUMENTS = [
-    "--expected-live-oid",
-    "101",
-    "--expected-old-oid",
-    "202",
-]
 
 
-def _relation_oid_row(live_oid, old_oid):
-    return SimpleNamespace(
-        _mapping={"live_oid": live_oid, "old_oid": old_oid},
-    )
+def _row(**values):
+    return SimpleNamespace(_mapping=values)
+
+
+def _transaction(outcomes):
+    @asynccontextmanager
+    async def transaction():
+        try:
+            yield
+        except Exception:
+            outcomes.append("rollback")
+            raise
+        outcomes.append("commit")
+
+    return transaction
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("relation_row", "expected_message"),
-    [
-        (_relation_oid_row(None, 202), "relation is missing"),
-        (_relation_oid_row(303, 202), "relation identity changed"),
-    ],
-)
-async def test_rollback_rejects_missing_or_stale_precheck(
-    monkeypatch,
-    relation_row,
-    expected_message,
-):
-    all_rows = AsyncMock(return_value=[relation_row])
+async def test_rollback_rejects_missing_relation_before_locking(monkeypatch):
+    all_rows = AsyncMock(return_value=[_row(present=False)])
     status = AsyncMock()
     transaction = AsyncMock()
     monkeypatch.setattr(terminology_synonyms.db, "all", all_rows)
     monkeypatch.setattr(terminology_synonyms.db, "status", status)
     monkeypatch.setattr(terminology_synonyms.db, "transaction", transaction)
 
-    with pytest.raises(RuntimeError, match=expected_message):
-        await terminology_synonyms._rollback_terminology_snapshot(
-            "tenant",
-            expected_live_oid=101,
-            expected_old_oid=202,
-        )
+    with pytest.raises(RuntimeError, match="relation is missing"):
+        await terminology_synonyms._rollback_terminology_snapshot("tenant")
 
     status.assert_not_awaited()
     transaction.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_rollback_rechecks_relation_identity_after_lock(monkeypatch):
-    transaction_outcomes = []
-
-    @asynccontextmanager
-    async def transaction():
-        try:
-            yield
-        except Exception:
-            transaction_outcomes.append("rollback")
-            raise
-        transaction_outcomes.append("commit")
-
-    all_rows = AsyncMock(
-        side_effect=[
-            [_relation_oid_row(101, 202)],
-            [_relation_oid_row(303, 202)],
-        ]
-    )
+async def test_rollback_rejects_empty_predecessor_after_lock(monkeypatch):
+    outcomes = []
+    all_rows = AsyncMock(side_effect=[[_row(present=True)], [_row(has_rows=False)]])
     status = AsyncMock()
     monkeypatch.setattr(terminology_synonyms.db, "all", all_rows)
     monkeypatch.setattr(terminology_synonyms.db, "status", status)
-    monkeypatch.setattr(terminology_synonyms.db, "transaction", transaction)
+    monkeypatch.setattr(terminology_synonyms.db, "transaction", _transaction(outcomes))
 
-    with pytest.raises(RuntimeError, match="relation identity changed while acquiring locks"):
-        await terminology_synonyms._rollback_terminology_snapshot(
-            "tenant",
-            expected_live_oid=101,
-            expected_old_oid=202,
-        )
+    with pytest.raises(RuntimeError, match="predecessor is empty"):
+        await terminology_synonyms._rollback_terminology_snapshot("tenant")
 
-    assert transaction_outcomes == ["rollback"]
+    assert outcomes == ["rollback"]
     assert [call.args[0] for call in status.await_args_list] == [
-        'LOCK TABLE "tenant"."terminology_synonym_old", '
-        '"tenant"."terminology_synonym" IN ACCESS EXCLUSIVE MODE;'
+        'LOCK TABLE "tenant"."terminology_synonym_old", "tenant"."terminology_synonym" IN ACCESS EXCLUSIVE MODE;'
     ]
 
 
 @pytest.mark.asyncio
-async def test_rollback_rejects_duplicate_oids_and_empty_predecessor(monkeypatch):
-    all_rows = AsyncMock(
-        side_effect=[
-            [_relation_oid_row(101, 202)],
-            [_relation_oid_row(101, 202)],
-            [SimpleNamespace(_mapping={"has_rows": False})],
-        ]
-    )
+async def test_rollback_swaps_by_name_without_relation_identity_checks(monkeypatch):
+    outcomes = []
+    all_rows = AsyncMock(side_effect=[[_row(present=True)], [_row(has_rows=True)]])
     status = AsyncMock()
-
-    @asynccontextmanager
-    async def transaction():
-        yield
-
+    publish = AsyncMock()
     monkeypatch.setattr(terminology_synonyms.db, "all", all_rows)
     monkeypatch.setattr(terminology_synonyms.db, "status", status)
-    monkeypatch.setattr(terminology_synonyms.db, "transaction", transaction)
+    monkeypatch.setattr(terminology_synonyms.db, "transaction", _transaction(outcomes))
+    monkeypatch.setattr(terminology_synonyms, "publish_local_reference_family_generation", publish)
 
-    with pytest.raises(ValueError, match="must be PostgreSQL OIDs"):
-        await terminology_synonyms._rollback_terminology_snapshot(
-            "tenant",
-            expected_live_oid=0,
-            expected_old_oid=202,
-        )
-    with pytest.raises(ValueError, match="must be distinct"):
-        await terminology_synonyms._rollback_terminology_snapshot(
-            "tenant",
-            expected_live_oid=101,
-            expected_old_oid=101,
-        )
-    all_rows.assert_not_awaited()
+    assert await terminology_synonyms._rollback_terminology_snapshot("tenant") == {
+        "live": "terminology_synonym",
+        "predecessor": "terminology_synonym_old",
+        "schema": "tenant",
+    }
 
-    with pytest.raises(RuntimeError, match="predecessor is empty"):
-        await terminology_synonyms._rollback_terminology_snapshot(
-            "tenant",
-            expected_live_oid=101,
-            expected_old_oid=202,
-        )
-
-    assert all("ALTER TABLE" not in call.args[0] for call in status.await_args_list)
-
-
-@pytest.mark.asyncio
-async def test_rollback_verification_failure_rolls_back_all_renames(monkeypatch):
-    transaction_outcomes = []
-
-    @asynccontextmanager
-    async def transaction():
-        try:
-            yield
-        except Exception:
-            transaction_outcomes.append("rollback")
-            raise
-        transaction_outcomes.append("commit")
-
-    all_rows = AsyncMock(
-        side_effect=[
-            [_relation_oid_row(101, 202)],
-            [_relation_oid_row(101, 202)],
-            [SimpleNamespace(_mapping={"has_rows": True})],
-            [_relation_oid_row(303, 101)],
-        ]
-    )
-    status = AsyncMock()
-    monkeypatch.setattr(terminology_synonyms.db, "all", all_rows)
-    monkeypatch.setattr(terminology_synonyms.db, "status", status)
-    monkeypatch.setattr(terminology_synonyms.db, "transaction", transaction)
-
-    with pytest.raises(RuntimeError, match="rollback verification failed"):
-        await terminology_synonyms._rollback_terminology_snapshot(
-            "tenant",
-            expected_live_oid=101,
-            expected_old_oid=202,
-        )
-
-    assert transaction_outcomes == ["rollback"]
+    assert outcomes == ["commit"]
+    assert all_rows.await_count == 2
+    assert "oid" not in str(all_rows.await_args_list[0].args[0])
     assert sum("ALTER TABLE" in call.args[0] for call in status.await_args_list) == 3
+    publish.assert_awaited_once_with(terminology_synonyms.db, importer_id="terminology-synonyms", schema_name="tenant")
 
 
 @pytest.mark.asyncio
@@ -187,9 +100,9 @@ async def test_rollback_runtime_connects_and_disconnects(monkeypatch):
     async def init_db(database):
         calls.append(("connect", database))
 
-    async def rollback(schema, **oids):
-        calls.append(("rollback", schema, oids))
-        return {"live_oid": 202}
+    async def rollback(schema):
+        calls.append(("rollback", schema))
+        return {"schema": schema}
 
     async def disconnect():
         calls.append(("disconnect",))
@@ -199,19 +112,12 @@ async def test_rollback_runtime_connects_and_disconnects(monkeypatch):
     monkeypatch.setattr(terminology_synonyms, "_rollback_terminology_snapshot", rollback)
     monkeypatch.setattr(terminology_synonyms.db, "disconnect", disconnect)
 
-    rollback_result = await terminology_synonyms.rollback_terminology_snapshot(
-        expected_live_oid=101,
-        expected_old_oid=202,
-    )
+    rollback_result = await terminology_synonyms.rollback_terminology_snapshot()
 
-    assert rollback_result == {"live_oid": 202}
+    assert rollback_result == {"schema": "tenant"}
     assert calls == [
         ("connect", terminology_synonyms.db),
-        (
-            "rollback",
-            "tenant",
-            {"expected_live_oid": 101, "expected_old_oid": 202},
-        ),
+        ("rollback", "tenant"),
         ("disconnect",),
     ]
 
@@ -224,7 +130,7 @@ async def test_rollback_runtime_preserves_primary_failure_during_disconnect(
     async def init_db(_database):
         return None
 
-    async def rollback(*_args, **_kwargs):
+    async def rollback(*_args):
         raise RuntimeError("synthetic rollback failure")
 
     async def disconnect():
@@ -235,37 +141,28 @@ async def test_rollback_runtime_preserves_primary_failure_during_disconnect(
     monkeypatch.setattr(terminology_synonyms.db, "disconnect", disconnect)
 
     with pytest.raises(RuntimeError, match="synthetic rollback failure"):
-        await terminology_synonyms.rollback_terminology_snapshot(
-            expected_live_oid=101,
-            expected_old_oid=202,
-        )
+        await terminology_synonyms.rollback_terminology_snapshot()
     assert "synthetic disconnect failure" in caplog.text
 
     monkeypatch.setattr(
         terminology_synonyms,
         "_rollback_terminology_snapshot",
-        AsyncMock(return_value={"live_oid": 202}),
+        AsyncMock(return_value={"schema": "tenant"}),
     )
     with pytest.raises(RuntimeError, match="synthetic disconnect failure"):
-        await terminology_synonyms.rollback_terminology_snapshot(
-            expected_live_oid=101,
-            expected_old_oid=202,
-        )
+        await terminology_synonyms.rollback_terminology_snapshot()
 
 
 def _invoke(arguments):
     return CliRunner().invoke(main.manage, [COMMAND, *arguments])
 
 
-def test_rollback_command_requires_and_forwards_both_relation_oids(monkeypatch):
+def test_rollback_command_takes_no_relation_oids(monkeypatch):
     calls = []
 
-    async def rollback(*, expected_live_oid, expected_old_oid):
-        calls.append((expected_live_oid, expected_old_oid))
-        return {
-            "live_oid": expected_old_oid,
-            "predecessor_oid": expected_live_oid,
-        }
+    async def rollback():
+        calls.append("rollback")
+        return {"live": "terminology_synonym", "schema": "tenant"}
 
     monkeypatch.setattr(
         terminology_synonyms,
@@ -274,19 +171,19 @@ def test_rollback_command_requires_and_forwards_both_relation_oids(monkeypatch):
     )
     monkeypatch.setattr(main, "_run_async", asyncio.run)
 
-    result = _invoke(ARGUMENTS)
+    result = _invoke([])
 
     assert result.exit_code == 0, result.output
-    assert calls == [(101, 202)]
-    assert result.output == '{"live_oid":202,"predecessor_oid":101}\n'
+    assert calls == ["rollback"]
+    assert result.output == '{"live":"terminology_synonym","schema":"tenant"}\n'
 
-    missing_oid_result = _invoke(ARGUMENTS[:-2])
-    assert missing_oid_result.exit_code == 2
-    assert "Missing option" in missing_oid_result.output
+    old_flag_result = _invoke(["--expected-live-oid", "101"])
+    assert old_flag_result.exit_code == 2
+    assert "No such option" in old_flag_result.output
 
 
 def test_rollback_command_redacts_runtime_failures(monkeypatch):
-    async def rollback(**_kwargs):
+    async def rollback():
         raise RuntimeError("postgresql://private.invalid?password=secret")
 
     monkeypatch.setattr(
@@ -296,7 +193,7 @@ def test_rollback_command_redacts_runtime_failures(monkeypatch):
     )
     monkeypatch.setattr(main, "_run_async", asyncio.run)
 
-    result = _invoke(ARGUMENTS)
+    result = _invoke([])
 
     assert result.exit_code == 1
     assert "terminology synonym rollback failed" in result.output
