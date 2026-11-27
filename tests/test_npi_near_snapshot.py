@@ -184,7 +184,8 @@ async def test_near_plan_route_materializes_legacy_count_candidates(near_snapsho
     near_snapshot.provider_rows = near_snapshot.provider_rows[1:]
     following = json.loads((await npi.get_near_npi(request)).body)
     assert following["items"][0]["npi"] == 1000000012 and following["has_more"] is False
-    assert following["total_count"] == 2 and near_snapshot.count_statements == [first_count, first_count]
+    # The cursor carries the total counted on the same pinned plan snapshots, so the page does not count again.
+    assert following["total_count"] == 2 and near_snapshot.count_statements == [first_count]
     assert any("page_geo AS MATERIALIZED" in query for query in page_statements[1:])
     assert all(f"a.npi IN ({membership})" in query and "OFFSET 0" not in query for query in page_statements[1:])
 
@@ -192,7 +193,7 @@ async def test_near_plan_route_materializes_legacy_count_candidates(near_snapsho
     request.args["count_only"] = "1"
     page_count = len(page_statements)
     assert json.loads((await npi.get_near_npi(request)).body) == {"rows": 2}
-    assert len(page_statements) == page_count and near_snapshot.count_statements == [first_count] * 3
+    assert len(page_statements) == page_count and near_snapshot.count_statements == [first_count] * 2
     assert all(parameters["scope_snapshots"] == [4] for parameters in near_snapshot.query_parameters)
 
 
