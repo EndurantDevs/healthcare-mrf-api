@@ -432,7 +432,7 @@ async def test_policy_and_same_edge_parameters(page_boundary):
     assert parameters[7] == "%gold%plan%" and parameters[9] == "%example%ppo%"
     assert "edge.company_id=$5" in sql and "edge.plan_search LIKE $8" in sql
     assert "edge.company_search LIKE $10" in sql and "edge.plan_search LIKE $10" in sql
-    assert "DISTINCT ON (network_id,visible_document)" in sql
+    assert "GROUP BY network_id,visible_document" in sql
 
 
 @pytest.mark.asyncio
@@ -745,3 +745,33 @@ async def test_final_response_envelope_is_bounded_even_when_every_network_row_fi
 def test_page_sql_guards_search_materialized_ctes_when_unfiltered():
     assert "WHERE edge.metadata_generation=$1 AND $10::text IS NOT NULL" in catalog._PAGE_SQL
     assert "AND ($7::text IS NOT NULL OR $10::text IS NOT NULL)" in catalog._PAGE_SQL
+
+
+def test_page_sql_reads_filtered_networks_by_index():
+    edge_networks = catalog._PAGE_SQL.split("edge_networks AS MATERIALIZED (")[1].split("), visible_edges")[0]
+    assert "$5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL" in edge_networks
+    # A label disjunction here would hide the company trigram index from the planner.
+    assert "source_companies" not in edge_networks and "EXISTS" not in edge_networks
+    assert "network.network_id IN (SELECT network_id FROM edge_networks)" in catalog._PAGE_SQL
+    assert "candidate.document_json->>'evidence_id') COLLATE \"C\">=company.source_generation" in catalog._PAGE_SQL
+
+
+@pytest.mark.asyncio
+async def test_control_row_validates_once(monkeypatch):
+    from process import registry_fhir_catalog_custody as custody
+
+    validate = AsyncMock(side_effect=[ValueError("rejected"), None, None, None])
+    monkeypatch.setattr(custody, "validate_fhir_catalog_snapshot_record", validate)
+    monkeypatch.setattr(catalog, "_VALIDATED_ROW", {})
+    connection = SimpleNamespace(execute=AsyncMock(), is_in_transaction=lambda: True)
+    snapshot_by_field = {"metadata_generation": "a" * 64, "source_vector_json": "[]"}
+    with pytest.raises(ValueError, match="rejected"):
+        await catalog._validated_snapshot(connection, snapshot_by_field)
+    await catalog._validated_snapshot(connection, snapshot_by_field)
+    await catalog._validated_snapshot(connection, dict(snapshot_by_field))
+    assert validate.await_count == 2
+    connection.execute.assert_awaited_once_with("SET LOCAL row_security = off")
+    await catalog._validated_snapshot(connection, snapshot_by_field | {"source_vector_json": "[{}]"})
+    connection.is_in_transaction = lambda: False
+    await catalog._validated_snapshot(connection, snapshot_by_field | {"source_vector_json": "[{}]"})
+    assert validate.await_count == 4
