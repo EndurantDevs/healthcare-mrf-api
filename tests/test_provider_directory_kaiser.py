@@ -300,3 +300,19 @@ async def test_rows_below_the_previous_edition_fail_the_crawl(monkeypatch):
     diagnostics_by_type, _counts = await _close(monkeypatch, server, "synthetic_short_run", minimum_rows=2)
 
     assert {diagnostic["error"] for diagnostic in diagnostics_by_type.values()} == {kaiser.ROWS_BELOW_MINIMUM_ERROR}
+
+
+def test_activated_census_row_keeps_stored_metadata_when_seed_becomes_ordinary():
+    from sqlalchemy import column
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    kept_sql = kaiser.kept_activated_row_sql("stored", "incoming")
+    assert all(f"stored -> '{key}'" in kept_sql for key in kaiser.REVIEWED_SUBSET_ACTIVATION_KEYS)
+    assert kept_sql.endswith("incoming ->> 'provider_directory_manual_only' = 'false'")
+    expression = kaiser.kept_activated_row_expression(column("stored", JSONB), column("incoming", JSONB))
+    compiled = str(expression.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert compiled.count("jsonb_typeof") == 2 and "provider_directory_manual_only" in compiled
+    assert "provider_directory_reviewed_subset_activation_v2') = 'object'" in importer._source_metadata_update_sql(
+        "metadata_json", target_prefix="t", incoming_prefix="EXCLUDED"
+    )

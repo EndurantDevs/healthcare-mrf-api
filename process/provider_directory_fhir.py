@@ -37173,9 +37173,9 @@ def _source_metadata_update_expression(table, excluded_value):
             incoming_metadata,
         ),
     )
-    retired_replay = _ordinary_partition_generation_reset_expression(
-        incoming_metadata,
-        target_metadata,
+    retired_replay = or_(
+        _ordinary_partition_generation_reset_expression(incoming_metadata, target_metadata),
+        kaiser.kept_activated_row_expression(target_metadata, incoming_metadata),
     )
     policy_preserved_metadata = _preserved_source_reviewed_root_policy_expression(
         target_metadata,
@@ -37253,9 +37253,9 @@ def _source_metadata_update_sql(
         target_metadata,
         policy_preserved_metadata,
     )
-    retired_replay = _ordinary_partition_generation_reset_sql(
-        incoming_metadata,
-        target_metadata,
+    retired_replay = (
+        f"({_ordinary_partition_generation_reset_sql(incoming_metadata, target_metadata)}) "
+        f"OR ({kaiser.kept_activated_row_sql(target_metadata, incoming_metadata)})"
     )
     generation_reset = (
         f"({_pending_policy_generation_reset_sql(target_metadata, incoming_metadata)}) "
