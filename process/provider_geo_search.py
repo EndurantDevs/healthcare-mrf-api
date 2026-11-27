@@ -3,7 +3,8 @@
 
 Each build writes a new generation table, indexes and analyzes it, and only then publishes it by switching the
 current row of the state table. The previous generation stays for rollback. Every generation records the address
-and NPI generations it was built from, and readers use it only while those are still the published ones.
+and NPI generations it was built from. Readers use it while those are still the published ones and, after an input
+is published, for as long as the build of its replacement is running.
 """
 
 from __future__ import annotations
@@ -55,7 +56,8 @@ _GENERATION_KEY = (
     "CASE WHEN origin_lineage_id IS NOT NULL AND origin_generation IS NOT NULL THEN "
     "jsonb_build_array(local_lineage_id, local_generation, origin_lineage_id, origin_generation) END"
 )
-_BUILD_LOCK_ID = 7_310_427_651_118_003_201
+# Held for a whole rebuild or rollback. Readers treat a held lock as "the next generation is being built".
+BUILD_LOCK_ID = 7_310_427_651_118_003_201
 # Readers hold it shared for their transaction; retiring a table takes it exclusively first.
 RETIRE_LOCK_ID = 7_310_427_651_118_003_202
 _BUILD_ATTEMPTS = 3
@@ -491,15 +493,15 @@ async def rebuild_provider_geo_search(
     should_wait, needs_build = waits_for_build, force
     for _round in range(_BUILD_ATTEMPTS):
         if should_wait:
-            await connection.execute("SELECT pg_advisory_lock($1)", _BUILD_LOCK_ID)
-        elif not await connection.fetchval("SELECT pg_try_advisory_lock($1)", _BUILD_LOCK_ID):
+            await connection.execute("SELECT pg_advisory_lock($1)", BUILD_LOCK_ID)
+        elif not await connection.fetchval("SELECT pg_try_advisory_lock($1)", BUILD_LOCK_ID):
             return outcome_by_field
         try:
             outcome_by_field = await _rebuild_locked(
                 connection, schema, uses_service_locations=uses_service_locations, needs_build=needs_build
             )
         finally:
-            await connection.execute("SELECT pg_advisory_unlock($1)", _BUILD_LOCK_ID)
+            await connection.execute("SELECT pg_advisory_unlock($1)", BUILD_LOCK_ID)
         # A caller refused as busy while this build finished relies on this check after the unlock.
         if await _is_current(connection, schema, uses_service_locations=uses_service_locations):
             return outcome_by_field
@@ -542,7 +544,7 @@ async def _rebuild_locked(connection, schema: str, *, uses_service_locations: bo
 async def rollback_provider_geo_search(connection, *, schema: str = "mrf") -> dict[str, object]:
     """Point readers back at the newest earlier published generation that still exists."""
     state = _state(schema)
-    await connection.execute("SELECT pg_advisory_lock($1)", _BUILD_LOCK_ID)
+    await connection.execute("SELECT pg_advisory_lock($1)", BUILD_LOCK_ID)
     try:
         async with connection.transaction():
             current = await connection.fetchval(f"SELECT generation FROM {state} WHERE is_current FOR UPDATE")
@@ -558,7 +560,7 @@ async def rollback_provider_geo_search(connection, *, schema: str = "mrf") -> di
             await connection.execute(f"UPDATE {state} SET is_current = true WHERE generation = $1", previous)
         return {"status": "rolled_back", "from": current, "to": previous}
     finally:
-        await connection.execute("SELECT pg_advisory_unlock($1)", _BUILD_LOCK_ID)
+        await connection.execute("SELECT pg_advisory_unlock($1)", BUILD_LOCK_ID)
 
 
 async def run_provider_geo_search(*, rollback: bool = False, force: bool = False) -> dict[str, object]:
@@ -575,7 +577,10 @@ async def run_provider_geo_search(*, rollback: bool = False, force: bool = False
 
 
 async def refresh_after_publication(source: str, *, test_mode: bool = False) -> None:
-    """Rebuild after an address or NPI publication committed; a failure leaves readers on the address table."""
+    """Rebuild after an address or NPI publication committed; readers keep the previous generation meanwhile.
+
+    A failed rebuild releases the build lock, which leaves readers on the address table.
+    """
     if test_mode:
         return
     from db.connection import db

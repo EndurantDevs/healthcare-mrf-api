@@ -367,6 +367,27 @@ async def test_new_inputs_need_a_new_generation_and_two_are_kept(geo_db):
 
 
 @pytest.mark.asyncio
+async def test_previous_generation_serves_during_rebuild(geo_db):
+    """After an input is published, reads keep the previous generation only while its replacement is built."""
+    await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True)
+    await geo_db.connection.execute("UPDATE mrf.npi_result_generation SET local_generation = local_generation + 1")
+    async with geo_db.engine.connect() as connection:
+        read = _ReadConnection(connection)
+        assert await _lookup(read) is None
+        await connection.commit()
+        await geo_db.connection.execute("SELECT pg_advisory_lock($1)", builder.BUILD_LOCK_ID)
+        try:
+            assert (await _lookup(read)).table_sql.endswith("provider_geo_search_g1")
+            await connection.commit()
+            # An input restored without a published identity is not served, rebuild or not.
+            await geo_db.connection.execute("UPDATE mrf.npi_result_generation SET origin_generation = NULL")
+            assert await _lookup(read) is None
+            await connection.commit()
+        finally:
+            await geo_db.connection.execute("SELECT pg_advisory_unlock($1)", builder.BUILD_LOCK_ID)
+
+
+@pytest.mark.asyncio
 async def test_rollback_serves_the_previous_generation_when_its_inputs_return(geo_db):
     await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True)
     await geo_db.connection.execute("UPDATE mrf.entity_address_result_generation SET local_generation = 2")
@@ -395,7 +416,7 @@ async def test_failed_build_leaves_the_current_generation_serving(geo_db, monkey
         "SELECT count(*) FROM pg_class WHERE relname LIKE 'provider\\_geo\\_search\\_g2%'"
     )
     assert leftovers == 0
-    assert await geo_db.connection.fetchval("SELECT pg_try_advisory_lock($1)", builder._BUILD_LOCK_ID) is True
+    assert await geo_db.connection.fetchval("SELECT pg_try_advisory_lock($1)", builder.BUILD_LOCK_ID) is True
     monkeypatch.setattr(builder, "_projection_sql", original)
     assert (await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True))[
         "generation"

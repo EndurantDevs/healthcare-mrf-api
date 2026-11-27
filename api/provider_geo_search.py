@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_geo_search import (
+    BUILD_LOCK_ID,
     ENTITY_TYPE_COLUMN,
     LAYOUT,
     LEGACY_LAYOUT,
@@ -27,11 +28,20 @@ from process.provider_geo_search import (
 logger = logging.getLogger(__name__)
 _COLUMN_REFERENCE = re.compile(r'(?<!\w)"?a"?\s*\.\s*(?:"([^"]+)"|([a-z_][a-z0-9_]*))', re.IGNORECASE)
 _stale_tables_logged: set[str] = set()
+# The builder holds its session lock for a whole rebuild; pg_locks shows the 64-bit key as two halves.
+_REBUILDING = (
+    "EXISTS (SELECT 1 FROM pg_catalog.pg_locks AS held "
+    "WHERE held.locktype = 'advisory' AND held.granted AND held.objsubid = 1 "
+    f"AND held.classid = CAST('{BUILD_LOCK_ID >> 32}' AS oid) "
+    f"AND held.objid = CAST('{BUILD_LOCK_ID & 0xFFFFFFFF}' AS oid) "
+    "AND held.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()))"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderGeoSearch:
-    """One published projection generation whose inputs match the read's address and NPI generations."""
+    """The published projection generation a read uses: built from the published inputs, or still serving
+    while its replacement is being built."""
 
     table_sql: str
     layout: int = LAYOUT
@@ -39,7 +49,11 @@ class ProviderGeoSearch:
 
 
 async def current_provider_geo_search(connection, schema: str, *, include_service_locations: bool):
-    """Return the current generation when it was built from the published inputs, else None (address table)."""
+    """Return the current generation while it matches the published inputs or its replacement is being built.
+
+    During a rebuild the previous generation lags the newly published addresses or providers by that one
+    publication. Without a running rebuild a generation that no longer matches is not used (address table).
+    """
     state = storage_relation(schema, STATE_TABLE)
     # The pin comes first and is held for the read's transaction, so no table checked below can be retired before
     # the read uses it. A missing table or grant must fall back here: an error would abort the transaction.
@@ -64,9 +78,10 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
             f"""SELECT s.table_name, s.layout,
                        s.layout IN (:layout, :legacy_layout)
                        AND s.include_service_locations = :include_service_locations
-                       AND s.address_input = ({address_sql}) AND s.npi_input = ({npi_sql})
                        AND COALESCE(has_table_privilege({relation}, 'SELECT'), false)
-                       AS is_fresh,
+                       AND ((s.address_input = ({address_sql}) AND s.npi_input = ({npi_sql}))
+                            OR (({address_sql}) IS NOT NULL AND ({npi_sql}) IS NOT NULL AND {_REBUILDING}))
+                       AS is_servable,
                        {geo_entity_type_column_available(relation)} AS has_entity_type_code
                   FROM {state} AS s
                  WHERE s.is_current"""
@@ -78,8 +93,8 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
     )
     if not current_rows:
         return None
-    table_name, layout, is_fresh, has_entity_type_code = current_rows[0]
-    if not is_fresh:
+    table_name, layout, is_servable, has_entity_type_code = current_rows[0]
+    if not is_servable:
         if table_name not in _stale_tables_logged:
             _stale_tables_logged.add(table_name)
             logger.warning(
