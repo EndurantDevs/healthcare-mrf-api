@@ -152,21 +152,31 @@ async def _swap_one_table(
     }
 
 
-async def _lock_cutover_relations(connection: Any, schema: str, selection: Any) -> None:
-    """Acquire short NOWAIT locks across the plan, headers, parents, incumbents, and stages."""
+async def _lock_against_writers(connection: Any, relations: list[str]) -> None:
+    """Hold SHARE NOWAIT so compared heaps cannot change; readers keep running during the scans."""
     await connection.execute("SET LOCAL lock_timeout = '1s'")
     await connection.execute("SET LOCAL standard_conforming_strings = 'on'")
+    await connection.execute("LOCK TABLE " + ",".join(relations) + " IN SHARE MODE NOWAIT")
+
+
+def _cutover_heaps(schema: str, selection: Any) -> list[str]:
+    heap_refs = []
+    for root in GENERIC_HISTORY_TABLES:
+        old_name = f"pd_dataset_history_{selection.old_oid_by_table[root]}"
+        heap_refs.extend(
+            [f"ONLY {_qualified(schema, old_name)}", _qualified(schema, _stage_name(root, selection.plan_sha256))]
+        )
+    return heap_refs
+
+
+async def _lock_cutover_relations(connection: Any, schema: str, selection: Any) -> None:
+    """Acquire short NOWAIT locks across the plan, headers, parents, incumbents, and stages."""
     await connection.execute(
         f"LOCK TABLE {_qualified(schema, 'pd_dataset_migration_plan')}, "
         f"{_qualified(schema, 'provider_directory_endpoint_dataset')} IN SHARE MODE NOWAIT"
     )
-    locked_relations = []
-    for root in GENERIC_HISTORY_TABLES:
-        old_name = f"pd_dataset_history_{selection.old_oid_by_table[root]}"
-        stage_name = _stage_name(root, selection.plan_sha256)
-        locked_relations.extend(
-            [f"ONLY {_qualified(schema, root)}", f"ONLY {_qualified(schema, old_name)}", _qualified(schema, stage_name)]
-        )
+    root_refs = [f"ONLY {_qualified(schema, root)}" for root in GENERIC_HISTORY_TABLES]
+    locked_relations = root_refs + _cutover_heaps(schema, selection)
     await connection.execute("LOCK TABLE " + ",".join(locked_relations) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
 
 
@@ -179,6 +189,15 @@ async def cutover_history_compaction(connection: Any, *, schema: str = "mrf") ->
     try:
         initial = await select_compaction_plan(connection, schema=schema)
         async with connection.transaction(isolation="read_committed"):
+            # Fingerprint scans run under SHARE (writers wait, readers do not); the exclusive lock covers only DDL.
+            await _lock_against_writers(connection, _cutover_heaps(schema, initial))
+            stage_oid_by_root: dict[str, int] = {}
+            for root in GENERIC_HISTORY_TABLES:
+                old_name = f"pd_dataset_history_{initial.old_oid_by_table[root]}"
+                stage_name = _stage_name(root, initial.plan_sha256)
+                stage_oid_by_root[root] = await _verify_stage_for_cutover(
+                    connection, schema, root, stage_name, old_name, initial
+                )
             await _lock_cutover_relations(connection, schema, initial)
             selection = await select_compaction_plan(connection, schema=schema)
             if selection.plan_sha256 != initial.plan_sha256:
@@ -186,11 +205,9 @@ async def cutover_history_compaction(connection: Any, *, schema: str = "mrf") ->
             updated_plan = json.loads(_canonical_json(selection.plan))
             swapped_by_table: dict[str, dict[str, Any]] = {}
             for root in GENERIC_HISTORY_TABLES:
-                old_name = f"pd_dataset_history_{selection.old_oid_by_table[root]}"
                 stage_name = _stage_name(root, selection.plan_sha256)
-                stage_oid = await _verify_stage_for_cutover(connection, schema, root, stage_name, old_name, selection)
                 swapped_by_table[root] = await _swap_one_table(
-                    connection, schema, root, stage_name, stage_oid, selection, updated_plan
+                    connection, schema, root, stage_name, stage_oid_by_root[root], selection, updated_plan
                 )
             await connection.execute(
                 f"UPDATE {_qualified(schema, 'pd_dataset_migration_plan')} SET plan=$1::jsonb WHERE singleton",
@@ -202,7 +219,7 @@ async def cutover_history_compaction(connection: Any, *, schema: str = "mrf") ->
 
 
 async def _load_rollback_receipts(connection: Any, schema: str, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Validate retired partition receipts and lock all tables needed for rollback."""
+    """Validate retired partition receipts against the active plan."""
     retired_entries = await connection.fetch(
         """SELECT c.oid::bigint AS oid, c.relname, obj_description(c.oid, 'pg_class') AS comment_text
         FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -217,22 +234,33 @@ async def _load_rollback_receipts(connection: Any, schema: str, plan: dict[str, 
         receipt_by_root[comment["root"]] = comment
     if set(receipt_by_root) != set(GENERIC_HISTORY_TABLES):
         raise HistoryCompactionError("compaction_rollback_incomplete")
-    locked_relations = [f"{_qualified(schema, 'pd_dataset_migration_plan')}"]
     for root in GENERIC_HISTORY_TABLES:
-        receipt_entry = receipt_by_root[root]
-        if plan["tables"][root]["original_oid"] != receipt_entry["new_oid"]:
+        if plan["tables"][root]["original_oid"] != receipt_by_root[root]["new_oid"]:
             raise HistoryCompactionError("compaction_rollback_plan_mismatch")
-        new_name = f"pd_dataset_history_{receipt_entry['new_oid']}"
-        retired_name = f"pd_dataset_history_retired_{receipt_entry['old_oid']}"
-        locked_relations.extend(
-            [
-                f"ONLY {_qualified(schema, root)}",
-                f"ONLY {_qualified(schema, new_name)}",
-                f"ONLY {_qualified(schema, retired_name)}",
-            ]
-        )
-    await connection.execute("LOCK TABLE " + ",".join(locked_relations) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
     return receipt_by_root
+
+
+def _rollback_heaps(schema: str, receipt_by_root: dict[str, dict[str, Any]]) -> list[str]:
+    heap_refs = []
+    for root in GENERIC_HISTORY_TABLES:
+        new_name, retired_name = _rollback_names(receipt_by_root[root])
+        heap_refs.extend([f"ONLY {_qualified(schema, new_name)}", f"ONLY {_qualified(schema, retired_name)}"])
+    return heap_refs
+
+
+def _rollback_names(receipt_entry: dict[str, Any]) -> tuple[str, str]:
+    return f"pd_dataset_history_{receipt_entry['new_oid']}", f"pd_dataset_history_retired_{receipt_entry['old_oid']}"
+
+
+async def _verify_rollback_parity(connection: Any, schema: str, receipt_entry: dict[str, Any]) -> None:
+    """Refuse rollback when the active heap no longer holds exactly the rows the retired heap kept."""
+    retained_keys = await _sorted_keys(connection, receipt_entry["retained_keys"])
+    new_name, retired_name = _rollback_names(receipt_entry)
+    new_fingerprint = await _history_fingerprint(connection, _qualified(schema, new_name), retained_keys)
+    if new_fingerprint != await _history_fingerprint(
+        connection, f"ONLY {_qualified(schema, retired_name)}", retained_keys
+    ):
+        raise HistoryCompactionError("compaction_rollback_parity_failed")
 
 
 async def _restore_one_table(
@@ -242,7 +270,7 @@ async def _restore_one_table(
     receipt_entry: dict[str, Any],
     restored_plan: dict[str, Any],
 ) -> int:
-    """Verify fingerprint parity and reattach the retired partition for one history root."""
+    """Reattach the retired partition for one history root; parity is verified beforehand."""
     old_oid, new_oid = receipt_entry["old_oid"], receipt_entry["new_oid"]
     new_name = f"pd_dataset_history_{new_oid}"
     retired_name = f"pd_dataset_history_retired_{old_oid}"
@@ -250,10 +278,6 @@ async def _restore_one_table(
     prev_keys = await _sorted_keys(connection, receipt_entry["previous_keys"])
     retained_keys = await _sorted_keys(connection, receipt_entry["retained_keys"])
     parent_ref = _qualified(schema, root)
-    if await _history_fingerprint(
-        connection, _qualified(schema, new_name), retained_keys
-    ) != await _history_fingerprint(connection, f"ONLY {_qualified(schema, retired_name)}", retained_keys):
-        raise HistoryCompactionError("compaction_rollback_parity_failed")
     if retained_keys:
         await connection.execute(f"ALTER TABLE {parent_ref} DETACH PARTITION {_qualified(schema, new_name)}")
     retired_ref = _qualified(schema, retired_name)
@@ -282,10 +306,17 @@ async def rollback_history_compaction(connection: Any, *, schema: str = "mrf") -
         raise HistoryCompactionError("compaction_already_running")
     try:
         async with connection.transaction(isolation="read_committed"):
-            await connection.execute("SET LOCAL lock_timeout = '1s'")
-            await connection.execute("SET LOCAL standard_conforming_strings = 'on'")
             plan = await _load_migration_plan(connection, schema)
             receipt_by_root = await _load_rollback_receipts(connection, schema, plan)
+            heap_refs = _rollback_heaps(schema, receipt_by_root)
+            await _lock_against_writers(connection, heap_refs)
+            for root in GENERIC_HISTORY_TABLES:
+                await _verify_rollback_parity(connection, schema, receipt_by_root[root])
+            root_refs = [f"ONLY {_qualified(schema, root)}" for root in GENERIC_HISTORY_TABLES]
+            locked_relations = [_qualified(schema, "pd_dataset_migration_plan"), *root_refs, *heap_refs]
+            await connection.execute("LOCK TABLE " + ",".join(locked_relations) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
+            if await _load_migration_plan(connection, schema) != plan:
+                raise HistoryCompactionError("compaction_rollback_plan_mismatch")
             restored_plan = json.loads(_canonical_json(plan))
             restored_oid_by_table: dict[str, int] = {}
             for root in GENERIC_HISTORY_TABLES:
