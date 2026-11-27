@@ -7,7 +7,7 @@ import re
 from db.migration_provider_dataset_online import _expected_bulk_relationships
 from db.migration_provider_directory_dataset_candidates import TABLES
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.plan_release_storage_catalog import CATALOG_SQL, ROLE_SQL
+from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import storage_roles
 from process.plan_release_storage_provision import _FAMILY_SQL, _close_relation_grants
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -219,10 +219,10 @@ _RETIRED_FUNCTIONS = (
 
 
 async def verify_generic_source_family(connection, policy, *, require_inert=True):
-    """Whole attached family ownership, inherited/column ACL and native-only proof."""
-    owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
+    """Whole attached family table shape and native-only proof; PostgreSQL enforces access."""
     roots = [storage_relation(policy.schema, name) for name in PAYLOAD_ROOTS]
-    relation_rows = await connection.fetch(CATALOG_SQL, roots, owner, readers)
+    # The owner and reader arguments only feed CATALOG_SQL's ACL columns, which are not read here.
+    relation_rows = await connection.fetch(CATALOG_SQL, roots, 0, [])
     _require(
         len(relation_rows) >= len(roots)
         and set(PAYLOAD_ROOTS) <= {relation_by_field["relname"] for relation_by_field in relation_rows},
@@ -248,13 +248,10 @@ async def verify_generic_source_family(connection, policy, *, require_inert=True
             _require(relation_by_field["relkind"] == "r" and not relation_by_field["parents"], "global_root_changed")
         _require(
             relation_by_field["nspname"] == policy.schema
-            and relation_by_field["relowner"] == owner
             and relation_by_field["relpersistence"] == "p"
             and relation_by_field["relkind"] in {"r", "p"}
             and not relation_by_field["relrowsecurity"]
-            and not relation_by_field["relforcerowsecurity"]
-            and relation_by_field["direct_acl_closed"]
-            and relation_by_field["readers_closed"],
+            and not relation_by_field["relforcerowsecurity"],
             "family_custody_changed",
         )
         if require_inert:
@@ -376,9 +373,8 @@ def _native_control_reference_valid(trigger_by_field, schema, target_by_oid):
 
 
 async def capture_generic_source_global_roots(publisher, roots):
-    """Capture only fixed, nonpartitioned managed roots under genuine source custody."""
+    """Return the shape-checked rows of fixed, nonpartitioned managed roots."""
     from process.provider_directory_generic_source_policy import bound_publisher
-    from process.provider_directory_generic_source_storage import _layout_proof
 
     _require(publisher is bound_publisher(), "publisher_connection_changed")
     _require(
@@ -388,7 +384,7 @@ async def capture_generic_source_global_roots(publisher, roots):
     family = await verify_generic_source_family(publisher.connection, publisher.policy)
     selected_by_root = {row["relname"]: row for row in family if row["relname"] in roots}
     _require(set(selected_by_root) == set(roots), "global_roots_missing")
-    return {root: _layout_proof(selected_by_root[root]) for root in roots}
+    return selected_by_root
 
 
 def _require_fhir_inventory(proof):
@@ -573,7 +569,7 @@ async def _verify_control_closure(connection, policy):
 
 
 async def verify_generic_source_read_family(connection, schema, owner_role, runtime_roles):
-    """Read custody uses its existing explicit owner/runtime tuple, never a new login."""
+    """Check the read family's table shape; PostgreSQL enforces the readers' access."""
     storage_identifier(schema)
     storage_identifier(owner_role)
     _require(
@@ -585,40 +581,16 @@ async def verify_generic_source_read_family(connection, schema, owner_role, runt
     )
     for role in runtime_roles:
         storage_identifier(role)
-    names = (owner_role, *runtime_roles)
-    roles = await connection.fetch(ROLE_SQL, list(names), owner_role, owner_role, schema)
-    by_name = {role["rolname"]: role for role in roles}
-    _require(set(by_name) == set(names), "reader_roles_missing")
-    owner = by_name[owner_role]
-    flags = ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-    _require(
-        not owner["rolcanlogin"] and not owner["elevated"] and not any(owner[flag] for flag in flags),
-        "owner_unprotected",
-    )
-    _require(
-        all(
-            not by_name[name]["elevated"]
-            and not by_name[name]["owner_set"]
-            and not by_name[name]["namespace_owner_reachable"]
-            and not by_name[name]["namespace_create"]
-            and by_name[name]["namespace_owner_protected"]
-            and by_name[name]["namespace_usage"]
-            for name in runtime_roles
-        ),
-        "reader_authority",
-    )
+    # The owner and reader arguments only feed CATALOG_SQL's ACL columns, which are not read here.
     relation_rows = await connection.fetch(
-        CATALOG_SQL,
-        [storage_relation(schema, name) for name in PAYLOAD_ROOTS],
-        owner["oid"],
-        [by_name[name]["oid"] for name in runtime_roles],
+        CATALOG_SQL, [storage_relation(schema, name) for name in PAYLOAD_ROOTS], 0, []
     )
     native_control_oids = await _native_control_references(connection, schema, relation_rows)
-    _require_reader_family(relation_rows, schema, owner["oid"], native_control_oids)
+    _require_reader_family(relation_rows, schema, native_control_oids)
     return relation_rows
 
 
-def _require_reader_family(relation_rows, schema, owner_oid, native_control_oids=()):
+def _require_reader_family(relation_rows, schema, native_control_oids=()):
     """Admit only native closed list roots and their direct persistent leaves."""
     root_oids_by_name = {
         relation_by_field["relname"]: relation_by_field["oid"]
@@ -637,12 +609,9 @@ def _require_reader_family(relation_rows, schema, owner_oid, native_control_oids
         is_root = relation_by_field["relname"] in root_oids_by_name
         _require(
             relation_by_field["nspname"] == schema
-            and relation_by_field["relowner"] == owner_oid
             and relation_by_field["relpersistence"] == "p"
             and not relation_by_field["relrowsecurity"]
             and not relation_by_field["relforcerowsecurity"]
-            and relation_by_field["direct_acl_closed"]
-            and relation_by_field["readers_closed"]
             and (relation_by_field["inert"] or relation_by_field["oid"] in native_control_oids)
             and relation_by_field["native_checks"]
             and all(

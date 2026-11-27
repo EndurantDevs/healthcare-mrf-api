@@ -12,6 +12,7 @@ from process import provider_directory_cms_native_inputs as inputs
 from process import provider_directory_cms_native_registration as registration
 from process import provider_directory_generic_source_policy as policy_module
 from process import provider_directory_generic_source_provision as provision
+from process.plan_release_storage_catalog import ROLE_SQL
 from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
 
 
@@ -113,7 +114,7 @@ class CatalogConnection:
 
     async def fetch(self, sql, *parameters):
         self.events.append(("fetch", sql, parameters))
-        if sql == provision.ROLE_SQL:
+        if sql == ROLE_SQL:
             return deepcopy(self.roles)
         if sql == provision._FHIR_NAMED_INPUT_SQL:
             if self.cancel_physical:
@@ -204,7 +205,7 @@ async def test_empty_three_parents_bind_portable_names_and_semantic_layout(catal
     assert proof["parents"] == [["mrf", name] for name in provision.FHIR_INPUT_ROOTS]
     assert len(proof["inventory"]) == 3
     assert all(row["parents"] == [] for row in proof["inventory"])
-    assert not any(event[1] == provision.ROLE_SQL for event in catalog.events)
+    assert not any(event[1] == ROLE_SQL for event in catalog.events)
     assert all("INSERT INTO" not in event[1] and "CREATE TRIGGER" not in event[1] for event in catalog.events)
     assert provision.require_protected_fhir_input(deepcopy(proof)) == proof
 
@@ -253,7 +254,7 @@ async def test_native_layout_capture_does_not_recheck_role_or_physical_identity(
         row["direct_acl_closed"] = False
     proof = await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
     assert proof["parents"] == [["mrf", name] for name in provision.FHIR_INPUT_ROOTS]
-    assert not any(event[1] in (provision.ROLE_SQL, provision.CATALOG_SQL) for event in catalog.events)
+    assert not any(event[1] in (ROLE_SQL, provision.CATALOG_SQL) for event in catalog.events)
 
 
 def _add_leaf(catalog):

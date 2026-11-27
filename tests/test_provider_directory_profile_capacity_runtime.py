@@ -256,22 +256,26 @@ async def test_postgres_applies_exact_finite_capacity_settings(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_capacity_settings_fail_before_mutation_without_temp_privilege(
+async def test_capacity_settings_fail_when_postgres_refuses_the_temp_helper(
     monkeypatch,
 ):
     """An unprivileged runtime must not silently lose the signed temp cap."""
 
     class MissingPrivilegeDatabase:
+        can_set_temp = False
+
         async def first(self, statement, **_params):
-            assert "has_parameter_privilege" in statement
-            return SimpleNamespace(_mapping={"can_set_temp": False, "remaining_ms": None})
+            assert "clock_timestamp()" in statement
+            return SimpleNamespace(_mapping={"remaining_ms": 1_800_000})
 
-        async def all(self, statement):
-            assert "pg_catalog.pg_proc" in statement
-            return []
+        async def scalar(self, statement, **_params):
+            if "has_parameter_privilege" in statement:
+                return self.can_set_temp
+            assert "set_provider_directory_profile_temp_file_limit" in statement
+            raise PermissionError("permission denied for function set_provider_directory_profile_temp_file_limit")
 
-        async def status(self, _statement):
-            raise AssertionError("capacity settings must not be mutated")
+        async def status(self, statement):
+            assert statement.startswith("SET LOCAL ")
 
     geometry = runtime.build_capacity_geometry(
         runtime.validated_capacity_limits(_limits_payload()),
@@ -285,10 +289,7 @@ async def test_capacity_settings_fail_before_mutation_without_temp_privilege(
     )
     monkeypatch.setattr(importer, "db", MissingPrivilegeDatabase())
 
-    with pytest.raises(
-        RuntimeError,
-        match="capacity_temp_file_limit_privilege_missing",
-    ):
+    with pytest.raises(PermissionError, match="permission denied"):
         await importer._apply_provider_directory_profile_capacity_settings(admission)
 
 
@@ -305,7 +306,7 @@ async def test_capacity_settings_refuse_database_clock_deadline_reserve(
 
         async def first(self, statement, **_params):
             assert "clock_timestamp()" in statement
-            return SimpleNamespace(_mapping={"can_set_temp": True, "remaining_ms": 1_000})
+            return SimpleNamespace(_mapping={"remaining_ms": 1_000})
 
         async def status(self, _statement):
             raise AssertionError("expired capacity settings must not mutate")

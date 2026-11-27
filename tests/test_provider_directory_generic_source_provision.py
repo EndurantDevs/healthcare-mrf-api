@@ -78,11 +78,69 @@ async def test_legacy_heap_root_refuses_before_any_guard_retirement(monkeypatch,
         )
         for name in provision.PAYLOAD_ROOTS
     ]
-    monkeypatch.setattr(provision, "storage_roles", AsyncMock(return_value=(17, [18])))
     connection = SimpleNamespace(fetch=AsyncMock(return_value=relation_rows), execute=AsyncMock())
     with pytest.raises(GenericCandidateError, match="partitioned_roots_required"):
         await provision.verify_generic_source_family(connection, _policy(), require_inert=False)
     connection.execute.assert_not_awaited()
+
+
+def _shape_rows():
+    return [
+        dict(
+            oid=index + 1,
+            relname=name,
+            nspname="source_schema",
+            relowner=9999,
+            relpersistence="p",
+            relkind="p" if name in provision.PARTITIONED_ROOTS else "r",
+            partition_key="LIST (dataset_id)" if name in provision.PARTITIONED_ROOTS else None,
+            parents=[],
+            relrowsecurity=False,
+            relforcerowsecurity=False,
+            direct_acl_closed=False,
+            readers_closed=False,
+            inert=True,
+            native_checks=True,
+            constraints=[{"type": "p", "valid": True}],
+        )
+        for index, name in enumerate(provision.PAYLOAD_ROOTS)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_family_check_runs_no_role_owner_or_acl_proof(monkeypatch):
+    """Only table shape is checked; PostgreSQL enforces who may read or write the family."""
+    rows = _shape_rows()
+    monkeypatch.setattr(provision, "storage_roles", AsyncMock(side_effect=AssertionError("role proof")))
+    for name in ("verify_proof_control", "capture_source_coverage_control", "capture_checkpoint_controls"):
+        monkeypatch.setattr(provision, name, AsyncMock())
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=rows))
+    assert await provision.verify_generic_source_family(connection, _policy()) == rows
+    connection.fetch.assert_awaited_once_with(
+        provision.CATALOG_SQL,
+        [provision.storage_relation("source_schema", name) for name in provision.PAYLOAD_ROOTS],
+        0,
+        [],
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_family_check_runs_no_role_owner_or_acl_proof():
+    rows = _shape_rows()
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=rows))
+    assert (
+        await provision.verify_generic_source_read_family(connection, "source_schema", "source_owner", ("reader",))
+        == rows
+    )
+    connection.fetch.assert_awaited_once_with(
+        provision.CATALOG_SQL,
+        [provision.storage_relation("source_schema", name) for name in provision.PAYLOAD_ROOTS],
+        0,
+        [],
+    )
+    rows[0]["relrowsecurity"] = True
+    with pytest.raises(GenericCandidateError, match="reader_family_changed"):
+        await provision.verify_generic_source_read_family(connection, "source_schema", "source_owner", ("reader",))
 
 
 @pytest.mark.asyncio
@@ -325,11 +383,9 @@ async def test_global_root_capture_keeps_complete_family_gate_and_exact_nonparti
     root = provision.CMS_DOCTORS_ROOTS[0]
     family = AsyncMock(return_value=[{"relname": root, "oid": 17}])
     monkeypatch.setattr(provision, "verify_generic_source_family", family)
-    from process import provider_directory_generic_source_storage as storage
-
-    proof_by_field = {"name": root, "oid": 17, "owner": 19, "layout_sha256": "a" * 64}
-    monkeypatch.setattr(storage, "_layout_proof", lambda row: proof_by_field)
-    assert await provision.capture_generic_source_global_roots(publisher, (root,)) == {root: proof_by_field}
+    assert await provision.capture_generic_source_global_roots(publisher, (root,)) == {
+        root: {"relname": root, "oid": 17}
+    }
     family.assert_awaited_once_with(publisher.connection, publisher.policy)
     with pytest.raises(GenericCandidateError, match="global_roots_changed"):
         await provision.capture_generic_source_global_roots(publisher, (provision.TABLES[0],))

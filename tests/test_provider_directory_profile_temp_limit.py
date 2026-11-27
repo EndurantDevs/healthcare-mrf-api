@@ -1,7 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Trust boundaries for the closed transaction temp-limit capability."""
-
-from types import SimpleNamespace
+"""Transaction temp-limit modes, exact readback and PostgreSQL refusals."""
 
 import pytest
 
@@ -10,41 +8,15 @@ from process import provider_directory_profile_temp_limit as temp_limit
 _UNSET = object()
 
 
-def _helper_catalog_entry():
-    return {
-        "function_oid": 20001,
-        "resolved_function_oid": 20001,
-        "function_body": temp_limit.TEMP_FILE_LIMIT_BODY,
-        "function_settings": ["search_path=pg_catalog"],
-        "language": "plpgsql",
-        "security_definer": True,
-        "signature_matches": True,
-        "owner_restricted": True,
-        "owner_can_set": True,
-        "caller_can_execute": True,
-        "execute_acl_restricted": True,
-        "caller_can_use_schema": True,
-        "caller_can_create": False,
-        "caller_can_assume_owner": False,
-        "caller_can_alter_owner": False,
-    }
-
-
 class TempLimitDatabase:
-    def __init__(self, *, can_set=False, helper_entries=None, observed_bytes=_UNSET, returned_bytes=_UNSET):
+    def __init__(self, *, can_set=False, observed_bytes=_UNSET, returned_bytes=_UNSET, helper_error=None):
         self.can_set = can_set
-        self.helper_entries = (
-            [SimpleNamespace(_mapping=_helper_catalog_entry())] if helper_entries is None else helper_entries
-        )
+        self.helper_error = helper_error
         self.observed_bytes = observed_bytes
         self.returned_bytes = returned_bytes
         self.setting_bytes = 4096
         self.statements = []
         self.mutations = []
-
-    async def all(self, statement):
-        self.statements.append(statement)
-        return self.helper_entries
 
     async def status(self, statement):
         self.statements.append(statement)
@@ -58,6 +30,8 @@ class TempLimitDatabase:
         if temp_limit.TEMP_FILE_LIMIT_FUNCTION in statement:
             assert "CAST(:limit_bytes AS bigint)" in statement
             assert params.keys() == {"limit_bytes"}
+            if self.helper_error is not None:
+                raise self.helper_error
             self.mutations.append((statement, params))
             self.setting_bytes = params["limit_bytes"]
             return self.setting_bytes if self.returned_bytes is _UNSET else self.returned_bytes
@@ -67,24 +41,35 @@ class TempLimitDatabase:
 
 @pytest.mark.asyncio
 async def test_direct_capability_does_not_require_helper():
-    database = TempLimitDatabase(can_set=True, helper_entries=[])
+    database = TempLimitDatabase(can_set=True)
     assert await temp_limit.require_temp_file_limit_capability(database) == "direct"
     assert len(database.statements) == 1
     assert not database.mutations
 
 
 @pytest.mark.asyncio
-async def test_helper_capability_checks_without_setting():
+async def test_helper_mode_reads_no_function_catalog():
     database = TempLimitDatabase()
     assert await temp_limit.require_temp_file_limit_capability(database) == "bounded"
-    assert len(database.statements) == 2
+    assert len(database.statements) == 1
+    assert "pg_proc" not in database.statements[0]
     assert not database.mutations
+
+
+@pytest.mark.asyncio
+async def test_postgres_refusal_of_the_helper_propagates():
+    refusal = PermissionError("permission denied for function set_provider_directory_profile_temp_file_limit")
+    database = TempLimitDatabase(helper_error=refusal)
+    with pytest.raises(PermissionError, match="permission denied"):
+        await temp_limit.apply_temp_file_limit(database, 1024)
+    assert not database.mutations
+    assert not any("pg_proc" in statement for statement in database.statements)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit_bytes", [0, 1024, temp_limit.TEMP_FILE_LIMIT_MAX_BYTES + 1024])
 async def test_direct_set_preserves_values_above_helper_cap(limit_bytes):
-    database = TempLimitDatabase(can_set=True, helper_entries=[])
+    database = TempLimitDatabase(can_set=True)
     await temp_limit.apply_temp_file_limit(database, limit_bytes)
     assert database.mutations == [f"SET LOCAL temp_file_limit = '{limit_bytes // 1024}kB';"]
     assert (
@@ -119,67 +104,6 @@ async def test_helper_limit_cannot_exceed_bound():
     database = TempLimitDatabase()
     with pytest.raises(ValueError, match="temp_file_limit_invalid"):
         await temp_limit.apply_temp_file_limit(database, temp_limit.TEMP_FILE_LIMIT_MAX_BYTES + 1024)
-    assert not database.mutations
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("helper_count", [0, 2])
-async def test_missing_or_overloaded_helper_fails_closed(helper_count):
-    database = TempLimitDatabase(helper_entries=[_helper_catalog_entry() for _ in range(helper_count)])
-    with pytest.raises(RuntimeError, match="temp_file_limit_privilege_missing"):
-        await temp_limit.apply_temp_file_limit(database, 1024)
-    assert not database.mutations
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("field_name", "changed_entry"),
-    [
-        ("function_oid", 0),
-        ("function_oid", True),
-        ("resolved_function_oid", 20002),
-        ("resolved_function_oid", True),
-        ("function_body", "BEGIN RETURN '0'; END;"),
-        ("function_settings", None),
-        ("function_settings", ["search_path=pg_catalog", "temp_file_limit=-1"]),
-        ("language", "sql"),
-        ("security_definer", False),
-        ("security_definer", 1),
-        ("signature_matches", False),
-        ("owner_restricted", False),
-        ("owner_can_set", False),
-        ("caller_can_execute", False),
-        ("execute_acl_restricted", False),
-        ("execute_acl_restricted", None),
-        ("execute_acl_restricted", 1),
-        ("execute_acl_restricted", "true"),
-        ("caller_can_use_schema", False),
-        ("caller_can_create", True),
-        ("caller_can_assume_owner", True),
-        ("caller_can_alter_owner", True),
-        ("caller_can_alter_owner", 0),
-    ],
-)
-async def test_execute_grant_does_not_accept_drift(field_name, changed_entry):
-    helper_by_field = _helper_catalog_entry()
-    helper_by_field[field_name] = changed_entry
-    database = TempLimitDatabase(helper_entries=[helper_by_field])
-    for operation in (
-        lambda: temp_limit.require_temp_file_limit_capability(database),
-        lambda: temp_limit.apply_temp_file_limit(database, 1024),
-    ):
-        with pytest.raises(RuntimeError, match="temp_file_limit_privilege_missing"):
-            await operation()
-    assert not database.mutations
-
-
-@pytest.mark.asyncio
-async def test_missing_acl_observation_fails_closed():
-    helper_by_field = _helper_catalog_entry()
-    helper_by_field.pop("execute_acl_restricted")
-    database = TempLimitDatabase(helper_entries=[helper_by_field])
-    with pytest.raises(RuntimeError, match="temp_file_limit_privilege_missing"):
-        await temp_limit.apply_temp_file_limit(database, 1024)
     assert not database.mutations
 
 
