@@ -241,6 +241,18 @@ async def test_lookup_serves_only_a_fresh_current_generation(caplog):
 
 @pytest.mark.provider_geo_search
 @pytest.mark.asyncio
+async def test_lookup_checks_running_rebuild():
+    """A generation behind the published inputs stays servable only while the builder holds its lock."""
+    lookup = _Rows([(True,)], [("provider_geo_search_g4", provider_geo_search.LAYOUT, True, True)])
+    await current_provider_geo_search(lookup, "mrf", include_service_locations=True)
+    guard_sql = lookup.statements[1][0]
+    high_half, low_half = divmod(provider_geo_search.BUILD_LOCK_ID, 2**32)
+    assert "FROM pg_catalog.pg_locks AS held" in guard_sql and "held.granted" in guard_sql
+    assert f"CAST('{high_half}' AS oid)" in guard_sql and f"CAST('{low_half}' AS oid)" in guard_sql
+
+
+@pytest.mark.provider_geo_search
+@pytest.mark.asyncio
 async def test_refresh_after_publication_never_fails_the_import(monkeypatch, caplog):
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
