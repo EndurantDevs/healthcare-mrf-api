@@ -230,6 +230,9 @@ _MAX_PREPARED_STATEMENT_CACHE_SIZE = 4096
 _DEFAULT_WORKER_QUERY_CACHE_SIZE = 500
 _DEFAULT_API_QUERY_CACHE_SIZE = 1000
 _MAX_QUERY_CACHE_SIZE = 10_000
+_DEFAULT_POOL_RECYCLE_SECONDS = 1800
+_MIN_POOL_RECYCLE_SECONDS = 60
+_MAX_POOL_RECYCLE_SECONDS = 86_400
 
 
 def _is_env_enabled(value: Optional[str], default: bool = False) -> bool:
@@ -286,6 +289,20 @@ def _bounded_cache_size(env_name: str, default: int, *, maximum: int) -> int:
     return parsed
 
 
+def _pool_recycle_seconds() -> int:
+    raw = os.getenv("HLTHPRT_DB_POOL_RECYCLE_SECONDS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_POOL_RECYCLE_SECONDS
+    parsed = int(raw)
+    if parsed == -1:
+        return -1
+    if not _MIN_POOL_RECYCLE_SECONDS <= parsed <= _MAX_POOL_RECYCLE_SECONDS:
+        raise ValueError(
+            f"HLTHPRT_DB_POOL_RECYCLE_SECONDS must be -1 or between {_MIN_POOL_RECYCLE_SECONDS} and {_MAX_POOL_RECYCLE_SECONDS}"
+        )
+    return parsed
+
+
 def _engine_connect_options(
     driver: str,
     *,
@@ -293,7 +310,10 @@ def _engine_connect_options(
     reader_login: Optional[Tuple[str, str]],
 ) -> dict[str, Any]:
     """Build SQLAlchemy engine options including API JIT and statement-cache sizing."""
-    options_by_name: dict[str, Any] = {}
+    options_by_name: dict[str, Any] = {
+        "pool_pre_ping": _is_env_enabled(os.getenv("HLTHPRT_DB_POOL_PRE_PING"), default=True),
+        "pool_recycle": _pool_recycle_seconds(),
+    }
     if reader_login:
         options_by_name["isolation_level"] = "REPEATABLE READ"
         options_by_name["execution_options"] = {"postgresql_readonly": True}

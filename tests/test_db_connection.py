@@ -989,3 +989,36 @@ async def test_reader_rejects_mixed_preparation_modes_before_connection(monkeypa
         async with database.reader_session(independent=True, temporary_setup=AsyncMock(), prepare_plan_workspace=True):
             pytest.fail("mixed Reader preparations entered")
     connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_database_connect_enables_pool_pre_ping_and_recycle_by_default(monkeypatch):
+    captured_kwargs_list: list[dict] = []
+
+    def fake_create_engine(_url, **kwargs):
+        captured_kwargs_list.append(kwargs)
+        return SimpleNamespace(connect=AsyncMock())
+
+    monkeypatch.delenv("HLTHPRT_DB_POOL_PRE_PING", raising=False)
+    monkeypatch.delenv("HLTHPRT_DB_POOL_RECYCLE_SECONDS", raising=False)
+    monkeypatch.setattr("db.connection.create_async_engine", fake_create_engine)
+    monkeypatch.setattr("db.connection.async_sessionmaker", lambda *_a, **_kw: lambda: "session")
+
+    await Database().connect()
+    assert captured_kwargs_list[-1]["pool_pre_ping"] is True
+    assert captured_kwargs_list[-1]["pool_recycle"] == 1800
+
+    monkeypatch.setenv("HLTHPRT_DB_POOL_PRE_PING", "false")
+    monkeypatch.setenv("HLTHPRT_DB_POOL_RECYCLE_SECONDS", "900")
+    await Database().connect()
+    assert captured_kwargs_list[-1]["pool_pre_ping"] is False
+    assert captured_kwargs_list[-1]["pool_recycle"] == 900
+
+    monkeypatch.setenv("HLTHPRT_DB_POOL_RECYCLE_SECONDS", "-1")
+    await Database().connect()
+    assert captured_kwargs_list[-1]["pool_recycle"] == -1
+
+    for bad_value in ("0", "59", "-2", "86401"):
+        monkeypatch.setenv("HLTHPRT_DB_POOL_RECYCLE_SECONDS", bad_value)
+        with pytest.raises(ValueError, match="HLTHPRT_DB_POOL_RECYCLE_SECONDS"):
+            await Database().connect()
