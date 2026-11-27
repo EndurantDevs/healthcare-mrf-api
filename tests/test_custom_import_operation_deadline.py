@@ -23,7 +23,7 @@ from tests.test_custom_import_build_source import _request
 from tests.test_custom_import_source_batch import _CURSOR, _PERMIT, _context_case
 
 
-@pytest.mark.parametrize("global_timeout,expected", [(60, 399.0), (600, 699.0)])
+@pytest.mark.parametrize("global_timeout,expected", [(60, 999.0), (1200, 1299.0)])
 def test_http_ceiling_uses_actual_protocol_anchor_not_extension_time(monkeypatch, global_timeout, expected):
     now = datetime(2030, 1, 1, tzinfo=timezone.utc)
     protocol = SimpleNamespace(_time=100.0, response_timeout=global_timeout)

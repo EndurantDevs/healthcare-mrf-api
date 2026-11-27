@@ -162,7 +162,7 @@ async def test_batch_deadline_does_not_escape_to_concurrent_or_keepalive_public_
         assert state.attempted == 1 and state.committed and not state.cancelled
         assert state.app.config.RESPONSE_TIMEOUT == _DEFAULT_TIMEOUT
         batch_observation = next(row for row in state.observations if row[0] == state.wire.path)
-        assert batch_observation[2] == (2 if state.kind == "admission" else 300)
+        assert batch_observation[2] == (2 if state.kind == "admission" else admission.MAX_BATCH_RESPONSE_SECONDS)
         assert batch_observation[1].request_timeout == state.app.config.REQUEST_TIMEOUT == 60
         assert (await state.client.get("/public-slow")).status_code == 503
         public_observation = state.observations[-1]

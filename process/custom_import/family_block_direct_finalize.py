@@ -8,7 +8,7 @@ import hashlib
 import json
 from collections import Counter
 
-from sqlalchemy import BigInteger, LargeBinary, Sequence, and_, func, literal, select, text
+from sqlalchemy import BigInteger, LargeBinary, Sequence, and_, exists, func, literal, select, text
 from sqlalchemy.dialects.postgresql import dialect
 from sqlalchemy.orm import aliased
 from sqlalchemy.schema import DropTable
@@ -46,7 +46,6 @@ from process.custom_import.family_block_finalize import _role_counts
 from process.custom_import.family_block_layout import _NEW, index_specifications, projection_index_specifications
 from process.custom_import.family_block_projection import (
     _add_contexts,
-    _child_output,
     _child_sources,
     _create_indexes,
     _reject_matches,
@@ -75,7 +74,12 @@ from process.custom_import.query_projection_sources import (
     field_slots,
 )
 from process.custom_import.query_projection_storage import query_projection_index_count
-from process.custom_import.query_projection_values import ambiguity_statement, configured_fields, reduction_statement
+from process.custom_import.query_projection_values import (
+    ambiguity_statement,
+    configured_fields,
+    keyed_child_reduction_statement,
+    reduction_statement,
+)
 from process.custom_import.runner_registry import load_registry
 from process.custom_import.runner_types import CandidateRunnerError, LeaseAuthorityLost
 from process.custom_import.storage_layout import snapshot_schema, snapshot_tables
@@ -431,42 +435,87 @@ async def _deduplicate_entity_indexes(session, binding: FamilyBlockBinding) -> N
     )
 
 
-async def _populate_projection_tables(
+def _projection_scopes(definition) -> tuple[tuple, tuple]:
+    fields = configured_fields(definition)
+    return (
+        tuple(field for field in fields if field.collection is None),
+        tuple(field for field in fields if field.collection is not None),
+    )
+
+
+async def _advance_finalize_stage(
     session,
-    binding: FamilyBlockBinding,
-    build,
-    gen_id: int,
-    scopes: tuple,
-) -> tuple[int, int]:
+    family_id: int,
+    next_stage: str,
+    *,
+    evidence_json: str | None = None,
+    set_evidence: bool = False,
+) -> None:
+    schema_sql = _DIALECT.identifier_preparer.quote_schema(snapshot_schema(family_id))
+    await staging._prepare_statement(session)
+    if set_evidence:
+        await session.execute(
+            text(
+                f"""
+                UPDATE {schema_sql}.{DIRECT_PROGRESS_TABLE}
+                SET finalize_stage = :next_stage,
+                    projection_evidence_json = :evidence_json
+                WHERE id = 1
+                """
+            ),
+            {"next_stage": next_stage, "evidence_json": evidence_json},
+        )
+        return
+    await session.execute(
+        text(f"UPDATE {schema_sql}.{DIRECT_PROGRESS_TABLE} SET finalize_stage = :next_stage WHERE id = 1"),
+        {"next_stage": next_stage},
+    )
+
+
+async def _table_row_count(session, table) -> int:
+    await staging._prepare_statement(session)
+    return int(await session.scalar(select(func.count()).select_from(table)) or 0)
+
+
+def _direct_keyed_child_sources(binding: FamilyBlockBinding, roots):
     definition = binding.layout.definition
-    roots, root_values_by_field = _direct_root_sources(binding, build, gen_id)
-    await _reject_matches(session, ambiguity_statement(roots))
-    written_counts: list[int] = []
-    for is_child_idx, scope_fields in enumerate(scopes):
-        is_child = bool(is_child_idx)
-        if not scope_fields:
-            written_counts.append(0)
-            continue
-        projection_table = binding.tables_by_role["query_child" if is_child else "query_root"]
-        src_rel, src_values_by_field = (roots, root_values_by_field)
-        if is_child:
-            src_rel, src_values_by_field = _child_sources(binding, roots)
-            await _reject_matches(session, ambiguity_statement(src_rel))
-            await _reject_matches(session, child_hash_collision_statement(src_rel))
-        reduced_stmt = reduction_statement(
-            src_rel, scope_fields, values_by_field=src_values_by_field, field_slots=field_slots(definition)
+    children = binding.tables_by_role["query_record"]
+    owned = roots.join(
+        children,
+        and_(
+            children.c.family_revision_id == roots.c.family_revision_id,
+            children.c.collection_slot == binding.layout.collection_slots[definition.query.child_collection],
+        ),
+    )
+    statement = select(
+        roots.c.entity_binding_id,
+        roots.c.selected_value,
+        roots.c.group_value,
+        children.c.key_rank,
+        children.c.key_variant,
+    ).select_from(owned)
+    values_by_field = {
+        field.field_id: children.c[scalar_column(field)] for field in _source_fields(definition, child=True)
+    }
+    return _value_relation(statement, values_by_field, "direct_projection_children")
+
+
+async def _verify_key_dictionary_bijection(session, binding: FamilyBlockBinding, roots) -> None:
+    """Confirm key_dictionary maps canonical child keys 1-to-1 and check per-entity hash collisions."""
+    keys = binding.tables_by_role["key_dictionary"]
+    duplicate_canonical = (
+        select(keys.c.canonical_child_key).group_by(keys.c.canonical_child_key).having(func.count() != 1)
+    )
+    await _reject_matches(session, duplicate_canonical)
+    await staging._prepare_statement(session)
+    has_hash_collision = (
+        await session.execute(
+            select(keys.c.child_key_sha256).group_by(keys.c.child_key_sha256).having(func.count() > 1).limit(1)
         )
-        if is_child:
-            guard, reduced_stmt = _child_output(binding, reduced_stmt.cte("direct_projection_reduced"))
-            await _reject_matches(session, guard)
-        await staging._prepare_statement(session)
-        inserted = await session.execute(
-            projection_table.insert().from_select(
-                tuple(projection_table.c.keys()), reduced_stmt, include_defaults=False
-            )
-        )
-        written_counts.append(int(inserted.rowcount))
-    return written_counts[0], written_counts[1]
+    ).first() is not None
+    if has_hash_collision:
+        expanded_children, _ = _child_sources(binding, roots)
+        await _reject_matches(session, child_hash_collision_statement(expanded_children))
 
 
 async def _digest_projection_tables(
@@ -500,33 +549,16 @@ async def _digest_projection_tables(
     )
 
 
-async def _run_f3_projections_and_indexes(
+async def _run_f3_root_projection(
     session,
     build,
     binding: FamilyBlockBinding,
     progress_by_col: dict[str, object],
 ) -> None:
-    """Populate derived query projections and build minimal compact v2 serving indexes."""
+    """Create projection lookup indexes and populate query_root (or minimal indexes when unprojected)."""
     definition = binding.layout.definition
-    gen_id = int(progress_by_col["reserved_generation_id"])
     fields = configured_fields(definition)
-    projection_evidence_json: str | None = None
-    if fields:
-        lookups = projection_index_specifications(binding.family_id, binding.layout)
-        await _create_indexes(session, binding, lookups)
-        scopes = tuple(
-            tuple(field for field in fields if (field.collection is not None) == is_child) for is_child in (False, True)
-        )
-        written_counts = await _populate_projection_tables(session, binding, build, gen_id, scopes)
-        remaining_specs = [
-            spec
-            for spec in index_specifications(binding.family_id, binding.layout)
-            if spec not in lookups and spec[0] not in ("fragment", "entity_binding")
-        ]
-        await _create_indexes(session, binding, remaining_specs)
-        await _deduplicate_entity_indexes(session, binding)
-        projection_evidence_json = await _digest_projection_tables(session, binding, build, scopes, written_counts)
-    else:
+    if not fields:
         minimal_specs = [
             spec
             for spec in index_specifications(binding.family_id, binding.layout)
@@ -535,18 +567,116 @@ async def _run_f3_projections_and_indexes(
         ]
         await _create_indexes(session, binding, minimal_specs)
         await _deduplicate_entity_indexes(session, binding)
-    schema_sql = _DIALECT.identifier_preparer.quote_schema(snapshot_schema(binding.family_id))
-    await staging._prepare_statement(session)
-    await session.execute(
-        text(
-            f"""
-            UPDATE {schema_sql}.{DIRECT_PROGRESS_TABLE}
-            SET finalize_stage = 'f4a',
-                projection_evidence_json = :evidence_json
-            WHERE id = 1
-            """
-        ),
-        {"evidence_json": projection_evidence_json},
+        await _advance_finalize_stage(session, binding.family_id, "f4a", evidence_json=None, set_evidence=True)
+        return
+    gen_id = int(progress_by_col["reserved_generation_id"])
+    lookups = projection_index_specifications(binding.family_id, binding.layout)
+    await _create_indexes(session, binding, lookups)
+    root_fields, child_fields = _projection_scopes(definition)
+    roots, root_values_by_field = _direct_root_sources(binding, build, gen_id)
+    await _reject_matches(session, ambiguity_statement(roots))
+    if root_fields:
+        reduced_stmt = reduction_statement(
+            roots, root_fields, values_by_field=root_values_by_field, field_slots=field_slots(definition)
+        )
+        query_root_table = binding.tables_by_role["query_root"]
+        await staging._prepare_statement(session)
+        await session.execute(
+            query_root_table.insert().from_select(
+                tuple(query_root_table.c.keys()), reduced_stmt, include_defaults=False
+            )
+        )
+    await _advance_finalize_stage(session, binding.family_id, "f3_child" if child_fields else "f3_idx")
+
+
+def _keyed_child_ambiguity_statement(keyed_children):
+    return (
+        select(
+            keyed_children.c.entity_binding_id,
+            keyed_children.c.selected_value,
+            keyed_children.c.key_rank,
+            keyed_children.c.key_variant,
+            keyed_children.c.group_value,
+            func.count().label("matching_count"),
+        )
+        .group_by(
+            keyed_children.c.entity_binding_id,
+            keyed_children.c.selected_value,
+            keyed_children.c.key_rank,
+            keyed_children.c.key_variant,
+            keyed_children.c.group_value,
+        )
+        .having(func.count() > 1)
+    )
+
+
+def _missing_dictionary_key_statement(query_child_table, keys):
+    return select(query_child_table.c.entity_binding_id).where(
+        ~exists(
+            select(literal(1)).where(
+                and_(
+                    keys.c.key_rank == query_child_table.c.key_rank,
+                    keys.c.key_variant == query_child_table.c.key_variant,
+                )
+            )
+        )
+    )
+
+
+async def _run_f3_child_projection(
+    session,
+    build,
+    binding: FamilyBlockBinding,
+    progress_by_col: dict[str, object],
+) -> None:
+    """Verify dictionary key bijection and populate query_child in its own bounded step."""
+    definition = binding.layout.definition
+    _root_fields, child_fields = _projection_scopes(definition)
+    if child_fields:
+        gen_id = int(progress_by_col["reserved_generation_id"])
+        roots, _ = _direct_root_sources(binding, build, gen_id)
+        await _verify_key_dictionary_bijection(session, binding, roots)
+        keyed_children, child_values_by_field = _direct_keyed_child_sources(binding, roots)
+        await _reject_matches(session, _keyed_child_ambiguity_statement(keyed_children))
+        reduced_stmt = keyed_child_reduction_statement(
+            keyed_children, child_fields, values_by_field=child_values_by_field, field_slots=field_slots(definition)
+        )
+        query_child_table = binding.tables_by_role["query_child"]
+        await staging._prepare_statement(session)
+        await session.execute(
+            query_child_table.insert().from_select(
+                tuple(query_child_table.c.keys()), reduced_stmt, include_defaults=False
+            )
+        )
+        await _reject_matches(
+            session, _missing_dictionary_key_statement(query_child_table, binding.tables_by_role["key_dictionary"])
+        )
+    await _advance_finalize_stage(session, binding.family_id, "f3_idx")
+
+
+async def _run_f3_serving_indexes(session, binding: FamilyBlockBinding) -> None:
+    """Build serving indexes and deduplicate entity indexes in their own bounded step."""
+    lookups = projection_index_specifications(binding.family_id, binding.layout)
+    remaining_specs = [
+        spec
+        for spec in index_specifications(binding.family_id, binding.layout)
+        if spec not in lookups and spec[0] not in ("fragment", "entity_binding")
+    ]
+    await _create_indexes(session, binding, remaining_specs)
+    await _deduplicate_entity_indexes(session, binding)
+    await _advance_finalize_stage(session, binding.family_id, "f3_digest")
+
+
+async def _run_f3_projection_digest(session, build, binding: FamilyBlockBinding) -> None:
+    """Digest populated query projection tables and persist evidence in its own bounded step."""
+    scopes = _projection_scopes(binding.layout.definition)
+    written_counts = (
+        await _table_row_count(session, binding.tables_by_role["query_root"]) if scopes[0] else 0,
+        await _table_row_count(session, binding.tables_by_role["query_child"]) if scopes[1] else 0,
+    )
+    projection_evidence_json = await _digest_projection_tables(session, binding, build, scopes, written_counts)
+    await _advance_finalize_stage(
+        session, binding.family_id, "f4a", evidence_json=projection_evidence_json, set_evidence=True
     )
 
 
@@ -1325,7 +1455,16 @@ async def _dispatch_finalize_stage(
         await _run_f2_winners(session, build, binding, progress_by_col)
         return
     if stage_name == "f3":
-        await _run_f3_projections_and_indexes(session, build, binding, progress_by_col)
+        await _run_f3_root_projection(session, build, binding, progress_by_col)
+        return
+    if stage_name == "f3_child":
+        await _run_f3_child_projection(session, build, binding, progress_by_col)
+        return
+    if stage_name == "f3_idx":
+        await _run_f3_serving_indexes(session, binding)
+        return
+    if stage_name == "f3_digest":
+        await _run_f3_projection_digest(session, build, binding)
         return
     if stage_name == "f4a":
         await _verify_structure_and_log(session, build, binding, progress_by_col)

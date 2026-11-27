@@ -88,3 +88,22 @@ def reduction_statement(source, fields, *, values_by_field, field_slots):
         _field_expression(source, field, values_by_field, slot) for field, slot in zip(fields, slots, strict=True)
     ]
     return select(*identities, *expressions).group_by(*identities)
+
+
+def keyed_child_reduction_statement(source, fields, *, values_by_field, field_slots):
+    """Reduce keyed child records by dictionary identity without re-joining canonical keys."""
+
+    identities = (
+        source.c.entity_binding_id,
+        source.c.selected_value,
+        source.c.key_rank,
+        source.c.key_variant,
+    )
+    fields = tuple(fields)
+    if any(field.collection is None for field in fields):
+        raise ValueError("keyed child projection fields must belong to a child collection")
+    slots = _checked_slots(fields, field_slots)
+    expressions = [
+        _field_expression(source, field, values_by_field, slot) for field, slot in zip(fields, slots, strict=True)
+    ]
+    return select(*identities, *expressions).group_by(*identities)
