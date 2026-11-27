@@ -22,7 +22,6 @@ from process.network_membership_serving_indexes import (
     _source_semantics,
 )
 from process.network_membership_validation import validate_network_membership_candidate
-from process.network_membership_writer_closure import freeze_network_candidate_writers
 from process.network_serving_reactivation import (
     NetworkServingReactivationError,
     NetworkServingReactivationReceipt,
@@ -137,10 +136,7 @@ async def _candidate_writer_roles(fixture, *, freeze=True):
         fixture.writer_roles = role_by_kind
         fixture.read_owner_role = role_by_kind["owner"]
         await _writer_role_grants(fixture)
-        if freeze:
-            await _freeze_fixture(fixture)
-        else:
-            await _loader_owned_candidate(fixture)
+        await _loader_owned_candidate(fixture)
         async with network_publication_lifecycle(fixture, _preparation_roles(fixture)) as lifecycle:
             await _grant_named_preparation_control(fixture.connection, role_by_kind["publisher"])
             fixture.seal_candidate, fixture.preparation_roles = lifecycle.seal_candidate, lifecycle.preparation_roles
@@ -218,30 +214,6 @@ async def _restore_candidate_owners(fixture, original_owner):
         await fixture.connection.execute(f'ALTER SCHEMA "{schema_name}" OWNER TO {original_owner}')
 
 
-async def _freeze_fixture(fixture):
-    connection, roles = fixture.connection, fixture.writer_roles
-    await _loader_owned_candidate(fixture)
-    original_role = await connection.fetchval("SELECT quote_ident(current_user)")
-    async with connection.transaction():
-        await connection.execute(f'SET LOCAL ROLE "{roles["publisher"]}"')
-        receipt = await freeze_network_candidate_writers(
-            connection,
-            fixture.copy_target,
-            owner_role=roles["owner"],
-            loader_roles=(roles["loader"],),
-            reader_roles=(roles["reader"],),
-            control_schema=fixture.control_schema,
-        )
-        await connection.execute(
-            f'UPDATE "{fixture.control_schema}".network_membership_candidate '
-            "SET validation_json=coalesce(validation_json,'{}'::jsonb)||jsonb_build_object('writer_closure',$1::jsonb) WHERE candidate_id=$2",
-            json.dumps(receipt),
-            UUID(fixture.copy_target.candidate_id),
-        )
-        await connection.execute(f"SET LOCAL ROLE {original_role}")
-    return receipt
-
-
 async def _loader_owned_candidate(fixture):
     connection, roles = fixture.connection, fixture.writer_roles
     namespace = f'"{fixture.copy_target.schema_name}"'
@@ -307,7 +279,7 @@ async def _second_candidate(fixture, *, expected_head=0, approved_revision=0):
             fixture.connection, copy_target, fixture.address_source, control_schema=fixture.control_schema
         )
         await _synthetic_serving_receipt(second_fixture)
-    await _freeze_fixture(second_fixture)
+    await _loader_owned_candidate(second_fixture)
     await fixture.seal_candidate(copy_target)
     return second_fixture
 

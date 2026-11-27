@@ -277,8 +277,8 @@ def test_registry_shards_isolate_long_publications_and_preserve_every_case(shard
     ]
     assert len(heavy_nodeids) == 21
     assert heavy_nodeids[-2:] == [
-        "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[legacy]",
-        "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[modern]",
+        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_metadata_execution_reader_successor_preserves_incumbent",
+        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent",
     ]
     for index, node in enumerate(heavy_nodeids):
         assert node in shards[index]
@@ -364,27 +364,14 @@ def test_anchor_collisions_keep_module_fixtures_together() -> None:
 )
 @pytest.mark.parametrize("shard_count", (1, 2, 4, 6, 8, 16, 32, 48))
 def test_native_proofs_use_measured_shards_without_redistributing_other_cases(shard_count, additional_nodeid) -> None:
-    catalog = "tests/test_registry_execution_catalog_postgres.py"
     shards_by_nodeid = {
         "tests/test_network_fhir_source_witness_publication_postgres.py::test_distinct_source_addition_retains_prior_capture_and_readers": (
             23,
             29,
         ),
-        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_metadata_execution_reader_successor_preserves_incumbent": (
-            22,
-            21,
-        ),
-        f"{catalog}::test_inaccessible_public_view_does_not_hide_unsafe_callbacks": (28, 2),
-        f"{catalog}::test_inaccessible_public_view_keeps_complete_metadata_and_transition_census": (28, 2),
-        f"{catalog}::test_public_view_external_return_rule_is_not_a_self_dependency": (47, 2),
-        f"{catalog}::test_public_view_rights_refuse_without_schema_usage[public]": (47, 2),
         "tests/test_verified_witness_custom_publication_postgres.py::test_source_v2_manual_commands_preserve_custody_and_replay": (
             47,
             10,
-        ),
-        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent": (
-            1,
-            12,
         ),
     }
     if additional_nodeid is not None:
@@ -394,7 +381,6 @@ def test_native_proofs_use_measured_shards_without_redistributing_other_cases(sh
         | {node + "[variant]" for node in shards_by_nodeid}
         | {node.replace("::test_", "::TestCatalog::test_") for node in shards_by_nodeid}
         | {node.replace("tests/", "other/", 1) for node in shards_by_nodeid}
-        | {f"{catalog}::test_case[{index}]" for index in range(500)}
         | {f"tests/test_unrelated.py::test_case[{index}]" for index in range(500)}
     )
     shards = [

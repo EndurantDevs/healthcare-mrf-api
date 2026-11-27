@@ -19,7 +19,6 @@ from process.network_approved_source_bindings import (
     RegistryNetworkSourceCoordinates,
     require_approved_network_source_bindings,
 )
-from process.network_candidate_custody import SOURCE_EVENT_ASSERTION
 from process.network_cms_registry_source_pair import _publication
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_membership_copy import MembershipCopyTarget
@@ -43,6 +42,7 @@ from process.registry_source_recipe_store import (
     resolve_retained_registry_source_recipes,
 )
 
+SOURCE_EVENT_ASSERTION = "source_event_assertion"
 _DOMAIN = UUID("7fe8e300-7046-5406-bd6c-c1527bd6fa85")
 _CHECKPOINT = "cms_source_notification"
 

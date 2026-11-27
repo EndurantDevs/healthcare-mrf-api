@@ -16,7 +16,6 @@ from process import provider_directory_generic_source_policy as source_policy
 from process.network_address_projection import _identifier
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import require_approved_network_source_bindings
-from process.network_candidate_custody import SOURCE_EVENT_ASSERTION
 from process.network_cms_registry_address_capture import NativeReceiptSession
 from process.network_legacy_membership_source import (
     PinnedACAMembershipSource,
@@ -40,7 +39,7 @@ from process.registry_aca_source_recipe import (
     require_registry_aca_source_batch,
 )
 from process.registry_candidate_composition import RegistryCompositionAddressSources, _target
-from process.registry_cms_source_consumer import _canonical_session
+from process.registry_cms_source_consumer import SOURCE_EVENT_ASSERTION, _canonical_session
 from process.registry_publication_execution import prepare_registry_candidate_for_context, source_worker_address_sources
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_source_recipe_store import (

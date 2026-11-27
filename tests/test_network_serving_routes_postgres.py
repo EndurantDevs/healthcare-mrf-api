@@ -24,7 +24,7 @@ from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_membership_publication_postgres import (
     _candidate_writer_roles,
     _clone_raw_inputs,
-    _freeze_fixture,
+    _loader_owned_candidate,
     _publish,
     _sequence_state,
     _snapshot,
@@ -147,7 +147,7 @@ async def _next_full_candidate(fixture):
             fixture.connection, copy_target, fixture.address_source, control_schema=fixture.control_schema
         )
         await _prepare(next_fixture)
-    await _freeze_fixture(next_fixture)
+    await _loader_owned_candidate(next_fixture)
     # Publication needs the recorded final validation of the configured preparation step.
     await fixture.seal_candidate(copy_target)
     return next_fixture
