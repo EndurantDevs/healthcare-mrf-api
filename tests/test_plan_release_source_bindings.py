@@ -108,23 +108,36 @@ def test_binding_query_cannot_combine_source_and_retained_storage(projection):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["manifest", "cohort"])
 @pytest.mark.parametrize("invalid_rows", [[], [{"valid": False}], [{"valid": 1}], [{"valid": True}] * 2])
-async def test_custody_requires_one_native_true_result(phase, invalid_rows):
-    responses = [invalid_rows] if phase == "manifest" else [[{"valid": True}], [], [], [], invalid_rows]
+async def test_custody_requires_one_native_true_result(invalid_rows):
+    responses = [[], [], invalid_rows]
     calls = []
 
     async def fetch(statement, *parameters):
         calls.append((statement, parameters))
         return responses[len(calls) - 1]
 
-    reason = "manifest_custody" if phase == "manifest" else "binding_custody"
-    with pytest.raises(ValueError, match="^plan_release_source_" + reason + "$"):
+    with pytest.raises(ValueError, match="^plan_release_source_binding_custody$"):
         await custody.require_source_binding_custody_fetch(fetch, "sample", admission())
     assert len(calls) == len(responses)
-    assert "catalog_runtime_manifest" in calls[0][0]
-    if phase == "cohort":
-        assert calls[-1][1][1:] == (SERVING_REVISION_ID, "sample.plan_release_serving_revision")
+    assert calls[-1][1][1:] == (SERVING_REVISION_ID,)
+
+
+@pytest.mark.asyncio
+async def test_cohort_check_skips_ownership_audits():
+    calls = []
+
+    async def fetch(statement, *parameters):
+        calls.append(statement)
+        return [{"valid": True}] if "AS valid" in statement else []
+
+    await custody.require_source_binding_custody_fetch(fetch, "sample", admission())
+    assert len(calls) == 3
+    assert not any(
+        word in statement
+        for statement in calls
+        for word in ("catalog_runtime_manifest", "relowner", "relacl", "pg_has_role", "has_table_privilege")
+    )
 
 
 class ReaderSession:

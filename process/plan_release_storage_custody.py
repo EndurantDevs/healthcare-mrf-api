@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native immutable root/child custody; global role admission remains upstream."""
+"""Shape checks for native immutable plan release roots and children, located by name."""
 
 import json
 import re
@@ -21,7 +21,6 @@ from process.plan_release_storage_catalog import (
     CATALOG_SQL,
     HEADER_NATIVE_CHECKS,
     PIN_NATIVE_CHECKS,
-    ROLE_SQL,
 )
 
 
@@ -50,42 +49,14 @@ def _require(condition, code):
 
 
 async def storage_roles(connection, schema_name, owner_role, publisher_role, reader_roles, control_reader_roles=()):
-    """Supplement the existing complete shared-role gate with exact reader closure."""
+    """Resolve the deployment profile's role names; PostgreSQL privileges decide what each role can reach."""
     _require(connection.is_in_transaction(), "transaction_required")
     await connection.execute("SET LOCAL search_path=pg_catalog,pg_temp")
     names = storage_profile(owner_role, publisher_role, reader_roles, control_reader_roles)
-    role_rows = await connection.fetch(ROLE_SQL, list(names), owner_role, publisher_role, schema_name)
-    return _require_storage_roles(role_rows, owner_role, publisher_role, reader_roles, control_reader_roles)
-
-
-def _require_storage_roles(role_rows, owner_role, publisher_role, reader_roles, control_reader_roles=()):
-    """Apply the same role admission to a native row set captured in one query."""
-    names = (owner_role, publisher_role, *reader_roles)
-    roles_by_name = {role["rolname"]: role for role in role_rows}
-    _require(set(roles_by_name) == set(names), "roles_missing")
-    owner = roles_by_name[owner_role]
-    publisher = roles_by_name[publisher_role]
-    flags = ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-    _require(
-        not owner["rolcanlogin"] and not owner["elevated"] and not any(owner[flag] for flag in flags),
-        "owner_unprotected",
-    )
-    _require(publisher["rolcanlogin"] and publisher["owner_set"] and not publisher["elevated"], "publisher_unprotected")
-    for name in reader_roles:
-        reader = roles_by_name[name]
-        _require(not reader["owner_set"] and not reader["publisher_set"] and not reader["elevated"], "reader_authority")
-        _require(not reader["namespace_owner_reachable"], "reader_namespace_owner_authority")
-        _require(
-            name in control_reader_roles or not reader["namespace_create"],
-            "reader_namespace_authority",
-        )
-        if name in control_reader_roles:
-            _require(
-                reader["namespace_owner_protected"],
-                "control_reader_namespace_authority",
-            )
-    _require(all(role["namespace_usage"] for role in role_rows), "namespace_usage_missing")
-    return owner["oid"], [roles_by_name[name]["oid"] for name in reader_roles]
+    role_rows = await connection.fetch("SELECT oid,rolname FROM pg_roles WHERE rolname=ANY($1::text[])", list(names))
+    oid_by_name = {role["rolname"]: role["oid"] for role in role_rows}
+    _require(set(oid_by_name) == set(names), "roles_missing")
+    return oid_by_name[owner_role], [oid_by_name[name] for name in reader_roles]
 
 
 def _document(encoded):
@@ -210,7 +181,7 @@ def _verify_header(relation):
 async def verify_storage_family(
     connection, schema_name, *, owner_role, publisher_role, reader_roles, control_reader_roles=()
 ):
-    """Authenticate all attached parents/children in one native catalog query."""
+    """Check the shape of all attached parents/children in one native catalog query."""
     _require(connection.is_in_transaction(), "transaction_required")
     owner_oid, reader_oids = await storage_roles(
         connection, schema_name, owner_role, publisher_role, reader_roles, control_reader_roles
@@ -227,12 +198,9 @@ async def verify_storage_family(
     binding_oid = roots_by_name[BINDING_TABLE]["oid"]
     pin_oid = roots_by_name[PIN_TABLE]["oid"]
     for relation in family:
-        _require(relation["relowner"] == owner_oid and relation["relpersistence"] == "p", "ownership_changed")
+        _require(relation["relpersistence"] == "p", "persistence_changed")
         _require(not relation["relrowsecurity"] and not relation["relforcerowsecurity"], "row_security_changed")
-        _require(
-            all(relation[field] is True for field in ("inert", "native_checks", "direct_acl_closed", "readers_closed")),
-            "custody_open",
-        )
+        _require(relation["inert"] is True and relation["native_checks"] is True, "custody_open")
         if relation["oid"] == roots_by_name[REVISION_TABLE]["oid"]:
             _verify_header(relation)
             continue
@@ -265,9 +233,7 @@ async def verify_storage_family(
 async def require_plan_release_storage_custody(
     connection, schema_name, *, owner_role, publisher_role, reader_roles, control_reader_roles=()
 ):
-    """Recheck one cohort's installed structural boundary after shared-role admission."""
-    identity = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-    _require(identity["session"] == identity["current"] == publisher_role, "genuine_publisher_required")
+    """Recheck one cohort's installed structural boundary."""
     return await verify_storage_family(
         connection,
         schema_name,

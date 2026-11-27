@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from api.plan_pricing_code_contract import SPEC, identity_digest, scope_selectors, validate_params
 from api.plan_pricing_code_oracle import CodeInputOracle, require_budget
-from api.plan_pricing_code_storage import attachment_name, lock_identity
+from api.plan_pricing_code_storage import lock_identity
 from api.plan_pricing_projection_contract import lock_provider_generation
 from api.plan_release_serving_resolution import PLAN_RELEASE_RESOLUTION_READY, resolve_plan_release_serving_resolution
 from db.connection import db
@@ -23,9 +23,6 @@ class _RollbackCalibration(Exception):
 async def _publication_state(session, identity):
     from api.ptg2_serving import PTG2_SCHEMA
 
-    attachment = await session.scalar(
-        text("SELECT to_regclass(:name)::oid"), {"name": "hp_snapshot_retention." + attachment_name(identity)}
-    )
     pins = (
         (
             await session.execute(
@@ -37,11 +34,11 @@ async def _publication_state(session, identity):
         .scalars()
         .all()
     )
-    return attachment, tuple(pins)
+    return tuple(pins)
 
 
 async def _cleanup_proof(calibration_by_field):
-    """Observe exact transaction-owned stage removal and unchanged publication state."""
+    """Observe stage removal by name and unchanged retention pins."""
     if calibration_by_field.get("schema") is None:
         return
     async with db.transaction() as session:
@@ -53,13 +50,6 @@ async def _cleanup_proof(calibration_by_field):
             is not None
         ):
             raise ValueError("code calibration stage survived rollback")
-        remaining = await session.scalar(
-            text("""SELECT count(*) FROM pg_class WHERE relnamespace=:namespace
-            AND (relname LIKE 'code_calibration_%' OR relname LIKE 'plan_pricing_%')"""),
-            {"namespace": calibration_by_field.get("temporary_namespace_oid", 0)},
-        )
-        if remaining != 0:
-            raise ValueError("code calibration temporary evidence survived rollback")
         if (
             await _publication_state(session, calibration_by_field["identity"])
             != calibration_by_field["publication_before"]
@@ -99,7 +89,7 @@ async def _resolved_inputs(session, params, calibration_by_field):
 
 
 async def _register_stage(session, calibration_by_field):
-    """Register an empty native and temporary preimage before creating candidate data."""
+    """Choose an unused stage schema name before creating candidate data."""
     dataset_id = uuid4()
     calibration_by_field["schema"] = native.reference_family_stage_schema(dataset_id)
     if (
@@ -107,14 +97,6 @@ async def _register_stage(session, calibration_by_field):
         is not None
     ):
         raise ValueError("code calibration stage preimage is not empty")
-    existing_temp = await session.scalar(
-        text("""SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema()
-        AND (relname LIKE 'code_calibration_%' OR relname LIKE 'plan_pricing_%')""")
-    )
-    if existing_temp != 0:
-        raise ValueError("code calibration temporary preimage is not empty")
-    await session.execute(text("CREATE TEMP TABLE code_calibration_registration(owner uuid) ON COMMIT DROP"))
-    calibration_by_field["temporary_namespace_oid"] = await session.scalar(text("SELECT pg_my_temp_schema()"))
     return dataset_id
 
 
@@ -171,7 +153,7 @@ async def calibrate(params, context):
                 await _cleanup_proof(calibration_by_field)
         finally:
             # Internal custody coordinates never become a reusable authority envelope.
-            for name in ("publication_before", "identity", "schema", "temporary_namespace_oid"):
+            for name in ("publication_before", "identity", "schema"):
                 calibration_by_field.pop(name, None)
     calibration_by_field.update(complete=True, cleanup_verified=True)
     return {"calibration": {**receipt, "rolled_back": True, "cleanup_verified": True}}

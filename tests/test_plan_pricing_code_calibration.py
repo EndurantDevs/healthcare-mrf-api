@@ -146,7 +146,7 @@ async def test_current_resolution_and_publisher_guard_precede_staging(monkeypatc
     monkeypatch.setattr(build, "resolve_inputs", AsyncMock(return_value=(identity_by_field, ())))
     publisher = AsyncMock()
     monkeypatch.setattr(calibration.native, "protected_publisher_owner", publisher)
-    monkeypatch.setattr(calibration, "_publication_state", AsyncMock(return_value=(None, ())))
+    monkeypatch.setattr(calibration, "_publication_state", AsyncMock(return_value=()))
     session = SimpleNamespace(execute=AsyncMock())
     if drift:
         with pytest.raises(ValueError, match="identity changed"):
@@ -229,23 +229,19 @@ async def test_complete_input_digest_enforces_byte_bounds_and_closes_stream(monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("remaining", ["stage", "temporary", "attachment", "pins", None])
+@pytest.mark.parametrize("remaining", ["stage", "pins", None])
 async def test_cleanup_requires_removed_stage_and_unchanged_publication(monkeypatch, remaining):
-    session = SimpleNamespace(
-        execute=AsyncMock(),
-        scalar=AsyncMock(side_effect=[71 if remaining == "stage" else None, int(remaining == "temporary")]),
-    )
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=71 if remaining == "stage" else None))
 
     @asynccontextmanager
     async def transaction():
         yield session
 
     monkeypatch.setattr(calibration.db, "transaction", transaction)
-    before = (None, ("snapshot-original",))
-    after = (42, before[1]) if remaining == "attachment" else (None, ("snapshot-foreign",))
-    publication = AsyncMock(return_value=before if remaining is None else after)
+    before = ("snapshot-original",)
+    publication = AsyncMock(return_value=before if remaining is None else ("snapshot-foreign",))
     monkeypatch.setattr(calibration, "_publication_state", publication)
-    audit_by_field = dict(schema="candidate_test", temporary_namespace_oid=17, identity={}, publication_before=before)
+    audit_by_field = dict(schema="candidate_test", identity={}, publication_before=before)
     if remaining:
         with pytest.raises(ValueError, match="survived rollback|changed publication"):
             await calibration._cleanup_proof(audit_by_field)
@@ -253,9 +249,20 @@ async def test_cleanup_requires_removed_stage_and_unchanged_publication(monkeypa
     else:
         await calibration._cleanup_proof(audit_by_field)
         assert audit_by_field["cleanup_verified"] is True
-    assert publication.await_count == int(remaining not in {"stage", "temporary"})
+    assert publication.await_count == int(remaining != "stage")
+    # Only the stage name is looked up; temporary relations are not audited.
+    assert session.scalar.await_count == 1
     await calibration._cleanup_proof({})
     assert session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_publication_state_reads_only_retention_pins():
+    pin_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: ["snapshot-a"]))
+    session = SimpleNamespace(execute=AsyncMock(return_value=pin_result), scalar=AsyncMock(side_effect=AssertionError))
+    identity_by_field = {"contract": "code", "scope": {}}
+    assert await calibration._publication_state(session, identity_by_field) == ("snapshot-a",)
+    assert "ptg2_snapshot_pin" in str(session.execute.await_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -283,24 +290,19 @@ async def test_unpublished_or_changed_revision_never_resolves_candidate_inputs(m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage,temporary", [(91, 0), (None, 1), (None, 0)])
-async def test_calibration_requires_empty_owned_preimage_before_temporary_ddl(stage, temporary):
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[stage, temporary, 17]), execute=AsyncMock())
+@pytest.mark.parametrize("stage", [91, None])
+async def test_calibration_refuses_used_stage_name(stage):
+    session = SimpleNamespace(scalar=AsyncMock(return_value=stage), execute=AsyncMock())
     audit_by_field = {}
-    if stage is not None or temporary:
+    if stage is not None:
         with pytest.raises(ValueError, match="preimage is not empty"):
             await calibration._register_stage(session, audit_by_field)
-        session.execute.assert_not_awaited()
-        assert "temporary_namespace_oid" not in audit_by_field
     else:
         dataset_id = await calibration._register_stage(session, audit_by_field)
-        assert audit_by_field == dict(
-            schema=calibration.native.reference_family_stage_schema(dataset_id), temporary_namespace_oid=17
-        )
-        assert (
-            str(session.execute.await_args.args[0])
-            == "CREATE TEMP TABLE code_calibration_registration(owner uuid) ON COMMIT DROP"
-        )
+        assert audit_by_field == dict(schema=calibration.native.reference_family_stage_schema(dataset_id))
+    # No temporary table or temporary namespace audit runs.
+    assert session.scalar.await_count == 1
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

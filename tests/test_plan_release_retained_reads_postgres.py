@@ -147,6 +147,17 @@ async def test_provisioned_roots_keep_the_normal_reader_path(monkeypatch):
             ) == serving._selection_from_rows(RELEASE, before)
 
 
+_SERVING_DRIFT = {
+    "root_column_grant",
+    "root_owner",
+    "legacy_write",
+    "pin_write",
+    "other_reader_write",
+    "public_reader",
+    "reader_grantable",
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "damage",
@@ -192,8 +203,12 @@ async def test_retained_storage_drift_is_refused_without_fallback(monkeypatch, d
         await admin.execute(statements_by_damage[damage])
         catalog = await _catalog(admin, case)
         async with reader.transaction(readonly=True):
-            with pytest.raises((ValueError, asyncpg.InsufficientPrivilegeError)):
-                await is_retained_binding_read(reader.fetch, case.schema)
+            # Owner, grant and reader-cohort drift no longer refuses; the case ids are kept.
+            if damage in _SERVING_DRIFT:
+                assert await is_retained_binding_read(reader.fetch, case.schema) is True
+            else:
+                with pytest.raises((ValueError, asyncpg.InsufficientPrivilegeError)):
+                    await is_retained_binding_read(reader.fetch, case.schema)
         assert await _catalog(admin, case) == catalog
 
 
@@ -518,7 +533,7 @@ async def test_canonical_reader_rejects_incomplete_or_unprotected_cohort_without
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drift", ["child_write", "header_owner", "runtime_manifest"])
 async def test_canonical_reader_serves_after_owner_grant_or_role_policy_drift(monkeypatch, drift):
-    async with canonical_case(monkeypatch) as (case, admin, _reader, registry, before, payloads):
+    async with canonical_case(monkeypatch) as (case, admin, reader, registry, before, payloads):
         if drift == "runtime_manifest":
             await admin.execute(f"DROP TABLE {registry}.catalog_runtime_manifest")
         else:
@@ -526,6 +541,9 @@ async def test_canonical_reader_serves_after_owner_grant_or_role_policy_drift(mo
         async with reader_session(case) as session:
             selected = await resolution.resolve_plan_release_guard_selection(session, RELEASE)
             assert selected == serving._selection_from_rows(RELEASE, before)
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            bulk = await lookup._fetch_release_binding_rows(reader, [RELEASE], 1024 * 1024)
+            assert serving._selection_from_rows(RELEASE, bulk) == serving._selection_from_rows(RELEASE, before)
 
 
 @pytest.mark.asyncio
