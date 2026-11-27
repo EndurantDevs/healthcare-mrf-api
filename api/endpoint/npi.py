@@ -1,8 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
-import base64
-import binascii
 import contextlib
 import hashlib
 import ipaddress
@@ -95,6 +93,9 @@ from api.provider_directory_dataset_sql import (
 from api.provider_directory_dataset_sql import (
     provider_directory_network_resolution_sql as _provider_directory_network_resolution_sql,
 )
+from api.provider_geo_cursor import carried_cursor_total
+from api.provider_geo_cursor import decode_nearby_cursor as _decode_nearby_cursor
+from api.provider_geo_cursor import encode_nearby_cursor as _encode_nearby_cursor
 from api.provider_geo_search import ProviderGeoSearch, nearby_search_fields, nearest_first_pages, request_geo_search
 from api.provider_geo_sql import (
     ImportedGeoQuery,
@@ -4872,7 +4873,6 @@ def _build_nearby_count_sql(
     )
 
 
-_NEARBY_CURSOR_VERSION = 1
 _NEARBY_CURSOR_IGNORED_PARAMS = frozenset({"cursor", "include_total", "limit"})
 
 
@@ -4887,44 +4887,6 @@ def _nearby_cursor_scope(args: Mapping[str, Any]) -> str:
         values.append(("network_selection", selection))
     serialized = json.dumps(values, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-
-def _encode_nearby_cursor(
-    scope: str,
-    distance_meters: float,
-    npi: int,
-    address_key: str,
-) -> str:
-    payload = {
-        "v": _NEARBY_CURSOR_VERSION,
-        "s": scope,
-        "d": float(distance_meters),
-        "n": int(npi),
-        "a": str(address_key).lower(),
-    }
-    encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    return encoded.rstrip(b"=").decode("ascii")
-
-
-def _decode_nearby_cursor(raw: str, scope: str) -> tuple[float, int, str]:
-    try:
-        value = str(raw or "").strip()
-        if not value or len(value) > 2048:
-            raise ValueError("invalid cursor length")
-        padding = "=" * (-len(value) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(value + padding))
-        distance = float(payload["d"])
-        npi = int(payload["n"])
-        address_key = str(uuid.UUID(str(payload["a"])))
-        if payload.get("v") != _NEARBY_CURSOR_VERSION:
-            raise ValueError("unsupported cursor version")
-        if payload.get("s") != scope:
-            raise ValueError("cursor filters do not match this request")
-        if not math.isfinite(distance) or distance < 0 or npi <= 0:
-            raise ValueError("invalid cursor values")
-        return distance, npi, address_key
-    except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise sanic.exceptions.InvalidUsage("cursor is invalid or does not match the current geo filters") from exc
 
 
 def _nearby_cursor_filter(
@@ -10722,6 +10684,14 @@ async def get_near_npi(
 
         if is_count_only:
             return response.json({"rows": await fetch_exact_total()}, default=str)
+        # A total holds only for the plan snapshots, filter year and code mappings it was counted with.
+        counted_with = plan_scope_parameters, dynamic_code_parameters_by_name
+        carried_total = carried_cursor_total(cursor_raw, counted_with) if initial_cursor is not None else None
+
+        async def fetch_page_total() -> int:
+            """Reuse the total a cursor carries; count for an opening page."""
+            return carried_total if carried_total is not None else await fetch_exact_total()
+
         if imported_statements is not None:
             res_q = await fetch_nearby_rows()
             total_mapping = getattr(res_q[0], "_mapping", {}) if res_q else {}
@@ -10730,9 +10700,9 @@ async def get_near_npi(
             total_count = int(total_mapping["_geo_total"])
         elif is_pagination_requested and current_network_address_scope() is not None:
             res_q = await fetch_nearby_rows()
-            total_count = await fetch_exact_total()
+            total_count = await fetch_page_total()
         elif is_pagination_requested:
-            res_q, total_count = await gather_reader_calls(db, fetch_nearby_rows(), fetch_exact_total())
+            res_q, total_count = await gather_reader_calls(db, fetch_nearby_rows(), fetch_page_total())
         else:
             res_q = await fetch_nearby_rows()
             total_count = None
@@ -10850,6 +10820,7 @@ async def get_near_npi(
                     float(distance_value),
                     int(npi_value),
                     str(address_key_value),
+                    (int(total_count or 0), counted_with),
                 )
         for provider_result in provider_results:
             if isinstance(provider_result, dict):

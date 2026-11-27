@@ -1653,6 +1653,28 @@ async def test_near_continuation_reads_bounded_disc(monkeypatch, empty_edges):
     ]
 
 
+@pytest.mark.asyncio
+async def test_near_continuation_reuses_counted_total(monkeypatch):
+    """A cursor carries the opening page's exact total, so a following page does not count again."""
+
+    address_keys = ["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"]
+    monkeypatch.setattr(npi_module, "db", _near_paging_db(*address_keys))
+    arguments_by_name = {"long": "-87.0", "lat": "41.0", "radius": "10", "limit": "1", "include_total": "1"}
+    opening_request = types.SimpleNamespace(args=dict(arguments_by_name), app=types.SimpleNamespace())
+    opening_page = json.loads((await npi_module.get_near_npi(opening_request)).body)
+
+    def refuse_recount(*_args, **_kwargs):
+        raise AssertionError("a following page counted again")
+
+    monkeypatch.setattr(npi_module, "build_native_nearby_count_sql", refuse_recount)
+    arguments_by_name["cursor"] = opening_page["next_cursor"]
+    following_request = types.SimpleNamespace(args=arguments_by_name, app=types.SimpleNamespace())
+    following_page = json.loads((await npi_module.get_near_npi(following_request)).body)
+
+    assert following_page["total_count"] == opening_page["total_count"] == 2
+    assert [provider["npi"] for provider in following_page["items"]] == [5556667778]
+
+
 def _near_card_provider_record(address_key):
     return _near_provider_record(
         1112223334,
