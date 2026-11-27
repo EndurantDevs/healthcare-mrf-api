@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
@@ -410,8 +411,30 @@ def _provider_city_count_address(scope, address_sql, *, city, state, address_cla
     return compact_city_search_relation(scope.manifest.compact_layout, scope.network_ids) or address_sql
 
 
-def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, is_plain, taxonomy_join=""):
-    """Plan a compact city page or a bounded NPI page for native provider reads."""
+_SEARCH_PAGE_CLAUSE = re.compile(
+    r"c\.type (?:IN \([^()]*\)|= 'primary')|state_name = :state"
+    r"|c\.taxonomy_array && (?:q\.int_codes|ARRAY\[:taxonomy_id\]::integer\[\])"
+)
+
+
+def _provider_network_search_page(scope, filters, clauses, indexed, taxonomy_page):
+    """Plan a page over a small network selection when its filters only need the search projection."""
+    layout = scope.manifest.compact_layout
+    if layout.network_search is None or filters.get("city") or filters.get("zip_code"):
+        return None
+    if not all(_SEARCH_PAGE_CLAUSE.fullmatch(clause) for clause in clauses):
+        return None
+    from api.network_compact_address import compact_network_search_page
+
+    taxonomy_join, prior_keys = taxonomy_page
+    keys, search_page, fallback = compact_network_search_page(layout, scope.network_ids, clauses, taxonomy_join)
+    # A larger selection keeps the page plan chosen before, with the key relations that plan reads.
+    keys = ",\n".join(part for part in (prior_keys, keys) if part)
+    return keys, fallback, lambda page_sql: f"({search_page}) UNION ALL ({page_sql})", f"{indexed} as c {taxonomy_join}"
+
+
+def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, is_plain, taxonomy_page=("", None)):
+    """Plan a compact city page, a small-selection page or a bounded NPI page for native provider reads."""
     if not (
         is_plain
         and scope is not None
@@ -419,6 +442,13 @@ def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, i
         and scope.manifest.supports_location_lookup
     ):
         return None
+    indexed = scoped_address_relation_sql(f"{schema}.{EntityAddressUnified.__tablename__}", location_lookup=True)
+    compact_page = _provider_compact_page(scope, filters, clauses, indexed, page_end, taxonomy_page[0])
+    return compact_page or _provider_network_search_page(scope, filters, clauses, indexed, taxonomy_page)
+
+
+def _provider_compact_page(scope, filters, clauses, indexed, page_end, taxonomy_join):
+    """Plan a compact city page or a bounded NPI page."""
     from api.network_compact_address import compact_city_page, compact_npi_page
 
     layout = scope.manifest.compact_layout
@@ -428,7 +458,6 @@ def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, i
     # Only the indexed city projection can keep a per-provider taxonomy probe.
     if taxonomy_join and not (is_city_page and layout.city_search is not None and "CROSS JOIN" not in taxonomy_join):
         return None
-    indexed = scoped_address_relation_sql(f"{schema}.{EntityAddressUnified.__tablename__}", location_lookup=True)
     if is_city_page:
         keys, city_page, fallback = compact_city_page(layout, scope.network_ids, clauses[0], taxonomy_join)
         return keys, fallback, lambda page_sql: f"({city_page}) UNION ALL ({page_sql})", f"{indexed} as c"

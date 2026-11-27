@@ -38,6 +38,7 @@ SEARCH_COLUMNS = (
 _LOCATION_COLUMNS = (*SEARCH_COLUMNS, "city_name", "inferred_npi")
 _COLUMNS = (*_LOCATION_COLUMNS, "geo", "canonical_network_ids")
 _CITY_INDEX = TABLE + "_city_page"
+_NETWORK_INDEX = TABLE + "_networks"
 _BATCH_ROWS = 25_000
 _SCOPE_FIELDS = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
 _FIELDS = {"contract", "scope", "table_name", "row_count", "sources", "indexes", "sha256"}
@@ -308,6 +309,10 @@ async def _build_geo_search_index(connection, qualified_table):
         f"CREATE INDEX {_CITY_INDEX} ON {qualified_table} (state_name,city_name,(coalesce(npi,inferred_npi)))"
         " WHERE type IN ('primary','secondary','practice','site')"
     )
+    # Lets a read fetch every office of a small network selection without touching the other offices.
+    await connection.execute(
+        f"CREATE INDEX {_NETWORK_INDEX} ON {qualified_table} USING gin (canonical_network_ids public.gin__int_ops)"
+    )
     await network_publication_step("Building geographic search index", unit="index", done=1, total=1)
     await connection.execute(f"ANALYZE {qualified_table}")
 
@@ -334,11 +339,11 @@ async def prepare_network_geo_search(connection, copy_target, layout):
             "table_name": TABLE,
             "row_count": count,
             "sources": json.loads(json.dumps(asdict(layout))),
-            # Keep the spatial receipt readable by readers that predate city pages.
+            # Keep the spatial receipt readable by readers that predate city and network pages.
             "indexes": [
                 {field: index_record[field] for field in ("name", *_INDEX_FIELDS)}
                 for index_record in indexes
-                if index_record["name"] != _CITY_INDEX
+                if index_record["name"] not in (_CITY_INDEX, _NETWORK_INDEX)
             ],
         }
         descriptor_by_field["sha256"] = _digest(descriptor_by_field)

@@ -490,3 +490,14 @@ def test_published_layout_binds_city_search_only_when_declared(published_entry, 
     layout = published.published_network_layout(candidate)
     assert layout.geo_search is not None
     assert layout.city_search == (layout.geo_search if city_search is True else None)
+
+
+@pytest.mark.parametrize("network_search", [None, False, True])
+def test_published_layout_binds_declared_network_search(published_entry, network_search):
+    candidate = _candidate(published_entry)
+    serving = candidate["validation_json"]["serving_readiness"]
+    serving["geo_search"] = {"table_name": "network_geo_search"}
+    if network_search is not None:
+        serving["network_search"] = network_search
+    layout = published.published_network_layout(candidate)
+    assert layout.network_search == (layout.geo_search if network_search is True else None)

@@ -72,6 +72,11 @@ class CompactNetworkLayout:
         """Use the location columns only when the candidate published them."""
         return self.geo_search if getattr(self, "_city_search", False) else None
 
+    @property
+    def network_search(self):
+        """Use the network id index only when the candidate published it."""
+        return self.geo_search if getattr(self, "_network_search", False) else None
+
     def __post_init__(self):
         if (
             type(self.ref_map) is not CompactAddressRelation
@@ -128,4 +133,5 @@ def bind_compact_geo_search_candidate(layout, candidate):
         if isinstance(validation, str):
             validation = json.loads(validation)
         object.__setattr__(bound, "_city_search", validation["serving_readiness"].get("city_search") is True)
+        object.__setattr__(bound, "_network_search", validation["serving_readiness"].get("network_search") is True)
     return bound

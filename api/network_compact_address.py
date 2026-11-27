@@ -167,6 +167,27 @@ def compact_city_page(layout, network_ids, address_type, provider_probe=""):
     return keys, page, f"NOT {small_selection}"
 
 
+# A larger selection costs more to read whole than the ordinary page plans do.
+SEARCH_PAGE_MEMBERSHIPS = 1_000_000
+
+
+def compact_network_search_page(layout, network_ids, clauses, taxonomy_join=""):
+    """Read a small network selection once through its network id index, then filter and order providers."""
+    _validate_address_selection(layout, network_ids, None, False)
+    small_selection = f"(SELECT total <= {SEARCH_PAGE_MEMBERSHIPS} FROM selected_search_bound)"
+    keys = f"""selected_search_bound AS MATERIALIZED (
+      SELECT coalesce(sum(row_count),0) AS total FROM ONLY {_relation(layout.ref_map)}
+      WHERE network_id=ANY(CAST(:_canonical_network_ids AS integer[]))
+    ), selected_search_offices AS MATERIALIZED (
+      SELECT npi,inferred_npi,state_name,type,taxonomy_array FROM ONLY {_relation(layout.network_search)}
+      WHERE canonical_network_ids OPERATOR(public.&&) CAST(:_canonical_network_ids AS integer[])
+        AND {small_selection}
+    )"""
+    page = f"""SELECT DISTINCT coalesce(c.npi,c.inferred_npi) AS npi FROM selected_search_offices c {taxonomy_join}
+      WHERE {" AND ".join(clauses)} ORDER BY npi LIMIT :limit OFFSET :start"""
+    return keys, page, f"NOT {small_selection}"
+
+
 def compact_city_search_relation(layout, network_ids):
     """Read the complete effective office projection for the pinned network selection."""
     _validate_address_selection(layout, network_ids, None, False)
