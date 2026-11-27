@@ -11,15 +11,13 @@ from db.registry_aca_source_notification import CONTRACT, CREATE_TABLE_SQL, INSE
 from process.network_address_projection import _identifier
 from process.network_cms_registry_address_capture import native_driver
 from process.network_legacy_membership_source import PinnedACAMembershipSource
-from process.network_membership_writer_closure import _protected_owner
 from process.registry_aca_global_epoch import (
     PinnedACAGlobalEpoch,
     decode_pinned_aca_global_epoch,
     require_registry_aca_global_epoch,
 )
-from process.registry_aca_source_notification_permissions import _RUNTIME_SQL
 from process.registry_aca_source_recipe import require_registry_aca_source_batch, require_registry_aca_source_recipe
-from process.registry_cms_source_notifications import _PRIVILEGES_SQL as _CMS_ACL_SQL
+from process.registry_cms_source_notifications import _INBOX_SHAPE_SQL
 from process.registry_source_recipe_store import (
     MAX_SOURCE_RECIPES,
     RegistrySourceMembershipRecipe,
@@ -30,14 +28,14 @@ from process.registry_source_recipe_store import (
 EPOCH_CONTRACT = "registry-aca-source-notification/v2"
 BATCH_CONTRACT = "registry-aca-source-notification/v3"
 
-_ACL_SQL = _CMS_ACL_SQL.replace("registry_cms_source_notification", TABLE)
-_IDENTITY_SQL = """SELECT n.oid::bigint AS schema_oid,n.nspowner::bigint AS owner_oid,o.*,
+# Values only: their hash is stored as reader_identity_sha256 in accepted source events.
+_IDENTITY_SQL = """SELECT n.oid::bigint AS schema_oid,n.nspowner::bigint AS owner_oid,
  t.oid::bigint AS inbox_oid,h.oid::bigint AS head_oid,
  current_database() AS database_name,(SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid
- FROM pg_namespace n JOIN pg_roles o ON o.oid=n.nspowner
- JOIN pg_class h ON h.relnamespace=n.oid AND h.relname='network_serving_control' AND h.relowner=n.nspowner
- JOIN pg_class t ON t.relnamespace=n.oid AND t.relname='registry_aca_source_notification' AND t.relowner=n.nspowner
- WHERE n.nspname=$1 AND current_user=session_user AND current_setting('role')='none'"""
+ FROM pg_namespace n
+ JOIN pg_class h ON h.relnamespace=n.oid AND h.relname='network_serving_control'
+ JOIN pg_class t ON t.relnamespace=n.oid AND t.relname='registry_aca_source_notification'
+ WHERE n.nspname=$1"""
 
 
 def _invalid():
@@ -200,34 +198,15 @@ class RegistryACASourceNotificationStore:
             _identifier(role)
 
     async def qualify(self, connection, *, writing):
-        """Require the original actor, protected native owner and closed bounded grants."""
+        """Require the transaction mode and inbox shape; return the reader identity values."""
         if not connection.is_in_transaction() or await connection.fetchval("SHOW transaction_isolation") not in (
             {"read committed", "repeatable read", "serializable"} if writing else {"repeatable read", "serializable"}
         ):
             _invalid()
         if await connection.fetchval("SHOW transaction_read_only") != ("off" if writing else "on"):
             _invalid()
-        actor = await connection.fetchval("SELECT current_user")
-        if actor not in ((self.publisher_role,) if writing else self.reader_roles):
-            _invalid()
         identity_by_field = await connection.fetchrow(_IDENTITY_SQL, self.control_schema)
-        roles = tuple(sorted({self.publisher_role, *self.reader_roles}))
-        if (
-            identity_by_field is None
-            or not _protected_owner(identity_by_field)
-            or not await connection.fetchval(
-                _ACL_SQL, self.control_schema, identity_by_field["rolname"], roles, self.publisher_role, INSERT_COLUMNS
-            )
-            or not await connection.fetchval(
-                _RUNTIME_SQL,
-                roles,
-                identity_by_field["owner_oid"],
-                self.control_schema,
-                self.publisher_role,
-                self.reader_roles,
-                INSERT_COLUMNS,
-            )
-        ):
+        if identity_by_field is None or not await connection.fetchval(_INBOX_SHAPE_SQL, self.control_schema, TABLE):
             _invalid()
         return {
             name: identity_by_field[name]
@@ -339,12 +318,11 @@ class RegistryACASourceNotificationStore:
             _invalid()
         return result
 
-    async def headers(self, connection, identity, *, after=None, upper=None, limit=25):
+    async def headers(self, connection, *, after=None, upper=None, limit=25):
         """Scan a closed finite UUID interval; restart a full interval after completion."""
         if type(limit) is not int or not 1 <= limit <= 25 or (after is not None and upper is None):
             _invalid()
-        if await self.qualify(connection, writing=False) != identity:
-            _invalid()
+        await self.qualify(connection, writing=False)
         for key in (after, upper):
             if key is not None:
                 validate_registry_aca_source_event(
@@ -369,7 +347,7 @@ class RegistryACASourceNotificationStore:
             if (previous is not None and header["capture_id"] <= previous) or header["capture_id"] > upper:
                 _invalid()
             previous = header["capture_id"]
-        if len(headers) > limit or await self.qualify(connection, writing=False) != identity:
+        if len(headers) > limit:
             _invalid()
         return {
             "headers": headers,

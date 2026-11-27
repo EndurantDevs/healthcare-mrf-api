@@ -25,7 +25,6 @@ from process.registry_aca_source_notifications import (
     validate_registry_aca_source_event,
 )
 from process.registry_cms_source_worker import (
-    _IDENTITY_SQL,
     _endpoint,
     _object,
     _roles,
@@ -166,42 +165,12 @@ def _consumer_config(document):
     return RegistryACASourceConsumerConfig(**consumer_fields_map)
 
 
-async def _identity(connection, config, role):
-    statement = _IDENTITY_SQL.replace("registry_cms_source_notification", "registry_aca_source_notification")
-    native = await connection.fetchrow(
-        statement, config.consumer.control_schema, config.notification_store.control_schema
-    )
-    if native is None:
-        _invalid()
-    identity_map = dict(native)
-    if (
-        identity_map.pop("safe_login") is not True
-        or identity_map.pop("current_role") != role
-        or identity_map.pop("session_role") != role
-        or identity_map["control_oid"] is None
-        or identity_map["inbox_oid"] is None
-        or connection.is_in_transaction()
-    ):
-        _invalid()
-    return identity_map
-
-
-async def _source_config(config, execution_identity):
+async def _source_config(config):
     """Qualify the original Source factory without keeping source fact locks during the build."""
-    async with source_policy.source_transaction(db, isolation="repeatable read") as session:
+    async with source_policy.source_transaction(db, isolation="repeatable read"):
         publisher = source_policy.bound_publisher()
         roles = source_authority_roles(publisher.policy)
         if config.source_authority_roles and config.source_authority_roles != roles:
-            _invalid()
-        from process.network_cms_registry_address_capture import native_driver
-
-        source = await native_driver(session)
-        identity_map = dict(
-            await source.fetchrow(
-                "SELECT current_database() AS database_name,(SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,inet_server_addr()::text AS server_address,inet_server_port() AS server_port,pg_postmaster_start_time() AS server_started"
-            )
-        )
-        if any(identity_map[name] != execution_identity[name] for name in identity_map):
             _invalid()
         source_policy.source_producer_identity()
     return replace(config, consumer=replace(config.consumer, source_authority_roles=roles))
@@ -222,11 +191,8 @@ async def run_registry_aca_source_worker(config, *, event=None):
         stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         async with execution.acquire() as connection:
-            execution_identity = await _identity(connection, config, config.consumer.execution_role)
-            config = await _source_config(config, execution_identity)
+            config = await _source_config(config)
             async with reader.acquire() as notification:
-                if await _identity(notification, config, config.reader_role) != execution_identity:
-                    _invalid()
                 async with notification.transaction(isolation="repeatable_read", readonly=True):
                     identity = await config.notification_store.qualify(notification, writing=False)
             consumer = await _configured_worker_runtime(config, stack)

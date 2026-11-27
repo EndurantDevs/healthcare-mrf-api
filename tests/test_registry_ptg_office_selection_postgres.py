@@ -293,7 +293,7 @@ async def test_committed_office_event_discovery_keeps_selection_separate_and_rea
         )
         identity = await qualify_registry_ptg_source_notifications(driver, store, reader_role=reader_role)
         operation_result = await read_registry_ptg_source_notification_headers(
-            driver, store, reader_role=reader_role, identity=identity, limit=1
+            driver, store, reader_role=reader_role, limit=1
         )
         pin = recipes[0].source_pin
         assert operation_result["headers"] == [

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Accepted receipt, immutable replay and native privilege refusal protocols."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -14,24 +15,10 @@ from tests.test_registry_aca_source_recipe import _ROLES, _prepared
 
 class _Connection:
     def __init__(self, *, writing=True):
-        self.writing, self.transaction, self.closed = writing, True, True
-        self.runtime_closed = True
-        self.actor = "publisher" if writing else "reader"
+        self.writing, self.transaction, self.shape = writing, True, True
         self.xid, self.rows, self.statements = "77", {}, []
         self.identity = dict(
-            schema_oid=1,
-            owner_oid=2,
-            inbox_oid=3,
-            head_oid=4,
-            database_name="synthetic",
-            database_oid=5,
-            rolname="owner",
-            rolcanlogin=False,
-            rolsuper=False,
-            rolcreatedb=False,
-            rolcreaterole=False,
-            rolreplication=False,
-            rolbypassrls=False,
+            schema_oid=1, owner_oid=2, inbox_oid=3, head_oid=4, database_name="synthetic", database_oid=5
         )
 
     def is_in_transaction(self):
@@ -42,27 +29,16 @@ class _Connection:
             return "repeatable read"
         if query == "SHOW transaction_read_only":
             return "off" if self.writing else "on"
-        if query == "SELECT current_user":
-            return self.actor
         if query == "SELECT pg_current_xact_id()::text":
             return self.xid
-        if query == notices._ACL_SQL:
-            assert args[0] == "registry_control" and args[-1] == notices.INSERT_COLUMNS
-            return self.closed
-        if query == notices._RUNTIME_SQL:
-            assert args == (
-                ("publisher", "reader"),
-                2,
-                "registry_control",
-                "publisher",
-                ("reader",),
-                notices.INSERT_COLUMNS,
-            )
-            return self.runtime_closed
+        if query == notices._INBOX_SHAPE_SQL:
+            assert args == ("registry_control", notices.TABLE)
+            return self.shape
         raise AssertionError(query)
 
     async def fetchrow(self, query, *args):
         if query == notices._IDENTITY_SQL:
+            assert args == ("registry_control",)
             return self.identity
         assert query.startswith("SELECT capture_id,source_schema,")
         return self.rows.get(args[0])
@@ -95,25 +71,21 @@ async def test_append_replay_and_hold_reprove_exact_native_recipe(monkeypatch):
     assert await _store().append(session, recipe) == first
     assert len(connection.statements) == 1
     assert await _store().hold(session, recipe.source_pin.prepared) == first
-    connection.writing, connection.actor = False, "reader"
+    connection.writing = False
     assert await _store().read(session, first["event"]) == first
     assert verifier.await_count >= 4
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["transaction", "actor", "owner", "acl", "runtime", "readonly"])
-async def test_native_authority_failure_prevents_any_insert(monkeypatch, damage):
+@pytest.mark.parametrize("damage", ["transaction", "missing", "shape", "readonly"])
+async def test_transaction_or_inbox_failure_prevents_any_insert(monkeypatch, damage):
     session, connection, recipe, _verifier = await _fixture(monkeypatch)
     if damage == "transaction":
         connection.transaction = False
-    elif damage == "actor":
-        connection.actor = "unconfigured"
-    elif damage == "owner":
-        connection.identity["rolcanlogin"] = True
-    elif damage == "acl":
-        connection.closed = False
-    if damage == "runtime":
-        connection.runtime_closed = False
+    elif damage == "missing":
+        connection.identity = None
+    elif damage == "shape":
+        connection.shape = False
     elif damage == "readonly":
         connection.writing = False
     with pytest.raises(ValueError, match="registry_aca_source_notification_invalid"):
@@ -122,12 +94,15 @@ async def test_native_authority_failure_prevents_any_insert(monkeypatch, damage)
 
 
 @pytest.mark.asyncio
-async def test_reader_requalification_rechecks_enrollment_role_policy():
+async def test_reader_qualification_keeps_stored_identity_values_without_role_census():
     connection = _Connection(writing=False)
-    await _store().qualify(connection, writing=False)
-    connection.runtime_closed = False
-    with pytest.raises(ValueError, match="registry_aca_source_notification_invalid"):
-        await _store().qualify(connection, writing=False)
+    identity = await _store().qualify(connection, writing=False)
+    # Accepted source events store a hash of exactly these values as reader_identity_sha256.
+    assert json.dumps(identity, sort_keys=True, separators=(",", ":")) == (
+        '{"database_name":"synthetic","database_oid":5,"head_oid":4,"inbox_oid":3,"owner_oid":2,"schema_oid":1}'
+    )
+    for clause in ("current_user", "session_user", "relowner", "rolcanlogin", "current_setting"):
+        assert clause not in notices._IDENTITY_SQL
     assert connection.statements == []
 
 
@@ -182,7 +157,7 @@ async def test_global_notice_replay_hold_and_read_keep_closed_union(monkeypatch)
     assert await _store().append(session, epoch) == first
     assert len(connection.statements) == 1
     assert await _store().hold(session, prepared) == first
-    connection.writing, connection.actor = False, "reader"
+    connection.writing = False
     assert await _store().read(session, first["event"]) == first
     assert await _store().accepted(session, prepared.ownership.dataset_id) == first
     verifier.side_effect = ValueError("native epoch drift")
@@ -228,14 +203,14 @@ async def test_global_notice_refuses_changed_or_cross_kind_evidence(monkeypatch,
 @pytest.mark.asyncio
 async def test_accepted_lookup_only_returns_requalified_existing_receipts(monkeypatch):
     session, connection, recipe, verifier = await _fixture(monkeypatch)
-    connection.writing, connection.actor = False, "reader"
+    connection.writing = False
     capture_id = recipe.source_pin.prepared.ownership.dataset_id
     assert await _store().accepted(session, capture_id) is None
     assert connection.statements == []
-    connection.writing, connection.actor = True, "publisher"
+    connection.writing = True
     first = await _store().append(session, recipe)
     assert await _store().accepted(session, str(capture_id), holding=True) == first
-    connection.writing, connection.actor = False, "reader"
+    connection.writing = False
     assert await _store().accepted(session, capture_id) == first
     verifier.side_effect = ValueError("retained closure changed")
     with pytest.raises(ValueError, match="retained closure changed"):
@@ -404,7 +379,7 @@ async def test_complete_batch_has_one_notification_hold_and_replay(monkeypatch):
     assert len(connection.rows) == len(connection.statements) == 1
     assert await _store().hold(session, recipes[0].source_pin.prepared) == first
     assert await _store().accepted(session, recipes[0].source_pin.prepared.ownership.dataset_id, holding=True) == first
-    connection.writing, connection.actor = False, "reader"
+    connection.writing = False
     assert await _store().read(session, first["event"]) == first
     assert verifier.await_count >= 6
 
@@ -442,7 +417,7 @@ async def test_self_consistent_partial_batch_payload_cannot_replace_complete_sta
     document["recipes_json"] = notices.canonical_registry_source_recipes(recipes[:1])
     row.update(zip(notices.INSERT_COLUMNS, notices._values(document, recipes[:1]), strict=True))
     event_header_map = {key: str(row[key]) for key in accepted["event"]}
-    connection.writing, connection.actor = False, "reader"
+    connection.writing = False
     with pytest.raises(ValueError):
         await _store().read(session, event_header_map)
     assert len(connection.rows) == 1

@@ -1075,26 +1075,6 @@ def _original_binder_observer(module, original, state, monkeypatch):
     return bind
 
 
-async def reject_elevated_notification_role(state):
-    """A genuine committed notification remains unavailable to an elevated Publisher."""
-    import pytest
-
-    database, store = state.database, state.store
-    sessions = await database._source_component.factory.publication_session_factory()
-    async with database.engine.begin() as connection:
-        await connection.execute(text(f'GRANT SET ON PARAMETER session_replication_role TO "{store.publisher_role}"'))
-    try:
-        async with sessions() as session, session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            with pytest.raises(ValueError, match="source_notification_invalid"):
-                await store.read(session, source_schema="mrf", receipt_id=state.pair.proof.serving_receipt_id)
-    finally:
-        async with database.engine.begin() as connection:
-            await connection.execute(
-                text(f'REVOKE SET ON PARAMETER session_replication_role FROM "{store.publisher_role}"')
-            )
-
-
 async def reject_unscoped_notification(state):
     import pytest
 

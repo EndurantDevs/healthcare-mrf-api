@@ -1,7 +1,6 @@
 """Committed office events require original read-only authority and an exact protected pair."""
 
 import json
-from copy import deepcopy
 from uuid import UUID
 
 import asyncpg
@@ -123,9 +122,7 @@ class Reader:
 
 
 async def page(reader, **kw):
-    return await notices.read_registry_ptg_source_notification_headers(
-        reader, STORE, reader_role="office_reader", identity=IDENTITY, **kw
-    )
+    return await notices.read_registry_ptg_source_notification_headers(reader, STORE, reader_role="office_reader", **kw)
 
 
 @pytest.mark.asyncio
@@ -139,7 +136,7 @@ async def test_genuine_paired_event_is_closed_and_discovery_does_not_require_sel
         "upper": row["capture_id"],
         "complete": True,
     }
-    assert reader.identity_reads == 2
+    assert reader.identity_reads == 1
     assert not any("registry_approved_record" in sql or "registry_network_binding" in sql for sql, _ in reader.calls)
 
 
@@ -159,9 +156,6 @@ async def test_bounded_rotation_fixed_upper_and_late_low_key_next_pass():
 @pytest.mark.asyncio
 async def test_empty_cycle_and_no_mutation_of_caller_cursor():
     assert await page(Reader()) == {"headers": [], "upper": None, "after": None, "complete": True}
-    original = deepcopy(IDENTITY)
-    await page(Reader([event()]))
-    assert IDENTITY == original
 
 
 @pytest.mark.asyncio
@@ -182,25 +176,6 @@ async def test_wrong_native_authority_refuses_before_header_read(field, value):
     with pytest.raises((ValueError, asyncpg.InsufficientPrivilegeError)):
         await page(reader)
     assert not any("LEFT JOIN" in sql for sql, _ in reader.calls)
-
-
-@pytest.mark.asyncio
-async def test_native_identity_change_after_pair_read_refuses():
-    reader = Reader([event()])
-    reader.drift = True
-    with pytest.raises(ValueError):
-        await page(reader)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("field", sorted(IDENTITY))
-async def test_each_full_identity_coordinate_is_bound(field):
-    reader = Reader([event()])
-    reader.identity[field] = (
-        reader.identity[field] + 10 if type(reader.identity[field]) is int else reader.identity[field] + "_changed"
-    )
-    with pytest.raises(ValueError):
-        await page(reader)
 
 
 @pytest.mark.asyncio
@@ -242,16 +217,17 @@ async def test_unpaired_tampered_or_mismatched_header_refuses(field, value):
         await page(Reader([row]))
 
 
-def test_native_original_login_and_role_guards_are_explicit():
+def test_identity_values_need_no_login_role_or_owner_census():
     for clause in (
-        "current_user=session_user",
-        "current_user=r.rolname",
-        "r.rolcanlogin",
-        "current_setting('role')='none'",
+        "current_user",
+        "rolcanlogin",
+        "current_setting('role')",
         "has_parameter_privilege",
-        "NOT r.rolcreatedb",
+        "rolcreatedb",
+        "nspowner",
+        "relowner",
     ):
-        assert clause in notices._IDENTITY_SQL
+        assert clause not in notices._IDENTITY_SQL
 
 
 @pytest.mark.asyncio

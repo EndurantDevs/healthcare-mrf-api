@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Finite receipt scans; native qualification is doubled for cursor protocol tests."""
+"""Finite receipt scans; transaction qualification is doubled for cursor protocol tests."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,8 +21,7 @@ def _header(number):
     [(None, None, [], True), (None, 3, [1, 2], False), (1, 3, [2, 3], True), (3, 3, [], True)],
 )
 async def test_scan_resumes_with_fixed_upper_bound(monkeypatch, after, upper, numbers, complete):
-    identity = object()
-    qualification = AsyncMock(return_value=identity)
+    qualification = AsyncMock(return_value=object())
     monkeypatch.setattr(notices.RegistryACASourceNotificationStore, "qualify", qualification)
     connection = SimpleNamespace(
         fetchval=AsyncMock(return_value=str(UUID(int=upper)) if upper else None),
@@ -30,14 +29,14 @@ async def test_scan_resumes_with_fixed_upper_bound(monkeypatch, after, upper, nu
     )
     cursor = str(UUID(int=after)) if after else None
     boundary = str(UUID(int=upper)) if after else None
-    receipt = await _store().headers(connection, identity, after=cursor, upper=boundary, limit=2)
+    receipt = await _store().headers(connection, after=cursor, upper=boundary, limit=2)
     assert receipt == {
         "headers": [_header(number) for number in numbers],
         "upper": str(UUID(int=upper)) if upper else None,
         "after": str(UUID(int=numbers[-1])) if numbers else cursor,
         "complete": complete,
     }
-    assert qualification.await_count == 2
+    qualification.assert_awaited_once()
     if after:
         connection.fetchval.assert_not_awaited()
     else:
@@ -49,23 +48,20 @@ async def test_scan_resumes_with_fixed_upper_bound(monkeypatch, after, upper, nu
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["reversed", "duplicate", "outside", "over_limit", "qualification"])
-async def test_scan_refuses_inconsistent_rows_or_changed_native_qualification(monkeypatch, damage):
-    identity = object()
-    qualification = AsyncMock(side_effect=[identity, object() if damage == "qualification" else identity])
-    monkeypatch.setattr(notices.RegistryACASourceNotificationStore, "qualify", qualification)
+@pytest.mark.parametrize("damage", ["reversed", "duplicate", "outside", "over_limit"])
+async def test_scan_refuses_inconsistent_rows(monkeypatch, damage):
+    monkeypatch.setattr(notices.RegistryACASourceNotificationStore, "qualify", AsyncMock())
     numbers_by_damage = {
         "reversed": [2, 1],
         "duplicate": [2, 2],
         "outside": [4],
         "over_limit": [1, 2, 3],
-        "qualification": [1, 2],
     }
     connection = SimpleNamespace(
         fetch=AsyncMock(return_value=[_header(number) for number in numbers_by_damage[damage]])
     )
     with pytest.raises(ValueError):
-        await _store().headers(connection, identity, upper=str(UUID(int=3)), limit=2)
+        await _store().headers(connection, upper=str(UUID(int=3)), limit=2)
 
 
 @pytest.mark.asyncio
@@ -74,5 +70,5 @@ async def test_invalid_scan_bounds_refuse_before_database_access(monkeypatch, op
     qualification = AsyncMock(side_effect=AssertionError("unexpected qualification"))
     monkeypatch.setattr(notices.RegistryACASourceNotificationStore, "qualify", qualification)
     with pytest.raises(ValueError):
-        await _store().headers(object(), object(), **options)
+        await _store().headers(object(), **options)
     qualification.assert_not_awaited()

@@ -34,14 +34,7 @@ _IDENTITY_SQL = """SELECT current_database() AS database_name,d.oid::bigint AS d
  JOIN pg_roles r ON r.rolname=$4
  JOIN pg_class a ON a.relnamespace=n.oid AND a.relname='registry_ptg_office_approval'
  JOIN pg_class h ON h.relnamespace=n.oid AND h.relname='registry_ptg_office_hold'
- WHERE d.datname=current_database() AND current_user=session_user AND current_user=r.rolname
- AND current_setting('role')='none' AND r.rolcanlogin
- AND NOT r.rolsuper AND NOT r.rolcreatedb AND NOT r.rolcreaterole
- AND NOT r.rolreplication AND NOT r.rolbypassrls
- AND NOT has_parameter_privilege(r.oid,'session_replication_role','SET')
- AND NOT w.rolsuper AND NOT w.rolcreatedb AND NOT w.rolcreaterole
- AND NOT w.rolreplication AND NOT w.rolbypassrls
- AND n.nspowner=o.oid AND a.relowner=o.oid AND h.relowner=o.oid"""
+ WHERE d.datname=current_database()"""
 _COLUMNS = """a.capture_id::text AS capture_id,a.actor_key,a.idempotency_key,a.approval_sha256,
  h.hold_sha256,
  CASE WHEN octet_length(a.approval_json::text)<=131072 THEN a.approval_json::text END AS approval_json,
@@ -83,7 +76,7 @@ def _identity(value):
 
 
 async def qualify_registry_ptg_source_notifications(connection, store, *, reader_role):
-    """Attest the original ordinary LOGIN and both protected tables in caller-owned RR/RO."""
+    """Require caller-owned RR/RO and both tables; return the reader identity values."""
     if type(store) is not RegistryPTGProducerScopeStore or store.control_schema is None:
         _invalid()
     for role in (store.owner_role, store.approval_role, reader_role):
@@ -156,18 +149,16 @@ def _event(event_by_name):
 
 
 async def read_registry_ptg_source_notification_headers(
-    connection, store, *, reader_role, identity, after=None, upper=None, limit=MAX_PAGE_ROWS
+    connection, store, *, reader_role, after=None, upper=None, limit=MAX_PAGE_ROWS
 ):
     """Read one finite UUID interval; reset both cursors after completion to see late commits."""
-    expected = _identity(identity)
     if type(limit) is not int or not 1 <= limit <= MAX_PAGE_ROWS or after is not None and upper is None:
         _invalid()
     after = _key(after) if after is not None else None
     upper = _key(upper) if upper is not None else None
     if after is not None and after > upper:
         _invalid()
-    if await qualify_registry_ptg_source_notifications(connection, store, reader_role=reader_role) != expected:
-        _invalid()
+    await qualify_registry_ptg_source_notifications(connection, store, reader_role=reader_role)
     namespace = _identifier(store.control_schema)
     approval = namespace + ".registry_ptg_office_approval"
     if upper is None:
@@ -194,8 +185,6 @@ async def read_registry_ptg_source_notification_headers(
                 _invalid()
             headers.append(event)
             previous = event["capture_id"]
-    if await qualify_registry_ptg_source_notifications(connection, store, reader_role=reader_role) != expected:
-        _invalid()
     final = headers[-1]["capture_id"] if headers else after
     return {"headers": headers, "upper": upper, "after": final, "complete": len(headers) < limit or final == upper}
 

@@ -199,22 +199,9 @@ async def test_second_pool_failure_closes_first_without_consumer(monkeypatch):
 class Connection:
     def __init__(self, role, events):
         self.role, self.events, self.active_transaction = role, events, False
-        self.identity = dict(
-            database_name="example",
-            database_oid=1,
-            server_address="127.0.0.1",
-            server_port=5432,
-            server_started="synthetic-start",
-            control_oid=2,
-            inbox_oid=3,
-            current_role=role,
-            session_role=role,
-            safe_login=True,
-        )
 
     async def fetchrow(self, query, *args):
-        assert query == worker._IDENTITY_SQL and args == ("office_control", "office_control")
-        return dict(self.identity)
+        raise AssertionError("the worker runs no connection identity query")
 
     def is_in_transaction(self):
         return self.active_transaction
@@ -352,7 +339,6 @@ async def test_typed_event_consumption_qualifies_before_work_and_closes_owned_re
         "startup",
         "executor checkout",
         "office_reader checkout",
-        "identity mismatch",
         "notification qualification",
         "runtime qualification",
         "consume",
@@ -362,8 +348,6 @@ async def test_typed_event_consumption_qualifies_before_work_and_closes_owned_re
 )
 async def test_runner_failures_drain_and_release_owned_pools_and_runtime(monkeypatch, failure):
     harness = resources(monkeypatch, failure)
-    if failure == "identity mismatch":
-        harness.reader.identity["server_started"] = "other-server-start"
 
     async def consume(**kwargs):
         try:
@@ -401,36 +385,6 @@ async def test_runner_failures_drain_and_release_owned_pools_and_runtime(monkeyp
         assert harness.events.index("consumer drained") < harness.events.index("executor released")
     else:
         consumer.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"safe_login": False},
-        {"current_role": "other"},
-        {"session_role": "other"},
-        {"control_oid": None},
-        {"inbox_oid": None},
-        {"active_transaction": True},
-    ],
-)
-async def test_runner_rejects_unqualified_execution_before_notification_or_runtime(monkeypatch, changes):
-    harness = resources(monkeypatch)
-    if "active_transaction" in changes:
-        harness.execution.active_transaction = True
-    else:
-        harness.execution.identity.update(changes)
-    with pytest.raises(ValueError, match="registry_ptg_source_worker_config_invalid"):
-        await worker.run_registry_ptg_source_worker(
-            worker.parse_registry_ptg_source_worker_config(json.dumps(configuration()))
-        )
-    assert harness.events == [
-        "executor checkout",
-        "executor released",
-        "executor closed",
-        "office_reader closed",
-    ]
 
 
 @pytest.mark.parametrize("changes", [{"sql_limits": object()}, {"notification_store": object()}, {"ptg": None}])
