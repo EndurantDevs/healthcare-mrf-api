@@ -40,6 +40,7 @@ from api.address_source_filter import (
 from api.code_systems import EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.custom_import_provider_sql import ProviderImportQuery
 from api.endpoint.pagination import parse_pagination
+from api.match_candidate_deadline import cap_statement_at_deadline, match_candidate_deadline
 from api.network_address_scope import (
     _model_table_columns,
     _npi_batch_address_filters,
@@ -4398,6 +4399,7 @@ async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict
             session = current_session()
         except RuntimeError as error:
             raise sanic.exceptions.ServiceUnavailable("Canonical network Reader is unavailable.") from error
+    await cap_statement_at_deadline(session)
     return await _npi_count_read(lambda: session.execute(stmt, params))
 
 
@@ -7677,10 +7679,7 @@ async def _run_match_candidate_stage_bounded(
 ) -> Any:
     """Run one endpoint stage within the shared remaining query budget."""
     try:
-        remaining_seconds = _MATCH_CANDIDATES_TIMEOUT_SECONDS - (time.monotonic() - started_at)
-        if remaining_seconds <= 0:
-            raise asyncio.TimeoutError()
-        async with asyncio.timeout(remaining_seconds):
+        async with match_candidate_deadline(started_at + _MATCH_CANDIDATES_TIMEOUT_SECONDS, database_session):
             return await operation()
     except asyncio.CancelledError:
         raise
