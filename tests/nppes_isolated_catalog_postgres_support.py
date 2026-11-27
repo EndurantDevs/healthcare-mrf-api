@@ -307,11 +307,14 @@ async def test_prepared_source_resumes_only_through_independent_freeze(runtime, 
             )
             == "UPDATE 0"
         )
+    relation = f'"{runtime.policy.schema}"."{table}"'
+    await runtime.admin.execute(f"GRANT SELECT ON {relation} TO PUBLIC")
     runtime.factory.enabled = True
     admitted = await admit_nppes_registry_archive(
         replay, required_config(), schema=runtime.policy.schema, database=runtime.factory.database
     )
     assert admitted.write_state == "inserted"
+    assert not await runtime.admin.fetchval("SELECT has_table_privilege('public', $1, 'SELECT')", relation)
     frozen = await _binding(runtime, replay.admission_row.admission_ref)
     assert frozen["phase"] == "published" and frozen["chunks"]["table"] is None
     assert frozen["tables"]["member"]["owner"] != before["tables"]["member"]["owner"]

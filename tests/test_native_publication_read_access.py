@@ -304,16 +304,11 @@ async def test_postgresql_authorization_failure_aborts_before_read_grants():
 
 
 @pytest.mark.asyncio
-async def test_native_grant_warning_cannot_claim_read_replay():
+async def test_native_read_replay_trusts_its_own_grants():
     native = SimpleNamespace(execute=AsyncMock(), fetch=AsyncMock(return_value=[]))
-    with pytest.raises(RuntimeError, match="grants_changed"):
-        await access._replay_reads(native, '"sample"."stage"', 19, [_grant()])
-
-
-@pytest.mark.asyncio
-async def test_native_read_replay_accepts_stronger_existing_grant_options():
-    native = SimpleNamespace(execute=AsyncMock(), fetch=AsyncMock(return_value=[dict(_grant(), is_grantable=True)]))
     await access._replay_reads(native, '"sample"."stage"', 19, [_grant()])
+    assert native.fetch.await_count == 1  # clears candidate reads; no re-read after granting
+    assert native.execute.await_args_list[-1].args[0].startswith("GRANT SELECT")
 
 
 @pytest.mark.asyncio

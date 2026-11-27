@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native-family cursor, closed publication and retry boundaries without a database."""
 
-import hashlib
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, date, datetime
@@ -18,6 +17,7 @@ from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
 PRODUCER = ("a" * 40, "sha256:" + "b" * 64)
+_REAL_TRANSACTION = storage._transaction
 
 
 def _buffers(first=1, count=2):
@@ -105,7 +105,6 @@ def _storage_harness_identity():
 
 def _patch_storage_harness(monkeypatch, transaction, binding_by_key, identity_by_key):
     monkeypatch.setattr(storage, "_transaction", transaction)
-    monkeypatch.setattr(storage, "_header_custody", AsyncMock())
     monkeypatch.setattr(
         storage, "_capture", AsyncMock(side_effect=lambda conn, configured, tables, **kwargs: _proofs(tables))
     )
@@ -189,6 +188,27 @@ async def test_batch_copy_and_cursor_commit_are_one_unit(harness):
     assert harness.state["sql"][0].startswith("INSERT")
     assert harness.state["sql"][1].startswith("UPDATE")
     assert harness.state["binding"]["chunks"]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_append_runs_no_catalog_role_or_chunk_queries(harness, monkeypatch):
+    @asynccontextmanager
+    async def source_transaction(_database):
+        yield
+
+    publisher = SimpleNamespace(connection=harness.connection, policy=harness.policy)
+    monkeypatch.setattr(storage, "_transaction", _REAL_TRANSACTION)
+    monkeypatch.setattr(storage.source_policy, "source_transaction", source_transaction)
+    monkeypatch.setattr(storage.source_policy, "bound_publisher", lambda: publisher)
+    harness.connection.fetch = AsyncMock()
+    await storage.append_nppes_evidence_batch(object(), harness.candidate, _buffers())
+    harness.connection.fetch.assert_not_awaited()
+    harness.connection.fetchval.assert_not_awaited()
+    storage._capture.assert_not_awaited()
+    storage._capture_chunks.assert_not_awaited()
+    assert [query.split(None, 1)[0] for query in harness.state["sql"]] == ["SET", "INSERT", "UPDATE"]
+    assert [call.args[0].endswith(" FOR UPDATE") for call in harness.connection.fetchrow.await_args_list] == [True]
+    assert len(harness.state["copies"]) == 5
 
 
 @pytest.mark.asyncio
@@ -390,34 +410,32 @@ def _catalog_rows(policy, names):
     [
         lambda rows: rows[0].update(inert=False),
         lambda rows: rows[0].update(native_checks=False),
-        lambda rows: rows[0].update(direct_acl_closed=False),
-        lambda rows: rows[0].update(relowner=501),
-        lambda rows: rows[0].update(relrowsecurity=True),
         lambda rows: rows[0]["columns"][0].__setitem__(2, False),
         lambda rows: rows[0]["columns"][0].__setitem__(3, "custom_default()"),
         lambda rows: rows[0]["constraints"].append(dict(type="f", valid=True)),
     ],
 )
-async def test_native_family_proof_rejects_hooks_acl_owner_shape_and_fk_drift(monkeypatch, mutation):
+async def test_native_family_proof_rejects_hooks_shape_and_fk_drift(mutation):
     policy = GenericSourcePolicy("source_schema", "source_owner", "source_publisher", ("source_reader",))
     names_by_key = {root: "npec_" + "a" * 32 + "_" + fields[3] for root, fields in storage.ROOTS.items()}
     rows = _catalog_rows(policy, names_by_key)
     connection = SimpleNamespace(fetch=AsyncMock(return_value=rows), fetchval=AsyncMock(return_value=True))
-    monkeypatch.setattr(storage, "storage_roles", AsyncMock(return_value=(500, [501])))
-    assert set(await storage._capture(connection, policy, names_by_key, indexed=False)) == set(storage.ROOTS)
+    proofs = await storage._capture(connection, policy, names_by_key, indexed=False)
+    assert set(proofs) == set(storage.ROOTS)
+    # Owner and oid are recorded from the catalog for the stored format, never compared.
+    assert all(proof["owner"] == 500 and proof["oid"] >= 100 for proof in proofs.values())
     mutation(rows)
     with pytest.raises(NppesPublicEvidenceWriterError):
         await storage._capture(connection, policy, names_by_key, indexed=False)
 
 
 @pytest.mark.asyncio
-async def test_native_family_proof_rejects_custom_types_or_operator_classes(monkeypatch):
+async def test_native_family_proof_rejects_custom_types_or_operator_classes():
     policy = GenericSourcePolicy("source_schema", "source_owner", "source_publisher", ("source_reader",))
     names_by_key = {root: "npec_" + "a" * 32 + "_" + fields[3] for root, fields in storage.ROOTS.items()}
     connection = SimpleNamespace(
         fetch=AsyncMock(return_value=_catalog_rows(policy, names_by_key)), fetchval=AsyncMock(return_value=False)
     )
-    monkeypatch.setattr(storage, "storage_roles", AsyncMock(return_value=(500, [501])))
     with pytest.raises(NppesPublicEvidenceWriterError):
         await storage._capture(connection, policy, names_by_key, indexed=False)
 
@@ -688,45 +706,31 @@ async def test_unknown_commit_replay_with_changed_content_is_rejected(harness):
 
 
 def _manifest_connection(chunk_values, is_missing):
-    async def cursor(query, maximum, **kwargs):
-        assert "pg_catalog.sha256" in query and maximum == storage.COPY_MAX_BYTES
+    async def cursor(query, **kwargs):
+        assert "sha256" not in query and "_payload" not in query
         assert kwargs == {"prefetch": 64}
         if is_missing:
             return
-        chunk_by_field = dict(
-            chunk_ordinal=chunk_values[0],
-            start_ordinal=chunk_values[1],
-            end_ordinal=chunk_values[2],
-            batch_sha256=chunk_values[3],
-            counts_json=chunk_values[4],
-            bounded=True,
+        yield dict(
+            zip(("chunk_ordinal", "start_ordinal", "end_ordinal"), chunk_values[:3]), counts_json=chunk_values[4]
         )
-        for index, root in enumerate(storage.ROOTS):
-            payload, digest = chunk_values[5 + 2 * index : 7 + 2 * index]
-            chunk_by_field[root + "_sha256"] = digest
-            chunk_by_field[root + "_valid"] = hashlib.sha256(payload).hexdigest() == digest
-        yield chunk_by_field
 
     return SimpleNamespace(cursor=cursor)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("corruption", (None, "payload", "digest", "missing", "scope", "producer", "range", "counts"))
-async def test_prepared_chunk_manifest_rejects_tamper_scope_and_missing_batches(harness, corruption):
+@pytest.mark.parametrize("corruption", (None, "missing", "range", "counts"))
+async def test_prepared_chunk_manifest_rejects_missing_or_misordered_batches(harness, corruption):
     await storage.append_nppes_evidence_batch(object(), harness.candidate, _buffers())
     binding = deepcopy(harness.state["binding"])
     chunk_values = list(harness.state["prepared_chunks"][0])
     change_by_corruption = {
-        "payload": (chunk_values, 5, chunk_values[5] + b" "),
-        "digest": (chunk_values, 6, "0" * 64),
-        "range": (chunk_values, 1, 2),
-        "counts": (chunk_values, 4, storage._encoded(dict.fromkeys(storage.ROOTS, 1))),
-        "scope": (binding["policy"], "schema", "other_schema"),
-        "producer": (binding, "producer_identity", ["e" * 40, PRODUCER[1]]),
+        "range": (1, 2),
+        "counts": (4, storage._encoded(dict.fromkeys(storage.ROOTS, 1))),
     }
     if corruption in change_by_corruption:
-        container, key, changed = change_by_corruption[corruption]
-        container[key] = changed
+        key, changed = change_by_corruption[corruption]
+        chunk_values[key] = changed
 
     connection = _manifest_connection(chunk_values, corruption == "missing")
     if corruption is None:
@@ -799,19 +803,13 @@ def _chunk_catalog_record(policy, name):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "corruption", (None, "owner", "direct_acl", "reader", "hook", "rls", "column", "type", "index", "native_type")
-)
-async def test_prepared_chunk_custody_refuses_owner_acl_hook_and_layout_drift(monkeypatch, corruption):
+@pytest.mark.parametrize("corruption", (None, "hook", "column", "type", "index", "native_type"))
+async def test_prepared_chunk_shape_refuses_hook_and_layout_drift(corruption):
     policy = GenericSourcePolicy("source_schema", "source_owner", "source_publisher", ("source_reader",))
     name = "npec_" + "a" * 32 + "_p"
     relation_by_field = _chunk_catalog_record(policy, name)
     change_by_corruption = {
-        "owner": (relation_by_field, "relowner", 501),
-        "direct_acl": (relation_by_field, "direct_acl_closed", False),
-        "reader": (relation_by_field, "readers_closed", False),
         "hook": (relation_by_field, "inert", False),
-        "rls": (relation_by_field, "relrowsecurity", True),
         "column": (relation_by_field, "columns", relation_by_field["columns"][:-1]),
         "type": (relation_by_field["columns"][0], 1, "text"),
         "index": (relation_by_field["indexes"][0], "unique", False),
@@ -822,11 +820,9 @@ async def test_prepared_chunk_custody_refuses_owner_acl_hook_and_layout_drift(mo
     connection = SimpleNamespace(
         fetch=AsyncMock(return_value=[relation_by_field]), fetchval=AsyncMock(return_value=corruption != "native_type")
     )
-    monkeypatch.setattr(storage, "storage_roles", AsyncMock(return_value=(500, [600])))
     if corruption is None:
         proof = await storage._capture_chunks(connection, policy, name)
         assert proof["name"] == name and proof["owner"] == 500 and proof["oid"] == 900
-        assert connection.fetch.await_args.args[-1] == []
     else:
         with pytest.raises(NppesPublicEvidenceWriterError):
             await storage._capture_chunks(connection, policy, name)

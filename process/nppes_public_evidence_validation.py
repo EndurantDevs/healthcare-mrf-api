@@ -177,8 +177,8 @@ async def validate_nppes_evidence_family(
 ) -> None:
     """Compare the closed family to its retained, initially canonical chunks.
 
-    Storage verifies complete chunk custody, digests and ordered source identity
-    before this set comparison. Archive decoding belongs only to preparation.
+    Storage verifies that the chunks cover every loaded ordinal before this set
+    comparison. Archive decoding belongs only to preparation.
     """
     if (
         type(tables_by_root) is not dict

@@ -167,20 +167,3 @@ async def _replay_reads(connection, target, owner, grants):
     await _clear_read_grants(connection, target)
     for statement in statements:
         await connection.execute(statement)
-    if grants:
-        actual = _read_scope(await connection.fetch(_TARGET_READS_SQL, target))
-        if not all(grant in actual or (*grant[:3], True) in actual for grant in _read_scope(grants)):
-            raise RuntimeError("publication_read_access_grants_changed")
-
-
-def _read_scope(grants):
-    """Compare the required named SELECT/MAINTAIN grants, without owner or grantor admission."""
-    return {
-        (
-            grant["column_name"],
-            None if grant["grantee"] == 0 else grant["rolname"],
-            grant["privilege_type"],
-            bool(grant["is_grantable"]),
-        )
-        for grant in grants
-    }

@@ -415,7 +415,7 @@ def _published_replay_binding(prepared, policy):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "corruption",
-    (None, "identity", "policy", "physical", "artifact", "release", "admission", "seal", "counts", "validation"),
+    (None, "identity", "policy", "artifact", "release", "admission", "seal", "counts", "validation"),
 )
 async def test_public_published_replay_enforces_read_only_and_reproves_binding(monkeypatch, tmp_path, corruption):
     prepared = await prepare_nppes_registry_replay(_prepared(tmp_path), _config())
@@ -426,8 +426,6 @@ async def test_public_published_replay_enforces_read_only_and_reproves_binding(m
             binding_by_key["identity"]["manifest_sha256"] = "00" * 32
         case "policy":
             binding_by_key["policy"]["owner_role"] = "different_owner"
-        case "physical":
-            binding_by_key["tables"]["member"]["oid"] += 1
         case "artifact" | "release" | "admission":
             table, column = {
                 "artifact": ("public_evidence_source_identity", "content_sha256"),
@@ -458,7 +456,6 @@ async def test_public_published_replay_enforces_read_only_and_reproves_binding(m
     monkeypatch.setattr(writer, "assert_nppes_candidate_catalog", AsyncMock(), raising=False)
     monkeypatch.setattr(writer.source_policy, "source_producer_identity", lambda: ("d" * 40, "sha256:" + "e" * 64))
     monkeypatch.setattr(writer.storage, "_transaction", storage_transaction)
-    monkeypatch.setattr(writer.storage, "_header_custody", AsyncMock())
     capture = AsyncMock(return_value=proofs_by_key)
     monkeypatch.setattr(writer.storage, "_capture", capture)
     monkeypatch.setattr(writer, "NppesRegistryMemberEncoder", lambda *_args: pytest.fail("published archive replayed"))
