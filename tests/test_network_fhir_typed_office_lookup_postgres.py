@@ -388,6 +388,21 @@ async def test_streamed_office_inputs_keep_only_approved_identities(office_input
 
 @pytest.mark.parametrize("field,value", [("address_key", UUID(int=1)), ("canonical_identity", "different")])
 @pytest.mark.parametrize("indexed", [False, True])
+async def test_office_inputs_reject_conflict_with_earlier_graph(office_input_pairs, field, value, indexed):
+    """An office already added by an earlier graph must agree with this graph's pairs."""
+    connection, stage, selected = office_input_pairs
+    offices = selected.relation("offices")
+    approved = await _office_approval(connection, indexed, ["approved"])
+    with pytest.raises(ValueError, match="registry_fhir_typed_office_collision"):
+        async with connection.transaction():
+            await mapping._office_inputs(connection, stage, selected, approved)
+            await connection.execute(f"UPDATE {offices} SET {field}=$1 WHERE location_id=md5('first')::uuid", value)
+            await mapping._office_inputs(connection, stage, selected, approved)
+    assert await connection.fetchval("SELECT count(*) FROM " + offices) == 0
+
+
+@pytest.mark.parametrize("field,value", [("address_key", UUID(int=1)), ("canonical_identity", "different")])
+@pytest.mark.parametrize("indexed", [False, True])
 async def test_streamed_office_inputs_roll_back_distant_conflicts(office_input_pairs, field, value, indexed):
     connection, stage, selected = office_input_pairs
     await connection.execute(f"UPDATE pg_temp.office_input_pairs SET {field}=$1 WHERE resource_id='05002'", value)

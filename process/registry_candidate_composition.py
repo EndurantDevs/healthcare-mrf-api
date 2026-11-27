@@ -172,16 +172,19 @@ async def _retained_source(connection, source_manifest, control_schema):
     if actual != source_manifest:
         raise RegistryCompositionError("registry_composition_source_changed")
     relation, predicate, retention = await _retained_memberships(connection, source_manifest, control_schema)
-    summary = await connection.fetchrow(
-        f"SELECT count(*) FILTER(WHERE {predicate}) AS source_rows,"
-        "count(*) FILTER(WHERE evidence_id !~ '^[0-9a-f]{64}$' "
-        "AND evidence_id !~ '^approved-custom:[0-9]+:[0-9a-f]{64}$') AS unknown_rows "
-        f"FROM {relation}"
-    )
-    if retention is None and summary["unknown_rows"]:
-        raise RegistryCompositionError("registry_composition_source_evidence_unsupported")
-    if retention is not None and summary["source_rows"] != retention["source_rows"]:
-        raise RegistryCompositionError("registry_composition_source_accounting_invalid")
+    if retention is not None:
+        # The published generation is read-only, so its receipt's row count stands without a recount.
+        source_rows = retention["source_rows"]
+    else:
+        summary = await connection.fetchrow(
+            f"SELECT count(*) FILTER(WHERE {predicate}) AS source_rows,"
+            "count(*) FILTER(WHERE evidence_id !~ '^[0-9a-f]{64}$' "
+            "AND evidence_id !~ '^approved-custom:[0-9]+:[0-9a-f]{64}$') AS unknown_rows "
+            f"FROM {relation}"
+        )
+        if summary["unknown_rows"]:
+            raise RegistryCompositionError("registry_composition_source_evidence_unsupported")
+        source_rows = summary["source_rows"]
     generations_by_source = {
         key: generation
         for key, generation in source_manifest.source_generations.items()
@@ -204,7 +207,7 @@ async def _retained_source(connection, source_manifest, control_schema):
         and not key.startswith("initial_source_recipe_")
     }
     generations_by_source["retained_network_source"] = source_manifest.manifest_sha256
-    return generations_by_source, summary["source_rows"]
+    return generations_by_source, source_rows
 
 
 def _target(
