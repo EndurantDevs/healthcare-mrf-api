@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -58,11 +58,9 @@ def _real_prepared(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stage_helpers_reject_missing_copy_driver_and_relations():
+async def test_stage_copy_rejects_missing_copy_driver():
     raw_connection = SimpleNamespace(driver_connection=object())
-    connection = SimpleNamespace(
-        get_raw_connection=AsyncMock(return_value=raw_connection)
-    )
+    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=raw_connection))
     copy_session = SimpleNamespace(connection=AsyncMock(return_value=connection))
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await stage._copy_prepared_projection(
@@ -71,48 +69,35 @@ async def test_stage_helpers_reject_missing_copy_driver_and_relations():
             stage_table="stage",
         )
 
-    oid_session = SimpleNamespace(scalar=AsyncMock(return_value=None))
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await stage._temp_relation_oid(oid_session, "stage")
-
 
 @pytest.mark.asyncio
-async def test_stage_rejects_oid_alias_and_preserves_shared_guard(monkeypatch):
-    monkeypatch.setattr(
-        stage,
-        "_temp_relation_oid",
-        AsyncMock(side_effect=[11, 11]),
-    )
-    monkeypatch.setattr(stage, "_create_stage_seal_table", AsyncMock())
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await stage._seal_staged_projection(
-            object(),
-            object(),
-            stage_table="stage",
-            seal_table="seal",
-            seal_token="a" * 32,
-            provider_group_count=1,
-        )
-
-    session = SimpleNamespace(
-        execute=AsyncMock(),
-        scalar=AsyncMock(return_value=1),
-    )
+async def test_stage_drop_removes_only_the_stage_table():
+    session = SimpleNamespace(execute=AsyncMock())
     await stage._drop_staged_tax_identity_source_projection(
         session,
         stage.StagedTaxIdentitySourceProjection(
             table_name="stage",
-            seal_table_name="seal",
-            stage_oid=11,
-            seal_oid=12,
-            seal_token="a" * 32,
+            provider_group_count=1,
         ),
     )
-    executed_statements = tuple(
-        str(call.args[0]) for call in session.execute.await_args_list
-    )
-    assert sum("DROP TABLE" in statement for statement in executed_statements) == 2
-    assert all("DROP FUNCTION" not in statement for statement in executed_statements)
+    executed_statements = tuple(str(call.args[0]) for call in session.execute.await_args_list)
+    assert executed_statements == ('DROP TABLE "pg_temp"."stage"',)
+
+
+@pytest.mark.asyncio
+async def test_stage_creates_no_seal_or_freeze(monkeypatch, tmp_path):
+    prepared = _real_prepared(tmp_path)
+    monkeypatch.setattr(stage, "_copy_prepared_projection", AsyncMock())
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, None, None, None, _QueryResult(one=(1, 1))]))
+    try:
+        staged = await stage.stage_tax_identity_source_projection(session, prepared)
+    finally:
+        prepared.cleanup()
+    assert staged.provider_group_count == 1
+    executed_sql = " ".join(str(call.args[0]) for call in session.execute.await_args_list).upper()
+    assert "TRIGGER" not in executed_sql
+    assert "FUNCTION" not in executed_sql
+    assert "_SEAL" not in executed_sql
 
 
 @pytest.mark.asyncio
@@ -120,15 +105,6 @@ async def test_stage_rejects_wrong_input_count_and_generic_failures(
     monkeypatch,
     tmp_path,
 ):
-    assert "evidence=<redacted>" in repr(
-        stage.StagedTaxIdentitySourceProjection(
-            table_name="stage",
-            seal_table_name="seal",
-            stage_oid=11,
-            seal_oid=12,
-            seal_token="a" * 32,
-        )
-    )
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await stage.stage_tax_identity_source_projection(object(), object())
 
@@ -152,9 +128,7 @@ async def test_stage_rejects_wrong_input_count_and_generic_failures(
                 prepared,
             )
 
-        failure_session = SimpleNamespace(
-            execute=AsyncMock(side_effect=RuntimeError("synthetic DB failure"))
-        )
+        failure_session = SimpleNamespace(execute=AsyncMock(side_effect=RuntimeError("synthetic DB failure")))
         with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
             await stage.stage_tax_identity_source_projection(
                 failure_session,
@@ -165,16 +139,23 @@ async def test_stage_rejects_wrong_input_count_and_generic_failures(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("expected_count,witness_mismatches", [(1,0),(0,1)])
-async def test_observation_publication_rejects_incomplete_or_inconsistent_sets(monkeypatch,expected_count,witness_mismatches):
-    monkeypatch.setattr(observations,"_observation_boundary",AsyncMock(return_value=(None,0)))
-    monkeypatch.setattr(observations,"begin_snapshot_candidate",AsyncMock(return_value="candidate"))
-    monkeypatch.setattr(observations,"finish_snapshot_candidate",AsyncMock())
-    monkeypatch.setattr(observations,"_count_witness_mismatches",AsyncMock(return_value=witness_mismatches))
-    with pytest.raises(TaxIdentitySourceProjectionError,match=_ERROR):
-        await observations._publish_observations(SimpleNamespace(scalar=AsyncMock(return_value="owned")),
-            schema='"mrf"',stage='"pg_temp"."stage"',snapshot_key=7,
-            prepared=SimpleNamespace(provider_group_occurrence_count=expected_count),heartbeat_callback=None)
+@pytest.mark.parametrize("expected_count,witness_mismatches", [(1, 0), (0, 1)])
+async def test_observation_publication_rejects_incomplete_or_inconsistent_sets(
+    monkeypatch, expected_count, witness_mismatches
+):
+    monkeypatch.setattr(observations, "_observation_boundary", AsyncMock(return_value=(None, 0)))
+    monkeypatch.setattr(observations, "begin_snapshot_candidate", AsyncMock(return_value="candidate"))
+    monkeypatch.setattr(observations, "finish_snapshot_candidate", AsyncMock())
+    monkeypatch.setattr(observations, "_count_witness_mismatches", AsyncMock(return_value=witness_mismatches))
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        await observations._publish_observations(
+            SimpleNamespace(scalar=AsyncMock(return_value="owned")),
+            schema='"mrf"',
+            stage='"pg_temp"."stage"',
+            snapshot_key=7,
+            prepared=SimpleNamespace(provider_group_occurrence_count=expected_count),
+            heartbeat_callback=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -184,7 +165,9 @@ async def test_observation_window_reserves_framing_and_stops_before_oversized_ro
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: rows)))
     assert await observations._observation_boundary(session, "stage", (2, 3)) == ((2, 5), 2)
     assert session.execute.await_args.args[1] == {
-        "source": 2, "ordinal": 3, "rows": observations.COPY_MAX_ROWS,
+        "source": 2,
+        "ordinal": 3,
+        "rows": observations.COPY_MAX_ROWS,
     }
     rows[:] = [(3, 0, 21)]
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
@@ -197,6 +180,7 @@ async def test_observation_window_reserves_framing_and_stops_before_oversized_ro
 @pytest.mark.parametrize("failure", ["export_count", "export_bytes", "import_count"])
 async def test_observation_copy_failure_prevents_seal_and_witness_publication(monkeypatch, failure):
     """Actual binary bytes and both COPY counts fence the publication boundary."""
+
     async def export(*_args, output, **_kwargs):
         output.write(b"x" * (33 if failure == "export_bytes" else 21))
         return "COPY 1" if failure == "export_count" else "COPY 2"
@@ -215,7 +199,10 @@ async def test_observation_copy_failure_prevents_seal_and_witness_publication(mo
     session = SimpleNamespace(scalar=AsyncMock(return_value="owned"))
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await observations._publish_observations(
-            session, schema='"synthetic"', stage='"stage"', snapshot_key=7,
+            session,
+            schema='"synthetic"',
+            stage='"stage"',
+            snapshot_key=7,
             prepared=SimpleNamespace(provider_group_occurrence_count=2),
             heartbeat_callback=heartbeat,
         )
@@ -235,9 +222,7 @@ async def test_publish_manifest_and_bindings_require_exact_replay(monkeypatch):
         source_count=1,
         content_digest=b"c" * 32,
     )
-    manifest_session = SimpleNamespace(
-        execute=AsyncMock(side_effect=[None, _QueryResult(optional=None)])
-    )
+    manifest_session = SimpleNamespace(execute=AsyncMock(side_effect=[None, _QueryResult(optional=None)]))
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await publish._publish_manifest(
             manifest_session,
@@ -271,8 +256,7 @@ async def test_publish_manifest_and_bindings_require_exact_replay(monkeypatch):
 async def test_publish_binding_heartbeat_and_generic_failures(monkeypatch):
     binding_values_by_field = {field_name: 0 for field_name in publish._BINDING_FIELDS}
     binding_values_rows = tuple(
-        {**binding_values_by_field, "source_key": source_number}
-        for source_number in range(1000)
+        {**binding_values_by_field, "source_key": source_number} for source_number in range(1000)
     )
     expected_values = tuple(
         tuple(binding_values[field_name] for field_name in publish._BINDING_FIELDS)
@@ -314,43 +298,15 @@ async def test_publish_binding_heartbeat_and_generic_failures(monkeypatch):
         )
 
 
-@pytest.mark.asyncio
-async def test_preflight_rejects_missing_seal_and_guard_records(monkeypatch):
-    handle = stage.StagedTaxIdentitySourceProjection(
-        table_name="stage",
-        seal_table_name="seal",
-        stage_oid=11,
-        seal_oid=12,
-        seal_token="a" * 32,
-    )
-    session = SimpleNamespace(
-        execute=AsyncMock(return_value=_QueryResult(optional=None))
-    )
+def test_preflight_record_shape_and_order_are_strict():
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await preflight._sealed_stage_values(session, staged=handle)
-
-    monkeypatch.setattr(
-        preflight,
-        "_stage_guard_records",
-        AsyncMock(return_value=()),
-    )
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await preflight._validate_stage_guards(object(), staged=handle)
-
-
-def test_preflight_record_hashing_and_order_are_strict():
-    digest = hashlib.sha256()
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        preflight._hash_staged_record(
-            digest,
+        preflight._validated_staged_record(
             (True, 0, 0, b"g" * 16, "missing", None),
         )
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        preflight._hash_staged_record(digest, object())
+        preflight._validated_staged_record(object())
 
-    prepared = SimpleNamespace(
-        bindings=(SimpleNamespace(source_key=1, source_ordinal=0),)
-    )
+    prepared = SimpleNamespace(bindings=(SimpleNamespace(source_key=1, source_ordinal=0),))
     source_counts = [
         {
             "matched_ein": 0,
@@ -361,65 +317,40 @@ def test_preflight_record_hashing_and_order_are_strict():
     ]
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         preflight._consume_stage_record_batch(
-            hashlib.sha256(),
             staged_records=((0, 0, 0, b"g" * 16, "missing", None),),
             prepared=prepared,
             source_counts=source_counts,
         )
 
 
+def _stage_rows_session(*staged_rows):
+    return SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                SimpleNamespace(all=lambda: list(staged_rows)),
+                SimpleNamespace(all=lambda: []),
+            ]
+        )
+    )
+
+
 @pytest.mark.asyncio
-async def test_preflight_rejects_provider_group_count_drift(monkeypatch, tmp_path):
+async def test_preflight_validates_rows_without_rehashing_the_stage(tmp_path):
     prepared = _real_prepared(tmp_path)
-    seal_token = "a" * 32
-    table_name = f"ptg2_tax_source_stage_{seal_token[:20]}"
     handle = stage.StagedTaxIdentitySourceProjection(
-        table_name=table_name,
-        seal_table_name=f"{table_name}_seal",
-        stage_oid=11,
-        seal_oid=12,
-        seal_token=seal_token,
+        table_name="stage",
+        provider_group_count=1,
     )
-    seal_values = (
-        handle.stage_oid,
-        handle.seal_oid,
-        handle.table_name,
-        prepared.copy_sha256,
-        prepared.copy_byte_count,
-        prepared.content_digest,
-        prepared.source_ordinal_map_digest,
-        prepared.binding_vector_digest,
-        prepared.aggregate_tax_content_digest,
-        prepared.source_count,
-        prepared.provider_group_occurrence_count,
-        2,
-        1,
-    )
-    monkeypatch.setattr(
-        preflight,
-        "_current_temp_relation_oids",
-        AsyncMock(
-            return_value={
-                handle.table_name: 11,
-                handle.seal_table_name: 12,
-            }
-        ),
-    )
-    monkeypatch.setattr(preflight, "_validate_stage_guards", AsyncMock())
-    monkeypatch.setattr(
-        preflight,
-        "_sealed_stage_values",
-        AsyncMock(return_value=seal_values),
-    )
-    monkeypatch.setattr(
-        preflight,
-        "_validate_stage_content_digest",
-        AsyncMock(),
-    )
+    matched_row = (0, 0, 0, (1).to_bytes(16, "big"), "matched_ein", bytes((7,)) * 32)
     try:
+        assert await preflight.validate_staged_tax_identity_source_projection(
+            _stage_rows_session(matched_row),
+            staged=handle,
+            prepared=replace(prepared, content_digest=b"z" * 32),
+        ) == ('"pg_temp"."stage"', 1)
         with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
             await preflight.validate_staged_tax_identity_source_projection(
-                SimpleNamespace(scalar=AsyncMock(return_value=1)),
+                _stage_rows_session((*matched_row[:4], "missing", None)),
                 staged=handle,
                 prepared=prepared,
             )

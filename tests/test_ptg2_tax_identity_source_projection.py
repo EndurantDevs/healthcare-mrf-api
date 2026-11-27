@@ -3,14 +3,12 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from process.ptg_parts import ptg2_tax_identity_source_observations as observations
-from process.ptg_parts import ptg2_tax_identity_source_preflight as source_preflight
 from process.ptg_parts import ptg2_tax_identity_source_stage as source_stage
 from process.ptg_parts import (
     ptg2_tax_identity_source_target_preflight as target_preflight,
@@ -24,18 +22,6 @@ from tests.test_ptg2_tax_identity_source_artifact import (
     _record,
     _sidecar,
 )
-
-
-def _stage_handle() -> source_stage.StagedTaxIdentitySourceProjection:
-    seal_token = "a" * 32
-    table_name = f"ptg2_tax_source_stage_{seal_token[:20]}"
-    return source_stage.StagedTaxIdentitySourceProjection(
-        table_name=table_name,
-        seal_table_name=f"{table_name}_seal",
-        stage_oid=11,
-        seal_oid=12,
-        seal_token=seal_token,
-    )
 
 
 @pytest.mark.parametrize(
@@ -60,32 +46,6 @@ def test_fresh_aggregate_source_map_is_schema_strict(source_ordinal_map):
         target_preflight.normalize_source_ordinal_entries(source_ordinal_map)
 
 
-def test_stage_handle_requires_exact_dataclass_and_integer_oids():
-    class StagedSubclass(source_stage.StagedTaxIdentitySourceProjection):
-        pass
-
-    class IntegerSubclass(int):
-        pass
-
-    handle = _stage_handle()
-    subclass_handle = StagedSubclass(
-        table_name=handle.table_name,
-        seal_table_name=handle.seal_table_name,
-        stage_oid=handle.stage_oid,
-        seal_oid=handle.seal_oid,
-        seal_token=handle.seal_token,
-    )
-
-    assert source_preflight._validated_stage_handle(handle) is handle
-    for invalid_handle in (
-        subclass_handle,
-        replace(handle, stage_oid=IntegerSubclass(handle.stage_oid)),
-        replace(handle, seal_oid=IntegerSubclass(handle.seal_oid)),
-    ):
-        with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-            source_preflight._validated_stage_handle(invalid_handle)
-
-
 @pytest.mark.asyncio
 async def test_stage_streams_authenticated_copy_once(tmp_path):
     sidecar = _sidecar(
@@ -104,9 +64,7 @@ async def test_stage_streams_authenticated_copy_once(tmp_path):
 
     copy_driver = SimpleNamespace(copy_to_table=AsyncMock(side_effect=copy_to_table))
     raw_connection = SimpleNamespace(driver_connection=copy_driver)
-    connection = SimpleNamespace(
-        get_raw_connection=AsyncMock(return_value=raw_connection)
-    )
+    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=raw_connection))
     session = SimpleNamespace(connection=AsyncMock(return_value=connection))
 
     await source_stage._copy_prepared_projection(
@@ -138,9 +96,7 @@ async def test_stage_rejects_copy_consumer_that_stops_before_eof(tmp_path):
     prepared = _prepare(tmp_path, (sidecar,))
     copy_driver = SimpleNamespace(copy_to_table=AsyncMock(return_value=None))
     raw_connection = SimpleNamespace(driver_connection=copy_driver)
-    connection = SimpleNamespace(
-        get_raw_connection=AsyncMock(return_value=raw_connection)
-    )
+    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=raw_connection))
     session = SimpleNamespace(connection=AsyncMock(return_value=connection))
 
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
@@ -155,20 +111,29 @@ async def test_stage_rejects_copy_consumer_that_stops_before_eof(tmp_path):
 
 @pytest.mark.asyncio
 async def test_observation_publication_uses_multiple_bounded_batches(monkeypatch):
-    boundary_reader = AsyncMock(side_effect=[((0,1),2),((0,3),2),((0,4),1),(None,0)])
+    boundary_reader = AsyncMock(side_effect=[((0, 1), 2), ((0, 3), 2), ((0, 4), 1), (None, 0)])
     batch_publisher = AsyncMock()
     finisher = AsyncMock()
     heartbeat = Mock()
-    monkeypatch.setattr(observations,"_observation_boundary",boundary_reader)
-    monkeypatch.setattr(observations,"_copy_observation_batch",batch_publisher)
-    monkeypatch.setattr(observations,"begin_snapshot_candidate",AsyncMock(return_value="candidate"))
-    monkeypatch.setattr(observations,"finish_snapshot_candidate",finisher)
-    monkeypatch.setattr(observations,"_count_witness_mismatches",AsyncMock(return_value=0))
-    session=SimpleNamespace(scalar=AsyncMock(return_value="owned"))
-    await observations._publish_observations(session,schema='"mrf"',stage='"pg_temp"."source_stage"',
-        snapshot_key=17,prepared=SimpleNamespace(provider_group_occurrence_count=5),heartbeat_callback=heartbeat)
-    assert boundary_reader.await_count==4
-    assert [call.kwargs["bounds"] for call in batch_publisher.await_args_list]==[
-        ((-1,-1),(0,1),2),((0,1),(0,3),2),((0,3),(0,4),1)]
-    finisher.assert_awaited_once_with(session,"mrf","candidate",5)
-    assert heartbeat.call_count==3
+    monkeypatch.setattr(observations, "_observation_boundary", boundary_reader)
+    monkeypatch.setattr(observations, "_copy_observation_batch", batch_publisher)
+    monkeypatch.setattr(observations, "begin_snapshot_candidate", AsyncMock(return_value="candidate"))
+    monkeypatch.setattr(observations, "finish_snapshot_candidate", finisher)
+    monkeypatch.setattr(observations, "_count_witness_mismatches", AsyncMock(return_value=0))
+    session = SimpleNamespace(scalar=AsyncMock(return_value="owned"))
+    await observations._publish_observations(
+        session,
+        schema='"mrf"',
+        stage='"pg_temp"."source_stage"',
+        snapshot_key=17,
+        prepared=SimpleNamespace(provider_group_occurrence_count=5),
+        heartbeat_callback=heartbeat,
+    )
+    assert boundary_reader.await_count == 4
+    assert [call.kwargs["bounds"] for call in batch_publisher.await_args_list] == [
+        ((-1, -1), (0, 1), 2),
+        ((0, 1), (0, 3), 2),
+        ((0, 3), (0, 4), 1),
+    ]
+    finisher.assert_awaited_once_with(session, "mrf", "candidate", 5)
+    assert heartbeat.call_count == 3
