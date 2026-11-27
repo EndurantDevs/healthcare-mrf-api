@@ -50,9 +50,7 @@ def _manifest_for_evidence(evidence):
     if evidence.root_policy is not None:
         manifest_by_field.update(
             schema_version=2,
-            desired_candidate_status=(
-                "verified_reviewed_subset_acquisition"
-            ),
+            desired_candidate_status=("verified_reviewed_subset_acquisition"),
             root_policy=evidence.root_policy.document(),
         )
     return manifest_by_field
@@ -168,9 +166,7 @@ def test_state_sync_gate_requires_exact_lowercase_true(monkeypatch):
 
 
 def test_verified_manifest_returns_exact_neutral_evidence(tmp_path):
-    manifest = activation.reviewed_subset_activation_manifest(
-        _write_manifest(tmp_path, _verified_manifest())
-    )
+    manifest = activation.reviewed_subset_activation_manifest(_write_manifest(tmp_path, _verified_manifest()))
 
     evidence = manifest.require_verified_evidence()
     assert manifest.is_verified is True
@@ -184,28 +180,16 @@ def test_verified_manifest_returns_exact_neutral_evidence(tmp_path):
 
 def test_activation_source_contract_excludes_mutable_state_and_marker():
     source_record = valid_source_record(activation.PENDING_STATUS)
-    expected_sha256 = activation.reviewed_subset_source_contract_sha256(
-        source_record
-    )
+    expected_sha256 = activation.reviewed_subset_source_contract_sha256(source_record)
     activated_source_record = deepcopy(source_record)
     activated_metadata = activated_source_record["metadata_json"]
-    activated_metadata["provider_directory_candidate_status"] = (
-        activation.VERIFIED_STATUS
-    )
-    activated_metadata[activation.ACTIVATION_METADATA_KEY] = {
-        "private": "database-only"
-    }
+    activated_metadata["provider_directory_candidate_status"] = activation.VERIFIED_STATUS
+    activated_metadata[activation.ACTIVATION_METADATA_KEY] = {"private": "database-only"}
 
-    assert activation.reviewed_subset_source_contract_sha256(
-        activated_source_record
-    ) == expected_sha256
+    assert activation.reviewed_subset_source_contract_sha256(activated_source_record) == expected_sha256
 
-    activated_metadata[
-        "provider_directory_current_version_census_page_count"
-    ] += 1
-    assert activation.reviewed_subset_source_contract_sha256(
-        activated_source_record
-    ) != expected_sha256
+    activated_metadata["provider_directory_current_version_census_page_count"] += 1
+    assert activation.reviewed_subset_source_contract_sha256(activated_source_record) != expected_sha256
 
 
 def test_exact_matching_twins_build_closed_private_activation_marker():
@@ -237,13 +221,9 @@ def test_exact_matching_twins_build_closed_private_activation_marker():
         "replay_evidence_sha256",
         "coverage_sha256",
     }
-    assert set(marker_by_field["candidate"]) == set(
-        marker_by_field["baseline"]
-    )
+    assert set(marker_by_field["candidate"]) == set(marker_by_field["baseline"])
     assert marker_by_field["cutoff"] == CUTOFF
-    assert marker_by_field["completion_proof_sha256"] == (
-        evidence.completion_proof_sha256
-    )
+    assert marker_by_field["completion_proof_sha256"] == (evidence.completion_proof_sha256)
 
 
 @pytest.mark.asyncio
@@ -256,8 +236,7 @@ async def test_selector_free_sync_locks_and_activates_exact_pending_state(
     _authorize_sync(monkeypatch, tmp_path, evidence)
     monkeypatch.setenv(activation.STATE_SYNC_ENABLED_ENV, "true")
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: source_record["source_id"],
     )
 
@@ -265,12 +244,8 @@ async def test_selector_free_sync_locks_and_activates_exact_pending_state(
         database=database,
     )
 
-    assert activation_result == activation.ReviewedSubsetActivationResult(
-        activated=True
-    )
-    assert activation.reviewed_subset_activation_result_json(
-        activation_result
-    ) == (
+    assert activation_result == activation.ReviewedSubsetActivationResult(activated=True)
+    assert activation.reviewed_subset_activation_result_json(activation_result) == (
         '{"activated":true,"already_applied":false,"status":"ok"}'
     )
     statements = [call[1] for call in database.calls]
@@ -287,15 +262,11 @@ async def test_selector_free_sync_locks_and_activates_exact_pending_state(
     assert "SELECT dataset.*" in statements[7]
     assert "FOR UPDATE OF dataset" in statements[7]
     assert "UPDATE" in statements[8]
-    assert "SET CONSTRAINTS" in statements[9]
+    assert not any("SET CONSTRAINTS" in statement for statement in statements)
     update_parameters = database.calls[8][2]
     marker_by_field = json.loads(update_parameters["activation_marker"])
-    assert marker_by_field["completion_proof_sha256"] == (
-        evidence.completion_proof_sha256
-    )
-    assert source_record["source_id"] not in (
-        activation.reviewed_subset_activation_result_json(activation_result)
-    )
+    assert marker_by_field["completion_proof_sha256"] == (evidence.completion_proof_sha256)
+    assert source_record["source_id"] not in (activation.reviewed_subset_activation_result_json(activation_result))
 
 
 @pytest.mark.asyncio
@@ -315,12 +286,8 @@ async def test_selector_free_sync_accepts_exact_idempotent_verified_state(
         expected_source_id=source_record["source_id"],
         evidence=evidence,
     )
-    source_record["metadata_json"][
-        "provider_directory_candidate_status"
-    ] = activation.VERIFIED_STATUS
-    source_record["metadata_json"][activation.ACTIVATION_METADATA_KEY] = (
-        selection.metadata_marker()
-    )
+    source_record["metadata_json"]["provider_directory_candidate_status"] = activation.VERIFIED_STATUS
+    source_record["metadata_json"][activation.ACTIVATION_METADATA_KEY] = selection.metadata_marker()
     if candidate_status != "validated":
         dataset_rows[1]["status"] = candidate_status
         dataset_rows[1]["published_at"] = "2026-08-09T00:02:00Z"
@@ -332,8 +299,7 @@ async def test_selector_free_sync_accepts_exact_idempotent_verified_state(
     _authorize_sync(monkeypatch, tmp_path, evidence)
     monkeypatch.setenv(activation.STATE_SYNC_ENABLED_ENV, "true")
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: source_record["source_id"],
     )
 
@@ -342,10 +308,7 @@ async def test_selector_free_sync_accepts_exact_idempotent_verified_state(
     )
 
     assert activation_result.is_already_applied is True
-    assert not any(
-        call[0] == "status" and "UPDATE" in call[1]
-        for call in database.calls
-    )
+    assert not any(call[0] == "status" and "UPDATE" in call[1] for call in database.calls)
 
 
 @pytest.mark.asyncio
@@ -370,8 +333,7 @@ async def test_selector_free_sync_fails_closed_before_row_mutation(
     _authorize_sync(monkeypatch, tmp_path, evidence)
     monkeypatch.setenv(activation.STATE_SYNC_ENABLED_ENV, "true")
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: source_record["source_id"],
     )
 
@@ -387,44 +349,26 @@ async def test_selector_free_sync_fails_closed_before_row_mutation(
 @pytest.mark.parametrize(
     "mutation",
     (
-        lambda source_rows, dataset_rows, evidence: source_rows.append(
-            deepcopy(source_rows[0])
-        ),
+        lambda source_rows, dataset_rows, evidence: source_rows.append(deepcopy(source_rows[0])),
         lambda source_rows, dataset_rows, evidence: dataset_rows.pop(),
-        lambda source_rows, dataset_rows, evidence: dataset_rows.append(
-            deepcopy(dataset_rows[1])
+        lambda source_rows, dataset_rows, evidence: dataset_rows.append(deepcopy(dataset_rows[1])),
+        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(status="verification_mismatch"),
+        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(is_current=True),
+        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(acquisition_root_run_id="root-baseline"),
+        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(completion_proof_sha256="f" * 64),
+        lambda source_rows, dataset_rows, evidence: source_rows[0]["metadata_json"].update(
+            provider_directory_verification_campaign_id="drift"
         ),
-        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(
-            status="verification_mismatch"
+        lambda source_rows, dataset_rows, evidence: dataset_rows[1]["publication_metadata_json"].update(
+            verification_baseline_dataset_id="other"
         ),
-        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(
-            is_current=True
-        ),
-        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(
-            acquisition_root_run_id="root-baseline"
-        ),
-        lambda source_rows, dataset_rows, evidence: dataset_rows[1].update(
-            completion_proof_sha256="f" * 64
-        ),
-        lambda source_rows, dataset_rows, evidence: source_rows[0][
-            "metadata_json"
-        ].update(provider_directory_verification_campaign_id="drift"),
-        lambda source_rows, dataset_rows, evidence: dataset_rows[1][
-            "publication_metadata_json"
-        ].update(verification_baseline_dataset_id="other"),
-        lambda source_rows, dataset_rows, evidence: dataset_rows[1][
-            "publication_metadata_json"
-        ]["twin_root_verification_v1"].update(
-            baseline_acquisition_root_run_id="other"
-        ),
-        lambda source_rows, dataset_rows, evidence: dataset_rows[1][
-            "publication_metadata_json"
-        ]["twin_root_verification_v1"]["proof"].update(
-            dataset_hash="f" * 64
-        ),
-        lambda source_rows, dataset_rows, evidence: source_rows[0].update(
-            requires_api_key=True
-        ),
+        lambda source_rows, dataset_rows, evidence: dataset_rows[1]["publication_metadata_json"][
+            "twin_root_verification_v1"
+        ].update(baseline_acquisition_root_run_id="other"),
+        lambda source_rows, dataset_rows, evidence: dataset_rows[1]["publication_metadata_json"][
+            "twin_root_verification_v1"
+        ]["proof"].update(dataset_hash="f" * 64),
+        lambda source_rows, dataset_rows, evidence: source_rows[0].update(requires_api_key=True),
     ),
 )
 def test_activation_selection_rejects_ambiguous_or_drifting_evidence(
@@ -470,18 +414,10 @@ def test_schema_selection_rejects_conflicting_runtime_names(monkeypatch):
         lambda manifest: manifest.update(desired_candidate_status="other"),
         lambda manifest: manifest.update(evidence=None),
         lambda manifest: manifest["evidence"].update(extra=True),
-        lambda manifest: manifest["evidence"].update(
-            source_contract_sha256="A" * 64
-        ),
-        lambda manifest: manifest["evidence"].update(
-            cutoff="2026-08-09T00:00:00Z"
-        ),
-        lambda manifest: manifest["evidence"].update(
-            verification_source_scope_sha256=True
-        ),
-        lambda manifest: manifest["evidence"].update(
-            completion_proof_sha256="3" * 63
-        ),
+        lambda manifest: manifest["evidence"].update(source_contract_sha256="A" * 64),
+        lambda manifest: manifest["evidence"].update(cutoff="2026-08-09T00:00:00Z"),
+        lambda manifest: manifest["evidence"].update(verification_source_scope_sha256=True),
+        lambda manifest: manifest["evidence"].update(completion_proof_sha256="3" * 63),
     ),
 )
 def test_manifest_rejects_open_or_noncanonical_shapes(tmp_path, mutation):
@@ -489,8 +425,6 @@ def test_manifest_rejects_open_or_noncanonical_shapes(tmp_path, mutation):
     mutation(manifest_by_field)
 
     with pytest.raises(activation.ReviewedSubsetActivationError) as error:
-        activation.reviewed_subset_activation_manifest(
-            _write_manifest(tmp_path, manifest_by_field)
-        )
+        activation.reviewed_subset_activation_manifest(_write_manifest(tmp_path, manifest_by_field))
 
     assert error.value.code == "manifest"

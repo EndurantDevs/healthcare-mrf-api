@@ -378,10 +378,9 @@ def _assert_activation_function_shapes(function_records) -> None:
 
 
 def _assert_activation_trigger_shapes(trigger_records) -> None:
-    """Require the four activation triggers to remain ENABLE ALWAYS."""
+    """Require the four retired activation triggers to stay dropped at head."""
 
-    assert {trigger_record["tgname"] for trigger_record in trigger_records} == (_EXPECTED_ACTIVATION_TRIGGERS)
-    assert all(trigger_record["tgenabled"] == "A" for trigger_record in trigger_records)
+    assert not trigger_records
 
 
 async def _assert_activation_object_shapes(

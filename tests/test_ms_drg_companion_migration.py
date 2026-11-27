@@ -47,7 +47,7 @@ def test_companion_migration_matches_models_without_runtime_imports(monkeypatch)
 
 def test_companion_migration_keeps_prior_head_and_refuses_destructive_downgrade():
     scripts = ScriptDirectory(str(ROOT / "alembic"))
-    assert scripts.get_heads() == ["20261126120000_stored_id_lookups_by_name"]
+    assert scripts.get_heads() == ["20261127120000_retire_reviewed_subset_source_guards"]
     assert (
         scripts.get_revision("20261123182000_custom_import_root_boolean_index").down_revision
         == "20261121050000_custom_import_rooted_text"

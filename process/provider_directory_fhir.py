@@ -37173,10 +37173,7 @@ def _source_metadata_update_expression(table, excluded_value):
             incoming_metadata,
         ),
     )
-    retired_replay = or_(
-        _ordinary_partition_generation_reset_expression(incoming_metadata, target_metadata),
-        kaiser.kept_activated_row_expression(target_metadata, incoming_metadata),
-    )
+    retired_replay = _ordinary_partition_generation_reset_expression(incoming_metadata, target_metadata)
     policy_preserved_metadata = _preserved_source_reviewed_root_policy_expression(
         target_metadata,
         target_metadata.op("||")(incoming_metadata),
@@ -37203,7 +37200,9 @@ def _source_metadata_update_expression(table, excluded_value):
         ),
         else_=effective_metadata,
     )
-    return case((retired_replay, target_metadata), else_=update)
+    return kaiser.retired_metadata_expression(
+        target_metadata, incoming_metadata, case((retired_replay, target_metadata), else_=update)
+    )
 
 
 def _effective_update_expression(table, statement, column: str):
@@ -37222,7 +37221,7 @@ def _effective_update_expression(table, statement, column: str):
     if table.name == ProviderDirectoryAPIEndpoint.__tablename__ and column in {"first_seen_at", "created_at"}:
         return func.coalesce(getattr(table.c, column), excluded_value)
     if table.name == ProviderDirectorySource.__tablename__ and column == "endpoint_id":
-        return func.coalesce(table.c.endpoint_id, excluded_value)
+        return kaiser.retired_endpoint_expression(table, statement.excluded)
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
         return _source_metadata_update_expression(table, excluded_value)
     if table.name == ProviderDirectorySource.__tablename__ and column in PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS:
@@ -37253,10 +37252,7 @@ def _source_metadata_update_sql(
         target_metadata,
         policy_preserved_metadata,
     )
-    retired_replay = (
-        f"({_ordinary_partition_generation_reset_sql(incoming_metadata, target_metadata)}) "
-        f"OR ({kaiser.kept_activated_row_sql(target_metadata, incoming_metadata)})"
-    )
+    retired_replay = _ordinary_partition_generation_reset_sql(incoming_metadata, target_metadata)
     generation_reset = (
         f"({_pending_policy_generation_reset_sql(target_metadata, incoming_metadata)}) "
         "OR ("
@@ -37267,14 +37263,18 @@ def _source_metadata_update_sql(
         f"THEN {_source_generation_metadata_without_state_sql(target_metadata)} "
         f"|| {incoming_metadata} ELSE {preserved_metadata} END"
     )
-    return (
-        f"CASE WHEN ({retired_replay}) THEN {target_metadata} "
-        "ELSE CASE WHEN COALESCE("
-        f"{incoming_prefix}.{quoted}::jsonb ->> "
-        "'provider_directory_acquisition_enabled', 'false') = 'true' "
-        f"THEN ({effective_metadata}) - "
-        "'provider_directory_acquisition_blocked_reason' "
-        f"ELSE {effective_metadata} END END"
+    return kaiser.retired_metadata_sql(
+        target_metadata,
+        incoming_metadata,
+        (
+            f"CASE WHEN ({retired_replay}) THEN {target_metadata} "
+            "ELSE CASE WHEN COALESCE("
+            f"{incoming_prefix}.{quoted}::jsonb ->> "
+            "'provider_directory_acquisition_enabled', 'false') = 'true' "
+            f"THEN ({effective_metadata}) - "
+            "'provider_directory_acquisition_blocked_reason' "
+            f"ELSE {effective_metadata} END END"
+        ),
     )
 
 
@@ -37295,7 +37295,7 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
     if table.name == ProviderDirectoryAPIEndpoint.__tablename__ and column in {"first_seen_at", "created_at"}:
         return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
     if table.name == ProviderDirectorySource.__tablename__ and column == "endpoint_id":
-        return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
+        return kaiser.retired_endpoint_sql(target_prefix, incoming_prefix)
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
         return _source_metadata_update_sql(
             column,

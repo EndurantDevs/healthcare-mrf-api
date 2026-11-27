@@ -16,7 +16,6 @@ from process.provider_directory_fhir_subset_activation_contract import (
     ReviewedSubsetActivationSelection,
     _quoted_relation,
     _row_mapping,
-    _schema_name,
     _text,
 )
 from process.provider_directory_fhir_subset_activation_selection import (
@@ -35,7 +34,7 @@ async def _initial_source_record(
     source_rows = await database.all(
         f"""
         SELECT source.source_id, source.endpoint_id, source.metadata_json
-          FROM {_quoted_relation('provider_directory_source')} AS source
+          FROM {_quoted_relation("provider_directory_source")} AS source
          WHERE source.source_id = :source_id
          ORDER BY source.endpoint_id
          LIMIT 2;
@@ -77,16 +76,13 @@ async def _lock_activation_api_endpoint(
     endpoint_rows = await database.all(
         f"""
         SELECT endpoint.endpoint_id
-          FROM {_quoted_relation('provider_directory_api_endpoint')} AS endpoint
+          FROM {_quoted_relation("provider_directory_api_endpoint")} AS endpoint
          WHERE endpoint.endpoint_id = :endpoint_id
          FOR UPDATE OF endpoint;
         """,
         endpoint_id=endpoint_id,
     )
-    if len(endpoint_rows) != 1 or (
-        _text(_row_mapping(endpoint_rows[0]).get("endpoint_id"))
-        != endpoint_id
-    ):
+    if len(endpoint_rows) != 1 or (_text(_row_mapping(endpoint_rows[0]).get("endpoint_id")) != endpoint_id):
         raise ReviewedSubsetActivationError("state")
 
 
@@ -99,7 +95,7 @@ async def _locked_source_rows(
     source_rows = await database.all(
         f"""
         SELECT source.*
-          FROM {_quoted_relation('provider_directory_source')} AS source
+          FROM {_quoted_relation("provider_directory_source")} AS source
          WHERE source.source_id = :source_id
             OR source.endpoint_id = :endpoint_id
             OR source.metadata_json::jsonb
@@ -115,11 +111,7 @@ async def _locked_source_rows(
 
 
 async def _lock_activation_source_table(database: Any) -> None:
-    await database.status(
-        "LOCK TABLE "
-        f"{_quoted_relation('provider_directory_source')} "
-        "IN SHARE MODE;"
-    )
+    await database.status(f"LOCK TABLE {_quoted_relation('provider_directory_source')} IN SHARE MODE;")
 
 
 async def _locked_dataset_rows(
@@ -132,7 +124,7 @@ async def _locked_dataset_rows(
     dataset_rows = await database.all(
         f"""
         SELECT dataset.*
-          FROM {_quoted_relation('provider_directory_endpoint_dataset')}
+          FROM {_quoted_relation("provider_directory_endpoint_dataset")}
                AS dataset
          WHERE dataset.endpoint_id = :endpoint_id
            AND dataset.completion_proof_required_version = 3
@@ -161,9 +153,7 @@ def _activation_campaign_id(source_row: Mapping[str, Any]) -> str:
     source_metadata = source_row.get("metadata_json")
     if not isinstance(source_metadata, Mapping):
         raise ReviewedSubsetActivationError("evidence")
-    campaign_id = _text(
-        source_metadata.get("provider_directory_verification_campaign_id")
-    )
+    campaign_id = _text(source_metadata.get("provider_directory_verification_campaign_id"))
     if campaign_id is None:
         raise ReviewedSubsetActivationError("evidence")
     return campaign_id
@@ -182,10 +172,8 @@ def _has_exact_activation_marker(
     )
     return bool(
         isinstance(source_metadata, Mapping)
-        and source_metadata.get("provider_directory_candidate_status")
-        == selection.verified_status
-        and source_metadata.get(selection.activation_metadata_key)
-        == marker_by_field
+        and source_metadata.get("provider_directory_candidate_status") == selection.verified_status
+        and source_metadata.get(selection.activation_metadata_key) == marker_by_field
         and other_activation_key not in source_metadata
     )
 
@@ -197,9 +185,7 @@ def _activation_endpoint_identity(
     """Return the exact serving snapshot and configured activation endpoint."""
 
     try:
-        serving_endpoint_id, configured_endpoint_id = (
-            subset_source_endpoint_identity(source_row)
-        )
+        serving_endpoint_id, configured_endpoint_id = subset_source_endpoint_identity(source_row)
     except ValueError:
         raise ReviewedSubsetActivationError("state") from None
     if configured_endpoint_id != selection.endpoint_id:
@@ -218,7 +204,7 @@ async def _cas_activate_source(
 
     updated_count = await database.status(
         f"""
-        UPDATE {_quoted_relation('provider_directory_source')}
+        UPDATE {_quoted_relation("provider_directory_source")}
            SET metadata_json = pg_catalog.jsonb_set(
                    pg_catalog.jsonb_set(
                        metadata_json::jsonb,
@@ -285,15 +271,11 @@ async def _activate_source(
         marker_by_field,
     ):
         return ReviewedSubsetActivationResult(activated=False)
-    if (
-        source_metadata.get("provider_directory_candidate_status")
-        != selection.pending_status
-        or any(
-            activation_key in source_metadata
-            for activation_key in (
-                ACTIVATION_METADATA_KEY,
-                ACTIVATION_METADATA_KEY_V2,
-            )
+    if source_metadata.get("provider_directory_candidate_status") != selection.pending_status or any(
+        activation_key in source_metadata
+        for activation_key in (
+            ACTIVATION_METADATA_KEY,
+            ACTIVATION_METADATA_KEY_V2,
         )
     ):
         raise ReviewedSubsetActivationError("state")
@@ -303,12 +285,6 @@ async def _activate_source(
         marker_by_field,
         serving_endpoint_id,
         configured_endpoint_id,
-    )
-    await database.status(
-        "SET CONSTRAINTS "
-        f'"{_schema_name()}".'
-        '"provider_directory_reviewed_subset_activation_source_guard" '
-        "IMMEDIATE;"
     )
     return ReviewedSubsetActivationResult(activated=True)
 
@@ -320,9 +296,7 @@ async def _initial_activation_identity(
     """Return the serving, configured, and campaign identity snapshot."""
 
     initial_source = await _initial_source_record(database, expected_source_id)
-    serving_endpoint_id, configured_endpoint_id = (
-        subset_source_endpoint_identity(initial_source)
-    )
+    serving_endpoint_id, configured_endpoint_id = subset_source_endpoint_identity(initial_source)
     return (
         serving_endpoint_id,
         configured_endpoint_id,
@@ -338,21 +312,15 @@ async def sync_reviewed_subset_transaction(
     """Lock, validate, and apply one exact reviewed source state."""
 
     async with runtime_database.transaction():
-        isolation = await runtime_database.scalar(
-            "SELECT pg_catalog.current_setting('transaction_isolation');"
-        )
+        isolation = await runtime_database.scalar("SELECT pg_catalog.current_setting('transaction_isolation');")
         if isolation != "read committed":
             raise ReviewedSubsetActivationError("state")
-        serving_endpoint_id, configured_endpoint_id, campaign_id = (
-            await _initial_activation_identity(
-                runtime_database,
-                expected_source_id,
-            )
+        serving_endpoint_id, configured_endpoint_id, campaign_id = await _initial_activation_identity(
+            runtime_database,
+            expected_source_id,
         )
         await _lock_activation_endpoint(runtime_database, configured_endpoint_id)
-        await _lock_activation_api_endpoint(
-            runtime_database, configured_endpoint_id
-        )
+        await _lock_activation_api_endpoint(runtime_database, configured_endpoint_id)
         await _lock_activation_source_table(runtime_database)
         source_rows = await _locked_source_rows(
             runtime_database,
@@ -362,9 +330,7 @@ async def sync_reviewed_subset_transaction(
         if len(source_rows) != 1:
             raise ReviewedSubsetActivationError("evidence")
         try:
-            locked_endpoint_identity = subset_source_endpoint_identity(
-                source_rows[0]
-            )
+            locked_endpoint_identity = subset_source_endpoint_identity(source_rows[0])
         except ValueError:
             raise ReviewedSubsetActivationError("evidence") from None
         if locked_endpoint_identity != (

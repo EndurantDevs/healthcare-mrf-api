@@ -302,17 +302,31 @@ async def test_rows_below_the_previous_edition_fail_the_crawl(monkeypatch):
     assert {diagnostic["error"] for diagnostic in diagnostics_by_type.values()} == {kaiser.ROWS_BELOW_MINIMUM_ERROR}
 
 
-def test_activated_census_row_keeps_stored_metadata_when_seed_becomes_ordinary():
-    from sqlalchemy import column
+def test_retired_census_row_takes_seed_metadata_and_endpoint():
+    from sqlalchemy import column, table
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.dialects.postgresql import JSONB
 
-    kept_sql = kaiser.kept_activated_row_sql("stored", "incoming")
-    assert all(f"stored -> '{key}'" in kept_sql for key in kaiser.REVIEWED_SUBSET_ACTIVATION_KEYS)
-    assert kept_sql.endswith("incoming ->> 'provider_directory_manual_only' = 'false'")
-    expression = kaiser.kept_activated_row_expression(column("stored", JSONB), column("incoming", JSONB))
-    compiled = str(expression.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
-    assert compiled.count("jsonb_typeof") == 2 and "provider_directory_manual_only" in compiled
+    def compiled(expression):
+        return str(expression.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+
+    metadata_sql = kaiser.retired_metadata_sql("stored", "incoming", "otherwise")
+    assert all(f"'{key}'" in metadata_sql for key in kaiser.RETIRED_CENSUS_KEYS)
+    assert metadata_sql.endswith("::text[]) || incoming ELSE otherwise END")
+    stored, incoming = column("stored", JSONB), column("incoming", JSONB)
+    metadata_expression = compiled(kaiser.retired_metadata_expression(stored, incoming, stored))
+    assert metadata_expression.count("jsonb_typeof") == 2 and "provider_directory_override" in metadata_expression
+    endpoint_sql = kaiser.retired_endpoint_sql("t", "EXCLUDED")
+    assert endpoint_sql.endswith(
+        'THEN EXCLUDED."endpoint_id" ELSE COALESCE(t."endpoint_id", EXCLUDED."endpoint_id") END'
+    )
+    source = table("provider_directory_source", column("endpoint_id"), column("metadata_json"))
+    endpoint_expression = compiled(kaiser.retired_endpoint_expression(source, source.c))
+    assert "THEN provider_directory_source.endpoint_id ELSE coalesce(" in endpoint_expression
+    update_sql = importer._effective_update_sql(
+        importer.ProviderDirectorySource.__table__, "endpoint_id", target_prefix="t", incoming_prefix="EXCLUDED"
+    )
+    assert update_sql == endpoint_sql
     assert "provider_directory_reviewed_subset_activation_v2') = 'object'" in importer._source_metadata_update_sql(
         "metadata_json", target_prefix="t", incoming_prefix="EXCLUDED"
     )
