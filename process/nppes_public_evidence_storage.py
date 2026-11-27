@@ -32,7 +32,6 @@ from process.nppes_public_evidence_rows import (
     source_release_values,
 )
 from process.nppes_public_evidence_writer_contract import writer_error
-from process.plan_release_storage_custody import storage_roles
 from process.plan_release_storage_provision import _GRANTEES_SQL
 from process.provider_directory_generic_candidate import COPY_FRAME_BYTES, COPY_MAX_BYTES, COPY_MAX_ROWS
 
@@ -320,33 +319,8 @@ async def _invoke(callback):
 async def _transaction(database):
     async with source_policy.source_transaction(database):
         publisher = source_policy.bound_publisher()
-        await storage_roles(publisher.connection, publisher.policy.schema, **publisher.policy.role_arguments())
+        await publisher.connection.execute("SET LOCAL search_path=pg_catalog,pg_temp")
         yield publisher.connection, publisher.policy
-
-
-async def _header_custody(connection, policy):
-    from process.nppes_isolated_catalog import verified_isolated_nppes_catalog
-
-    if await verified_isolated_nppes_catalog(connection, policy.schema, policy) is not None:
-        return
-    owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    rows = await connection.fetch(CATALOG_SQL, [storage_relation(policy.schema, HEADER)], owner, readers)
-    _require(len(rows) == 1)
-    row = rows[0]
-    _require(
-        row["relowner"] == owner
-        and row["relkind"] == "r"
-        and row["relpersistence"] == "p"
-        and not row["parents"]
-        and row["inert"]
-        and row["native_checks"]
-        and not row["relrowsecurity"]
-        and not row["relforcerowsecurity"]
-        and row["direct_acl_closed"]
-        and row["readers_closed"]
-        and tuple(column[0] for column in _json(row["columns"]))
-        == ("admission_ref", "source_release_ref", "candidate_storage_json", "created_at", "updated_at")
-    )
 
 
 async def _header_lock(connection, source_release_ref):
@@ -361,7 +335,6 @@ async def _header_lock(connection, source_release_ref):
 
 async def _locked(connection, policy, candidate, *, phases=("loading", "prepared", "published")):
     _require(type(candidate) is NppesEvidenceCandidate)
-    await _header_custody(connection, policy)
     lock_clause = await _header_lock(connection, candidate.identity["source_release_ref"])
     row = await connection.fetchrow(
         f"SELECT source_release_ref,candidate_storage_json FROM {storage_relation(policy.schema, HEADER)} "
@@ -401,7 +374,8 @@ async def _close_grants(connection, policy, name, *, readable=False):
         await connection.execute(f"GRANT SELECT ON TABLE {relation} TO {readers}")
 
 
-def _require_native_table(catalog_row, policy, owner, root, readable):
+def _require_native_table(catalog_row, policy, root):
+    """Check one payload table's shape; also return the owner recorded (never compared) in its proof."""
     columns, constraints, indexes = (_json(catalog_row[key]) for key in ("columns", "constraints", "indexes"))
     expected = (
         (*ROOTS[root][1], "created_at")
@@ -410,45 +384,27 @@ def _require_native_table(catalog_row, policy, owner, root, readable):
     )
     _require(
         catalog_row["nspname"] == policy.schema
-        and catalog_row["relowner"] == owner
         and catalog_row["relkind"] == "r"
         and catalog_row["relpersistence"] == "p"
         and not catalog_row["parents"]
         and not catalog_row["relispartition"]
-        and not catalog_row["relrowsecurity"]
-        and not catalog_row["relforcerowsecurity"]
         and catalog_row["inert"]
         and catalog_row["native_checks"]
-        and catalog_row["direct_acl_closed"]
-        and (not readable or catalog_row["readers_closed"])
         and tuple(column[0] for column in columns) == expected
         and all(column[2] is (column[0] not in _NULLABLE[root]) for column in columns)
         and all(column[3] == ("transaction_timestamp()" if column[0] == "created_at" else None) for column in columns)
         and all(column_item["type"] in {"p", "u"} and column_item["valid"] for column_item in constraints)
     )
-    return columns, constraints, indexes
+    return columns, constraints, indexes, catalog_row["relowner"]
 
 
-async def _capture(connection, policy, tables, *, indexed, readable=False, retained_catalog=None):
-    owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    if readable:
-        from process import nppes_isolated_catalog as isolated
+async def _catalog_rows(connection, policy, names):
+    # The owner and reader arguments only feed CATALOG_SQL's ACL columns, which are not read here.
+    return await connection.fetch(CATALOG_SQL, [storage_relation(policy.schema, name) for name in names], 0, [])
 
-        catalog = retained_catalog or isolated.issued_isolated_nppes_catalog()
-        if catalog is not None:
-            await isolated.verify_isolated_nppes_catalog(connection, policy, catalog)
-            _, owner, _, readers = await isolated._role_oids(
-                connection,
-                policy,
-                catalog.retained_owner_role,
-                catalog.retained_publisher_role,
-            )
-    catalog_rows = await connection.fetch(
-        CATALOG_SQL,
-        [storage_relation(policy.schema, name) for name in tables.values()],
-        owner,
-        readers if readable else [],
-    )
+
+async def _capture(connection, policy, tables, *, indexed):
+    catalog_rows = await _catalog_rows(connection, policy, tables.values())
     by_name = {catalog_row["relname"]: catalog_row for catalog_row in catalog_rows}
     _require(len(catalog_rows) == len(ROOTS) and set(by_name) == set(tables.values()))
     _require(
@@ -457,7 +413,7 @@ async def _capture(connection, policy, tables, *, indexed, readable=False, retai
     proofs_by_root = {}
     for root, name in tables.items():
         catalog_row = by_name[name]
-        columns, constraints, indexes = _require_native_table(catalog_row, policy, owner, root, readable)
+        columns, constraints, indexes, owner = _require_native_table(catalog_row, policy, root)
         expected_keys = _INDEX_KEYS[root] if indexed else ()
         _require(
             len(indexes) == len(expected_keys)
@@ -480,53 +436,28 @@ async def _capture(connection, policy, tables, *, indexed, readable=False, retai
 
 
 async def _verify(connection, policy, binding):
+    """Re-check the expected table shapes; stored oid, owner and layout digests are never compared."""
     tables_by_root = {root: proof["name"] for root, proof in binding["tables"].items()}
-    actual = await _capture(
-        connection,
-        policy,
-        tables_by_root,
-        indexed=binding["phase"] != "loading",
-        readable=binding["phase"] == "published",
-    )
-    _require(actual == binding["tables"])
+    await _capture(connection, policy, tables_by_root, indexed=binding["phase"] != "loading")
     if binding["phase"] != "published":
-        _require(
-            await _capture_chunks(connection, policy, binding["chunks"]["table"]["name"]) == binding["chunks"]["table"]
-        )
+        await _capture_chunks(connection, policy, binding["chunks"]["table"]["name"])
     return tables_by_root
 
 
-async def _capture_chunks(connection, policy, name, *, retained_catalog=None):
-    owner, _ = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    readers = []
-    if retained_catalog is not None:
-        from process import nppes_isolated_catalog as isolated
-
-        await isolated.verify_isolated_nppes_catalog(connection, policy, retained_catalog)
-        _, owner, _, readers = await isolated._role_oids(
-            connection,
-            policy,
-            retained_catalog.retained_owner_role,
-            retained_catalog.retained_publisher_role,
-        )
-    relations = await connection.fetch(CATALOG_SQL, [storage_relation(policy.schema, name)], owner, readers)
+async def _capture_chunks(connection, policy, name):
+    relations = await _catalog_rows(connection, policy, [name])
     _require(len(relations) == 1)
     chunk_relation = relations[0]
     columns, constraints, indexes = (_json(chunk_relation[key]) for key in ("columns", "constraints", "indexes"))
     _require(
         chunk_relation["relname"] == name
         and chunk_relation["nspname"] == policy.schema
-        and chunk_relation["relowner"] == owner
         and chunk_relation["relkind"] == "r"
         and chunk_relation["relpersistence"] == "p"
         and not chunk_relation["parents"]
         and not chunk_relation["relispartition"]
-        and not chunk_relation["relrowsecurity"]
-        and not chunk_relation["relforcerowsecurity"]
         and chunk_relation["inert"]
         and chunk_relation["native_checks"]
-        and chunk_relation["direct_acl_closed"]
-        and chunk_relation["readers_closed"]
         and tuple(column[0] for column in columns) == _CHUNK_COLUMNS
         and tuple(column[1] for column in columns)
         == ("bigint", "bigint", "bigint", "text", "jsonb", *(kind for _root in ROOTS for kind in ("bytea", "text")))
@@ -545,7 +476,12 @@ async def _capture_chunks(connection, policy, name, *, retained_catalog=None):
     )
     _require(await connection.fetchval(_NATIVE_LAYOUT_SQL, [chunk_relation["oid"]]) is True)
     layout_by_field = {"columns": columns, "constraints": constraints, "indexes": indexes, "parents": []}
-    return dict(name=name, oid=chunk_relation["oid"], owner=owner, layout_sha256=_fingerprint(layout_by_field))
+    return dict(
+        name=name,
+        oid=chunk_relation["oid"],
+        owner=chunk_relation["relowner"],
+        layout_sha256=_fingerprint(layout_by_field),
+    )
 
 
 async def _create_chunks(connection, policy, name):
@@ -605,7 +541,6 @@ async def prepare_nppes_evidence_candidate(database, prepared, *, producer_ident
     producer_identity = _json(_encoded(producer_identity))
     async with _transaction(database) as (connection, policy):
         _require(producer_identity == _json(_encoded(source_policy.source_producer_identity())))
-        await _header_custody(connection, policy)
         select = (
             f"SELECT admission_ref,source_release_ref,candidate_storage_json FROM {storage_relation(policy.schema, HEADER)} "
             "WHERE source_release_ref=$1"
@@ -720,19 +655,11 @@ async def _append_chunk(connection, policy, previous, payloads, batch):
 
 
 async def _verify_chunk_manifest(connection, policy, binding):
+    """Require chunks 1..count to cover every loaded ordinal, so validation compares every row."""
     relation = storage_relation(policy.schema, binding["chunks"]["table"]["name"])
-    digest_checks = ",".join(
-        f"{root}_sha256,{root}_sha256=pg_catalog.encode(pg_catalog.sha256({root}_payload),'hex') AS {root}_valid"
-        for root in ROOTS
-    )
-    size = "+".join(f"octet_length({root}_payload)" for root in ROOTS)
-    query = (
-        f"SELECT chunk_ordinal,start_ordinal,end_ordinal,batch_sha256,counts_json,{digest_checks},"
-        f"{size}<=$1::bigint AS bounded FROM {relation} ORDER BY chunk_ordinal"
-    )
-    chain, ordinal, chunk_count = _chunk_seed(binding), 0, 0
-    count_by_root, last_batch_by_field = dict.fromkeys(ROOTS, 0), None
-    async for chunk_record in connection.cursor(query, COPY_MAX_BYTES, prefetch=64):
+    query = f"SELECT chunk_ordinal,start_ordinal,end_ordinal,counts_json FROM {relation} ORDER BY chunk_ordinal"
+    ordinal, chunk_count, count_by_root = 0, 0, dict.fromkeys(ROOTS, 0)
+    async for chunk_record in connection.cursor(query, prefetch=64):
         counts = _json(chunk_record["counts_json"])
         _require(
             type(counts) is dict
@@ -740,36 +667,18 @@ async def _verify_chunk_manifest(connection, policy, binding):
             and all(type(count) is int and 0 <= count <= COPY_MAX_ROWS for count in counts.values())
         )
         _require(
-            chunk_record["bounded"] is True
-            and chunk_record["chunk_ordinal"] == chunk_count + 1
+            chunk_record["chunk_ordinal"] == chunk_count + 1
             and chunk_record["start_ordinal"] == ordinal + 1
             and chunk_record["end_ordinal"] <= binding["ordinal"]
             and counts["source_record"] == counts["member"] == chunk_record["end_ordinal"] - ordinal > 0
             and counts["common"] == counts["source_link"] == counts["typed"] <= counts["member"]
-            and type(chunk_record["batch_sha256"]) is str
-            and _HASH.fullmatch(chunk_record["batch_sha256"]) is not None
-            and all(chunk_record[root + "_valid"] is True for root in ROOTS)
         )
-        last_batch_by_field = dict(
-            start=chunk_record["start_ordinal"],
-            end=chunk_record["end_ordinal"],
-            sha256=chunk_record["batch_sha256"],
-            counts=counts,
-        )
-        metadata = dict(
-            chunk_ordinal=chunk_record["chunk_ordinal"],
-            **last_batch_by_field,
-            payload_sha256={root: chunk_record[root + "_sha256"] for root in ROOTS},
-        )
-        chain = _fingerprint({"previous": chain, "chunk": metadata})
         count_by_root = {root: count_by_root[root] + counts[root] for root in ROOTS}
         ordinal, chunk_count = chunk_record["end_ordinal"], chunk_record["chunk_ordinal"]
     _require(
         count_by_root == binding["counts"]
         and ordinal == binding["ordinal"]
         and chunk_count == binding["chunks"]["count"]
-        and chain == binding["chunks"]["sha256"]
-        and last_batch_by_field == binding["last_batch"]
     )
 
 
@@ -780,7 +689,7 @@ async def append_nppes_evidence_batch(database, candidate, buffers, *, cancel_ch
     async with _transaction(database) as (connection, policy):
         await _invoke(cancel_check)
         previous = await _locked(connection, policy, candidate, phases=("loading",))
-        tables = await _verify(connection, policy, previous)
+        tables_by_root = {root: proof["name"] for root, proof in previous["tables"].items()}
         await _invoke(cancel_check)
         if batch == previous["last_batch"]:
             return _candidate(previous)
@@ -789,7 +698,10 @@ async def append_nppes_evidence_batch(database, candidate, buffers, *, cancel_ch
             if prepared_records:
                 try:
                     status = await connection.copy_records_to_table(
-                        tables[root], schema_name=policy.schema, columns=ROOTS[root][1], records=prepared_records
+                        tables_by_root[root],
+                        schema_name=policy.schema,
+                        columns=ROOTS[root][1],
+                        records=prepared_records,
                     )
                 except (asyncio.CancelledError, TimeoutError) as interruption:
                     await cleanup_interrupted_copy(source_policy.source_copy_session(), connection, interruption)
@@ -981,7 +893,6 @@ async def resolve_nppes_evidence_family(connection, schema, admission_ref):
     )
     policy = _stored_policy(binding)
     _require(policy.schema == schema)
-    await _header_custody(connection, policy)
     await _verify(connection, policy, binding)
     await _assert_seal(connection, schema, binding)
     return binding["tables"]

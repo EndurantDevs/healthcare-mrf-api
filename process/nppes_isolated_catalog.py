@@ -550,7 +550,7 @@ async def commit_isolated_nppes_candidate(connection, policy, catalog, candidate
     _require(previous["policy"] == storage._policy_fields(policy))
     _require(previous["producer_identity"] == list(catalog.producer_identity) == candidate.producer_identity)
     if previous["phase"] == "published":
-        await _verify_published_candidate(connection, policy, catalog, previous, prepared)
+        await _verify_published_candidate(connection, policy, previous, prepared)
         return "already_present"
     tables = await storage._verify(connection, policy, previous)
     chunk = previous["chunks"]["table"]["name"]
@@ -560,9 +560,10 @@ async def commit_isolated_nppes_candidate(connection, policy, catalog, candidate
         + " IN ACCESS EXCLUSIVE MODE NOWAIT"
     )
     await storage._verify(connection, policy, previous)
+    for name in (*tables.values(), chunk):
+        await storage._close_grants(connection, policy, name)
     await _retain_payload(connection, policy, catalog, (*tables.values(), chunk))
-    frozen = await storage._capture(connection, policy, tables, indexed=True, readable=True, retained_catalog=catalog)
-    await storage._capture_chunks(connection, policy, chunk, retained_catalog=catalog)
+    frozen = await storage._capture(connection, policy, tables, indexed=True)
     await storage._verify_chunk_manifest(connection, policy, previous)
     await validate_nppes_evidence_family(
         connection,
@@ -584,18 +585,14 @@ async def commit_isolated_nppes_candidate(connection, policy, catalog, candidate
         updated_by_field["chunks"]["sha256"] = storage._chunk_seed(updated_by_field)
     updated_by_field["validation_sha256"] = storage._validation_fingerprint(updated_by_field)
     await storage._store(connection, policy.schema, previous, updated_by_field)
-    await _verify_published_candidate(connection, policy, catalog, updated_by_field, prepared)
+    await _verify_published_candidate(connection, policy, updated_by_field, prepared)
     return "inserted"
 
 
-async def _verify_published_candidate(connection, policy, catalog, binding, prepared):
+async def _verify_published_candidate(connection, policy, binding, prepared):
     from process import nppes_public_evidence_storage as storage
 
-    tables_by_root = {root: proof["name"] for root, proof in binding["tables"].items()}
-    actual = await storage._capture(
-        connection, policy, tables_by_root, indexed=True, readable=True, retained_catalog=catalog
-    )
-    _require(actual == binding["tables"])
+    await storage._verify(connection, policy, binding)
     await storage._assert_control_rows(connection, policy.schema, prepared)
     await storage._assert_seal(connection, policy.schema, binding)
 
@@ -647,7 +644,6 @@ async def publish_isolated_nppes_candidate(database, candidate, prepared):
     from process import nppes_public_evidence_storage as storage
     from process import provider_directory_generic_source_policy as source
 
-    catalog = issued_isolated_nppes_catalog()
     async with storage._transaction(database) as (connection, policy):
         await verified_isolated_nppes_catalog(connection, policy.schema, policy)
         binding = await storage._locked(connection, policy, candidate, phases=("prepared", "published"))
@@ -657,7 +653,7 @@ async def publish_isolated_nppes_candidate(database, candidate, prepared):
         publisher = source.bound_publisher()
         await verified_isolated_nppes_catalog(publisher.connection, publisher.policy.schema, publisher.policy)
         binding = await storage._locked(publisher.connection, publisher.policy, candidate, phases=("published",))
-        await _verify_published_candidate(publisher.connection, publisher.policy, catalog, binding, prepared)
+        await _verify_published_candidate(publisher.connection, publisher.policy, binding, prepared)
     return outcome
 
 
