@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from tests import test_provider_directory_cms_prepared_context_postgres as fixture
+from tests import cms_native_input_postgres_support as fixture
 
 
 def _connection():

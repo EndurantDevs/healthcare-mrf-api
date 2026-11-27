@@ -11,7 +11,7 @@ from sqlalchemy.engine import make_url
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_callable_custody as callables
-from tests.test_provider_directory_cms_legacy_history_postgres import _reader
+from tests.test_provider_directory_cms_canonical_layout_postgres import _reader
 from tests.test_provider_directory_cms_replay_resolution_postgres import _attacker_locks, _header
 from tests.test_provider_directory_cms_terminal_guard_resolution_postgres import (
     _PREPARATION_SCHEMA,

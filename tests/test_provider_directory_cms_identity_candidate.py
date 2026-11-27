@@ -542,3 +542,16 @@ async def test_finished_source_checks_authenticate_the_four_root_projection_of_f
     await candidate._complete_source_facts(publisher.connection, publisher.policy, identity, receipts)
     assert len(publisher.connection.reads) == 6
     assert not publisher.connection.copies
+
+
+def test_disagreeing_staged_and_published_entity_ids_require_reprepare():
+    observations = candidate._EntityObservations(
+        staged_bindings={"org-1": {"organization_id": uuid4()}},
+        published_bindings={"org-1": {"organization_id": uuid4(), "created_at": datetime.now(timezone.utc)}},
+        staged_evidence={},
+        published_evidence={},
+    )
+    with pytest.raises(candidate.CMSIdentityReprepareRequired, match="whole_candidate_reprepare_required"):
+        candidate.build_entity_batch_rows(
+            "cms-npd", "release-one", "Organization", {"org-1": ("a" * 64, {"id": "org-1"})}, observations
+        )

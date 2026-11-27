@@ -20,8 +20,8 @@ from db.plan_release_storage import storage_identifier
 from process import provider_directory_cms_callable_custody as callables
 from process import provider_directory_cms_preparation_custody as custody
 from tests.test_provider_dataset_candidates_postgres import _prepare_copy_guard_catalog
+from tests.test_provider_directory_cms_canonical_layout_postgres import _reader
 from tests.test_provider_directory_cms_canonical_layout_postgres import native_layout as core_layout
-from tests.test_provider_directory_cms_legacy_history_postgres import _reader
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 _NAMES = ("guard_pd_generic_dataset_finalization", replay.GUARD)

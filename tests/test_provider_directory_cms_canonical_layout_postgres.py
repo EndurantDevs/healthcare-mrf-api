@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from time import monotonic
 
@@ -12,10 +13,11 @@ import pytest
 import pytest_asyncio
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import Index, MetaData
+from sqlalchemy import Index, MetaData, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from db.connection import Database
 from db.models import CMSDoctorEducation, DoctorClinicianAddress
 from process.provider_directory_cms_canonical_layout import CONTRACT, require_cms_canonical_layout
 from tests.cms_npd_admission_postgres_support import _owned_database, _run_migrations
@@ -116,6 +118,30 @@ async def native_layout():
                 if connection is not None:
                     await connection.close()
                 await engine.dispose()
+
+
+@asynccontextmanager
+async def _reader(admin, *, readonly=True, isolation="REPEATABLE READ", assumed=False):
+    url = make_url(os.environ["HLTHPRT_CMS_LAYOUT_TEST_DSN"]).set(
+        database=await admin.fetchval("SELECT current_database()")
+    )
+    engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
+    database = Database()
+    database._database_override = url.database
+    try:
+        async with AsyncSession(bind=engine) as session, session.begin(), database.bind_existing_session(session):
+            await session.execute(
+                text("SET TRANSACTION ISOLATION LEVEL " + isolation + (" READ ONLY" if readonly else " READ WRITE"))
+            )
+            await session.execute(text("SET LOCAL search_path=pg_catalog"))
+            await session.execute(text("SET LOCAL statement_timeout='10s'"))
+            await session.execute(text("SET LOCAL lock_timeout='100ms'"))
+            if assumed:
+                await session.execute(text("SET LOCAL ROLE pg_read_all_data"))
+            native = await session.connection()
+            yield database, session, (await native.get_raw_connection()).driver_connection
+    finally:
+        await engine.dispose()
 
 
 async def _verify(connection, schema="mrf"):

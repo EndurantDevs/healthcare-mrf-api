@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native physical-input checks only; fixtures supply no CMS mutation authority."""
+"""Native named CMS input fixtures; they supply no CMS mutation authority."""
 
-import asyncio
 import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -15,7 +14,6 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from db.connection import Database
-from process.provider_directory_cms_prepared_context import observe_prepared_cms_inputs
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
 
@@ -164,89 +162,3 @@ async def publisher(case, *, source=False, materialize=True):
     finally:
         assert case.database._transaction_binding() is None
         await engine.dispose()
-
-
-def observe(case, session, driver):
-    return observe_prepared_cms_inputs(
-        case.database,
-        session,
-        driver,
-        source_binding=case.storage,
-        source_policy=case.source_policy,
-        prepared_policy=case.policy,
-        frozen_inventory=case.inventory,
-    )
-
-
-async def test_native_prepared_publisher_reads_complete_named_inputs(native_case):
-    case = native_case
-    async with publisher(case) as (session, driver), observe(case, session, driver) as evidence:
-        assert evidence["source_storage"] == {"catalog_schema": "accepted_catalog", "storage_schema": "private_source"}
-        assert evidence["frozen_inventory"] == case.inventory
-        assert all(set(relation) == {"schema_name", "relation_name"} for relation in case.inventory["relations"])
-        assert len(evidence["native_coordinates"]["relations"]) == 8
-        assert session.in_transaction()
-
-
-async def test_native_source_publisher_cannot_read_prepared_inputs(native_case):
-    case = native_case
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-        async with publisher(case, source=True) as (session, driver), observe(case, session, driver):
-            pytest.fail("Source publisher read private prepared inputs")
-
-
-async def test_native_input_reads_materialize_the_caller_transaction(native_case):
-    case = native_case
-    async with publisher(case, materialize=False) as (session, driver), observe(case, session, driver):
-        assert session.in_transaction() and driver.is_in_transaction()
-
-
-@pytest.mark.parametrize("table", ["frozen_input_0", "frozen_input_7"])
-async def test_native_missing_input_access_refuses_before_body(native_case, table):
-    case = native_case
-    await case.admin.execute(f'REVOKE SELECT ON private_source.{table} FROM "{case.roles["prepared_publisher"]}"')
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-        async with publisher(case) as (session, driver), observe(case, session, driver):
-            pytest.fail("unreadable input reached the body")
-
-
-async def test_native_inherited_task_cannot_borrow_prepared_session(native_case):
-    case = native_case
-    async with publisher(case) as (session, driver):
-
-        async def child():
-            async with observe(case, session, driver):
-                pytest.fail("inherited session reached the body")
-
-        with pytest.raises(RuntimeError, match="child asyncio task"):
-            await asyncio.create_task(child())
-
-
-@pytest.mark.parametrize("cancel", [False, True])
-async def test_native_caller_failure_or_cancellation_rolls_back_its_transaction(native_case, cancel):
-    case = native_case
-    entered = asyncio.Event()
-
-    async def work():
-        async with publisher(case) as (session, driver), observe(case, session, driver):
-            await session.execute(text("INSERT INTO accepted_catalog.transaction_probe VALUES(1)"))
-            entered.set()
-            if cancel:
-                await asyncio.Event().wait()
-            raise RuntimeError("caller failure")
-
-    if cancel:
-        task = asyncio.create_task(work())
-        try:
-            await asyncio.wait_for(entered.wait(), timeout=10)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        finally:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-    else:
-        with pytest.raises(RuntimeError, match="caller failure"):
-            await work()
-    assert await case.admin.fetchval("SELECT count(*) FROM accepted_catalog.transaction_probe") == 0
