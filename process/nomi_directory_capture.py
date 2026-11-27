@@ -188,9 +188,21 @@ async def _origin_page(http, binding, route, admission, url, payload):
 class NomiCapture:
     """One acquisition-root cache, with durable request budgeting and bounded normalized output."""
 
-    def __init__(self, db, plan):
+    def __init__(self, db, plan, *, retained):
         self.db = db
         self.plan = plan
+        if retained:
+            try:
+                attempts = db.execute("SELECT attempts FROM requests LIMIT 2").fetchall()
+            except sqlite3.DatabaseError:
+                raise ValueError("nomi_directory_retained_edition_required") from None
+            if (
+                len(attempts) != 1
+                or type(attempts[0][0]) is not int
+                or not 0 <= attempts[0][0] <= plan.max_origin_requests
+            ):
+                raise ValueError("nomi_directory_retained_edition_required")
+            return
         db.executescript("""
             CREATE TABLE IF NOT EXISTS requests (attempts INTEGER NOT NULL);
             INSERT INTO requests SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM requests);
@@ -301,21 +313,26 @@ async def _capture_window(capture, kind, window, search, request_page, cancel_ch
             return page, rows_seen, len(seen_keys), min_total or 0, max_total or 0
 
 
-def _capture_path(plan, root_run_id):
+def _capture_path(plan, root_run_id, *, require_retained):
     """Keep an edition's resume scope immutable and prevent cross-group replacement."""
     if type(root_run_id) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", root_run_id):
         raise ValueError("nomi_directory_acquisition_root_invalid")
     group_path = plan.root / "group.json"
     group = canonical_json(plan.group_id).encode()
-    if group_path.exists() and group_path.read_bytes() != group:
+    group_exists = group_path.exists()
+    if group_exists and group_path.read_bytes() != group:
         raise ValueError("nomi_directory_group_changed")
-    _atomic(group_path, group, immutable=True)
-    root = _directory(plan.root / root_run_id)
+    root = plan.root / root_run_id
     path = root / "capture.sqlite3"
     identity = root / "scope.json"
-    if identity.exists() and (not path.is_file() or identity.read_bytes() != plan.identity()):
-        raise ValueError("nomi_directory_retained_edition_required")
-    return path, identity
+    retained = path.exists() or identity.exists()
+    if retained or require_retained:
+        if not group_exists or not path.is_file() or not identity.is_file() or identity.read_bytes() != plan.identity():
+            raise ValueError("nomi_directory_retained_edition_required")
+    else:
+        _atomic(group_path, group, immutable=True)
+        _directory(root)
+    return path, identity, retained
 
 
 async def _capture_searches(capture, request_page, cancel_check, progress):
@@ -375,16 +392,18 @@ async def _capture_with_proxy(capture, binding, cancel_check, progress, pause):
 
 
 @asynccontextmanager
-async def acquire_directory(plan, root_run_id, binding, *, cancel_check, progress, pause):
+async def acquire_directory(plan, root_run_id, binding, *, cancel_check, progress, pause, require_retained=False):
     """Collect every configured search before admitting normalized resources."""
     lock = PTG2ArtifactStore(plan.root).named_lock(SOURCE_ID, "source-acquisition")
     if lock.try_acquire() is None:
         raise ValueError("nomi_directory_capture_already_active")
     try:
-        path, identity = _capture_path(plan, root_run_id)
-        with closing(sqlite3.connect(path)) as connection:
-            capture = NomiCapture(connection, plan)
-            _atomic(identity, plan.identity(), immutable=True)
+        path, identity, retained = _capture_path(plan, root_run_id, require_retained=require_retained)
+        database = f"{path.resolve().as_uri()}?mode=rw" if retained else path
+        with closing(sqlite3.connect(database, uri=retained)) as connection:
+            capture = NomiCapture(connection, plan, retained=retained)
+            if not retained:
+                _atomic(identity, plan.identity(), immutable=True)
             counts_by_endpoint = await _capture_with_proxy(capture, binding, cancel_check, progress, pause)
             proof = capture.summary(counts_by_endpoint)
             if set(proof["resource_counts"]) != set(RESOURCE_TYPES):

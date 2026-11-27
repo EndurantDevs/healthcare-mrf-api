@@ -1954,7 +1954,7 @@ async def has_empty_isolated_vsp_storage(directory, candidate, header):
 
 
 async def has_empty_named_root_storage(directory, candidate, header):
-    """Check empty rearmed named storage again under the worker's admission lock."""
+    """Prove named loading storage is empty under the worker's admission lock."""
     binding = _json(header["candidate_storage_json"])
     if type(binding) is not dict or binding.get("contract") != NAMED_ISOLATED_CONTRACT:
         return False

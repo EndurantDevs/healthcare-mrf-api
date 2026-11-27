@@ -133,7 +133,6 @@ from process import provider_directory_source_selection as source_selection
 from process import provider_directory_time_partition as time_partition
 from process import provider_directory_timestamp_recovery as timestamp_recovery
 from process import provider_directory_uhc_scan as uhc_scan
-from process import vsp_directory_integration as vsp_directory
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
     mark_control_run,
@@ -2165,6 +2164,7 @@ class EndpointDatasetCandidateSelection:
     semantic_projection_as_of: str | None = None
     proof_resource_scope: tuple[str, ...] | None = None
     require_retained_vsp_capture: bool = False
+    allow_initial_nomi_capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -58569,23 +58569,17 @@ def _should_repair_empty_endpoint_dataset_orphan(
     retry_of_run_id: str | None,
     checkpoint_context: PaginationCheckpointContext | None,
 ) -> bool:
-    if existing_dataset_map and _clean_text(existing_dataset_map.get("endpoint_id")) != endpoint_id:
-        raise RuntimeError("provider_directory_endpoint_dataset_identity_collision")
-    existing_root_run_id = _clean_text(existing_dataset_map.get("acquisition_root_run_id"))
-    if existing_dataset_map and existing_root_run_id != acquisition_root_run_id:
-        raise RuntimeError("provider_directory_endpoint_dataset_root_mismatch")
-    existing_status = _clean_text(existing_dataset_map.get("status"))
-    if existing_dataset_map.get("is_current") is True or existing_status in IMMUTABLE_ENDPOINT_DATASET_STATUSES:
-        raise RuntimeError("provider_directory_endpoint_dataset_root_already_finalized")
-    if existing_dataset_map and checkpoint_dataset_id is None:
-        if existing_status != ENDPOINT_DATASET_ACQUIRING and not vsp_directory.is_failed_capture_retry(
-            existing_dataset_map, checkpoint_context
-        ):
-            raise RuntimeError("provider_directory_endpoint_dataset_uncheckpointed_candidate_exists")
-        return True
-    if retry_of_run_id and checkpoint_context is not None and not existing_dataset_map:
-        raise RuntimeError("provider_directory_endpoint_dataset_retry_candidate_missing")
-    return False
+    from process.provider_directory_source_failure_control import should_repair_empty_orphan
+
+    return should_repair_empty_orphan(
+        sys.modules[__name__],
+        existing_dataset_map,
+        endpoint_id,
+        acquisition_root_run_id,
+        checkpoint_dataset_id,
+        retry_of_run_id,
+        checkpoint_context,
+    )
 
 
 def _persisted_verification_generation_fields(
@@ -58977,6 +58971,8 @@ async def _select_resumable_endpoint_dataset_candidate(
     verification_profile: EndpointDatasetVerificationProfile,
 ) -> EndpointDatasetCandidateSelection:
     """Return a lineage-proven active candidate or create a fresh selection."""
+    from process.provider_directory_source_failure_control import capture_retry_flags
+
     checkpoint_dataset_id = await _checkpoint_candidate_dataset_id(
         checkpoint_context,
         endpoint_id,
@@ -59009,9 +59005,8 @@ async def _select_resumable_endpoint_dataset_candidate(
         previous_dataset_id=previous_dataset_id,
         reused_from_checkpoint=checkpoint_dataset_id is not None,
         repair_empty_orphan=should_repair_empty_orphan,
-        require_retained_vsp_capture=should_repair_empty_orphan
-        and vsp_directory.is_failed_capture_retry(existing_dataset_map, checkpoint_context),
         resource_hash_contract=_dataset_resource_hash_contract(existing_dataset_map),
+        **capture_retry_flags(existing_dataset_map, checkpoint_context, should_repair_empty_orphan),
         **verification_fields_by_name,
     )
 
@@ -59294,6 +59289,7 @@ def _candidate_bound_checkpoint_context(
         dataset_id=selection.dataset_id,
         lineage_verified=True,
         require_retained_vsp_capture=selection.require_retained_vsp_capture,
+        allow_initial_nomi_capture=selection.allow_initial_nomi_capture,
     )
 
 

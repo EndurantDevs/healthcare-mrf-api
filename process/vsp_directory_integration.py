@@ -7,6 +7,7 @@ import time
 from datetime import date
 from itertools import batched
 
+from process.provider_directory_fetch_types import empty_capture_retry_matches
 from process.vsp_directory_contract import (
     ADAPTER_ID,
     ENDPOINT_SCOPE,
@@ -126,27 +127,11 @@ def is_rearmed_capture_retry(existing_by_field, checkpoint):
 
 
 def _empty_capture_retry_matches(existing_by_field, checkpoint, previous_run_id, status):
-    return bool(
+    return (
         checkpoint is not None
         and checkpoint.source_ids == (SOURCE_ID,)
         and checkpoint.canonical_api_base == ENDPOINT_SCOPE
-        and checkpoint.retry_of_run_id
-        and checkpoint.owner_run_id not in (checkpoint.retry_of_run_id, checkpoint.acquisition_root_run_id)
-        and existing_by_field.get("acquisition_root_run_id") == checkpoint.acquisition_root_run_id
-        and existing_by_field.get("import_run_id") == previous_run_id
-        and existing_by_field.get("status") == status
-        and existing_by_field.get("is_current") is False
-        and existing_by_field.get("resource_count") == 0
-        and all(
-            existing_by_field.get(field) is None
-            for field in (
-                "published_at",
-                "validated_at",
-                "dataset_hash",
-                "completion_proof_json",
-                "completion_proof_sha256",
-            )
-        )
+        and empty_capture_retry_matches(existing_by_field, checkpoint, previous_run_id, status)
     )
 
 
