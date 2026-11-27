@@ -256,6 +256,25 @@ async def test_online_history_compaction_cutover_rollback_and_drop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cutover_refuses_a_stage_whose_rows_changed(monkeypatch):
+    """Refuse cutover when stage rows no longer match the source, even with the prepared comment intact."""
+    async with _candidate_test_scope(monkeypatch) as (context, _roles_by_kind):
+        await _install_retirement_child_guards(context)
+        cat_schema, _retained_ids, _omitted_ids = await _seed_history_fixture(context)
+        try:
+            await run_migration(context.engine, _candidate_migration(), "upgrade")
+            connection, schema_name = context.connection, context.schema_name
+            prepared = await prepare_history_compaction(connection, schema=schema_name)
+            stage_ref = f"{context.schema}.{quoted(prepared['tables'][TABLES[0]]['stage_relation'])}"
+            await connection.execute(f"DELETE FROM {stage_ref} WHERE ctid = (SELECT min(ctid) FROM {stage_ref})")
+            with pytest.raises(HistoryCompactionError, match="compaction_stage_changed"):
+                await cutover_history_compaction(connection, schema=schema_name)
+            assert await connection.fetchval(f"SELECT count(*) FROM {stage_ref}") > 0
+        finally:
+            await context.connection.execute(f'DROP SCHEMA IF EXISTS "{cat_schema}" CASCADE')
+
+
+@pytest.mark.asyncio
 async def test_online_history_compaction_handles_empty_retained_keys(monkeypatch):
     """Verify full omission (zero retained keys) detaches empty partitions cleanly."""
     async with _candidate_test_scope(monkeypatch) as (context, _roles_by_kind):
@@ -296,16 +315,13 @@ async def test_prepare_history_compaction_guards_stage_slot_ownership(monkeypatc
             await prepare_history_compaction(connection, schema=schema_name)
         assert await connection.fetchval(f"SELECT count(*) FROM {stage_ref}") == 1
 
-        stage_oid = int(await connection.fetchval("SELECT to_regclass($1)::oid::bigint", stage_ref))
-        receipt_by_field = {
-            "component": _STAGE_COMPONENT,
-            "root": TABLES[0],
-            "old_oid": selection.old_oid_by_table[TABLES[0]],
-            "stage_oid": stage_oid,
-            "plan_sha256": "f" * 64,
-        }
+        receipt_by_field = {"component": _STAGE_COMPONENT, "root": TABLES[0], "plan_sha256": "f" * 64}
         comment_literal = json.dumps(receipt_by_field, sort_keys=True, separators=(",", ":")).replace("'", "''")
         await connection.execute(f"COMMENT ON TABLE {stage_ref} IS '{comment_literal}'")
         prepared = await prepare_history_compaction(connection, schema=schema_name)
         assert prepared["tables"][TABLES[0]]["stage_relation"] == stage_name
         assert prepared["tables"][TABLES[0]]["reused"] is False
+        stage_comment = json.loads(
+            await connection.fetchval("SELECT obj_description($1::regclass, 'pg_class')", stage_ref)
+        )
+        assert not {"old_oid", "stage_oid"} & set(stage_comment)

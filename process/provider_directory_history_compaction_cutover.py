@@ -57,7 +57,6 @@ async def _verify_stage_for_cutover(
         or comment.get("component") != _STAGE_COMPONENT
         or comment.get("root") != root
         or comment.get("plan_sha256") != selection.plan_sha256
-        or comment.get("stage_oid") != stage_oid
     ):
         raise HistoryCompactionError("compaction_stage_invalid")
     retained = selection.retained_keys_by_table[root]
@@ -65,6 +64,9 @@ async def _verify_stage_for_cutover(
     expected_fp = await _history_fingerprint(connection, old_ref, retained)
     if expected_fp != comment.get("fingerprints"):
         raise HistoryCompactionError("compaction_source_changed")
+    # Fingerprint the live stage under the cutover lock; its comment alone does not prove its rows.
+    if await _history_fingerprint(connection, stage_ref, retained) != expected_fp:
+        raise HistoryCompactionError("compaction_stage_changed")
     return int(stage_oid)
 
 

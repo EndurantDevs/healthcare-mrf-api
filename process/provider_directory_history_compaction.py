@@ -277,8 +277,6 @@ async def _is_existing_stage_ready(
         or comment.get("component") != _STAGE_COMPONENT
         or comment.get("root") != root
         or comment.get("plan_sha256") != selection.plan_sha256
-        or comment.get("old_oid") != selection.old_oid_by_table[root]
-        or comment.get("stage_oid") != stage_oid
     ):
         return False
     old_ref = f"ONLY {_qualified(schema, f'pd_dataset_history_{selection.old_oid_by_table[root]}')}"
@@ -394,10 +392,10 @@ async def _add_constraints_and_indexes(
     await _add_history_indexes(connection, stage_ref, stage_oid, parent_oid)
 
 
-async def _can_drop_existing_stage(connection: Any, root: str, stage_ref: str, old_oid: int) -> bool:
-    """Return true when an existing stage relation carries a valid ownership receipt; fail closed otherwise."""
+async def _can_drop_existing_stage(connection: Any, root: str, stage_ref: str) -> bool:
+    """Return true for a stage left by an earlier compaction plan; refuse any other relation at the name."""
     stage_entry = await connection.fetchrow(
-        """SELECT c.oid::bigint AS stage_oid, c.relkind::text AS relkind, c.relispartition,
+        """SELECT c.relkind::text AS relkind, c.relispartition,
           obj_description(c.oid, 'pg_class') AS raw_comment
         FROM pg_class c
         WHERE c.oid = to_regclass($1)::oid""",
@@ -416,8 +414,6 @@ async def _can_drop_existing_stage(connection: Any, root: str, stage_ref: str, o
         or type(receipt_by_field) is not dict
         or receipt_by_field.get("component") != _STAGE_COMPONENT
         or receipt_by_field.get("root") != root
-        or receipt_by_field.get("old_oid") != old_oid
-        or receipt_by_field.get("stage_oid") != stage_entry["stage_oid"]
         or type(plan_digest) is not str
         or len(plan_digest) != 64
     ):
@@ -448,7 +444,7 @@ async def _populate_and_verify_stage(
     )
     copy_cols = ",".join(_quote(col_entry["attname"]) for col_entry in col_entries)
     async with connection.transaction():
-        if await _can_drop_existing_stage(connection, root, stage_ref, old_oid):
+        if await _can_drop_existing_stage(connection, root, stage_ref):
             await connection.execute(f"DROP TABLE {stage_ref} RESTRICT")
         await connection.execute(
             f"CREATE TABLE {stage_ref} (LIKE {old_ref} INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING STORAGE)"
@@ -469,8 +465,6 @@ async def _populate_and_verify_stage(
             "component": _STAGE_COMPONENT,
             "root": root,
             "plan_sha256": selection.plan_sha256,
-            "old_oid": old_oid,
-            "stage_oid": stage_oid,
             "fingerprints": expected_fp,
         }
         await connection.execute(f"COMMENT ON TABLE {stage_ref} IS {_literal(_canonical_json(receipt_by_field))}")
