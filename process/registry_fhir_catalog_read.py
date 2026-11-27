@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
+from functools import lru_cache
 from uuid import UUID
 
 import asyncpg
@@ -343,9 +344,24 @@ def _network_item(document, query):
     return document
 
 
-async def _metadata_pin(connection, query, namespace):
+_VALIDATED_ROW = {}
+
+
+async def _validated_snapshot(connection, snapshot):
+    """Validate a control row once per process; the same row afterwards needs only its transaction setting."""
     from process.registry_fhir_catalog_custody import validate_fhir_catalog_snapshot_record
 
+    control_values = tuple(snapshot.values())
+    if _VALIDATED_ROW.get(snapshot["metadata_generation"]) == control_values and connection.is_in_transaction():
+        # The validator applies this before filtered reads; a skipped validation still needs it.
+        await connection.execute("SET LOCAL row_security = off")
+        return
+    await validate_fhir_catalog_snapshot_record(connection, snapshot)
+    _VALIDATED_ROW.clear()
+    _VALIDATED_ROW[snapshot["metadata_generation"]] = control_values
+
+
+async def _metadata_pin(connection, query, namespace):
     snapshot = await connection.fetchrow(
         f"SELECT {','.join(SNAPSHOT_COLUMNS)} "
         f"FROM {namespace}.registry_fhir_catalog_snapshot WHERE metadata_generation=coalesce($1::text,"
@@ -367,7 +383,7 @@ async def _metadata_pin(connection, query, namespace):
     _digest(snapshot["metadata_generation"])
     catalog_integer(snapshot["metadata_approved_revision"], 9223372036854775807, minimum=0)
     storage_identifier(snapshot["schema_name"])
-    await validate_fhir_catalog_snapshot_record(connection, snapshot)
+    await _validated_snapshot(connection, snapshot)
     if query.generation_id is not None and snapshot["network_generation"] != query.generation_id:
         return {**dict(snapshot), "_directory_generation": query.generation_id}
     return snapshot
@@ -495,8 +511,9 @@ WITH source_companies AS MATERIALIZED (
  SELECT edge.network_id,edge.relationship_id FROM {control}.registry_fhir_catalog_relationship edge
  WHERE edge.metadata_generation=$1 AND $10::text IS NOT NULL
    AND (edge.company_search LIKE $10 ESCAPE '\' OR edge.plan_search LIKE $10 ESCAPE '\')
-), matching_edges AS NOT MATERIALIZED (
- SELECT edge.network_id,edge.relationship_id,edge.source_generation,binding.binding_id,
+), joined_edges AS NOT MATERIALIZED (
+ SELECT edge.network_id,edge.relationship_id,edge.source_id,edge.source_generation,edge.company_search,
+   binding.binding_id,split_part(binding.document_json->>'evidence_id',':',1) AS evidence_generation,
    CASE WHEN edge.group_id=ANY($4::uuid[]) THEN
      (edge.document_json-'relationship_id') || jsonb_build_object('group',NULL)
    ELSE edge.document_json-'relationship_id' END AS visible_document,
@@ -510,26 +527,40 @@ WITH source_companies AS MATERIALIZED (
    AND (edge.company_id IS NULL OR NOT edge.company_id=ANY($3::uuid[]))
    AND ($5::uuid IS NULL OR edge.company_id=$5)
    AND ($6::uuid IS NULL OR (edge.group_id=$6 AND NOT edge.group_id=ANY($4::uuid[])))
-   AND ($7::text IS NULL OR edge.company_search LIKE $7 ESCAPE '\'
-     OR ($5::uuid IS NULL AND $6::uuid IS NULL AND edge.source_id<>'registry-manual'
-       AND EXISTS(SELECT 1 FROM source_companies company
-         WHERE company.source_generation=edge.source_generation
-           AND company.source_generation=split_part(binding.document_json->>'evidence_id',':',1)
-           AND lower(company.display_name) LIKE $7 ESCAPE '\')))
    AND ($8::text IS NULL OR edge.plan_search LIKE $8 ESCAPE '\')
    AND ($12::text[] IS NULL OR ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
      binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
      binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12)
+), matching_edges AS NOT MATERIALIZED (
+ SELECT network_id,relationship_id,source_generation,binding_id,visible_document,redacted FROM joined_edges edge
+ WHERE $7::text IS NULL OR edge.company_search LIKE $7 ESCAPE '\'
+   OR ($5::uuid IS NULL AND $6::uuid IS NULL AND edge.source_id<>'registry-manual'
+     AND EXISTS(SELECT 1 FROM source_companies company
+       WHERE company.source_generation=edge.source_generation
+         AND company.source_generation=edge.evidence_generation
+         AND lower(company.display_name) LIKE $7 ESCAPE '\'))
+), edge_networks AS MATERIALIZED (
+ -- A source-labelled edge always has its network in source_label_networks, so only direct matches are read here.
+ SELECT DISTINCT network_id FROM joined_edges edge
+ WHERE ($5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL OR $8::text IS NOT NULL)
+   AND ($7::text IS NULL OR edge.company_search LIKE $7 ESCAPE '\')
 ), visible_edges AS NOT MATERIALIZED (
- SELECT DISTINCT ON (network_id,visible_document) network_id,
-   visible_document || jsonb_build_object('relationship_id',CASE WHEN redacted THEN
-     encode(sha256(convert_to(visible_document::text,'UTF8')),'hex') ELSE relationship_id END) AS document
- FROM matching_edges ORDER BY network_id,visible_document,redacted DESC,relationship_id
+ SELECT network_id,visible_document,(CASE WHEN bool_or(redacted)
+     THEN encode(sha256(convert_to(visible_document::text,'UTF8')),'hex')
+     ELSE min(relationship_id) END) COLLATE "default" AS relationship_id
+ FROM matching_edges GROUP BY network_id,visible_document
 ), source_label_networks AS MATERIALIZED (
  SELECT DISTINCT binding.network_id,lower(company.display_name) LIKE $10 ESCAPE '\' AS broad_match
- FROM {control}.registry_fhir_catalog_binding binding
- JOIN source_companies company ON company.source_generation=split_part(binding.document_json->>'evidence_id',':',1)
- WHERE binding.metadata_generation=$1 AND $5::uuid IS NULL AND $6::uuid IS NULL
+ FROM source_companies company
+ -- Each label reads its own evidence range by index; OFFSET 0 keeps the planner from hashing every binding.
+ CROSS JOIN LATERAL (SELECT candidate.network_id,candidate.binding_id,candidate.document_json
+   FROM {control}.registry_fhir_catalog_binding candidate
+   WHERE candidate.metadata_generation=$1
+     AND (candidate.document_json->>'evidence_id') COLLATE "C">=company.source_generation
+     AND (candidate.document_json->>'evidence_id') COLLATE "C"<company.source_generation||';'
+     AND split_part(candidate.document_json->>'evidence_id',':',1)=company.source_generation
+   OFFSET 0) binding
+ WHERE $5::uuid IS NULL AND $6::uuid IS NULL
    AND ($7::text IS NOT NULL OR $10::text IS NOT NULL)
    AND ($7::text IS NULL OR lower(company.display_name) LIKE $7 ESCAPE '\')
    AND ($12::text[] IS NULL OR ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
@@ -554,7 +585,7 @@ WITH source_companies AS MATERIALIZED (
          binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12))
    AND ($13::integer IS NULL OR network.network_id=$13)
    AND (($5::uuid IS NULL AND $6::uuid IS NULL AND $7::text IS NULL AND $8::text IS NULL)
-     OR EXISTS(SELECT 1 FROM visible_edges edge WHERE edge.network_id=network.network_id)
+     OR network.network_id IN (SELECT network_id FROM edge_networks)
      OR ($7::text IS NOT NULL AND network.network_id IN (SELECT network_id FROM source_label_networks)))
 ), page AS MATERIALIZED (
  SELECT * FROM filtered ORDER BY lower(display_name) COLLATE "C",network_id OFFSET $14 LIMIT $15
@@ -583,10 +614,12 @@ WITH source_companies AS MATERIALIZED (
          THEN $17+jsonb_array_length(bindings.documents) END)) AS document
  FROM page
  CROSS JOIN LATERAL (
-   SELECT (SELECT count(*) FROM visible_edges edge WHERE edge.network_id=page.network_id) AS total,
-     coalesce((SELECT jsonb_agg(selected.document ORDER BY selected.document->>'relationship_id')
-       FROM (SELECT document FROM visible_edges edge WHERE edge.network_id=page.network_id
-         ORDER BY document->>'relationship_id' OFFSET $16 LIMIT 5) selected),'[]'::jsonb) AS documents
+   SELECT count(*) AS total,coalesce(jsonb_agg(numbered.visible_document
+       || jsonb_build_object('relationship_id',numbered.relationship_id) ORDER BY numbered.relationship_id)
+     FILTER (WHERE numbered.position>$16 AND numbered.position<=$16+5),'[]'::jsonb) AS documents
+   FROM (SELECT edge.visible_document,edge.relationship_id,
+       row_number() OVER (ORDER BY edge.relationship_id) AS position
+     FROM visible_edges edge WHERE edge.network_id=page.network_id) numbered
  ) relationships
  CROSS JOIN LATERAL (
    SELECT (SELECT count(*) FROM {control}.registry_fhir_catalog_binding binding
@@ -633,20 +666,24 @@ def _catalog_page_statement(snapshot, manifest):
 
 def _source_company_parameters(snapshot, policy):
     """Read only immutable labels, hiding unlinked assertions under organization restrictions."""
-    from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_companies
-
     if policy.excluded_company_ids or policy.excluded_group_ids:
         return "[]"
     vector = snapshot["source_vector_json"]
-    if type(vector) is str:
-        vector = json.loads(vector)
+    return _source_company_json(vector if type(vector) is str else json.dumps(vector))
+
+
+@lru_cache(maxsize=2)
+def _source_company_json(vector_json):
+    """Encode one source vector's validated labels; a published vector never changes."""
+    from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_companies
+
     rows = [
         {
             "source_generation": entry["source_generation"],
             "status": entry["status"],
             "source_companies": validate_fhir_catalog_source_companies(entry["source_companies"]),
         }
-        for entry in vector
+        for entry in json.loads(vector_json)
         if "source_companies" in entry
     ]
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
