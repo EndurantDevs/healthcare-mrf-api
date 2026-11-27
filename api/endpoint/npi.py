@@ -9181,10 +9181,8 @@ async def list_providers(
             eligible_address_clauses,
             _runtime_db_schema(),
             start + limit,
-            is_plain=is_npi_order
-            and is_native_only
-            and page_import_context is None
-            and not (phone_digits or use_taxonomy_filter),
+            is_plain=is_npi_order and is_native_only and page_import_context is None and not phone_digits,
+            taxonomy_join=taxonomy_source if use_taxonomy_filter else "",
         )
         hydration_source = address_source
         if network_page is not None:

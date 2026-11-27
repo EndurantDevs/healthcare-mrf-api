@@ -410,7 +410,7 @@ def _provider_city_count_address(scope, address_sql, *, city, state, address_cla
     return compact_city_search_relation(scope.manifest.compact_layout, scope.network_ids) or address_sql
 
 
-def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, is_plain):
+def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, is_plain, taxonomy_join=""):
     """Plan a compact city page or a bounded NPI page for native provider reads."""
     if not (
         is_plain
@@ -425,9 +425,12 @@ def _provider_plain_network_page(scope, filters, clauses, schema, page_end, *, i
     is_city_page = len(clauses) == 3 and filters.get("city") and filters.get("state") and not filters.get("zip_code")
     if not is_city_page and (len(clauses) != 1 or page_end > 64):
         return None
+    # Only the indexed city projection can keep a per-provider taxonomy probe.
+    if taxonomy_join and not (is_city_page and layout.city_search is not None and "CROSS JOIN" not in taxonomy_join):
+        return None
     indexed = scoped_address_relation_sql(f"{schema}.{EntityAddressUnified.__tablename__}", location_lookup=True)
     if is_city_page:
-        keys, city_page, fallback = compact_city_page(layout, scope.network_ids, clauses[0])
+        keys, city_page, fallback = compact_city_page(layout, scope.network_ids, clauses[0], taxonomy_join)
         return keys, fallback, lambda page_sql: f"({city_page}) UNION ALL ({page_sql})", f"{indexed} as c"
     return None, None, partial(compact_npi_page, layout, scope.network_ids, clauses[0]), f"{indexed} as c"
 

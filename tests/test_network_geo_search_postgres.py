@@ -272,10 +272,15 @@ async def _assert_published_city_search(connection, layout, network_ids, expecte
         f"SELECT count(DISTINCT coalesce(c.npi,c.inferred_npi)) FROM {relation_sql} c "
         f"WHERE city_name=:city AND state_name=:state AND {address_type}"
     )
+    probe = "JOIN LATERAL (SELECT 1 WHERE {}) kept ON TRUE"
+    probed_sql = compact_city_page(layout, network_ids, address_type, probe.format("c.type IS NOT NULL"))[1]
+    unmatched_sql = compact_city_page(layout, network_ids, address_type, probe.format("FALSE"))[1]
     for statement, offset, expected_values in (
         (count_sql, 0, [len(expected_npis)]),
         (page_sql, 0, expected_npis),
         (page_sql, 1, []),
+        (probed_sql, 0, expected_npis),
+        (unmatched_sql, 0, []),
     ):
         compiled = text(statement).compile(dialect=PGDialect_asyncpg())
         binds_by_name = {

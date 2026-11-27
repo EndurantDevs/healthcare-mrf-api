@@ -135,11 +135,12 @@ def compact_selected_offices(layout, network_ids):
     return keys, offices
 
 
-def compact_city_page(layout, network_ids, address_type):
+def compact_city_page(layout, network_ids, address_type, provider_probe=""):
     """Intersect selected offices and state before fetching each matching city's first providers."""
     search = compact_city_search_relation(layout, network_ids)
     if search is not None:
-        page = f"""SELECT DISTINCT coalesce(c.npi,c.inferred_npi) AS npi FROM {search} c
+        # A provider-level probe filters in index order, so the page still stops at its limit.
+        page = f"""SELECT DISTINCT coalesce(c.npi,c.inferred_npi) AS npi FROM {search} c {provider_probe}
           WHERE c.state_name=:state AND c.city_name=:city AND {address_type}
           ORDER BY npi LIMIT :limit OFFSET :start"""
         return None, page, "FALSE"
