@@ -291,14 +291,21 @@ async def _typed_source_read_scope(connection, recipe, approved, control_schema,
     if runtime.catalog_bindings is None:
         await require_bindings(connection, approved, recipe.binding_coordinates, control_schema=control_schema)
     else:
-        from process.registry_imported_catalog_bindings import published_fhir_catalog_bindings_sql
+        from process.registry_imported_catalog_bindings import (
+            current_catalog_descriptor,
+            published_fhir_catalog_bindings_sql,
+        )
 
+        # A capture stored before count-only catalog families is checked as the catalog's same edition.
+        descriptor = await current_catalog_descriptor(
+            connection, runtime.catalog_bindings, approved, pin.catalog_descriptor, control_schema=control_schema
+        )
         await published_fhir_catalog_bindings_sql(
             connection,
             runtime.catalog_bindings,
             approved,
             recipe.binding_coordinates,
-            pin.catalog_descriptor,
+            descriptor,
             control_schema=control_schema,
         )
     return pin, profiles[0], origin
