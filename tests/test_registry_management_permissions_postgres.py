@@ -1196,65 +1196,6 @@ async def test_fresh_login_owned_migration_precedes_protected_operator_enrollmen
 
 
 @pytest.mark.parametrize(
-    "membership_options",
-    (
-        pytest.param("WITH ADMIN FALSE, INHERIT TRUE, SET FALSE", id="inherited-insert"),
-        pytest.param("WITH ADMIN FALSE, INHERIT FALSE, SET TRUE", id="set-only"),
-        pytest.param("WITH ADMIN FALSE, INHERIT FALSE, SET FALSE", id="member-only"),
-    ),
-)
-async def test_aca_original_reader_rejects_publisher_role_drift_after_enrollment(permissions_db, membership_options):
-    from process.registry_aca_source_notification_permissions import (
-        install_registry_aca_source_notification_permissions,
-    )
-    from process.registry_aca_source_notifications import RegistryACASourceNotificationStore
-
-    fixture, connection = permissions_db, permissions_db.connection
-    await _install(fixture)
-    publisher, reader_role = fixture.roles_by_kind["publisher"], fixture.roles_by_kind["api"]
-    password, reader = uuid4().hex, None
-    store = RegistryACASourceNotificationStore(fixture.schema, publisher, (reader_role,))
-    try:
-        await connection.execute(f"ALTER ROLE \"{reader_role}\" LOGIN PASSWORD '{password}'")
-        async with connection.transaction():
-            await install_registry_aca_source_notification_permissions(
-                connection,
-                control_schema=fixture.schema,
-                publisher_role=publisher,
-                reader_roles=(reader_role,),
-                runtime_roles=tuple(sorted(fixture.roles_by_kind.values())),
-            )
-        url = fixture.sessions.kw["bind"].url.set(drivername="postgresql", username=reader_role, password=password)
-        reader = await asyncpg.connect(url.render_as_string(hide_password=False))
-        assert tuple(await reader.fetchrow("SELECT current_user,session_user,current_setting('role')")) == (
-            reader_role,
-            reader_role,
-            "none",
-        )
-        async with reader.transaction(isolation="repeatable_read", readonly=True):
-            identity = await store.qualify(reader, writing=False)
-        await connection.execute(f'GRANT "{publisher}" TO "{reader_role}" {membership_options}')
-        assert await reader.fetchval("SELECT pg_has_role(current_user,$1,'MEMBER')", publisher)
-        relation = f'"{fixture.schema}".registry_aca_source_notification'
-        assert not await reader.fetchval("SELECT has_table_privilege(current_user,$1,'INSERT')", relation)
-        assert await reader.fetchval("SELECT has_any_column_privilege(current_user,$1,'INSERT')", relation) is (
-            "INHERIT TRUE" in membership_options
-        )
-        async with reader.transaction(isolation="repeatable_read", readonly=True):
-            with pytest.raises(ValueError, match="registry_aca_source_notification_invalid"):
-                await store.qualify(reader, writing=False)
-        await connection.execute(f'REVOKE "{publisher}" FROM "{reader_role}"')
-        async with reader.transaction(isolation="repeatable_read", readonly=True):
-            assert await store.qualify(reader, writing=False) == identity
-        assert await connection.fetchval(f"SELECT count(*) FROM {relation}") == 0
-    finally:
-        if reader is not None:
-            await reader.close()
-        await connection.execute(f'REVOKE "{publisher}" FROM "{reader_role}"')
-        await connection.execute(f'ALTER ROLE "{reader_role}" NOLOGIN PASSWORD NULL')
-
-
-@pytest.mark.parametrize(
     ("global_role", "membership_options"),
     (
         pytest.param("pg_write_all_data", "", id="pg_write_all_data"),

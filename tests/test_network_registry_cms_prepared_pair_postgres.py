@@ -1691,24 +1691,6 @@ async def _verify_notification_operator_refusals(session, store, foreign_role):
     )
 
 
-async def _refuse_elevated_notification_role(database, retained, predecessor, store):
-    """Grant the forbidden parameter as admin before opening the genuine Source snapshot."""
-    async with database.engine.begin() as connection:
-        await connection.execute(text(f'GRANT SET ON PARAMETER session_replication_role TO "{store.publisher_role}"'))
-    try:
-        with pytest.raises(ValueError, match="source_notification_invalid"):
-            async with support.original_source_transaction(database, isolation="repeatable read") as session:
-                receipt_id, payload = await _publish_stages(session, retained, predecessor)
-                await retention.bind_prepared_registry_cms_source_pair(
-                    session, retained, receipt_id=receipt_id, receipt_payload=payload
-                )
-    finally:
-        async with database.engine.begin() as connection:
-            await connection.execute(
-                text(f'REVOKE SET ON PARAMETER session_replication_role FROM "{store.publisher_role}"')
-            )
-
-
 def _notification_callback(original_bind, stores, recorded_notifications):
     async def notify_bound(session, prepared, *, receipt_id, receipt_payload):
         from process import registry_cms_source_notifications as notifications
@@ -1813,13 +1795,9 @@ async def test_native_signed_retention_budget_refuses_before_copy(monkeypatch, t
 
 
 async def _verify_native_notification_publication(state, monkeypatch):
-    from tests.cms_registry_native_producer_postgres_support import (
-        reject_elevated_notification_role,
-        reject_unscoped_notification,
-    )
+    from tests.cms_registry_native_producer_postgres_support import reject_unscoped_notification
 
     await _verify_notification_populated_downgrade(state.database, state.store)
-    await reject_elevated_notification_role(state)
     await reject_unscoped_notification(state)
     await _verify_genuine_retained_state(state, monkeypatch)
     await _verify_committed_notification(state.database, state.pair, state.store, state.notices[-1])

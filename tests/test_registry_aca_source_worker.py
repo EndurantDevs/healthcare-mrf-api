@@ -142,10 +142,6 @@ async def test_source_census_is_derived_from_genuine_policy_and_cannot_omit_owne
         "mrf", "source_owner", "source_publisher", ("control_reader", "source_reader"), ("control_reader",)
     )
     publisher = SimpleNamespace(policy=policy)
-    identity_map = dict(
-        database_name="example", database_oid=1, server_address="127.0.0.1", server_port=1, server_started="start"
-    )
-    native = SimpleNamespace(fetchrow=AsyncMock(return_value=identity_map))
 
     @asynccontextmanager
     async def source_transaction(*args, **kwargs):
@@ -154,14 +150,11 @@ async def test_source_census_is_derived_from_genuine_policy_and_cannot_omit_owne
     monkeypatch.setattr(worker.source_policy, "source_transaction", source_transaction)
     monkeypatch.setattr(worker.source_policy, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(worker.source_policy, "source_producer_identity", lambda: ("a" * 40, "sha256:" + "b" * 64))
-    from process import network_cms_registry_address_capture
-
-    monkeypatch.setattr(network_cms_registry_address_capture, "native_driver", AsyncMock(return_value=native))
-    actual = await worker._source_config(config, identity_map)
+    actual = await worker._source_config(config)
     assert actual.source_authority_roles == ("control_reader", "source_owner", "source_publisher", "source_reader")
     omitted = replace(config, consumer=replace(config.consumer, source_authority_roles=("source_reader",)))
     with pytest.raises(ValueError):
-        await worker._source_config(omitted, identity_map)
+        await worker._source_config(omitted)
 
 
 @pytest.mark.asyncio

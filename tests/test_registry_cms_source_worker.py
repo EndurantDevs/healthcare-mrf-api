@@ -4,7 +4,7 @@
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -170,28 +170,17 @@ def test_direct_config_refuses_invalid_limits_and_digest_before_work():
 
 
 class Connection:
-    def __init__(self, role, *, wrong_database=False, in_transaction=False):
-        self.role, self.wrong_database, self.transaction = role, wrong_database, in_transaction
+    def __init__(self, role):
+        self.role, self.statements = role, []
 
     def is_in_transaction(self):
-        return self.transaction
+        return False
 
     async def fetchrow(self, query, *args):
-        assert args == ("registry", "inbox")
-        return dict(
-            database_name="other" if self.wrong_database else "example",
-            database_oid=1,
-            server_address="127.0.0.1",
-            server_port=5432,
-            server_started="synthetic-start",
-            control_oid=2,
-            inbox_oid=3,
-            current_role=self.role,
-            session_role=self.role,
-            safe_login=True,
-        )
+        raise AssertionError("the worker runs no connection identity query")
 
     async def fetchval(self, query):
+        self.statements.append(query)
         return "on" if "read_only" in query else "repeatable read"
 
 
@@ -240,7 +229,7 @@ class Engine:
         self.harness.events.append("reader dispose")
 
 
-def resources(monkeypatch, *, wrong_database=False, fail_connect=False, fail_close=False):
+def resources(monkeypatch, *, fail_connect=False, fail_close=False):
     """Model pool/engine lifecycle without claiming a native database qualification."""
     harness = SimpleNamespace(
         events=[],
@@ -249,7 +238,7 @@ def resources(monkeypatch, *, wrong_database=False, fail_connect=False, fail_clo
         fail_connect=fail_connect,
         fail_close=fail_close,
         execution=Connection("registry_executor"),
-        reader=Connection("source_reader", wrong_database=wrong_database),
+        reader=Connection("source_reader"),
     )
     verify = AsyncMock()
     monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", verify)
@@ -305,11 +294,10 @@ async def test_one_consume_has_finite_actual_checkout_limits_and_state_only_outp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["database", "connect", "consumer", "cancel", "close", "result"])
+@pytest.mark.parametrize("failure", ["connect", "consumer", "cancel", "close", "result"])
 async def test_failure_and_cancellation_drain_before_owned_cleanup(monkeypatch, failure):
     events, _options, _verify, _sessions = resources(
         monkeypatch,
-        wrong_database=failure == "database",
         fail_connect=failure == "connect",
         fail_close=failure == "close",
     )
@@ -332,17 +320,9 @@ async def test_failure_and_cancellation_drain_before_owned_cleanup(monkeypatch, 
         assert events == ["reader connect", "reader dispose"]
         return
     assert events.index("release") < events.index("pool close") < events.index("reader dispose")
-    if failure not in {"database", "connect"}:
-        assert events.index("consumer drained") < events.index("release")
+    assert events.index("consumer drained") < events.index("release")
     if failure == "close":
         assert events[-2:] == ["pool terminate", "reader dispose"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("role,transaction", [("other", False), ("registry_executor", True)])
-async def test_execution_identity_refuses_wrong_actor_or_open_transaction(role, transaction):
-    with pytest.raises(ValueError):
-        await worker._identity(Connection(role, in_transaction=transaction), parsed(), "registry_executor")
 
 
 @pytest.mark.asyncio
@@ -352,7 +332,20 @@ async def test_notification_reader_requires_read_settings(monkeypatch, read_only
     connection.fetchval = AsyncMock(side_effect=[read_only, isolation])
     monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", AsyncMock())
     with pytest.raises(ValueError, match="registry_cms_source_worker_connection_invalid"):
-        await worker._notification_reader_identity(parsed(), connection)
+        await worker._notification_reader_settings(parsed(), connection)
+
+
+@pytest.mark.asyncio
+async def test_reader_checkout_runs_only_limit_and_setting_statements(monkeypatch):
+    _events, options, verify, _sessions = resources(monkeypatch)
+    async with AsyncExitStack() as stack:
+        await worker._notification_sessions(parsed(), stack)
+    reader, checkouts = Connection("source_reader"), []
+    verify.reset_mock()
+    options["listener"](SimpleNamespace(run_async=checkouts.append), None, None)
+    await checkouts[0](reader)
+    verify.assert_awaited_once_with(reader)
+    assert reader.statements == ["SHOW transaction_read_only", "SHOW transaction_isolation"]
 
 
 def test_actual_command_registration_and_unsupported_argument_redaction():
@@ -392,29 +385,6 @@ def test_explicit_cli_remains_compatible_without_periodic_endpoint():
     configured = configuration()
     configured.pop("source_endpoint_id")
     assert worker.parse_registry_cms_source_worker_config(json.dumps(configured)).source_endpoint_id is None
-
-
-@pytest.mark.asyncio
-async def test_identity_refuses_unsafe_login_before_work():
-    connection = Connection("registry_executor")
-    original = connection.fetchrow
-
-    async def unsafe(*args):
-        return await original(*args) | {"safe_login": False}
-
-    connection.fetchrow = unsafe
-    with pytest.raises(ValueError, match="connection_invalid"):
-        await worker._identity(connection, parsed(), "registry_executor")
-    for flag in (
-        "rolcanlogin",
-        "rolsuper",
-        "rolcreatedb",
-        "rolcreaterole",
-        "rolreplication",
-        "rolbypassrls",
-        "pg_has_role",
-    ):
-        assert flag in worker._IDENTITY_SQL
 
 
 @pytest.mark.asyncio

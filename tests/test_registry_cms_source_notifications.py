@@ -124,14 +124,16 @@ async def test_rc_preflight_is_publisher_only_and_never_widens_committed_reader(
     from process import registry_cms_source_notifications as notifications
 
     class Connection:
+        queries = []
+
         def is_in_transaction(self):
             return True
 
-        async def fetchval(self, query, *_arguments):
+        async def fetchval(self, query, *arguments):
+            self.queries.append((query, arguments))
             return {
                 "SHOW transaction_isolation": "read committed",
                 "SHOW transaction_read_only": "off" if writing else "on",
-                "SELECT current_user": "publisher",
             }.get(query, True)
 
     connection = Connection()
@@ -143,6 +145,7 @@ async def test_rc_preflight_is_publisher_only_and_never_widens_committed_reader(
     store = RegistryCMSSourceNotificationStore("registry_control", "protected_owner", "publisher", _attempt())
     if writing:
         assert await store._connection(object(), writing=True) is connection
+        assert connection.queries[-1] == (notifications._INBOX_SHAPE_SQL, ("registry_control", notifications.TABLE))
     else:
         with pytest.raises(ValueError, match="source_notification_invalid"):
             await store._connection(object(), writing=False)
@@ -202,3 +205,30 @@ async def test_matching_notification_headers_are_typed_and_bounded_before_read(m
     with pytest.raises(ValueError, match="source_notification_invalid"):
         await reader.matching_headers(object(), {} if fault == "coordinates" else coordinates)
     assert driver.fetch.await_count == int(fault != "coordinates")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", ["inserted", "same", "different"])
+async def test_notify_receipt_reads_back_only_after_a_conflict(monkeypatch, stored):
+    from tests.test_network_cms_registry_source_pair import _retained_pair
+
+    pair = _retained_pair()
+    store = RegistryCMSSourceNotificationStore("registry_control", "protected_owner", "publisher", _attempt())
+    values = notifications._row_values(RegistryCMSSourceNotification(_attempt(), pair))
+    stored_by_column = dict(zip(notifications.INSERT_COLUMNS, values, strict=True))
+    if stored == "different":
+        stored_by_column["notification_json"] = "{}"
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=["repeatable read", True if stored == "inserted" else None]),
+        fetchrow=AsyncMock(return_value=stored_by_column),
+    )
+    monkeypatch.setattr(RegistryCMSSourceNotificationStore, "_connection", AsyncMock(return_value=connection))
+    monkeypatch.setattr(notifications, "_require_current_publication", AsyncMock())
+    receipt_id = pair.proof.serving_receipt_id
+    if stored == "different":
+        with pytest.raises(ValueError, match="source_notification_invalid"):
+            await store.notify_receipt(object(), receipt_id=receipt_id, pair=pair)
+    else:
+        assert (await store.notify_receipt(object(), receipt_id=receipt_id, pair=pair)).pair == pair
+    assert "DO NOTHING RETURNING true" in connection.fetchval.await_args_list[1].args[0]
+    assert connection.fetchrow.await_count == int(stored != "inserted")

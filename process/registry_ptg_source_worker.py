@@ -13,7 +13,7 @@ import click
 from sqlalchemy.exc import ArgumentError
 
 from process.network_address_projection import _identifier
-from process.registry_cms_source_worker import _IDENTITY_SQL, _endpoint, _object, _roles, _unique, _watch_control_cancel
+from process.registry_cms_source_worker import _endpoint, _object, _roles, _unique, _watch_control_cancel
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
 from process.registry_ptg_scope_runtime import _database_url
 from process.registry_ptg_source_consumer import (
@@ -136,24 +136,6 @@ def parse_registry_ptg_source_worker_config(encoded):
         _invalid()
 
 
-async def _identity(connection, config, role):
-    identity_by_name = dict(
-        await connection.fetchrow(
-            _IDENTITY_SQL, config.consumer.control_schema, config.notification_store.control_schema
-        )
-    )
-    if (
-        identity_by_name.pop("safe_login") is not True
-        or identity_by_name.pop("current_role") != role
-        or identity_by_name.pop("session_role") != role
-        or identity_by_name["control_oid"] is None
-        or identity_by_name["inbox_oid"] is None
-        or connection.is_in_transaction()
-    ):
-        _invalid()
-    return identity_by_name
-
-
 async def run_registry_ptg_source_worker(config, *, event=None):
     """Consume one accepted event using independently qualified bounded execution and reader pools."""
     if type(config) is not RegistryPTGSourceWorkerConfig:
@@ -168,10 +150,7 @@ async def run_registry_ptg_source_worker(config, *, event=None):
         stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         async with execution.acquire() as connection:
-            native_identity = await _identity(connection, config, config.consumer.execution_role)
             async with reader.acquire() as notification_connection:
-                if await _identity(notification_connection, config, config.reader_role) != native_identity:
-                    _invalid()
                 async with notification_connection.transaction(isolation="repeatable_read", readonly=True):
                     identity = await qualify_registry_ptg_source_notifications(
                         notification_connection, config.notification_store, reader_role=config.reader_role

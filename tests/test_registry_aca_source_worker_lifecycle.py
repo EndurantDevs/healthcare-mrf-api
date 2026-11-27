@@ -25,15 +25,8 @@ def _pool_factory(config, events, outcome):
         assert options["min_size"] == options["max_size"] == 1
         if role == config.reader_role and outcome == "reader_startup":
             raise RuntimeError("reader startup failed")
-        identity_by_field = dict(
-            safe_login=True,
-            current_role=role,
-            session_role=role,
-            control_oid=1,
-            inbox_oid=2,
-        )
         connection = SimpleNamespace(
-            fetchrow=AsyncMock(return_value=identity_by_field),
+            fetchrow=AsyncMock(side_effect=AssertionError("the worker runs no connection identity query")),
             is_in_transaction=lambda: False,
             transaction=transaction,
         )

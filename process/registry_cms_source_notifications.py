@@ -163,6 +163,12 @@ SELECT EXISTS(SELECT 1 FROM target c CROSS JOIN closure_scope s JOIN pg_roles o 
 """.format(unsafe=_NATIVE_RUNTIME_ROLE_UNSAFE_SQL)
 
 
+# Shape refusal for an inbox table this code reads and writes; PostgreSQL grants enforce access.
+_INBOX_SHAPE_SQL = """SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind='r' AND c.relpersistence='p'
+ AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relhastriggers AND NOT c.relhasrules)"""
+
+
 @dataclass(frozen=True)
 class RegistryCMSSourceNotificationReader:
     """Fixed read capability with no publication attempt or notification writer."""
@@ -251,13 +257,14 @@ class RegistryCMSSourceNotificationStore:
         await _require_current_publication(session, connection, pair)
         namespace = _identifier(self.control_schema)
         values = _row_values(notification)
-        await connection.execute(
-            f"INSERT INTO {namespace}.{TABLE} ({','.join(INSERT_COLUMNS)}) VALUES($1,$2,$3,$4::text::xid8,$5,$6,$7) ON CONFLICT(source_schema,receipt_id) DO NOTHING",
+        inserted = await connection.fetchval(
+            f"INSERT INTO {namespace}.{TABLE} ({','.join(INSERT_COLUMNS)}) VALUES($1,$2,$3,$4::text::xid8,$5,$6,$7) ON CONFLICT(source_schema,receipt_id) DO NOTHING RETURNING true",
             *values,
         )
-        stored = await _read_row(connection, namespace, values[0], receipt_id)
-        if stored is None or tuple(stored[column] for column in INSERT_COLUMNS) != values:
-            _invalid()
+        if not inserted:
+            stored = await _read_row(connection, namespace, values[0], receipt_id)
+            if stored is None or tuple(stored[column] for column in INSERT_COLUMNS) != values:
+                _invalid()
         return notification
 
     async def read(self, session, *, source_schema, receipt_id):
@@ -267,7 +274,6 @@ class RegistryCMSSourceNotificationStore:
 
 async def _notification_connection(configuration, session, *, writing):
     connection = await native_driver(session)
-    roles = tuple(sorted({configuration.publisher_role, *configuration.reader_roles}))
     if (
         not connection.is_in_transaction()
         or await connection.fetchval("SHOW transaction_isolation")
@@ -275,16 +281,7 @@ async def _notification_connection(configuration, session, *, writing):
             {"read committed", "repeatable read", "serializable"} if writing else {"repeatable read", "serializable"}
         )
         or await connection.fetchval("SHOW transaction_read_only") != ("off" if writing else "on")
-        or await connection.fetchval("SELECT current_user")
-        not in ((configuration.publisher_role,) if writing else roles)
-        or not await connection.fetchval(
-            _PRIVILEGES_SQL,
-            configuration.control_schema,
-            configuration.owner_role,
-            roles,
-            configuration.publisher_role,
-            INSERT_COLUMNS,
-        )
+        or not await connection.fetchval(_INBOX_SHAPE_SQL, configuration.control_schema, TABLE)
     ):
         _invalid()
     return connection

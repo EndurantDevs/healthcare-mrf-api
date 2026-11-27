@@ -128,23 +128,16 @@ def _negative_fixture(monkeypatch, failure):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["clone_acl", "publisher_parameter"])
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_negative_acl_changes_precede_source_snapshot_and_restore(monkeypatch, kind, cancelled):
-    """ACL/parameter damage is admin-only and cancellation still restores it."""
+async def test_negative_acl_changes_precede_source_snapshot_and_restore(monkeypatch, cancelled):
+    """ACL damage is admin-only and cancellation still restores it."""
     if cancelled:
         failure = asyncio.CancelledError()
-    elif kind == "clone_acl":
-        failure = NetworkCustomAddressSourceError("Native owner or runtime privileges are not closed")
     else:
-        failure = ValueError("registry_cms_source_notification_invalid")
+        failure = NetworkCustomAddressSourceError("Native owner or runtime privileges are not closed")
     database, events = _negative_fixture(monkeypatch, failure)
     retained = SimpleNamespace(address_ownership=SimpleNamespace(schema_name="retained_clone"))
-    store = SimpleNamespace(publisher_role="source_publisher")
-    if kind == "clone_acl":
-        operation = fixture._reject_open_custody(database, retained, ("retained_owner", "reader"), {})
-    else:
-        operation = fixture._refuse_elevated_notification_role(database, retained, {}, store)
+    operation = fixture._reject_open_custody(database, retained, ("retained_owner", "reader"), {})
     if cancelled:
         with pytest.raises(asyncio.CancelledError):
             await operation

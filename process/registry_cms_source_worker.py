@@ -43,20 +43,6 @@ from process.registry_publication_worker import (
 CONFIG_ENV = "HLTHPRT_REGISTRY_CMS_SOURCE_WORKER"
 MAX_CONFIG_BYTES = 16 * 1024
 _STATES = {"completed", "replayed", "busy", "review_required", "stale_source", "conflict"}
-_IDENTITY_SQL = """SELECT current_database()::text AS database_name,
- (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,
- inet_server_addr()::text AS server_address,inet_server_port() AS server_port,
- pg_postmaster_start_time() AS server_started,to_regnamespace($1)::oid::bigint AS control_oid,
- to_regnamespace($2)::oid::bigint AS inbox_oid,
- current_user::text AS current_role,session_user::text AS session_role,
- EXISTS(SELECT 1 FROM pg_roles actor WHERE actor.rolname=current_user AND actor.rolcanlogin
-   AND NOT (actor.rolsuper OR actor.rolcreatedb OR actor.rolcreaterole OR actor.rolreplication OR actor.rolbypassrls)
-   AND NOT EXISTS(SELECT 1 FROM pg_roles elevated
-     WHERE (elevated.rolsuper OR elevated.rolcreatedb OR elevated.rolcreaterole OR elevated.rolreplication
-       OR elevated.rolbypassrls OR elevated.rolname IN ('pg_read_server_files','pg_write_server_files',
-       'pg_execute_server_program','pg_read_all_data','pg_write_all_data','pg_signal_backend',
-       'pg_checkpoint','pg_create_subscription')) AND pg_has_role(actor.oid,elevated.oid,'MEMBER'))
- ) AS safe_login"""
 _COORDINATES = {"source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id"}
 
 
@@ -238,34 +224,14 @@ def parse_registry_cms_source_worker_config(encoded):
         _invalid()
 
 
-async def _identity(connection, config, role):
-    identity_by_name = dict(
-        await connection.fetchrow(
-            _IDENTITY_SQL, config.consumer.control_schema, config.notification_store.control_schema
-        )
-    )
-    if (
-        identity_by_name.pop("safe_login") is not True
-        or identity_by_name.pop("current_role") != role
-        or identity_by_name.pop("session_role") != role
-        or identity_by_name["control_oid"] is None
-        or identity_by_name["inbox_oid"] is None
-        or connection.is_in_transaction()
-    ):
-        raise ValueError("registry_cms_source_worker_connection_invalid")
-    return identity_by_name
-
-
-async def _notification_reader_identity(config, connection):
-    """Require finite limits, a direct reader and read-only repeatable-read settings."""
+async def _notification_reader_settings(config, connection):
+    """Require finite limits and read-only repeatable-read settings."""
     await config.sql_limits.verify(connection)
-    identity = await _identity(connection, config, config.notification_url.username)
     if (
         await connection.fetchval("SHOW transaction_read_only") != "on"
         or await connection.fetchval("SHOW transaction_isolation") != "repeatable read"
     ):
         raise ValueError("registry_cms_source_worker_connection_invalid")
-    return identity
 
 
 async def _notification_sessions(config, stack):
@@ -291,19 +257,18 @@ async def _notification_sessions(config, stack):
     stack.push_async_callback(engine.dispose)
     async with engine.connect() as reader:
         raw = await reader.get_raw_connection()
-        expected_identity = await _notification_reader_identity(config, raw.driver_connection)
+        await _notification_reader_settings(config, raw.driver_connection)
 
     async def verify(connection):
-        """Verify actual reader limits, direct role and trusted database on each checkout."""
-        if await _notification_reader_identity(config, connection) != expected_identity:
-            raise ValueError("registry_cms_source_worker_connection_invalid")
+        """Verify actual reader limits and read-only settings on each checkout."""
+        await _notification_reader_settings(config, connection)
 
     def checkout(connection, _record, _proxy):
         """Run native verification through the genuine adapted checkout."""
         connection.run_async(verify)
 
     event.listen(engine.sync_engine, "checkout", checkout)
-    return async_sessionmaker(engine), expected_identity
+    return async_sessionmaker(engine)
 
 
 async def run_registry_cms_source_worker(config, *, event=None):
@@ -318,12 +283,10 @@ async def run_registry_cms_source_worker(config, *, event=None):
         {name: getattr(config, name) for name in REGISTRY_CMS_EVENT_FIELDS} if event is None else dict(event)
     )
     async with AsyncExitStack() as stack:
-        sessions, identity = await _notification_sessions(config, stack)
+        sessions = await _notification_sessions(config, stack)
         pool = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, pool)
         async with _BoundedPool(pool, config.sql_limits.connect_timeout_seconds).acquire() as connection:
-            if await _identity(connection, config, config.consumer.execution_role) != identity:
-                raise ValueError("registry_cms_source_worker_connection_invalid")
             consumer = await _configured_worker_runtime(config, stack)
             if consumer.composition_runtime is not None:
                 await consumer.composition_runtime.qualify()

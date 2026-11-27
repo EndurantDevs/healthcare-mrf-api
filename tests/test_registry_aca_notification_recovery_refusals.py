@@ -152,7 +152,7 @@ class NotificationReader(_Connection):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("refusal", ["rebound_inbox", "reader_grants", "missing_receipt"])
+@pytest.mark.parametrize("refusal", ["rebound_inbox", "inbox_shape", "missing_receipt"])
 async def test_unqualified_notification_read_closes_snapshot_without_mutation(refusal):
     connection = NotificationReader()
     identity_by_field = {
@@ -161,8 +161,8 @@ async def test_unqualified_notification_read_closes_snapshot_without_mutation(re
     }
     if refusal == "rebound_inbox":
         connection.identity["inbox_oid"] += 1
-    elif refusal == "reader_grants":
-        connection.runtime_closed = False
+    elif refusal == "inbox_shape":
+        connection.shape = False
     release_events = []
 
     @asynccontextmanager
