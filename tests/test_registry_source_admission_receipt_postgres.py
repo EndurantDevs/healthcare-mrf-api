@@ -250,13 +250,16 @@ async def test_historical_replay_does_not_manufacture_missing_completion(permiss
 
 
 @pytest.mark.asyncio
-async def test_column_write_privilege_cannot_authorize_completed_lookup(permissions_db):
+async def test_column_write_grant_no_longer_blocks_completed_lookup(permissions_db):
     fixture = permissions_db
     await _install(fixture)
     prepared = _input()
     edition = _edition(prepared)
     async with fixture.connection.transaction():
-        await admission.admit_cms_mlr_edition(fixture.connection, prepared, edition, control_schema=fixture.schema)
+        receipt = await admission.admit_cms_mlr_edition(
+            fixture.connection, prepared, edition, control_schema=fixture.schema
+        )
+    # Grants are PostgreSQL's job; the lookup compares retained content, not the permission closure.
     await fixture.connection.execute(
         f'GRANT UPDATE(observation_json) ON "{fixture.schema}".registry_source_observation TO "{fixture.roles_by_kind["api"]}"'
     )
@@ -268,7 +271,7 @@ async def test_column_write_privilege_cannot_authorize_completed_lookup(permissi
                 header_sha256=admission._source_header_sha256(_HEADERS),
                 control_schema=fixture.schema,
             )
-            is None
+            == receipt
         )
     assert (
         await fixture.connection.fetchval(f'SELECT count(*) FROM "{fixture.schema}".registry_source_observation') == 2

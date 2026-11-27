@@ -280,42 +280,10 @@ def _approval_document(document, evidence):
     }
 
 
-_PERMISSIONS_SQL = """
-WITH scope AS (
- SELECT c.*,n.oid AS schema_oid,n.nspowner,o.oid AS owner_oid,w.oid AS approval_oid,r.oid AS reader_oid,
-        o.rolcanlogin OR o.rolsuper OR o.rolcreatedb OR o.rolcreaterole OR o.rolreplication OR o.rolbypassrls
-          AS owner_unsafe
- FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
- JOIN pg_roles o ON o.rolname=:owner_role JOIN pg_roles w ON w.rolname=:approval_role
- JOIN pg_roles r ON r.rolname=current_user
- WHERE n.nspname=:schema_name AND c.relname='registry_ptg_producer_scope'
-), grants AS (
- SELECT a.* FROM scope s CROSS JOIN LATERAL aclexplode(coalesce(s.relacl,acldefault('r',s.relowner))) a
- UNION ALL SELECT a.* FROM scope s JOIN pg_attribute att ON att.attrelid=s.oid
- CROSS JOIN LATERAL aclexplode(att.attacl) a WHERE att.attnum>0 AND NOT att.attisdropped
-)
-SELECT relkind='r' AND relpersistence='p' AND NOT relrowsecurity AND NOT relforcerowsecurity
- AND relowner=owner_oid AND nspowner=owner_oid AND NOT owner_unsafe AND approval_oid<>owner_oid
- AND NOT EXISTS(SELECT 1 FROM grants g WHERE g.grantee<>owner_oid AND
-   (g.grantee=0 OR g.is_grantable OR g.privilege_type<>'SELECT' AND
-      NOT(g.grantee=approval_oid AND g.privilege_type='INSERT')))
- AND NOT EXISTS(SELECT 1 FROM pg_roles p WHERE
-   (p.oid=reader_oid OR p.oid=approval_oid OR p.oid IN (SELECT grantee FROM grants WHERE grantee<>owner_oid))
-   AND (p.rolsuper OR p.rolcreaterole OR p.rolreplication OR p.rolbypassrls
-     OR pg_has_role(p.oid,owner_oid,'MEMBER') OR pg_has_role(p.oid,owner_oid,'SET')
-     OR EXISTS(SELECT 1 FROM pg_roles elevated WHERE (elevated.rolsuper OR elevated.rolcreaterole)
-       AND pg_has_role(p.oid,elevated.oid,'MEMBER'))))
- AND has_schema_privilege(reader_oid,schema_oid,'USAGE')
- AND NOT has_schema_privilege(reader_oid,schema_oid,'CREATE')
- AND has_table_privilege(reader_oid,oid,'SELECT')
- AND NOT has_table_privilege(reader_oid,oid,'UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
- AND NOT has_any_column_privilege(reader_oid,oid,'UPDATE,REFERENCES')
- AND CASE WHEN :write THEN reader_oid=approval_oid AND has_table_privilege(reader_oid,oid,'INSERT')
-   ELSE NOT has_table_privilege(reader_oid,oid,'INSERT')
-     AND NOT has_any_column_privilege(reader_oid,oid,'INSERT')
-     AND NOT pg_has_role(reader_oid,approval_oid,'MEMBER')
-     AND NOT pg_has_role(reader_oid,approval_oid,'SET') END AS closed FROM scope
-"""
+# Shape, row-security and current-role read preflight for one admin registry table.
+_TABLE_SHAPE_SQL = """SELECT c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+ AND has_schema_privilege(n.oid,'USAGE') AND has_table_privilege(c.oid,'SELECT')
+ FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2"""
 
 
 async def _protected_store(session, store, *, write, table_name=TABLE):

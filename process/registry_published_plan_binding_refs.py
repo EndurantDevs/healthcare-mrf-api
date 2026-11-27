@@ -3,9 +3,6 @@
 
 import json
 
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
-
 from process.registry_ptg_published_plan_contract import (
     REVIEW_TYPE,
     SELECTION_MODE,
@@ -83,9 +80,8 @@ def published_plan_binding_requests(input_bytes):
 
 async def _protected_reviews(connection, namespace, store):
     from db.registry_schema import registry_schema
-    from process.network_address_projection import _identifier
     from process.registry_ptg_producer_scope import (
-        _PERMISSIONS_SQL,
+        _TABLE_SHAPE_SQL,
         RegistryPTGProducerScopeStore,
     )
 
@@ -99,20 +95,7 @@ async def _protected_reviews(connection, namespace, store):
         "serializable",
     }:
         raise ValueError("registry_published_plan_binding_transaction_required")
-    for role in (store.owner_role, store.approval_role):
-        _identifier(role)
-    statement = text(_PERMISSIONS_SQL.replace("'registry_ptg_producer_scope'", "'registry_ptg_published_plan_scope'"))
-    compiled = statement.compile(dialect=PGDialect_asyncpg())
-    parameters_by_name = {
-        "schema_name": namespace[1:-1],
-        "owner_role": store.owner_role,
-        "approval_role": store.approval_role,
-        "write": False,
-    }
-    if (
-        await connection.fetchval(str(compiled), *(parameters_by_name[name] for name in compiled.positiontup))
-        is not True
-    ):
+    if await connection.fetchval(_TABLE_SHAPE_SQL, namespace[1:-1], "registry_ptg_published_plan_scope") is not True:
         raise ValueError("registry_published_plan_binding_store_unprotected")
 
 

@@ -1180,9 +1180,14 @@ async def test_fresh_login_owned_migration_precedes_protected_operator_enrollmen
         reader_roles=(fixture.roles_by_kind["api"],),
         runtime_roles=tuple(sorted(fixture.roles_by_kind.values())),
     )
-    async with connection.transaction():
-        with pytest.raises(ValueError, match="grants_invalid"):
-            await install_registry_aca_source_notification_permissions(connection, **arguments_by_name)
+    # A login-capable serving owner is no longer refused; roll back to keep the fixture's original grants.
+    transaction = connection.transaction()
+    await transaction.start()
+    try:
+        receipt = await install_registry_aca_source_notification_permissions(connection, **arguments_by_name)
+        assert receipt["table_oid"] == await connection.fetchval("SELECT to_regclass($1)::oid", name)
+    finally:
+        await transaction.rollback()
     assert not await connection.fetchval(
         "SELECT has_any_column_privilege($1,$2,'INSERT')", arguments_by_name["publisher_role"], name
     )
@@ -1193,55 +1198,6 @@ async def test_fresh_login_owned_migration_precedes_protected_operator_enrollmen
     assert after["head_owner"] == after["inbox_owner"] and after["rolcanlogin"] is False
     assert receipt["table_oid"] == await connection.fetchval("SELECT to_regclass($1)::oid", name)
     assert await connection.fetchval("SELECT count(*) FROM " + name) == 0
-
-
-@pytest.mark.parametrize(
-    ("global_role", "membership_options"),
-    (
-        pytest.param("pg_write_all_data", "", id="pg_write_all_data"),
-        pytest.param("pg_read_all_data", "", id="pg_read_all_data"),
-        pytest.param("pg_write_all_data", " WITH INHERIT FALSE, SET TRUE", id="pg_write_all_data-set-only"),
-        pytest.param("pg_read_all_data", " WITH INHERIT FALSE, SET TRUE", id="pg_read_all_data-set-only"),
-    ),
-)
-async def test_aca_enrollment_rejects_effective_global_authority_outside_reader_subset(
-    permissions_db, global_role, membership_options
-):
-    from process.registry_aca_source_notification_permissions import (
-        install_registry_aca_source_notification_permissions,
-    )
-
-    fixture, connection = permissions_db, permissions_db.connection
-    await _install(fixture)
-    extra = fixture.roles_by_kind["api"]
-    await connection.execute(f'GRANT "{global_role}" TO "{extra}"' + membership_options)
-    try:
-        if membership_options:
-            assert await connection.fetchval("SELECT pg_has_role($1,$2,'SET')", extra, global_role)
-            assert not await connection.fetchval("SELECT pg_has_role($1,$2,'USAGE')", extra, global_role)
-            privilege = "INSERT" if global_role == "pg_write_all_data" else "SELECT"
-            assert not await connection.fetchval(
-                "SELECT has_any_column_privilege($1,$2,$3)",
-                extra,
-                f'"{fixture.schema}".registry_aca_source_notification',
-                privilege,
-            )
-        async with connection.transaction():
-            with pytest.raises(ValueError, match="grants_invalid"):
-                await install_registry_aca_source_notification_permissions(
-                    connection,
-                    control_schema=fixture.schema,
-                    publisher_role=fixture.roles_by_kind["publisher"],
-                    reader_roles=(fixture.roles_by_kind["ancestor"],),
-                    runtime_roles=tuple(sorted(fixture.roles_by_kind.values())),
-                )
-        assert not await connection.fetchval(
-            "SELECT has_any_column_privilege($1,$2,'INSERT')",
-            fixture.roles_by_kind["publisher"],
-            f'"{fixture.schema}".registry_aca_source_notification',
-        )
-    finally:
-        await connection.execute(f'REVOKE "{global_role}" FROM "{extra}"')
 
 
 async def test_aca_control_namespace_move_preserves_native_oid_acl_indexes_and_rows(permissions_db, monkeypatch):

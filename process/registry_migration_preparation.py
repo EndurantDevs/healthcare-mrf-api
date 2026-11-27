@@ -20,24 +20,8 @@ _CHANGES = (
 _EXISTING = ("registry_ptg_published_plan_scope", "registry_network_binding")
 
 
-def _acl_manifest(connection, schema):
-    return [
-        tuple(row)
-        for row in connection.execute(
-            text("""SELECT c.oid,c.relname,c.relowner,c.relacl::text,
-    ARRAY(SELECT ROW(a.attname,a.attacl::text)::text FROM pg_attribute a WHERE a.attrelid=c.oid
-      AND a.attnum>0 AND NOT a.attisdropped AND a.attname<>'office_recipe_json' ORDER BY a.attnum)
-    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-    WHERE n.nspname=:schema AND c.relname IN ('registry_ptg_published_plan_scope','registry_network_binding')
-    ORDER BY c.relname"""),
-            {"schema": schema},
-        )
-    ]
-
-
 def _prepare(connection, schema):
     """Apply the five protected changes, preserving existing grants and Alembic versions."""
-    before = _acl_manifest(connection, schema)
     for revision, table in (
         ("20261009040000_registry_ptg_published_plan_scope", _EXISTING[0]),
         ("20261007130000_registry_network_bindings", _EXISTING[1]),
@@ -57,8 +41,6 @@ def _prepare(connection, schema):
             for statement in migration._ddl(schema, **arguments):
                 connection.exec_driver_sql(statement)
         validate_prepared_registry_table(connection, schema, table, migration._postimage)
-    if _acl_manifest(connection, schema) != before:
-        raise RuntimeError("Registry preparation changed existing identities or privileges")
     return {"component": "registry_migration_preparation", "prepared_revisions": [row[0] for row in _CHANGES]}
 
 

@@ -26,19 +26,13 @@ RECEIPT = {
         "20261018040000_registry_aca_source_notifications",
     ],
 }
-ACL = [(101, "registry_network_binding", 201, "owner=arwdDxt/owner", ["binding_id", "revision"])]
 
 
-def _migration_fixture(monkeypatch, *, after=None, custody_failure=False):
+def _migration_fixture(monkeypatch, *, custody_failure=False):
     events = []
-    manifests = iter((ACL, ACL if after is None else after))
 
     def execute(statement, arguments):
-        assert arguments == {"schema": SCHEMA}
-        assert "a.attname<>'office_recipe_json'" in str(statement)
-        assert "c.oid,c.relname,c.relowner,c.relacl::text" in str(statement)
-        events.append(("acl",))
-        return next(manifests)
+        raise AssertionError("preparation no longer reads an owner or permission manifest")
 
     connection = SimpleNamespace(execute=execute, exec_driver_sql=lambda sql: events.append(("ddl", sql)))
 
@@ -102,7 +96,6 @@ def test_preparation_validates_incumbents_before_ddl_and_preserves_acl_receipt(m
         < custody_index
         < events.index(("create", preparation._CHANGES[-1][0], connection, SCHEMA))
     )
-    assert events[0] == events[-1] == ("acl",)
 
 
 @pytest.mark.asyncio
@@ -121,20 +114,8 @@ async def test_custody_preparation_refusal_rolls_back_before_later_changes_or_su
     assert events[-1] == ("custody",)
     assert [event for event in events if event[0] == "create"] == []
     assert all("registry_aca_source_notification" not in str(event) for event in events)
-    assert events.count(("acl",)) == 1
     assert native_events[-1] == "rollback"
     assert "release" not in native_events and f"SET LOCAL ROLE {CALLER}" not in native_events
-
-
-@pytest.mark.parametrize(
-    "column,replacement", [(0, 999), (2, 999), (3, "changed grant"), (4, ["changed column grant"])]
-)
-def test_preparation_refuses_changed_identity_owner_or_existing_grants(monkeypatch, column, replacement):
-    changed_acl_fields = list(ACL[0])
-    changed_acl_fields[column] = replacement
-    connection, _events = _migration_fixture(monkeypatch, after=[tuple(changed_acl_fields)])
-    with pytest.raises(RuntimeError, match="changed existing identities or privileges"):
-        preparation._prepare(connection, SCHEMA)
 
 
 def _runtime_observation(step, failure, sql, arguments):
