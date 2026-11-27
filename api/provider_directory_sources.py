@@ -34,13 +34,7 @@ DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifes
 RUNNABLE_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition"})
 # These sources can publish an acquisition before separate Profile qualification.
 PROFILE_OPT_IN_SOURCES = frozenset(
-    {
-        "cms-npd",
-        VSP_DIRECTORY_SOURCE_ID,
-        "pdfhir_0b5cfd565c53364a73981dcb",
-        "pdfhir_67f47e3af69543ce63cfbf6d",
-        NETWORK_SNAPSHOT_SOURCE_ID,
-    }
+    {"cms-npd", VSP_DIRECTORY_SOURCE_ID, "pdfhir_0b5cfd565c53364a73981dcb", NETWORK_SNAPSHOT_SOURCE_ID}
 )
 PUBLIC_ENTRY_FIELDS = (
     "entry_id",

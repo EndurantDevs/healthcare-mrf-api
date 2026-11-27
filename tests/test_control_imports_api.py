@@ -4745,11 +4745,10 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources(monkeypa
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (60, 47, 46)
+    ) == (60, 47, 47)
     assert len(catalog["catalog_digest"]) == 64
     assert len(runnable_items) == 47
     assert {entry["entry_id"] for entry in runnable_items if not entry["profile_enabled"]} == {
-        "kaiser",
         "uhc",
         "vsp-provider-directory",
     }
