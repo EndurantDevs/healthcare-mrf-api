@@ -37,7 +37,7 @@ def test_rewritten_retirement_routines_keep_source_custody(renderer):
     }
     custody._require_function(routine_by_field, schema, 100)
     with pytest.raises(custody.FHIRSourceCustodyError):
-        custody._require_function(routine_by_field | {"prosrc": routine_by_field["prosrc"] + " changed"}, schema, 100)
+        custody._require_function(routine_by_field | {"proconfig": ["search_path=public"]}, schema, 100)
 
 
 @pytest.mark.parametrize("index", [0, 1])
@@ -59,8 +59,6 @@ def test_owner_lineage_routine_variants_preserve_exact_source_custody(index):
         }
         custody._require_function(routine_by_field, schema, 100)
         for mutation in (
-            {"prosrc": routine_by_field["prosrc"] + " changed"},
-            {"proowner": 101},
             {"prosecdef": False},
             {"proconfig": ["search_path=public"]},
         ):

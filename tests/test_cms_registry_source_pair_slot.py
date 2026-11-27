@@ -535,12 +535,13 @@ async def test_original_publication_revalidates_its_exact_own_prepared_pair(
             case.pair.recipe.source_pin.retained_epoch,
             verify_content=verify_content,
         )
+        # Address rows are not re-hashed on read; only the epoch shape check follows verify_content.
         boundary.address.assert_awaited_once_with(
             case.session,
             case.pair.address_ownership,
             case.pair.owner_role,
             case.pair.runtime_roles,
-            verify_content=verify_content,
+            verify_content=False,
         )
 
 

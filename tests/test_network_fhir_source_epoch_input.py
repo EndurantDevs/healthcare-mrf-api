@@ -303,3 +303,39 @@ async def test_retained_fhir_source_binds_published_partition_names(monkeypatch,
     else:
         with pytest.raises(custody.FHIRSourceCustodyError, match="^fhir_source_custody_unavailable$"):
             await custody._generic_partitioned_custody(connection, source_pin, "source_owner", ("source_reader",))
+
+
+@pytest.mark.asyncio
+async def test_reader_pin_does_not_reprove_family_or_control_receipts(monkeypatch):
+    from process import provider_directory_generic_source_provision as provision
+    from process import provider_directory_generic_source_storage as storage
+
+    source_pin = SimpleNamespace(schema_name="synthetic", endpoint_id="endpoint", dataset_sha256="d" * 64)
+    source_policy = SimpleNamespace(schema="synthetic", owner_role="owner", runtime_roles=("reader",))
+    publisher = SimpleNamespace(connection=object(), policy=source_policy)
+    roots = (storage.RESOURCE, storage.WITNESS, storage.RELATIONSHIP)
+    binding_by_field = {
+        "identity": {"acquisition_root_run_id": "run"},
+        "tables": {root: {"name": root + "_child"} for root in roots},
+    }
+    header_by_field = dict(
+        acquisition_root_run_id="run", content_proof_admission_sha256="a" * 64, publication_metadata_sha256="b" * 64
+    )
+    coverage, controls, family = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(pin, "_header", AsyncMock(return_value=header_by_field))
+    monkeypatch.setattr(
+        pin.custody, "_generic_partitioned_custody", AsyncMock(return_value={"binding": binding_by_field})
+    )
+    monkeypatch.setattr(pin, "capture_source_coverage_control", coverage)
+    monkeypatch.setattr(pin, "capture_source_cms_epoch_controls", controls)
+    monkeypatch.setattr(provision, "verify_generic_source_family", family)
+    monkeypatch.setattr(storage, "_verify_tables", AsyncMock())
+
+    _policy, _header, native, relations = await pin._capture(publisher, source_pin, "a" * 64, "b" * 64)
+    driver = SimpleNamespace(execute=AsyncMock())
+    await pin._pin(driver, source_policy, native, relations)
+
+    coverage.assert_awaited_once_with(publisher.connection, source_policy)
+    controls.assert_awaited_once_with(publisher.connection, source_policy)
+    family.assert_not_awaited()
+    assert driver.execute.await_args.args[0].startswith("LOCK TABLE ")

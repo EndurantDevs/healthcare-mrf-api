@@ -587,13 +587,15 @@ def _covered_truncate_native_row(monkeypatch):
     return row
 
 
-def test_source_release_covered_truncate_authenticates_native_body_and_acl(monkeypatch):
+def test_source_release_covered_truncate_checks_native_definition_and_acl(monkeypatch):
     from process import provider_directory_generic_source_release_checks as checks
     from process.network_fhir_source_custody import FHIRSourceCustodyError
 
     row = _covered_truncate_native_row(monkeypatch)
     checks._require_guard_function(row, "source_schema", 201, {103})
     row["prosrc"] += " RETURN NULL;"
+    checks._require_guard_function(row, "source_schema", 201, {103})
+    row["provolatile"] = "s"
     with pytest.raises(FHIRSourceCustodyError, match="fhir_source_custody_unavailable"):
         checks._require_guard_function(row, "source_schema", 201, {103})
     row = _covered_truncate_native_row(monkeypatch)

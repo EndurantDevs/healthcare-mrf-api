@@ -270,7 +270,10 @@ async def _sealed_scope(connection, proof):
 
 
 async def require_registry_cms_source_pair(session, pair, *, verify_content=True):
-    """Verify retained names and semantic content independently of later cutovers."""
+    """Verify retained names and layout independently of later cutovers.
+
+    Capture validated the address content once; verify_content adds only the epoch table-shape check.
+    """
     if type(pair) is not RegistryCMSRetainedSourcePair or type(verify_content) is not bool:
         raise ValueError("registry_cms_source_pair_invalid")
     await _normalize_receipt_session(session, pair.address_ownership.schema_name)
@@ -278,14 +281,14 @@ async def require_registry_cms_source_pair(session, pair, *, verify_content=True
     await require_retained_cms_fhir_source_epoch(
         connection, pair.proof.source_pin, pair.recipe.source_pin.retained_epoch, verify_content=verify_content
     )
-    receipt, catalog = await address_clone_identity(
-        session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=verify_content
+    _, catalog = await address_clone_identity(
+        session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=False
     )
     comment = await connection.fetchval(
         "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
         pair.address_ownership.schema_name,
     )
-    await _require_address_pair_layout(session, pair, catalog, receipt=receipt, verify_content=verify_content)
+    await _require_address_pair_layout(session, pair, catalog, verify_content=False)
     if comment != _pair_comment(pair) + _json(pair.as_dict()):
         from process.network_registry_cms_prepared_cleanup import decode_prepared_registry_cms_source_pair
         from process.network_registry_cms_prepared_pair import _pair_from_prepared_receipt

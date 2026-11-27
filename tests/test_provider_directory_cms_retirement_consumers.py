@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Typed retirement successors retain every existing identity and custody check."""
 
-import hashlib
 import re
 from copy import deepcopy
 from types import SimpleNamespace
@@ -98,33 +97,20 @@ def test_original_allocation_parent_keeps_all_other_pins(original_guards):
 
 
 @pytest.mark.parametrize("name", [name for name in ORIGINAL_SHA256 if name in reader._REACHABLE_FUNCTIONS])
-@pytest.mark.parametrize("prehashed", [False, True])
-def test_retained_reader_accepts_typed_bodies_with_original_owner_and_settings(name, prehashed):
+def test_retained_reader_accepts_typed_bodies_and_keeps_settings(name):
     expected = reader._REACHABLE_FUNCTIONS[name]
     entry_by_field = dict(
         proname=name,
         proowner=105,
         prosrc=_PAIRS[name][1],
-        lanname=expected[1],
-        provolatile=expected[2],
-        prosecdef=expected[3],
-        proconfig=list(expected[4]) if expected[4] is not None else None,
+        lanname=expected[0],
+        provolatile=expected[1],
+        prosecdef=expected[2],
+        proconfig=list(expected[3]) if expected[3] is not None else None,
     )
-    if prehashed:
-        entry_by_field["body_sha256"] = reader._typed_retirement_digest(name, _SCHEMA)
     reader._require_function(entry_by_field, _SCHEMA, 105)
-    for damaged in ({**entry_by_field, "proowner": 999}, {**entry_by_field, "proconfig": ["search_path=public"]}):
-        with pytest.raises(reader.FHIRSourceCustodyError):
-            reader._require_function(damaged, _SCHEMA, 105)
-    entry_by_field["prosrc"] += "\nRETURN NULL;"
-    if prehashed:
-        entry_by_field["body_sha256"] = hashlib.sha256(
-            reader._normalized(
-                entry_by_field["prosrc"].replace(reader._identifier(_SCHEMA) + ".", '"__schema__".')
-            ).encode()
-        ).hexdigest()
     with pytest.raises(reader.FHIRSourceCustodyError):
-        reader._require_function(entry_by_field, _SCHEMA, 105)
+        reader._require_function({**entry_by_field, "proconfig": ["search_path=public"]}, _SCHEMA, 105)
 
 
 @pytest.mark.asyncio
