@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 
+from api import network_compact_address
 from api.network_address_scope import network_address_read_scope, scoped_address_parameters, scoped_address_relation_sql
 from api.network_compact_address import compact_address_native_sql, compact_city_page, compact_city_search_relation
 from api.provider_list_sql import _address_zip5_filter
@@ -209,6 +210,54 @@ async def test_published_city_search_preserves_inferred_and_non_geocoded_offices
 
     for network_ids, expected_npis in (((42,), []), ((42, 99), [2222222222]), ((99,), [2222222222]), ((88,), [])):
         await _assert_published_city_search(db.connection, projected, network_ids, expected_npis)
+
+
+_EVERY_TAXONOMY = "CROSS JOIN (SELECT ARRAY(SELECT generate_series(0, 9)) AS int_codes) AS q"
+_SEARCH_CLAUSES = ["c.taxonomy_array && q.int_codes", "c.type IN ('primary','secondary','practice','site')"]
+
+
+async def _union_page_npis(connection, layout, network_ids):
+    """Run the search page and the ordinary page as the two arms of one statement, as a provider list does."""
+    key_ctes, page_sql, fallback = network_compact_address.compact_network_search_page(
+        layout, network_ids, _SEARCH_CLAUSES, _EVERY_TAXONOMY
+    )
+    compiled = text(f"WITH {key_ctes} ({page_sql}) UNION ALL (ORDINARY_PAGE)").compile(dialect=PGDialect_asyncpg())
+    binds_by_name = {"_canonical_network_ids": list(network_ids), "limit": 100, "start": 0}
+    page_binds = [binds_by_name[name] for name in compiled.positiontup]
+    ordinary_sql, ordinary_binds = compact_address_native_sql(
+        layout, first_parameter=len(page_binds) + 1, network_ids=network_ids
+    )
+    ordinary_page = (
+        f"SELECT DISTINCT coalesce(c.npi,c.inferred_npi) AS npi FROM {ordinary_sql} c {_EVERY_TAXONOMY} "
+        f"WHERE {' AND '.join(_SEARCH_CLAUSES)} AND {fallback} ORDER BY npi"
+    )
+    statement = str(compiled).replace("ORDINARY_PAGE", ordinary_page)
+    found_rows = await connection.fetch(statement, *page_binds, *ordinary_binds)
+    return [found_row[0] for found_row in found_rows]
+
+
+@pytest.mark.asyncio
+async def test_network_search_page_reads_small_selections(search_db, monkeypatch):
+    db, layout = search_db, search_db.second_layout
+    await db.connection.execute(f"UPDATE {search._qualified(layout.base)} SET taxonomy_array='{{1}}'")
+    await db.connection.execute(f"UPDATE {search._qualified(layout.custom)} SET taxonomy_array='{{2}}'")
+    descriptor = await search.prepare_network_geo_search(db.connection, db.search_target, layout)
+    candidate = _candidate(db.search_target, layout, descriptor)
+    assert bind_compact_geo_search_candidate(layout, candidate).network_search is None
+    candidate["validation_json"]["serving_readiness"]["network_search"] = True
+    projected = bind_compact_geo_search_candidate(layout, candidate)
+    index_records = await search._index_records(db.connection, search._qualified(projected.network_search))
+    definition_by_name = {index["name"]: index["definition"] for index in index_records}
+    assert "USING gin (canonical_network_ids" in definition_by_name[search._NETWORK_INDEX]
+    assert search._NETWORK_INDEX not in {index["name"] for index in descriptor["indexes"]}
+
+    selections = ((42,), (42, 99), (99,), (88,))
+    search_pages = [await _union_page_npis(db.connection, projected, network_ids) for network_ids in selections]
+    assert any(search_pages)
+    # Above the bound the search arm reads nothing and the ordinary arm answers alone, with the same providers.
+    monkeypatch.setattr(network_compact_address, "SEARCH_PAGE_MEMBERSHIPS", -1)
+    ordinary_pages = [await _union_page_npis(db.connection, projected, network_ids) for network_ids in selections]
+    assert search_pages == ordinary_pages
 
 
 @pytest.mark.asyncio

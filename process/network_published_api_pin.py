@@ -121,6 +121,7 @@ def published_network_layout(candidate, *, retained_base_name=None):
 
         bind_compact_geo_search(layout, CompactAddressRelation(schema, search["table_name"]))
         object.__setattr__(layout, "_city_search", serving.get("city_search") is True)
+        object.__setattr__(layout, "_network_search", serving.get("network_search") is True)
     return layout
 
 

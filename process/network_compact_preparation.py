@@ -144,7 +144,7 @@ async def prepare_compact_network_readiness(
             connection, copy_target.schema_name, include_reuse_keys=has_typed_memberships
         ),
         **({"slice_ref_revision": 2} if has_typed_memberships else {}),
-        **({"geo_search": geo_search, "city_search": True} if geo_search is not None else {}),
+        **({"geo_search": geo_search, "city_search": True, "network_search": True} if geo_search is not None else {}),
         **await independent_network_storage_metadata(connection, candidate, physical, control_schema=control_schema),
     }
     await connection.execute(

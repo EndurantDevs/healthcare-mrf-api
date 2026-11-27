@@ -9143,7 +9143,7 @@ async def list_providers(
             _runtime_db_schema(),
             start + limit,
             is_plain=is_npi_order and is_native_only and page_import_context is None and not phone_digits,
-            taxonomy_join=taxonomy_source if use_taxonomy_filter else "",
+            taxonomy_page=(taxonomy_source if use_taxonomy_filter else "", selected_keys),
         )
         hydration_source = address_source
         if network_page is not None:
