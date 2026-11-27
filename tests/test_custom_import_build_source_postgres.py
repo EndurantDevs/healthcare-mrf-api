@@ -283,9 +283,7 @@ async def test_global_admission_handles_duplicates_invalid_presence_and_orphan_p
     async with _source_case() as case:
         request = await _retained_request(case, records_by_stream=records_by_stream)
         outcome = await staging.stage_segmented_source(case.sessions, request)
-        assert (
-            outcome.phase == "rejected" and outcome.source_occurrence_count == 7 and outcome.candidate_error_count == 1
-        )
+        assert outcome.phase == "graph" and outcome.source_occurrence_count == 7 and outcome.candidate_error_count == 0
         async with case.sessions() as session, session.begin():
             models = await session.run_sync(_candidate_models, request)
             occurrence_model = models[CustomImportBuildOccurrence]

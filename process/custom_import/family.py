@@ -249,7 +249,6 @@ def _admit_child_records(
                 continue
             root_key = _parent_key(child_record, collection)
             if root_key is None or root_key not in root_records_by_key:
-                candidate_error_codes.add("orphan_child")
                 continue
             rejection_code = _record_error(
                 child_record,

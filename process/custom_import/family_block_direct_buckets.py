@@ -73,7 +73,8 @@ _COMMITMENT_COLUMNS = (
     "retained",
 )
 _REJECTED_ROOT_COLUMNS = ("raw_key_sha256", "typed_key_sha256", "canonical_typed_key")
-_CANDIDATE_CODES = frozenset({"root_not_object", "root_key_missing", "child_not_object", "orphan_child"})
+_CANDIDATE_CODES = frozenset({"root_not_object", "root_key_missing", "child_not_object"})
+_UNKEYED_CODES = _CANDIDATE_CODES | frozenset({"orphan_child"})
 _UNKEYED_ROOT_CODES = frozenset({"root_not_object", "root_key_missing"})
 
 _STAGE_SELECT_SQL = (
@@ -378,9 +379,10 @@ def _collect_unkeyed_and_orphan_rejections(
     source_rejections = candidate_errors = 0
     for unkeyed in unkeyed_rows:
         code = unkeyed[_COL_INITIAL_CODE]
-        if code not in _CANDIDATE_CODES:
+        if code not in _UNKEYED_CODES:
             raise FamilyBlockUnavailable("unkeyed source row lacks a candidate error code")
-        candidate_errors += 1
+        if code in _CANDIDATE_CODES:
+            candidate_errors += 1
         if code in _UNKEYED_ROOT_CODES:
             source_rejections += 1
         rej_hash = unkeyed[_COL_REJ_HASH]
@@ -401,7 +403,8 @@ def _collect_unkeyed_and_orphan_rejections(
         for child_entry in orphan_children:
             initial_code = child_entry[_COL_INITIAL_CODE]
             effective_code = "child_not_object" if initial_code == "child_not_object" else "orphan_child"
-            candidate_errors += 1
+            if effective_code in _CANDIDATE_CODES:
+                candidate_errors += 1
             typed_hash = child_entry[_COL_TYPED_HASH]
             rejection_emits.append(
                 _RejectionEmit(
@@ -552,12 +555,13 @@ def _admit_single_family(
     )
     if is_typed_dup:
         family_rejections.append(_emit_from_staged(first_root, "duplicate_root_key"))
+    cand_error_count = sum(1 for emit in candidate_emits if emit.code in _CANDIDATE_CODES)
     if family_codes or is_typed_dup:
         return (
             None,
             [*candidate_emits, *family_rejections],
             len(family_codes) if family_codes else 1,
-            len(candidate_emits),
+            cand_error_count,
         )
     if typed_hash is None or first_root[_COL_PACKED_SLOTS] is None:
         raise FamilyBlockUnavailable("accepted root lacks typed identity or payload")
@@ -574,7 +578,7 @@ def _admit_single_family(
         raw_children_by_slot=raw_by_slot,
         unpacked_children_by_slot=None,
     )
-    return bundle, candidate_emits, 0, len(candidate_emits)
+    return bundle, candidate_emits, 0, cand_error_count
 
 
 def _bucket_admission_maps(

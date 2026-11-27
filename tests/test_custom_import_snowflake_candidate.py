@@ -549,7 +549,9 @@ def test_bridge_preserves_generic_child_rejection(child_values):
     admitted = assemble_root_families(request.definition, prepared.roots, {"details": children})
 
     if child_values == ("orphan",):
-        assert admitted.candidate_errors == ("orphan_child",)
+        assert admitted.candidate_errors == ()
+        assert len(admitted.families) == 1
+        assert admitted.families[0].children == {"details": ()}
     else:
         assert admitted.families == ()
         assert [rejection.code for rejection in admitted.rejections] == ["duplicate_child_key"]

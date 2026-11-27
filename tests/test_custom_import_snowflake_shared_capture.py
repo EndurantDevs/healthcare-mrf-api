@@ -256,7 +256,9 @@ def test_shared_capture_preserves_distinct_parent_columns(monkeypatch):
     replay = prepare_bundle_replay(connector.acquire(request))
     assert replay.roots[0]["npi"] != replay.children_by_collection["details"][0]["detail_npi"]
     families = assemble_root_families(definition, replay.roots, replay.children_by_collection)
-    assert families.candidate_errors == ("orphan_child",)
+    assert families.candidate_errors == ()
+    assert len(families.families) == 1
+    assert families.families[0].children["details"] == ()
     assert cursor.closed and connection.closed
 
 

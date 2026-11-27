@@ -360,18 +360,33 @@ async def _reference_pages(session, table, family_id):
             raise SnapshotRetirementRefused("snapshot retirement retains a revision reference")
 
 
+_DIRECT_STAGE_OPTIONAL_NAMES = (
+    "custom_import_block_query_input",
+    "direct_stage_progress",
+    "direct_stage_volatile_guard",
+    "direct_stage_commitments",
+    "direct_stage_rejected_roots",
+)
+
+
 async def _optional_relation_names(session, family_id):
     return tuple(
         await session.scalars(
             text("""
         SELECT c.relname FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname=:namespace AND c.relname=ANY(CAST(:names AS text[]))
+        WHERE n.nspname=:namespace AND c.relkind='r'
+          AND (c.relname=ANY(CAST(:names AS text[])) OR c.relname ~ '^direct_stage_p_[0-9]+$')
         ORDER BY c.relname
     """),
             {
                 "namespace": snapshot_schema(family_id),
-                "names": ["source_bulk_landing", "legacy_copy_origin", *COMPACT_TABLE_NAMES],
+                "names": [
+                    "source_bulk_landing",
+                    "legacy_copy_origin",
+                    *COMPACT_TABLE_NAMES,
+                    *_DIRECT_STAGE_OPTIONAL_NAMES,
+                ],
             },
         )
     )

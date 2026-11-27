@@ -334,7 +334,7 @@ failures AS MATERIALIZED (
 )
 SELECT (SELECT f.problem FROM failures f ORDER BY f.occurrence_id,f.stage LIMIT 1) fatal_code,
     count(*)::integer rows_processed,coalesce(max(d.occurrence_id),:admission_after_occurrence_id) last_id,
-    count(*) FILTER (WHERE d.error_code IN ('root_not_object','root_key_missing','child_not_object','orphan_child')) errors,
+    count(*) FILTER (WHERE d.error_code IN ('root_not_object','root_key_missing','child_not_object')) errors,
     coalesce(jsonb_agg(jsonb_build_object(
         'occurrence_id',d.occurrence_id,'parent_id',d.parent_id,'record_kind',d.record_kind,
         'pack_id',d.pack_id,'source_ordinal',d.source_ordinal,'collection_slot',d.collection_slot,

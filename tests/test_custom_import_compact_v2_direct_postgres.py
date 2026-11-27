@@ -437,57 +437,112 @@ async def test_direct_v2_retention_and_rollback(monkeypatch):
             assert receipt.to_generation_id == base_out.generation_id
 
 
+async def _run_direct_v2_case(monkeypatch, case, source_rows, *, dataset_key: str, idempotency_key: str):
+    await _install_compact_schema(case)
+    policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16, 65_536, 2000, 120, 300))
+    connector, bundle, adapter, cursor, connection = _runtime(
+        monkeypatch, source_rows, interleaved=True, partition_rows=2, processing_policy=policy
+    )
+    bundle = connector.prepare_request(
+        _read_definition(bundle.definition, nullable_other=True),
+        bindings=bundle.bindings,
+        encoding=bundle.encoding,
+        processing_policy=policy,
+    )
+    monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
+    async with case.sessions() as session, session.begin():
+        registered = await register_snowflake_source_binding(
+            session,
+            dataset_key=dataset_key,
+            definition=bundle.definition,
+            binding=_binding(connector.build_statement(bundle), policy),
+        )
+    request = SnowflakeBundleCandidateRequest(
+        dataset_id=registered.dataset_id,
+        definition_revision_id=registered.definition_revision_id,
+        schema_revision_id=registered.schema_revision_id,
+        definition=bundle.definition,
+        bundle_request=bundle,
+        idempotency_key=idempotency_key,
+        lease_token=f"{idempotency_key}-lease".encode(),
+        source_binding_revision_id=registered.source_binding_revision_id,
+        source_binding_sha256=registered.source_binding_sha256,
+    )
+    return await runner.run_segmented_snowflake_candidate(
+        case.sessions, connector, request, processing_policy=policy, direct_compact=True
+    )
+
+
 @pytest.mark.asyncio
-async def test_direct_v2_orphan_child_rejects(monkeypatch):
-    """Orphan child rows transition direct compact v2 builds cleanly to candidate_rejected."""
+async def test_direct_v2_orphan_child_is_ignored_and_publishes(monkeypatch):
+    """Orphan child rows are ignored while valid families publish cleanly in direct compact v2."""
     orphan_rows = [
         _shared_row("1003000126", key="k1", amount=Decimal("1.0")) + (None, None, None),
         (1, 2, "other_source", None, None, None, None, None, None, None, "1234567893", "orphan-k", Decimal("2.0")),
     ]
     async with _source_case() as case:
-        await _install_compact_schema(case)
-        policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16, 65_536, 2000, 120, 300))
-        connector, bundle, adapter, _cursor, connection = _runtime(
-            monkeypatch, orphan_rows, interleaved=True, partition_rows=2, processing_policy=policy
+        outcome = await _run_direct_v2_case(
+            monkeypatch, case, orphan_rows, dataset_key="synthetic_orphan_v2", idempotency_key="orphan-v2-1"
         )
-        bundle = connector.prepare_request(
-            _read_definition(bundle.definition, nullable_other=True),
-            bindings=bundle.bindings,
-            encoding=bundle.encoding,
-            processing_policy=policy,
-        )
-        monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, _cursor))
-        async with case.sessions() as session, session.begin():
-            registered = await register_snowflake_source_binding(
-                session,
-                dataset_key="synthetic_orphan_v2",
-                definition=bundle.definition,
-                binding=_binding(connector.build_statement(bundle), policy),
+        assert outcome.status == "activated"
+        assert (outcome.accepted_family_count, outcome.rejection_count) == (1, 0)
+        async with case.sessions() as session:
+            build = (await session.scalars(select(CustomImportBuildAttempt))).one()
+            execution = await session.get(CustomImportExecution, outcome.execution_id)
+            assert build.phase == "verified" and build.candidate_error_count == 0
+            assert execution.state == "completed"
+            assert len((await session.scalars(select(CustomImportGenerationSeal))).all()) == 1
+            family_id = await session.scalar(
+                select(CustomImportSnapshotFamily.family_id).where(
+                    CustomImportSnapshotFamily.generation_id == outcome.generation_id
+                )
             )
-        request = SnowflakeBundleCandidateRequest(
-            dataset_id=registered.dataset_id,
-            definition_revision_id=registered.definition_revision_id,
-            schema_revision_id=registered.schema_revision_id,
-            definition=bundle.definition,
-            bundle_request=bundle,
-            idempotency_key="orphan-v2-1",
-            lease_token=b"orphan-v2-lease",
-            source_binding_revision_id=registered.source_binding_revision_id,
-            source_binding_sha256=registered.source_binding_sha256,
+            rej_codes = (
+                await session.scalars(text(f'SELECT code FROM "ci_snapshot_{family_id}".custom_import_rejection'))
+            ).all()
+            assert rej_codes == ["orphan_child"]
+
+
+@pytest.mark.asyncio
+async def test_direct_v2_root_key_missing_rejects_and_drops_stage_tables(monkeypatch):
+    """Unkeyed root rows still reject direct compact v2 builds and drop staging/query-input tables."""
+    bad_rows = [
+        _shared_row("1003000126", key="k1", amount=Decimal("1.0")) + (None, None, None),
+        _shared_row(None, key="k2", amount=Decimal("2.0")) + (None, None, None),
+    ]
+    async with _source_case() as case:
+        outcome = await _run_direct_v2_case(
+            monkeypatch,
+            case,
+            bad_rows,
+            dataset_key="synthetic_unkeyed_root_v2",
+            idempotency_key="unkeyed-root-v2-1",
         )
-        outcome = await runner.run_segmented_snowflake_candidate(
-            case.sessions, connector, request, processing_policy=policy, direct_compact=True
-        )
-        assert outcome.status == "candidate_rejected" and (outcome.accepted_family_count, outcome.rejection_count) == (
-            1,
-            0,
-        )
+        assert outcome.status == "candidate_rejected"
+        assert (outcome.accepted_family_count, outcome.rejection_count) == (1, 1)
         async with case.sessions() as session:
             build = (await session.scalars(select(CustomImportBuildAttempt))).one()
             execution = await session.get(CustomImportExecution, outcome.execution_id)
             assert build.phase == "rejected" and build.candidate_error_count == 1
             assert execution.state == "failed"
             assert (await session.scalars(select(CustomImportGenerationSeal))).all() == []
+            family_id = await session.scalar(
+                select(CustomImportSnapshotFamily.family_id).where(
+                    CustomImportSnapshotFamily.execution_id == outcome.execution_id
+                )
+            )
+            leftover = (
+                await session.scalars(
+                    text(
+                        "SELECT c.relname FROM pg_catalog.pg_class c "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+                        "WHERE n.nspname=:schema "
+                        "AND (c.relname LIKE 'direct_stage_%' OR c.relname = 'custom_import_block_query_input')"
+                    ),
+                    {"schema": f"ci_snapshot_{family_id}"},
+                )
+            ).all()
+            assert leftover == []
 
 
 def _sign_hosted_permit(
