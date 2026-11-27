@@ -7,8 +7,7 @@ This module never issues that authority or binds a SOURCE context.
 """
 
 import json
-import re
-from datetime import datetime, timezone
+from datetime import datetime
 from types import SimpleNamespace
 
 from sqlalchemy import JSON
@@ -136,78 +135,6 @@ async def _read_header(workspace, expected_by_field):
     return actual
 
 
-async def _native_tables(workspace, handoff, native, is_named, roots):
-    """Compare declared names while accepting the old stored-name receipt shape."""
-    from process.provider_directory_cms_prepared_allocation import read_cms_generic_copy_tables
-
-    if is_named:
-        expected_by_root = {root: handoff.document["tables"][root] for root in roots}
-        observed_by_root = native["tables"]
-    else:
-        expected_by_root = await read_cms_generic_copy_tables(workspace)
-        observed_by_root = {}
-        for root, table in native["tables"].items():
-            _require(
-                type(table) is dict and set(table) in ({"schema", "name"}, {"name", "oid", "owner", "layout_sha256"}),
-                "native_publication_changed",
-            )
-            observed_by_root[root] = {"schema": table.get("schema", workspace.catalog_schema), "name": table["name"]}
-    _require(observed_by_root == expected_by_root, "native_publication_changed")
-
-
-async def _native_component(workspace, handoff, header, payloads, native):
-    """Compare native-four data; Control separately authenticates its claim and authority."""
-    _require(type(native) is dict, "native_publication_required")
-    native = json.loads(json.dumps(native, allow_nan=False))
-    roots = storage.RELATIONS[:4]
-    counts_by_root = {root: payloads["row_counts"][root] for root in roots}
-    is_named = native.get("contract") == "generic-source-named-publication-v1"
-    fields = {
-        "contract",
-        "dataset_id",
-        "endpoint_id",
-        "run_id",
-        "attempt_id",
-        "source_handoff_sha256",
-        "tables",
-        "counts",
-        "completed_at",
-    }
-    if not is_named:
-        fields.update({"frozen_sha256", "validation_sha256"})
-    _require(
-        set(native) == fields
-        and native.get("contract") in {"generic-source-canonical-copy-v1", "generic-source-named-publication-v1"}
-        and native.get("dataset_id") == workspace.identity["dataset_id"]
-        and native.get("endpoint_id") == workspace.identity["endpoint_id"]
-        and native.get("source_handoff_sha256") == handoff.document_sha256
-        and native.get("counts") == counts_by_root
-        and all(type(count) is int and count >= 0 for count in native["counts"].values())
-        and counts_by_root[storage.RESOURCE] == handoff.document["admission"]["resource_count"]
-        and all(type(native.get(key)) is str and 0 < len(native[key]) <= 128 for key in ("run_id", "attempt_id"))
-        and (
-            is_named
-            or all(
-                type(native.get(key)) is str and re.fullmatch(r"[0-9a-f]{64}", native[key])
-                for key in ("frozen_sha256", "validation_sha256")
-            )
-        )
-        and type(native.get("tables")) is dict
-        and set(native["tables"]) == set(roots),
-        "native_publication_changed",
-    )
-    try:
-        stamp = datetime.fromisoformat(native["completed_at"])
-        _require(stamp.utcoffset() is not None, "native_publication_changed")
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("cms_prepared_candidate_native_publication_changed") from error
-    _require(
-        stamp.astimezone(timezone.utc).replace(tzinfo=None) == header["published_at"], "native_publication_changed"
-    )
-    await _native_tables(workspace, handoff, native, is_named, roots)
-    return native
-
-
 async def _descriptor(workspace, header, coverage_proof_by_field):
     canonical = storage_relation(workspace.catalog_schema, storage.HEADER)
     rows = await workspace.connection.fetch(
@@ -259,7 +186,7 @@ async def _candidate_report(workspace, handoff, header, identities, payloads):
     }
 
 
-async def read_prepared_cms_candidate(workspace, handoff, *, native_publication=None):
+async def read_prepared_cms_candidate(workspace, handoff):
     """Read complete noncurrent data evidence; this does not authenticate authority.
 
     The caller holds its qualified fence or pinned snapshot and may retain this
@@ -269,29 +196,7 @@ async def read_prepared_cms_candidate(workspace, handoff, *, native_publication=
     header = await _read_header(workspace, expected_header)
     identities = await read_prepared_cms_identity_publication(workspace, handoff)
     payloads = await verify_prepared_cms_payloads(workspace, handoff)
-    if header["status"] == "published":
-        payloads["native_publication"] = await _native_component(
-            workspace, handoff, header, payloads, native_publication
-        )
-    return await _candidate_report(workspace, handoff, header, identities, payloads)
-
-
-async def read_prepared_cms_generic_candidate(workspace, handoff, *, allocation, native_publication):
-    """Read the four copied targets while the two closed CMS heaps remain unattached."""
-    from process.provider_directory_cms_prepared_payload_publication import verify_allocated_cms_generic_payloads
-
-    _, expected_header = await _inputs(workspace, handoff)
-    header = await _read_header(workspace, expected_header)
-    _require(
-        header["status"] == "published"
-        and header["is_current"] is False
-        and header["published_at"] is not None
-        and header["superseded_at"] is None,
-        "published_noncurrent_required",
-    )
-    identities = await read_prepared_cms_identity_publication(workspace, handoff)
-    payloads = await verify_allocated_cms_generic_payloads(workspace, handoff, allocation=allocation)
-    payloads["native_publication"] = await _native_component(workspace, handoff, header, payloads, native_publication)
+    _require(header["status"] != "published", "native_publication_required")
     return await _candidate_report(workspace, handoff, header, identities, payloads)
 
 

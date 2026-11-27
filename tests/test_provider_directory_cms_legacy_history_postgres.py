@@ -10,11 +10,28 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from db.connection import Database
-from db.plan_release_storage import storage_relation
+from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_legacy_history as history
+from process import provider_directory_cms_prepared_workspace as workspace
 from tests.test_provider_directory_cms_canonical_layout_postgres import native_layout
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
+
+
+def _parent_statements(schema, root, name):
+    """Render an empty LIST parent with the fixed private payload columns, constraints and indexes."""
+    relation = storage_relation(schema, name)
+    constraints = [
+        "CONSTRAINT " + storage_identifier(name + "_pkey" if kind == "p" else key) + " " + definition
+        for key, kind, definition, _columns in workspace._payload_constraints(root)
+        if kind in {"c", "p", "u"}
+    ]
+    columns = ",".join(workspace._layouts()[root][0] + constraints)
+    yield f"CREATE TABLE {relation}({columns}) PARTITION BY LIST(dataset_id)"
+    for index, (_key, definition, *_semantics, primary) in enumerate(workspace._LAYOUTS[root]["indexes"]):
+        if not primary:
+            method = definition.split(" USING ", 1)[1]
+            yield f"CREATE INDEX {storage_identifier(name + '_i' + str(index))} ON {relation} USING {method}"
 
 
 @asynccontextmanager
@@ -218,7 +235,6 @@ async def test_native_composite_anti_joins_reject_cross_dataset_orphans(native_l
 
 async def test_named_history_capture_reads_actual_plan_metadata_and_complete_content(native_layout):
     from process import provider_directory_cms_history_capture as capture
-    from process import provider_directory_cms_snapshot_parents as parents
 
     parents_by_root = {
         root: {"schema": "mrf", "name": "history_future_" + str(index)}
@@ -226,7 +242,7 @@ async def test_named_history_capture_reads_actual_plan_metadata_and_complete_con
     }
     try:
         for root, relation in parents_by_root.items():
-            for statement in parents.cms_snapshot_parent_statements("mrf", root, relation["name"]):
+            for statement in _parent_statements("mrf", root, relation["name"]):
                 await native_layout.execute(statement)
         async with _reader(native_layout) as reader:
             record_by_field = await capture.capture_cms_history_data(
