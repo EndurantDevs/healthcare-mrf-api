@@ -48,36 +48,17 @@ for relative_path, expected_hash in manifest["files"].items():
     assert hashlib.sha256(installed_path.read_bytes()).hexdigest() == expected_hash
 assert not {"db.connection", "db.models", "click", "arq"}.intersection(sys.modules)
 
-from process.plan_pricing_control_catalog import NATIVE_RUN_COLUMNS
-from process.plan_pricing_no_work import RETRY_NATIVE_PREDICATE, require_native_control_shape
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_source_lifecycle_lock
 
 class NativeContract:
     def __init__(self):
-        self.columns = list(NATIVE_RUN_COLUMNS)
         self.statements = []
-
-    async def fetch(self, query, *args):
-        assert "pg_attribute" in query
-        return [{"attname": name, "type": "timestamp without time zone"} for name in self.columns]
-
-    async def fetchrow(self, query, *args):
-        assert "pg_index" in query
-        return {"valid": True, "keys": ["retry_of_run_id", "run_id"], "predicate": RETRY_NATIVE_PREDICATE}
 
     async def execute(self, statement, parameters):
         self.statements.append((str(statement), parameters))
 
 async def verify_native_contracts():
     connection = NativeContract()
-    await require_native_control_shape(connection)
-    connection.columns.pop()
-    try:
-        await require_native_control_shape(connection)
-    except ValueError as error:
-        assert "native_run_columns_changed" in str(error)
-    else:
-        raise AssertionError("changed native columns were accepted")
     assert await acquire_ptg2_source_lifecycle_lock(connection, source_key="synthetic_source") == "synthetic_source"
     assert len(connection.statements) == 3
     assert connection.statements[0][1] == {"lock_timeout": "500ms", "statement_timeout": "5s"}

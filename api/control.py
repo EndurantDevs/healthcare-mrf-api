@@ -384,9 +384,10 @@ async def control_get_import(request, run_id: str):
 
     _require_control_auth(request)
     if "evidence" in request.args:
-        from api.plan_pricing_no_work_http import pricing_no_work_response
-
-        return await pricing_no_work_response(request, run_id)
+        if request.args.getlist("evidence") != ["managed-pricing-no-work-v1"]:
+            raise BadRequest("unsupported pricing control evidence selector")
+        # No deployment configures the managed pricing control schema, so no run has this evidence.
+        raise SanicException("pricing no-work evidence is not qualified", status_code=409)
     run = await get_import_run(run_id)
     if not run:
         raise NotFound("import run not found")

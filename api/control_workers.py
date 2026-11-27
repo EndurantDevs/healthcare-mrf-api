@@ -74,7 +74,6 @@ class _AdmittedWorkerRequest(dict[str, Any]):
     ordinary_fhir_profile_job: tuple[str, str, str, str, str] | None = None
     ordinary_fhir_profile_lease: object | None = None
     npi_source_launch: object | None = None
-    pricing_control_admission: object | None = None
     scoped_catalog_admission: bool = False
 
 
@@ -539,9 +538,7 @@ async def _guarded_ptg_family_ensure(
         if any("plan-pricing-projection" in spec.importers for spec in selected_specs):
             from api.plan_pricing_worker_policy import admit_pricing_worker
 
-            worker_payload.pricing_control_admission = await admit_pricing_worker(
-                connection.raw_connection.driver_connection, run_id, worker_payload
-            )
+            await admit_pricing_worker(connection.raw_connection.driver_connection, run_id)
         launch_task = asyncio.create_task(asyncio.to_thread(ensure_worker, worker_payload))
         return await _await_worker_launch(launch_task)
 
@@ -1369,9 +1366,6 @@ def _worker_job_environment(
         )
     env_list.extend(_worker_job_secret_env(spec.worker_class, launch_request=launch_request))
     env_list.extend(provider_directory_source_worker.source_proxy_environment(spec, launch_request, env_list))
-    from api.plan_pricing_worker_policy import pricing_worker_policy_environment
-
-    env_list.extend(pricing_worker_policy_environment(launch_request))
     return env_list, run_id
 
 
@@ -1425,12 +1419,9 @@ def _worker_job_container(
     if resource_dict:
         container_dict["resources"] = resource_dict
     pvc_volumes = _worker_job_pvc_volumes(fhir_launch)
-    from api.plan_pricing_worker_policy import pricing_worker_policy_volumes
-
     volumes = [
         *pvc_volumes,
         *_worker_job_secret_volumes(spec, fhir_launch, launch_request=launch_request),
-        *pricing_worker_policy_volumes(spec, launch_request),
     ]
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
