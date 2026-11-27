@@ -165,11 +165,11 @@ async def verify_catalog_restoration(content_database, *, fail=False):
                 terminate=connection.terminate,
             )
             with pytest.raises(asyncpg.DivisionByZeroError):
-                await epoch._catalog_relations(driver, schema)
+                await epoch._epoch_catalog_relations(driver, schema)
         else:
-            catalog = await epoch._catalog_relations(connection, schema)
+            catalog = await epoch._epoch_catalog_relations(connection, schema)
             assert [row["relname"] for row in catalog] == sorted(epoch._TABLES)
-            assert catalog == await epoch._catalog_relations(connection, schema)
+            assert catalog == await epoch._epoch_catalog_relations(connection, schema)
         await _assert_caller_preserved(connection, schema, previous, search_path)
 
 
@@ -199,7 +199,7 @@ async def verify_repeated_cancellation(content_database, monkeypatch, boundary, 
             transaction=lambda: transaction,
             terminate=connection.terminate,
         )
-        operation = epoch._catalog_relations if catalog else epoch._content
+        operation = epoch._epoch_catalog_relations if catalog else epoch._content
         task = asyncio.create_task(operation(driver, content_database.schema))
         try:
             if boundary == "rollback":

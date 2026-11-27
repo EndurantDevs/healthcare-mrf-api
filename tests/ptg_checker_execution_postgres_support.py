@@ -12,7 +12,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from process.network_fhir_source_custody import _require_routine_capabilities
 from process.ptg_parts.ptg2_snapshot_candidates import (
     attach_snapshot_candidates,
     begin_snapshot_candidate,
@@ -145,6 +144,16 @@ async def _reader_trigger_probe(reader_engine, engine, schema, writer, candidate
         await connection.rollback()
 
 
+# The runtime reader may execute no SECURITY DEFINER routine except the two reviewed dataset checks.
+_READER_DEFINER_ROUTINES_SQL = """SELECT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+  WHERE p.prosecdef AND p.prorettype NOT IN ('trigger'::regtype,'event_trigger'::regtype)
+    AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+    AND (n.nspname<>$2 OR p.proowner<>$3::oid OR p.proname NOT IN
+      ('provider_directory_uhc_flex_practitioner_dataset_ready','provider_directory_uhc_flex_practitioner_dataset_valid'))
+    AND EXISTS(SELECT 1 FROM pg_roles r WHERE r.rolname=ANY($1::text[])
+      AND has_schema_privilege(r.oid,n.oid,'USAGE') AND has_function_privilege(r.oid,p.oid,'EXECUTE')))"""
+
+
 async def _upgrade_twice(engine, schema, reader):
     from tests.test_ptg_snapshot_candidates_postgres import _migration
 
@@ -218,7 +227,9 @@ async def checker_execution_case(engine, schema, writer):
         owner_oid, checker_oid = await _upgrade_twice(engine, schema, reader)
         await _reader_trigger_probe(engine_by_role[reader], engine, schema, writer, candidate_oid, False)
         async with engine_by_role[reader].begin() as connection:
-            await _require_routine_capabilities(await candidate_driver(connection), (reader,), schema, owner_oid)
+            assert not await (await candidate_driver(connection)).fetchval(
+                _READER_DEFINER_ROUTINES_SQL, [reader], schema, owner_oid
+            )
         async with engine.begin() as connection:
             await connection.exec_driver_sql(f'DROP TABLE "{schema}"."{candidate}"')
             await connection.exec_driver_sql(

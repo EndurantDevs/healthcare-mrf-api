@@ -577,35 +577,6 @@ async def _content_chunks(connection, schema, source_input=None):
     return _hash(receipts)
 
 
-async def _catalog_relations(connection, schema):
-    """Read native layout, keys and exact index identities as one bounded catalog set."""
-    # Deparsed expressions and operator classes must not depend on the reader's path.
-    async with _borrowed_epoch_settings(connection):
-        await connection.execute("SET LOCAL search_path TO pg_catalog")
-        relations = await connection.fetch(
-            """SELECT c.oid::bigint,c.relname,c.relkind,c.relpersistence,c.relowner::bigint,c.relhastriggers,
-      c.relrowsecurity,c.relforcerowsecurity,pg_relation_filenode(c.oid)::bigint AS filenode,n.oid::bigint AS schema_oid,n.nspowner::bigint,
-      EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
-      (SELECT jsonb_agg(jsonb_build_array(a.attname,a.atttypid,a.atttypmod,a.attnotnull,a.attgenerated,a.attidentity) ORDER BY a.attnum)
-       FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped)::text AS columns,
-      EXISTS(SELECT 1 FROM pg_attrdef d WHERE d.adrelid=c.oid) AS defaults,
-      (SELECT jsonb_agg(jsonb_build_object('oid',i.indexrelid::bigint,'name',ix.relname,'method',am.amname,
-        'owner_oid',ix.relowner::bigint,'filenode',pg_relation_filenode(ix.oid)::bigint,'unique',i.indisunique,'primary',i.indisprimary,
-        'valid',i.indisvalid,'ready',i.indisready,'live',i.indislive,'key_count',i.indnkeyatts,'attribute_count',i.indnatts,
-        'expressions',i.indexprs IS NOT NULL,'predicate',i.indpred IS NOT NULL,'options',i.indoption::text,
-        'columns',(SELECT jsonb_agg(a.attname ORDER BY key.ordinal) FROM unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,ordinal)
-          LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum),
-        'definition',pg_get_indexdef(i.indexrelid)) ORDER BY ix.relname)
-        FROM pg_index i JOIN pg_class ix ON ix.oid=i.indexrelid JOIN pg_am am ON am.oid=ix.relam
-        WHERE i.indrelid=c.oid)::text AS indexes,
-      (SELECT jsonb_agg(jsonb_build_array(k.oid,k.contype,k.conindid,pg_get_constraintdef(k.oid)) ORDER BY k.oid)
-        FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype<>'n')::text AS constraints
-      FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname""",
-            schema,
-        )
-        return relations
-
-
 async def _epoch_catalog_relations(connection, schema):
     """Read only functional columns, keys and indexes for the named edition."""
     # Deparsed expressions and operator classes must not depend on the reader's path.

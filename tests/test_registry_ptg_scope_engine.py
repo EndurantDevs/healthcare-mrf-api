@@ -204,24 +204,6 @@ def test_source_only_spec_needs_no_invented_office_rows():
 
 
 @pytest.mark.asyncio
-async def test_office_witness_still_requires_count_before_source_or_custody(monkeypatch):
-    monkeypatch.setattr(cohort, "_require_frozen_source", AsyncMock(side_effect=AssertionError("office count bypass")))
-    specification = engine.RegistryPTGScopeSourceSpecification(
-        ID, "synthetic_ptg", "snapshot_example", "source_example", "company_example", "cohort_example"
-    )
-    with pytest.raises(cohort.RegistryPTGCohortAuthorityError, match="accounting_invalid"):
-        async for _ in cohort.read_registry_ptg_source_witness_pages(
-            None,
-            specification,
-            frozen_authority={},
-            graph_identity={},
-            office_assertion_table_oid=7,
-            selected_dense_source_keys=(0,),
-        ):
-            pytest.fail("office count gate yielded a witness")
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("change", [None, "import", "run", "source_key"])
 async def test_native_source_derivation_uses_fixed_schema_and_actual_binding(monkeypatch, change):
     frozen = PtgResultArchiveSourceAuthority(

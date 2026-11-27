@@ -437,24 +437,6 @@ class FHIRSourceCustodyError(ValueError):
     """Retained source custody is unavailable or has changed."""
 
 
-async def _require_routine_capabilities(connection, runtime_roles, schema, owner_oid):
-    """Exclude directly callable definer capabilities in every non-system namespace."""
-    unsafe = await connection.fetchval(
-        """SELECT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-      WHERE p.prosecdef AND p.prorettype NOT IN ('trigger'::regtype,'event_trigger'::regtype)
-        AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
-        AND (n.nspname<>$2 OR p.proowner<>$3::oid OR p.proname NOT IN
-          ('provider_directory_uhc_flex_practitioner_dataset_ready','provider_directory_uhc_flex_practitioner_dataset_valid'))
-        AND EXISTS(SELECT 1 FROM pg_roles r WHERE r.rolname=ANY($1::text[])
-          AND has_schema_privilege(r.oid,n.oid,'USAGE') AND has_function_privilege(r.oid,p.oid,'EXECUTE')))""",
-        list(runtime_roles),
-        schema,
-        owner_oid,
-    )
-    if unsafe:
-        raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
-
-
 def _require_function(function_record, schema, owner_oid):
     """Recognize a reachable routine by name, language, volatility, definer and settings.
 

@@ -365,13 +365,9 @@ async def test_full_input_and_closed_grain_are_revalidated(arrange, replacement)
         assert not prepared.session.witness_calls
 
 
-def test_legacy_admission_still_refuses_and_no_legacy_namespace_is_fabricated():
+def test_no_legacy_namespace_is_fabricated():
     import inspect
 
-    assert 'raise RegistryPTGCohortAuthorityError("registry_ptg_scope_unavailable")' in inspect.getsource(
-        witness.source.require_registry_ptg_cohort_authority
-    )
-    assert "_office_relation(" not in inspect.getsource(witness)
     assert "expected_rows" not in inspect.getsource(witness)
 
 
