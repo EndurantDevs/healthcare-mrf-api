@@ -14,6 +14,7 @@ from process.provider_directory_generic_source_storage import _close_grants, _re
 from process.provider_directory_source_checkpoint_control import source_checkpoint_transaction
 
 ROOT = "provider_directory_postal_partition_checkpoint"
+UNREADABLE_SLOTS_SUFFIX = ":unreadable_slots"
 
 
 async def provision(connection, policy):
@@ -94,6 +95,26 @@ async def save_completed_partitions(database, schema, context, rows):
         )
 
 
+async def unreadable_partitions(database, schema, context, checkpoint_type):
+    """Read leaves walked to completion with verified unreadable search slots."""
+    async with source_checkpoint_transaction(
+        database, schema=schema, dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
+        relation = storage_relation(source.bound_publisher().storage_binding.storage_schema, ROOT)
+        checkpoint_rows = await database.all(
+            f"""SELECT partition_identity, pages_fetched, rows_fetched FROM {relation}
+                WHERE dataset_id=:dataset_id AND acquisition_root_run_id=:root AND checkpoint_type=:checkpoint_type""",
+            dataset_id=context.dataset_id,
+            root=context.acquisition_root_run_id,
+            checkpoint_type=f"{checkpoint_type}{UNREADABLE_SLOTS_SUFFIX}",
+        )
+    return (
+        {checkpoint_row[0] for checkpoint_row in checkpoint_rows},
+        sum(checkpoint_row[1] for checkpoint_row in checkpoint_rows),
+        sum(checkpoint_row[2] for checkpoint_row in checkpoint_rows),
+    )
+
+
 async def prepare_fetch(
     directory,
     source_record: dict[str, Any],
@@ -120,6 +141,20 @@ async def prepare_fetch(
         ) = await completed_partitions(
             directory.db, directory._schema(), state.postal_checkpoint_context, checkpoint_type
         )
+        (
+            unreadable_identities,
+            resumed_unreadable_pages,
+            resumed_unreadable_slots,
+        ) = await unreadable_partitions(
+            directory.db, directory._schema(), state.postal_checkpoint_context, checkpoint_type
+        )
+        if unreadable_identities:
+            state.completed_partition_identities.update(unreadable_identities)
+        if resumed_unreadable_pages > 0:
+            state.unreadable_optum_page_count = resumed_unreadable_pages
+            state.unreadable_optum_slot_count = resumed_unreadable_slots
+            state.partition_error_count = resumed_unreadable_pages
+            state.error_message = f"partition_errors_{resumed_unreadable_pages}_last_optum_unreadable_search_slots"
         if resource_type == "PractitionerRole" and state.postal_checkpoint_context.retry_of_run_id:
             start_url_queue = asyncio.LifoQueue()
             start_urls = list(
@@ -218,6 +253,87 @@ async def record_partition(
             state.pending_partition_checkpoint_rows.clear()
     if checkpoint_batch_rows:
         await _persist_partitions(directory, state, checkpoint_batch_rows)
+
+
+async def record_unreadable_partition(
+    directory,
+    state: PartitionFetchState,
+    source_record: dict[str, Any],
+    resource_type: str,
+    request_url: str,
+    run_id: str | None,
+    *,
+    unreadable_pages: int,
+    unreadable_slots: int,
+) -> None:
+    """Record a fully walked isolated leaf whose only gaps are verified unreadable slots."""
+    if state.postal_checkpoint_context is None or unreadable_pages <= 0 or unreadable_slots < unreadable_pages:
+        return
+    partition_identity = directory._uhc_partition_identity(
+        source_record,
+        resource_type,
+        request_url,
+    )
+    checkpoint_type = directory._uhc_partition_checkpoint_type(source_record, resource_type)
+    if not partition_identity or not checkpoint_type or not run_id:
+        return
+    unreadable_type = f"{checkpoint_type}{UNREADABLE_SLOTS_SUFFIX}"
+    checkpoint_batch_rows: list[dict[str, Any]] = []
+    async with state.checkpoint_lock:
+        if partition_identity in state.completed_partition_identities:
+            return
+        state.completed_partition_identities.add(partition_identity)
+        checkpoint_row_by_field = directory._reverse_lookup_checkpoint_row(
+            source_record, unreadable_type, partition_identity, run_id
+        )
+        checkpoint_row_by_field.update(pages_fetched=unreadable_pages, rows_fetched=unreadable_slots)
+        state.pending_partition_checkpoint_rows.append(checkpoint_row_by_field)
+        if len(state.pending_partition_checkpoint_rows) >= directory._partition_checkpoint_flush_rows():
+            checkpoint_batch_rows = list(state.pending_partition_checkpoint_rows)
+            state.pending_partition_checkpoint_rows.clear()
+    if checkpoint_batch_rows:
+        await _persist_partitions(directory, state, checkpoint_batch_rows)
+
+
+async def record_chain_checkpoint(
+    directory,
+    request,
+    *,
+    is_complete: bool,
+    has_split_children: bool,
+    has_non_slot_failure: bool,
+    current_url: str | None,
+    rows_fetched: int,
+) -> None:
+    """Persist either a clean leaf checkpoint or a verified unreadable-slot leaf checkpoint."""
+    if is_complete and not has_split_children:
+        await directory._record_partition_checkpoint(
+            request.state,
+            request.source_record,
+            request.resource_type,
+            request.request_url,
+            request.fetch_options.run_id,
+            pages_fetched=len(request.page_identities),
+            rows_fetched=rows_fetched,
+        )
+        return
+    if (
+        not current_url
+        and not has_split_children
+        and not has_non_slot_failure
+        and request.unreadable_page_counts
+        and not request.state.stop_event.is_set()
+    ):
+        await record_unreadable_partition(
+            directory,
+            request.state,
+            request.source_record,
+            request.resource_type,
+            request.request_url,
+            request.fetch_options.run_id,
+            unreadable_pages=len(request.unreadable_page_counts),
+            unreadable_slots=sum(request.unreadable_page_counts),
+        )
 
 
 async def flush_partitions(directory, state: PartitionFetchState) -> None:

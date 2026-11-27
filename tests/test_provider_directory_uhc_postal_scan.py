@@ -183,6 +183,7 @@ async def test_named_role_retry_reuses_proved_numeric_splits(monkeypatch, parent
     leaves = {"7102", "71030", "88000-1234"}
     monkeypatch.setattr(postal_checkpoint, "isolated_context", lambda *_: context)
     monkeypatch.setattr(postal_checkpoint, "completed_partitions", AsyncMock(return_value=(leaves, 7, 64)))
+    monkeypatch.setattr(postal_checkpoint, "unreadable_partitions", AsyncMock(return_value=(set(), 0, 0)))
     starts = [_role_url(prefix) for prefix in ("710", "88000", "9", "Q")]
 
     queue, state = await importer._prepare_partition_fetch(
@@ -957,13 +958,14 @@ async def test_retained_role_scans_guarded_zip4_children_before_broader_root(mon
     context = SimpleNamespace(retry_of_run_id="previous-run")
     monkeypatch.setattr(postal_checkpoint, "isolated_context", lambda *_: context)
     monkeypatch.setattr(postal_checkpoint, "completed_partitions", AsyncMock(return_value=({"77031"}, 1, 1)))
+    monkeypatch.setattr(postal_checkpoint, "unreadable_partitions", AsyncMock(return_value=(set(), 0, 0)))
     record_checkpoint = AsyncMock()
     monkeypatch.setattr(postal_checkpoint, "record_partition", record_checkpoint)
     delayed_child = _role_url("77030-4")
     fetch, calls = _fake_role_server({"77030": 7, "77030-": 7}, fail_once={"77030-4"})
     monkeypatch.setattr(importer, "_fetch_source_json", fetch)
 
-    result = await importer._fetch_partitioned_resource_rows(
+    scan_result = await importer._fetch_partitioned_resource_rows(
         SOURCE,
         "PractitionerRole",
         ProviderDirectoryPractitionerRole,
@@ -971,7 +973,7 @@ async def test_retained_role_scans_guarded_zip4_children_before_broader_root(mon
         _options(run_id="retained-run"),
     )
 
-    assert result.complete and result.error is None
+    assert scan_result.complete and scan_result.error is None
     assert calls[0] == _role_url("77030")
     assert [_query(url)["address-postalcode"] for url in calls[1:4]] == ["77030", "77030-", "77030"]
     child_urls = [_role_url(f"77030-{digit}") for digit in range(10)]
@@ -1021,6 +1023,118 @@ async def test_uhc_retries_a_failed_first_page_after_a_gateway_burst(monkeypatch
     assert scan_result.complete
     assert [call.args[1] for call in fetch.await_args_list] == [_role_url("77030-4")] * 3
     assert [call.args for call in sleep.await_args_list] == [(5.0,), (30.0,)]
+
+
+@pytest.mark.asyncio
+async def test_uhc_default_leaf_retry_schedule_survives_four_gateway_bursts(monkeypatch):
+    default_delays = (5.0, 30.0, 120.0, 300.0)
+    monkeypatch.setattr(uhc_scan, "LEAF_RETRY_DELAYS_SECONDS", default_delays)
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", "1")
+    fetch = AsyncMock(
+        side_effect=[
+            (502, {}, None, 1),
+            (502, {}, None, 1),
+            (502, {}, None, 1),
+            (502, {}, None, 1),
+            (200, _bundle(1, resource_id="role"), None, 1),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(uhc_scan.asyncio, "sleep", sleep)
+
+    scan_result = await _scan_roles(monkeypatch, fetch, start_prefixes=("77030-4",))
+
+    assert scan_result.complete
+    assert [call.args for call in sleep.await_args_list] == [(delay,) for delay in default_delays]
+
+
+def _gapped_and_flaky_fetch(gapped_prefix, flaky_prefix, flaky_failures, requested_urls):
+    """Serve one leaf with a verified unreadable slot and one leaf with a transient 502."""
+    from tests.test_provider_directory_optum_outage import PAGE_ERROR
+
+    gapped_cursor = f"{BASE}?_getpages=gapped&_getpagesoffset=2&_count=2&_pagetype=opaque"
+
+    async def fetch(_directory, request):
+        url = request.current_url
+        requested_urls.append(url)
+        query = _query(url)
+        if query.get("_getpages") == "gapped":
+            start, count = int(query["_getpagesoffset"]), int(query["_count"])
+            if start <= 3 < start + count:
+                return PAGE_ERROR
+            entries = [
+                {"resource": {"resourceType": "PractitionerRole", "id": f"gap-{idx}"}}
+                for idx in range(start, start + count)
+            ]
+            return 200, {"resourceType": "Bundle", "type": "searchset", "total": 4, "entry": entries}, None, 1
+        prefix = query.get(ROLE_PARAM)
+        if prefix == gapped_prefix:
+            first_entries = [
+                {"resource": {"resourceType": "PractitionerRole", "id": gapped_prefix}},
+                {"resource": {"resourceType": "PractitionerRole", "id": f"{gapped_prefix}-1"}},
+            ]
+            return (
+                200,
+                {
+                    "resourceType": "Bundle",
+                    "type": "searchset",
+                    "total": 4,
+                    "entry": first_entries,
+                    "link": [{"relation": "next", "url": gapped_cursor}],
+                },
+                None,
+                1,
+            )
+        if prefix == flaky_prefix and flaky_failures:
+            return 502, {}, None, 1
+        return 200, _bundle(1, resource_id=flaky_prefix), None, 1
+
+    return fetch
+
+
+@pytest.mark.asyncio
+async def test_isolated_postal_scan_checkpoints_and_restores_unreadable_slot_leaves(monkeypatch):
+    """A walked leaf with verified unreadable slots is skipped on retry while preserving gap counts."""
+    from process import provider_directory_optum_pages as optum_pages
+
+    factory, _requested_postcodes, persist = _postal_scan_spies(monkeypatch)
+    origin, successor = "run_" + "a" * 32, "run_" + "b" * 32
+    context = importer.PaginationCheckpointContext(
+        BASE, "1" * 64, (SOURCE["source_id"],), origin, origin, dataset_id="synthetic-dataset"
+    )
+    gapped_prefix, flaky_prefix = "77030-1234", "77030-1235"
+    flaky_failures, requested_urls = ["http_502"], []
+    monkeypatch.setattr(
+        importer.fhir_response,
+        "fetch_partition_response",
+        _gapped_and_flaky_fetch(gapped_prefix, flaky_prefix, flaky_failures, requested_urls),
+    )
+    options = _options(retain_rows=False, row_batch_handler=persist)
+
+    async def scan(scan_context):
+        return await importer._fetch_partitioned_resource_rows(
+            {**SOURCE, "_pagination_checkpoint_context": scan_context},
+            "PractitionerRole",
+            ProviderDirectoryPractitionerRole,
+            [_role_url(gapped_prefix), _role_url(flaky_prefix)],
+            replace(options, run_id=scan_context.owner_run_id),
+        )
+
+    async with importer.postal_checkpoint.source.bind_generic_source_transaction_factory(factory):
+        first_result = await scan(context)
+        assert not first_result.complete and first_result.error == "partition_errors_2_last_http_502"
+        requested_urls.clear()
+        flaky_failures.clear()
+        retry_context = replace(context, owner_run_id=successor, retry_of_run_id=origin, lineage_verified=True)
+        resumed_result = await scan(retry_context)
+
+    assert requested_urls == [_role_url(flaky_prefix)]
+    assert not resumed_result.complete
+    assert resumed_result.error == "partition_errors_1_last_optum_unreadable_search_slots"
+    assert resumed_result.fetch_diagnostic["unreadable_optum_page_count"] == 1
+    assert resumed_result.fetch_diagnostic["unreadable_optum_slot_count"] == 1
+    resumed_diagnostic = importer._resource_fetch_diagnostic(resumed_result, rows_written=resumed_result.rows_written)
+    assert optum_pages.has_only_unreadable_slots(resumed_diagnostic)
 
 
 @pytest.mark.asyncio
