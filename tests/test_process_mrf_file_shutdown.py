@@ -64,6 +64,7 @@ def _install_mrf_shutdown_finalizer_mocks(monkeypatch, operations, mark_run, cre
     monkeypatch.setattr(process_initial.db, "scalar", AsyncMock(return_value=1))
     monkeypatch.setattr(process_initial.db, "transaction", _mrf_shutdown_transaction)
     monkeypatch.setattr(process_initial.db, "insert", lambda _table: _ImportHistoryUpsert())
+    monkeypatch.setattr(process_initial, "publish_network_identities", AsyncMock(return_value={"networks": 0}))
     monkeypatch.setattr(process_initial, "_refresh_all_plan_drug_statistics", AsyncMock())
     monkeypatch.setattr(
         process_initial,
@@ -427,7 +428,8 @@ async def test_mrf_shutdown_defers_serving_indexes_and_reports_phase_timings(mon
     assert terminal_metrics["plans_count"] == 1
     assert terminal_metrics["summary_rows"] == 0
     phase_names = [timing["phase"] for timing in terminal_metrics["mrf_finalize_phase_timings"]]
-    assert phase_names[:4] == [
+    assert phase_names[:5] == [
+        "mrf_network_identity",
         "plan_drug_statistics",
         "mrf_address_summary",
         "mrf_address_summary_analyze",
