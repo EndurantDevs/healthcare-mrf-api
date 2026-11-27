@@ -80,7 +80,8 @@ async def test_reader_cannot_attach_and_changed_native_image_cannot_replay():
     async with storage_case(provisioned=True) as case:
         prepared = await prepare_pin_case(case)
         reader = await case.connect(case.reader)
-        with pytest.raises(ValueError):
+        # PostgreSQL refuses the reader's role switch now that session identity is not audited first.
+        with pytest.raises((ValueError, asyncpg.InsufficientPrivilegeError)):
             await _retain(prepared, connection=reader)
         await _retain(prepared)
         admin = await case.connect()

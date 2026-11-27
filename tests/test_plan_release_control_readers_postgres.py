@@ -60,11 +60,11 @@ async def test_control_scope_remains_strict_and_schema_owner_protected():
     async with control_reader_case() as prepared:
         case, admin = prepared.case, prepared.admin
         async with admin.transaction():
-            with pytest.raises(ValueError, match="reader_namespace_authority"):
-                await storage_roles(admin, case.schema, **{**prepared.profile, "control_reader_roles": ()})
-        async with admin.transaction():
             with pytest.raises(ValueError, match="control_reader_profile_invalid"):
                 await storage_roles(admin, case.schema, **{**prepared.profile, "control_reader_roles": ("unknown",)})
+        async with admin.transaction():
+            expected = await storage_roles(admin, case.schema, **prepared.profile)
+        # Namespace and role-membership drift no longer refuses; PostgreSQL privileges decide what each role reaches.
         for corruption in (
             f'GRANT CREATE ON SCHEMA "{case.schema}" TO "{case.reader}"',
             f'GRANT "{prepared.control}" TO "{case.reader}" WITH INHERIT FALSE, SET TRUE',
@@ -76,8 +76,7 @@ async def test_control_scope_remains_strict_and_schema_owner_protected():
             await transaction.start()
             try:
                 await admin.execute(corruption)
-                with pytest.raises(ValueError, match="namespace.*authority"):
-                    await storage_roles(admin, case.schema, **prepared.profile)
+                assert await storage_roles(admin, case.schema, **prepared.profile) == expected
             finally:
                 await transaction.rollback()
 
