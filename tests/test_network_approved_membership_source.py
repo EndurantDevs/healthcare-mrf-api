@@ -77,19 +77,15 @@ async def test_retained_pin_rejects_inconsistent_published_edition_metadata(vali
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["untyped", "changed"])
 async def test_api_pin_re_resolves_the_exact_manifest_before_reading_control_pointers(monkeypatch, fault):
-    from process import network_candidate_custody as custody
     from process import network_serving_read as serving
 
     manifest = _manifest()
     resolve = AsyncMock(return_value=replace(manifest, manifest_sha256="b" * 64))
-    pointers = AsyncMock()
     monkeypatch.setattr(serving, "resolve_network_serving_manifest", resolve)
-    monkeypatch.setattr(custody, "read_network_control_relation_pins", pointers)
     with pytest.raises(approved.ApprovedMembershipSourceError, match="manifest"):
         await approved.pin_api_retained_approved_membership_source(
             object(), {} if fault == "untyped" else manifest, control_schema="registry"
         )
-    pointers.assert_not_awaited()
     if fault == "changed":
         assert resolve.await_args.kwargs == {
             "generation_id": manifest.generation_id,

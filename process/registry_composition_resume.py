@@ -6,11 +6,11 @@ from uuid import UUID, uuid5
 
 import asyncpg
 
-from process.network_candidate_custody import MAX_RECEIPT_BYTES
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_membership_copy import MembershipCopyTarget
 from process.registry_source_contribution_store import verify_registry_source_contributions
 
+MAX_RECEIPT_BYTES = 2 * 1024 * 1024
 _SCOPE_FIELDS = ("dataset_id", "schema_id", "producer_id")
 _RESUMABLE_STATES = frozenset(("open", "sealed", "validated", "ready", "published"))
 _SIZE_SQL = "+".join(

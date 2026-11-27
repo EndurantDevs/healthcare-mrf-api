@@ -180,21 +180,6 @@ def test_v3_candidate_verification_binds_approved_generation_origin_and_recipe_i
         composition.verify_initial_source_office_receipt(damaged)
 
 
-def test_v3_receipt_does_not_widen_the_parent_candidate_custody_cap():
-    from process import network_candidate_custody as custody
-    from tests.test_network_candidate_custody import _candidate_record
-
-    candidate = _candidate_record()
-    candidate["validation_json"] = {composition.SUMMARY_KEY: _summary()}
-    assert custody._evidence(candidate)["validation_json"] == candidate["validation_json"]
-    assert composition.MAX_RECEIPT_BYTES == 4096
-    assert summary.MAX_V3_RECEIPT_BYTES == 128 * 1024
-    assert custody.MAX_RECEIPT_BYTES == 2 * 1024 * 1024
-    candidate["validation_json"]["oversized_other_component"] = "x" * custody.MAX_RECEIPT_BYTES
-    with pytest.raises(custody.NetworkCandidateCustodyError):
-        custody._evidence(candidate)
-
-
 @pytest.mark.asyncio
 async def test_v3_keeps_changed_recipes_raw_and_exact_facts(monkeypatch):
     recipe = _recipe()

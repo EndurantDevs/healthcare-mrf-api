@@ -77,8 +77,8 @@ EXCLUSIVE_REGISTRY_TEST_SHARDS = {
     "tests/test_network_registry_cms_prepared_pair_postgres.py::test_native_retained_pair_survives_receipt_head_refresh[copy_bounds1]": 16,
     "tests/test_network_registry_cms_prepared_pair_postgres.py::test_native_retention_address_copy_interruptions_preserve_source[copy_bounds0]": 17,
     "tests/test_network_registry_cms_prepared_pair_postgres.py::test_native_retention_address_copy_interruptions_preserve_source[copy_bounds1]": 18,
-    "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[legacy]": 19,
-    "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[modern]": 20,
+    "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_metadata_execution_reader_successor_preserves_incumbent": 19,
+    "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent": 20,
 }
 
 
@@ -169,36 +169,15 @@ def _registry_shard_index(nodeid: str, shard_count: int) -> int:
     ):
         return 29
     if shard_count == 48 and nodeid == (
-        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py"
-        "::test_metadata_execution_reader_successor_preserves_incumbent"
-    ):
-        return 21
-    if shard_count == 48 and nodeid == (
         "tests/test_registry_cms_refresh_anchors_postgres.py"
         "::test_cms_anchor_uses_genuine_accepted_notification_and_original_native_evidence"
     ):
         return 21
-    # Place catalog proofs within the fixed budget without changing reserved hash buckets.
-    if shard_count == 48 and nodeid in (
-        "tests/test_registry_execution_catalog_postgres.py"
-        "::test_inaccessible_public_view_does_not_hide_unsafe_callbacks",
-        "tests/test_registry_execution_catalog_postgres.py"
-        "::test_inaccessible_public_view_keeps_complete_metadata_and_transition_census",
-        "tests/test_registry_execution_catalog_postgres.py"
-        "::test_public_view_external_return_rule_is_not_a_self_dependency",
-        "tests/test_registry_execution_catalog_postgres.py"
-        "::test_public_view_rights_refuse_without_schema_usage[public]",
-    ):
-        return 2
     if shard_count == 48 and nodeid == (
         "tests/test_verified_witness_custom_publication_postgres.py"
         "::test_source_v2_manual_commands_preserve_custody_and_replay"
     ):
         return 10
-    if shard_count == 48 and nodeid == (
-        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent"
-    ):
-        return 12
     if shard_count == 48 and nodeid in (
         "tests/test_registry_membership_refresh_execution_postgres.py"
         "::test_accepted_aca_refresh_publication_replay_and_pinned_second_generation",
