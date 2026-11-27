@@ -335,26 +335,11 @@ async def test_independent_work_checks_empty_reference_domain(slice_db):
 
 
 def test_validation_chunks_partition_entire_network_domain(monkeypatch):
-    """Bounded network ranges and mega-network bucket slices partition all IDs without overlap."""
+    """Network ranges cover every ID once and a network over the row budget is checked alone."""
     monkeypatch.setattr(compact_validation, "_VALIDATION_CHUNK_ROWS", 10)
-    monkeypatch.setattr(compact_validation, "_VALIDATION_MEGA_NETWORK_ROWS", 20)
-    assert compact_validation._validation_chunks([]) == [(None, None, None)]
+    assert compact_validation._validation_chunks([]) == [(None, None)]
     chunks = compact_validation._validation_chunks([(1, 6), (2, 6), (5, 40), (6, 25), (10, 4)])
-    normal_chunks = [(lo, hi) for lo, hi, bucket in chunks if bucket is None]
-    buckets_by_mega_id = {}
-    for lo, hi, bucket in chunks:
-        if bucket is not None:
-            assert lo == hi
-            buckets_by_mega_id.setdefault(lo, []).append(bucket)
-    assert normal_chunks == [(None, 1), (1, 2), (2, 4), (6, None)]
-    for mega_id in (5, 6):
-        covered_buckets = set()
-        first_flags = []
-        for start, end, is_first in buckets_by_mega_id[mega_id]:
-            assert start <= end
-            first_flags.append(is_first)
-            covered_buckets.update(range(start, end + 1))
-        assert covered_buckets == set(range(64)) and first_flags == [True] + [False] * (len(first_flags) - 1)
+    assert chunks == [(None, 1), (1, 2), (2, 5), (5, 6), (6, None)]
 
 
 async def _apply_chunked_corruption(db, namespace, selected, corruption, expected_rows):
@@ -421,7 +406,6 @@ async def test_chunked_typed_compact_validation_handles_mega_networks_and_corrup
     """Chunked order-indexed validation accepts valid mega-networks and rejects every corruption."""
     db = slice_db
     monkeypatch.setattr(compact_validation, "_VALIDATION_CHUNK_ROWS", 2)
-    monkeypatch.setattr(compact_validation, "_VALIDATION_MEGA_NETWORK_ROWS", 3)
     pairs = [(7, 0), (42, 0), (42, 1), (42, 2), (42, 3), (88, 2), (99, 3)]
     copy_target = await _candidate(db, pairs)
     namespace = '"' + copy_target.schema_name + '"'
