@@ -3,6 +3,7 @@
 
 import json
 import os
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -14,7 +15,14 @@ from process import registry_imported_catalog_bindings as imported
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_typed_mapping import _approved_graph_keys, _prepare_mapping_bindings
-from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
+from process.registry_fhir_catalog_observation import (
+    CATALOG_OBSERVATION_CONTRACT,
+    catalog_observation_descriptor_digest,
+)
+from process.registry_fhir_catalog_sources import (
+    fhir_catalog_source_generation,
+    validate_fhir_catalog_source_descriptor,
+)
 from tests.test_registry_fhir_catalog_sources import descriptor as source_descriptor
 
 
@@ -206,6 +214,68 @@ async def test_prepared_fhir_lookup_preserves_approved_keys_and_rejects_later_am
         with pytest.raises(ValueError, match="registry_imported_catalog_binding_conflict"):
             async with case.connection.transaction():
                 await _prepare_mapping_bindings(case.connection, bindings, arguments, typed=True)
+
+
+def _legacy_digest_descriptor(descriptor, **changes):
+    """Record the same edition with the per-family digests older captures stored."""
+    legacy = deepcopy(descriptor)
+    for counts in legacy["admission"]["families"].values():
+        counts["sha256"] = "a" * 64
+    legacy.update(changes)
+    receipt = catalog_observation_descriptor_digest(legacy)
+    legacy.update(accepted_receipt_sha256=receipt, accepted_receipt_id=CATALOG_OBSERVATION_CONTRACT + ":" + receipt)
+    return validate_fhir_catalog_source_descriptor(legacy)
+
+
+@pytest.mark.asyncio
+async def test_retained_capture_descriptor_maps_through_current_catalog_edition(imported_catalog):
+    """A capture stored with per-family digests maps exactly like the catalog's count-only descriptor."""
+    case = imported_catalog
+    legacy = _legacy_digest_descriptor(case.descriptor)
+    assert fhir_catalog_source_generation(legacy) != case.generation
+    async with case.connection.transaction():
+        with pytest.raises(ValueError, match="registry_imported_catalog_source_changed"):
+            async with case.connection.transaction():
+                await imported.published_catalog_binding_query(
+                    case.connection, case.scope, case.approved, case.coordinates, legacy, control_schema=case.control
+                )
+        current = await imported.current_catalog_descriptor(
+            case.connection, case.scope, case.approved, legacy, control_schema=case.control
+        )
+        assert current == case.descriptor
+        unchanged = await imported.current_catalog_descriptor(
+            case.connection, case.scope, case.approved, case.descriptor, control_schema=case.control
+        )
+        assert unchanged is case.descriptor
+        generation = fhir_catalog_source_generation(current)
+        bindings = await imported.published_catalog_binding_query(
+            case.connection, case.scope, case.approved, case.coordinates, current, control_schema=case.control
+        )
+        arguments = (case.approved.approved_revision, *case.coordinates.sql_parameters, generation)
+        prepared, parameters = await _prepare_mapping_bindings(case.connection, bindings, arguments, typed=True)
+        mapped = await case.connection.fetch(
+            "SELECT source_key,network_id FROM " + prepared.relation + " ORDER BY source_key"
+        )
+    assert parameters == (case.generation,)
+    assert [tuple(binding_row) for binding_row in mapped] == [("network-10", 10), ("network-20", 50)]
+
+
+@pytest.mark.asyncio
+async def test_retained_capture_from_another_dataset_keeps_catalog_rejection(imported_catalog):
+    """A different dataset is never substituted, so the exact catalog check still refuses it."""
+    case = imported_catalog
+    other = _legacy_digest_descriptor(case.descriptor, dataset_sha256="b" * 64)
+    async with case.connection.transaction():
+        assert (
+            await imported.current_catalog_descriptor(
+                case.connection, case.scope, case.approved, other, control_schema=case.control
+            )
+            is other
+        )
+        with pytest.raises(ValueError, match="registry_imported_catalog_source_changed"):
+            await imported.published_catalog_binding_query(
+                case.connection, case.scope, case.approved, case.coordinates, other, control_schema=case.control
+            )
 
 
 @pytest.mark.asyncio

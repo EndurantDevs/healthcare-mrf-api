@@ -57,6 +57,27 @@ async def published_fhir_catalog_bindings_sql(connection, scope, approved, coord
     return _binding_sql(control, catalog, scope.metadata_generation, source_system=coordinates.source_system)
 
 
+async def current_catalog_descriptor(connection, scope, approved, descriptor, *, control_schema):
+    """Use the catalog's own descriptor when a retained capture recorded the same edition in an older form."""
+    from process.registry_imported_source_reuse import compatible_source_edition
+
+    snapshot = await _catalog_snapshot(connection, scope, approved, storage_identifier(control_schema))
+    catalog = storage_identifier(snapshot["schema_name"])
+    stored_rows = await connection.fetch(
+        "SELECT CASE WHEN octet_length(descriptor_json::text)<=8388608 THEN descriptor_json::text END AS descriptor "
+        f"FROM {catalog}.registry_fhir_catalog_source "
+        "WHERE profile='published_normalized' AND descriptor_json->'coordinates'=$1::jsonb",
+        json.dumps(descriptor["coordinates"]),
+    )
+    wanted = compatible_source_edition(descriptor)
+    candidates = [_document(stored["descriptor"]) for stored in stored_rows if stored["descriptor"] is not None]
+    matches = [candidate for candidate in candidates if compatible_source_edition(candidate) == wanted]
+    # Zero or several matches keep the recorded descriptor, so the exact catalog check still rejects it.
+    if len(matches) != 1 or matches[0] == descriptor:
+        return descriptor
+    return matches[0]
+
+
 def require_valid_catalog_bindings(invalid):
     """Reject a conflicting or incomplete imported binding scope before its mapping can be used."""
     if invalid is not False:

@@ -217,13 +217,16 @@ async def _map_typed_recipes(
         read = await _read_mapping_recipe(
             connection, recipe, approved, read_context, source_reader, retained_proofs, control_schema
         )
+        catalog_bindings = read_context.source_witness_runtime.catalog_bindings
         inputs.append(
             (
                 read,
                 TypedGraphApproval(
                     approved_source=approved,
                     binding_coordinates=recipe.binding_coordinates,
-                    catalog_descriptor=recipe.source_pin.catalog_descriptor,
+                    catalog_descriptor=await _catalog_descriptor(
+                        connection, recipe, approved, catalog_bindings, control_schema
+                    ),
                     catalog_generation=recipe.source_pin.catalog_generation,
                     catalog_bindings=read_context.source_witness_runtime.catalog_bindings,
                 ),
@@ -253,20 +256,23 @@ async def _has_retained_sample_coverage(connection, recipe, approved, control_sc
     if proof.semantic_receipt is None:
         return True
     from process.network_fhir_typed_mapping import _approved_graph_keys, typed_graph_bindings
+    from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
 
+    descriptor = await _catalog_descriptor(connection, recipe, approved, catalog_bindings, control_schema)
+    generation = (
+        recipe.source_pin.catalog_generation
+        if descriptor is recipe.source_pin.catalog_descriptor
+        else fhir_catalog_source_generation(descriptor)
+    )
     approval = TypedGraphApproval(
         approved,
         recipe.binding_coordinates,
-        recipe.source_pin.catalog_descriptor,
+        descriptor,
         catalog_bindings=catalog_bindings,
         catalog_generation=recipe.source_pin.catalog_generation,
     )
     bindings = await typed_graph_bindings(connection, approval, control_schema=control_schema)
-    arguments = (
-        approved.approved_revision,
-        *recipe.binding_coordinates.sql_parameters,
-        recipe.source_pin.catalog_generation,
-    )
+    arguments = (approved.approved_revision, *recipe.binding_coordinates.sql_parameters, generation)
     from process.network_fhir_typed_contract import PLAN_TIER_CONTRACT
 
     current_keys = await _approved_graph_keys(
@@ -278,6 +284,18 @@ async def _has_retained_sample_coverage(connection, recipe, approved, control_sc
     )
     sampled_keys = {network["network_source_key"] for network in proof.semantic_receipt["networks"]}
     return set(current_keys) <= sampled_keys
+
+
+async def _catalog_descriptor(connection, recipe, approved, catalog_bindings, control_schema):
+    """Pin a retained capture's mapping to the current catalog's descriptor for the same edition."""
+    descriptor = recipe.source_pin.catalog_descriptor
+    if catalog_bindings is None:
+        return descriptor
+    from process.registry_imported_catalog_bindings import current_catalog_descriptor
+
+    return await current_catalog_descriptor(
+        connection, catalog_bindings, approved, descriptor, control_schema=control_schema
+    )
 
 
 async def _typed_office_matches(connection, mappings, recipe_hash, approved, address_source, roles, control_schema):
