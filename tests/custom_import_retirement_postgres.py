@@ -134,17 +134,28 @@ async def test_retirement_removes_only_replaced_storage_and_replays_exactly():
     async with isolated_publication_case() as case:
         attempt, family_id = await _replaced_fence(case)
         async with case.sessions() as session, session.begin():
-            for name in COMPACT_TABLE_NAMES:
-                await session.execute(text(f'CREATE TABLE "ci_snapshot_{family_id}"."{name}" (id bigint PRIMARY KEY)'))
+            for table_name in (
+                *COMPACT_TABLE_NAMES,
+                "custom_import_block_query_input",
+                "direct_stage_progress",
+                "direct_stage_volatile_guard",
+                "direct_stage_commitments",
+                "direct_stage_rejected_roots",
+                "direct_stage_p_0",
+                "direct_stage_p_1",
+            ):
+                await session.execute(
+                    text(f'CREATE TABLE "ci_snapshot_{family_id}"."{table_name}" (id bigint PRIMARY KEY)')
+                )
         async with case.sessions() as session, session.begin():
             await _bounded(session)
-            result = await retirement.retire_snapshot_family(
+            receipt = await retirement.retire_snapshot_family(
                 session,
                 family_id,
                 engine_id="synthetic",
                 assert_external_unreferenced=_external_fixture_check,
             )
-            assert result.reason == "replaced_fence" and not result.replayed
+            assert receipt.reason == "replaced_fence" and not receipt.replayed
             assert await session.get(CustomImportSnapshotFamily, family_id) is not None
             assert await session.get(CustomImportSnapshotRetirement, family_id) is not None
         async with case.sessions() as session, session.begin():
@@ -155,7 +166,7 @@ async def test_retirement_removes_only_replaced_storage_and_replays_exactly():
                 engine_id="synthetic",
                 assert_external_unreferenced=_external_fixture_check,
             )
-            assert replay.replayed and replay.retained_bytes == result.retained_bytes
+            assert replay.replayed and replay.retained_bytes == receipt.retained_bytes
         with pytest.raises(DBAPIError, match="custom_import_snapshot_retired"):
             async with case.sessions() as session, session.begin():
                 await _call(session, case, attempt, "create_custom_import_snapshot_family")

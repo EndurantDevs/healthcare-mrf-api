@@ -128,7 +128,9 @@ def test_policy_does_not_admit_duplicate_roots_or_orphans():
     result = assemble_root_families(definition, [_root(), _root()], {"rates": [_rate(), _rate()]})
     assert [entry.code for entry in result.rejections] == ["duplicate_root_key"]
     orphan = assemble_root_families(definition, [_root()], {"rates": [_rate(npi="1003000126")]})
-    assert orphan.candidate_errors == ("orphan_child",)
+    assert orphan.candidate_errors == ()
+    assert len(orphan.families) == 1
+    assert orphan.families[0].children == {"rates": ()}
 
 
 def test_preflight_collapses_sample_children_but_keeps_raw_observations_and_bounds():

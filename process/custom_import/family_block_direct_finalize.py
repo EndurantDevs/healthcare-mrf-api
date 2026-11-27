@@ -104,6 +104,7 @@ async def _drop_direct_stage_tables(session, family_id: int) -> None:
         DIRECT_VOLATILE_GUARD_TABLE,
         DIRECT_COMMITMENTS_TABLE,
         DIRECT_REJECTED_TABLE,
+        "custom_import_block_query_input",
     ):
         await staging._prepare_statement(session)
         await session.execute(text(f"DROP TABLE IF EXISTS {schema_sql}.{tbl_name}"))

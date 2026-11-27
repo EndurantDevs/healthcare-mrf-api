@@ -585,7 +585,9 @@ def test_family_build_rejects_non_object_records_and_invalid_key_shapes(definiti
         [_root()],
         {"rates": [{"service_code": "A100", "amount": Decimal("12.50")}]},
     )
-    assert orphan_result.candidate_errors == ("orphan_child",)
+    assert orphan_result.candidate_errors == ()
+    assert len(orphan_result.families) == 1
+    assert orphan_result.families[0].children == {"rates": ()}
 
 
 def test_family_build_rejects_null_invalid_entity_and_decimal_values(definition):
@@ -791,11 +793,13 @@ def test_missing_nullable_field_does_not_hide_a_later_required_field():
     assert {entry.code for entry in result.rejections} == {"required_field_missing"}
 
 
-def test_orphan_child_rejects_the_whole_candidate(definition):
+def test_orphan_child_is_ignored_without_rejecting_the_candidate(definition):
     result = assemble_root_families(definition, [_root()], {"rates": [_rate(npi="1003000126")]})
-    assert result.candidate_errors == ("orphan_child",)
-    with pytest.raises(CandidateRejected, match="orphan_child"):
-        merge_families({}, result, refresh_mode="upsert")
+    assert result.candidate_errors == ()
+    assert len(result.families) == 1
+    assert result.families[0].children == {"rates": ()}
+    merged = merge_families({}, result, refresh_mode="upsert")
+    assert set(merged) == {("1234567893",)}
 
 
 def test_root_without_a_logical_key_rejects_the_whole_candidate(definition):
@@ -831,7 +835,9 @@ def test_non_hashable_key_values_are_rejected_without_raising(definition):
             ]
         },
     )
-    assert child_result.candidate_errors == ("orphan_child",)
+    assert child_result.candidate_errors == ()
+    assert len(child_result.families) == 1
+    assert child_result.families[0].children == {"rates": ()}
 
 
 def test_upsert_retains_rejected_and_absent_families_but_snapshot_requires_scope(
