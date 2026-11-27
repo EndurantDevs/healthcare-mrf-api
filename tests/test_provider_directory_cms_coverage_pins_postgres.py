@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from process import provider_directory_cms_serving_coverage as coverage
-from tests.test_provider_directory_cms_prepared_context_postgres import native_case, publisher
+from tests.cms_native_input_postgres_support import native_case, publisher
 
 SCHEMA = '"accepted_catalog"'
 DATASET = "selected'quoted"

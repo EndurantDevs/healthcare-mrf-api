@@ -93,3 +93,16 @@ async def test_cms_doctors_group_batch_validates_exact_pac_ids_before_database_u
     for invalid_id in ("", " 123", "123 ", "x" * 65):
         with pytest.raises(ValueError, match="org_pac_id_invalid"):
             await bind_cms_doctors_group_batch(None, org_pac_ids=["123", invalid_id])
+
+
+def test_non_mapping_resource_is_rejected_before_its_fields_are_read():
+    with pytest.raises(ValueError, match="entity_resource_invalid"):
+        _source_resource_identity("cms-directory", "2026-09", [("resourceType", "Organization"), ("id", "org-1")])
+
+
+@pytest.mark.asyncio
+async def test_batch_above_byte_budget_is_rejected_before_database_use():
+    padding = "x" * (12 * 1024 * 1024)
+    resources = [{"resourceType": "Organization", "id": f"org-{index}", "name": padding} for index in range(3)]
+    with pytest.raises(ValueError, match="batch_bytes_invalid"):
+        await bind_entity_batch(None, source_id="cms-directory", release_id="release-one", resources=resources)

@@ -11,9 +11,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from db import migration_fhir_source_rollback as rollback
 from db.plan_release_storage import storage_identifier
 from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
+from tests.cms_native_input_postgres_support import native_input_resources
 from tests.test_cms_noncurrent_seal_guard_postgres import _seal, _seed
 from tests.test_cms_noncurrent_seal_guard_postgres import header_case as header_case
-from tests.test_provider_directory_cms_prepared_context_postgres import native_input_resources
 
 
 @pytest_asyncio.fixture

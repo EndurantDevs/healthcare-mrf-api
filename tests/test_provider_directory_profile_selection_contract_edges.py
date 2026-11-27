@@ -174,10 +174,7 @@ def test_variant_selection_rejects_shared_reviewed_endpoint() -> None:
 
 
 def test_flex_contract_rejects_unknown_and_malformed_dataset_coordinates() -> None:
-    assert (
-        flex_contract.uhc_flex_profile_expected_resources("synthetic-unknown-dataset")
-        is None
-    )
+    assert flex_contract.uhc_flex_profile_expected_resources("synthetic-unknown-dataset") is None
     assert not flex_contract._is_rooted_resource_counts_valid([])
     assert not flex_contract._is_rooted_resource_counts_valid(_BrokenResourceCounts())
     assert not flex_contract.is_uhc_flex_publication_metadata_valid(
@@ -186,3 +183,13 @@ def test_flex_contract_rejects_unknown_and_malformed_dataset_coordinates() -> No
         endpoint_id="synthetic-endpoint",
         evidence_run_id="synthetic-run",
     )
+
+
+def test_cms_incumbent_with_two_rows_for_one_endpoint_is_ambiguous() -> None:
+    dataset_rows = [
+        {"endpoint_id": "synthetic-cms-endpoint", "dataset_id": "synthetic-first"},
+        {"endpoint_id": "synthetic-cms-endpoint", "dataset_id": "synthetic-second"},
+    ]
+
+    with pytest.raises(selection_dataset.ProviderDirectoryProfileSelectionDrift, match="cms_incumbent_ambiguous"):
+        selection_dataset._cms_incumbent_pair(dataset_rows, "synthetic-cms-endpoint")

@@ -17,8 +17,8 @@ from db import migration_cms_noncurrent_seal as migration
 from db.models import ProviderDirectoryDatasetResource, ProviderDirectoryEndpointDataset, ProviderDirectorySource
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_directory_admission_seal import admission_seal_from_validated_metadata
+from tests.cms_native_input_postgres_support import native_case as native_case
 from tests.cms_noncurrent_seal_postgres_support import install_native_header_guards
-from tests.test_provider_directory_cms_prepared_context_postgres import native_case as native_case
 from tests.test_provider_directory_dataset_selection_bounded_db import _large_metadata_by_field
 
 

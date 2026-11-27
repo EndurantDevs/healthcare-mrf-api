@@ -13,8 +13,8 @@ from sqlalchemy.engine import make_url
 from db import migration_cms_replay_resolution as migration
 from db.plan_release_storage import storage_identifier, storage_relation
 from tests.provider_directory_subset_completion_pg_support import terminal_metadata, valid_evidence_pairs
+from tests.test_provider_directory_cms_canonical_layout_postgres import _reader
 from tests.test_provider_directory_cms_canonical_layout_postgres import native_layout as native_layout
-from tests.test_provider_directory_cms_legacy_history_postgres import _reader
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 _GUARD = storage_relation("mrf", migration.GUARD) + "()"
