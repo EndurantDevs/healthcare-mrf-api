@@ -146,6 +146,32 @@ async def test_native_capture_and_mapping_preserve_only_source_proven_providers(
 
 
 @pytest.mark.asyncio
+async def test_plans_sharing_a_network_map_each_provider_once(native_provider_case):
+    case = native_provider_case
+    relation = f'"{case.catalog.schema_name}".registry_fhir_catalog_binding'
+    async with case.writer.transaction():
+        # A second plan on the same network checksum, as ACA issuers publish one binding per plan.
+        await case.writer.execute(
+            f"INSERT INTO {relation} SELECT metadata_generation,network_id,$1,source_id,"
+            f"document_json||jsonb_build_object('binding_id',$1::uuid,'source_key',document_json->>'source_key'||'-plan-b') "
+            f"FROM {relation} LIMIT 1",
+            uuid4(),
+        )
+        mapped = await providers.rebuild_native_provider_stage(
+            case.writer,
+            case.recipe,
+            case.approved,
+            catalog_scope=case.catalog_scope,
+            control_schema=case.fixture.control,
+        )
+        rows = await case.writer.fetch(
+            "SELECT provider_id FROM " + mapped.provider_only_table + " ORDER BY provider_id"
+        )
+        assert [row["provider_id"] for row in rows] == ["1234567893", "1999999984"]
+        await case.writer.execute("DROP TABLE " + mapped.provider_only_table)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_catalog_key_rejects_native_mapping_and_rolls_back_its_table(native_provider_case):
     case = native_provider_case
     relation = f'"{case.catalog.schema_name}".registry_fhir_catalog_binding'

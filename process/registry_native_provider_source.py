@@ -464,11 +464,12 @@ async def _map_native_provider_facts(connection, bindings, selected, name, captu
     result = await connection.fetchrow(
         "WITH "
         + bindings
-        + ", selected AS MATERIALIZED (SELECT * FROM ("
+        # Facts are unique per (source_key,npi), so distinct pairs here keep the fact rows distinct without a sort.
+        + ", selected AS MATERIALIZED (SELECT DISTINCT * FROM ("
         + selected
         + ") candidates WHERE NOT (SELECT invalid FROM binding_check)), mapped AS (INSERT INTO "
         + name
-        + " SELECT DISTINCT selected.network_id,'npi',fact.npi::text,encode(sha256(convert_to(jsonb_build_array($11::text,"
+        + " SELECT selected.network_id,'npi',fact.npi::text,encode(sha256(convert_to(jsonb_build_array($11::text,"
         "fact.source_key,'npi',fact.npi::text,selected.network_id)::text,'UTF8')),'hex')"
         + (", $12::integer" if source_slot is not None else "")
         + f" FROM {capture} fact JOIN selected USING(source_key) WHERE {valid_npi_sql('fact.npi')}) "

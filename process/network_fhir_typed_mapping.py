@@ -129,28 +129,36 @@ def require_catalog_graph_scope(stage, coordinates, descriptor):
 
 
 async def _office_inputs(connection, stage, mapping, approved):
-    # The office primary key removes repeats without sorting the complete graph.
+    """Group the approved pairs once per office, reject any office with two addresses, then add new offices."""
     if isinstance(approved, _PreparedBindingRows):
-        selection = f"EXISTS (SELECT FROM {approved.relation} b WHERE b.source_key=p.network_source_key)"
+        # A one-time key array keeps the pair scan and its partial aggregates on parallel workers.
+        keys_sql = f"(SELECT array_agg(source_key) FROM {approved.relation})::text[]"
         parameters = ()
     else:
-        selection = "p.network_source_key=ANY($1::text[])"
+        keys_sql = "$1::text[]"
         parameters = (approved,)
-    column_sql = "provider_id,location_id,address_key,canonical_identity"
-    await connection.execute(
-        f"INSERT INTO {mapping.relation('offices')} ({column_sql}) SELECT {column_sql} FROM {stage.relation('pairs')} p "
-        f"WHERE {selection} ON CONFLICT DO NOTHING",
-        *parameters,
-    )
+    # "C" keeps the filter off the pair primary key, so most of a graph is scanned in parallel, not probed.
+    pairs = f'{stage.relation("pairs")} p WHERE (p.network_source_key COLLATE "C")=ANY({keys_sql})'
+    offices = mapping.relation("offices")
+    # Workers aggregate the pairs; only the grouped offices meet offices added by earlier graphs.
     require(
         await connection.fetchval(
-            f"SELECT NOT EXISTS(SELECT FROM {stage.relation('pairs')} p LEFT JOIN LATERAL ("
-            f"SELECT address_key,canonical_identity FROM {mapping.relation('offices')} o "
-            "WHERE (o.provider_id,o.location_id)=(p.provider_id,p.location_id) OFFSET 0) o ON true "
-            f"WHERE {selection} AND (o.address_key IS DISTINCT FROM p.address_key OR o.canonical_identity IS DISTINCT FROM p.canonical_identity))",
+            f"""SELECT NOT EXISTS(SELECT FROM (
+              SELECT provider_id,location_id,
+                min(address_key::text) AS address_min,max(address_key::text) AS address_max,
+                min(canonical_identity) AS identity_min,max(canonical_identity) AS identity_max
+              FROM {pairs} GROUP BY provider_id,location_id
+            ) g LEFT JOIN {offices} o USING(provider_id,location_id)
+            WHERE g.address_min<>g.address_max OR g.identity_min<>g.identity_max
+              OR o.address_key::text<>g.address_min OR o.canonical_identity<>g.identity_min)""",
             *parameters,
         ),
         "office_collision",
+    )
+    await connection.execute(
+        f"INSERT INTO {offices} (provider_id,location_id,address_key,canonical_identity) "
+        f"SELECT provider_id,location_id,address_key,canonical_identity FROM {pairs} ON CONFLICT DO NOTHING",
+        *parameters,
     )
 
 
