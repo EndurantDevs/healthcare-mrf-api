@@ -9,6 +9,7 @@ import asyncpg
 import pytest
 
 from db.migration_provider_directory_dataset_candidates import TABLES
+from process import provider_directory_history_compaction_cutover as cutover_module
 from process.provider_directory_cms_preparation_policy import _histories
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_generic_source_provision import _retained_empty_dataset_histories
@@ -252,6 +253,59 @@ async def test_online_history_compaction_cutover_rollback_and_drop(monkeypatch):
             await _assert_downstream_checks(context, schema_name, roles_by_kind)
             await run_migration(context.engine, _candidate_migration(), "upgrade")
         finally:
+            await context.connection.execute(f'DROP SCHEMA IF EXISTS "{cat_schema}" CASCADE')
+
+
+async def _probe_reader_and_writer(probe, root_ref, heap_ref):
+    """Read the history root and try to write one compared heap, each with a short lock timeout."""
+    async with probe.transaction():
+        await probe.execute("SET LOCAL lock_timeout = '200ms'")
+        await probe.fetchval(f"SELECT count(*) FROM {root_ref}")
+    try:
+        async with probe.transaction():
+            await probe.execute("SET LOCAL lock_timeout = '200ms'")
+            await probe.execute(f"DELETE FROM {heap_ref} WHERE false")
+    except asyncpg.LockNotAvailableError:
+        return "read ok", "write blocked"
+    return "read ok", "write allowed"
+
+
+def _probe_on_first_fingerprint(monkeypatch, probe, root_ref, heap_ref, probe_results):
+    original_fingerprint = cutover_module._history_fingerprint
+
+    async def probing_fingerprint(*arguments):
+        if not probe_results:
+            probe_results.append(await _probe_reader_and_writer(probe, root_ref, heap_ref))
+        return await original_fingerprint(*arguments)
+
+    monkeypatch.setattr(cutover_module, "_history_fingerprint", probing_fingerprint)
+
+
+@pytest.mark.asyncio
+async def test_cutover_and_rollback_verify_without_blocking_readers(monkeypatch):
+    """Fingerprint scans hold only SHARE locks: readers proceed, writers to the compared heaps wait."""
+    async with _candidate_test_scope(monkeypatch) as (context, _roles_by_kind):
+        await _install_retirement_child_guards(context)
+        cat_schema, _retained_ids, _omitted_ids = await _seed_history_fixture(context)
+        probe = await connect(database_url())
+        try:
+            await run_migration(context.engine, _candidate_migration(), "upgrade")
+            connection, schema_name = context.connection, context.schema_name
+            root_ref = f"{context.schema}.{TABLES[0]}"
+            selection = await select_compaction_plan(connection, schema=schema_name)
+            old_ref = f"{context.schema}.{quoted(f'pd_dataset_history_{selection.old_oid_by_table[TABLES[0]]}')}"
+            await prepare_history_compaction(connection, schema=schema_name)
+            cutover_probes = []
+            _probe_on_first_fingerprint(monkeypatch, probe, root_ref, old_ref, cutover_probes)
+            swapped = await cutover_history_compaction(connection, schema=schema_name)
+            assert cutover_probes == [("read ok", "write blocked")]
+            new_ref = f"{context.schema}.{quoted(f'pd_dataset_history_{swapped["tables"][TABLES[0]]["new_oid"]}')}"
+            rollback_probes = []
+            _probe_on_first_fingerprint(monkeypatch, probe, root_ref, new_ref, rollback_probes)
+            assert (await rollback_history_compaction(connection, schema=schema_name))["status"] == "rolled_back"
+            assert rollback_probes == [("read ok", "write blocked")]
+        finally:
+            await probe.close()
             await context.connection.execute(f'DROP SCHEMA IF EXISTS "{cat_schema}" CASCADE')
 
 
