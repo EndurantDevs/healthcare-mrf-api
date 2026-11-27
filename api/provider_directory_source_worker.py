@@ -739,16 +739,14 @@ def _require_selected_directory_route(params, route, policy):
         if route is None or not policy.use_proxy(SOURCE_ID, SOURCE_ENDPOINT):
             raise ValueError("delta_dental_finder_source_proxy_required")
 
-    from process import nomi_directory_integration as nomi_directory
+    from process.provider_directory_source_selection import LOCATOR_ADAPTERS
 
-    if (
-        _uses_source_http(params)
-        and isinstance(params, dict)
-        and nomi_directory.is_explicit_selection(params.get("source_ids"))
-    ):
-        nomi_directory.require_task(params, test_mode=bool(params.get("test_mode")))
-        if route is None or not policy.use_proxy(nomi_directory.SOURCE_ID, nomi_directory.ENDPOINT_SCOPE):
-            raise ValueError("nomi_directory_worker_proxy_route_required")
+    if _uses_source_http(params) and isinstance(params, dict):
+        for adapter in LOCATOR_ADAPTERS:
+            if adapter.is_explicit_selection(params.get("source_ids")):
+                adapter.require_task(params, test_mode=bool(params.get("test_mode")))
+                if route is None or not policy.use_proxy(adapter.SOURCE_ID, adapter.ENDPOINT_SCOPE):
+                    raise ValueError(f"{adapter.capture.PREFIX}_worker_proxy_route_required")
 
 
 def admit_fhir_source_worker_launch(admitted_run):

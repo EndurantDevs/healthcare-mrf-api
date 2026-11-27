@@ -22,6 +22,9 @@ from process.vsp_directory_contract import canonical_json
 from process.vsp_directory_http import strict_json
 from process.vsp_directory_store import _atomic, _directory
 
+ORG_NAME = "Nomi Health"
+URN = "nomi"
+PREFIX = "nomi_directory"
 SOURCE_ID = "nomi-health-directory"
 ENTRY_ID = "nomi-health-provider-directory"
 ADAPTER_ID = "nomi-directory-json-v1"

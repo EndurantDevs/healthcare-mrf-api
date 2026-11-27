@@ -14,6 +14,7 @@ from api.provider_directory_rooted_fhir_publication import (
     unavailable_rooted_fhir_publication,
 )
 from api.provider_directory_source_worker import has_fresh_source_route, is_delta_route_available
+from process import eyemed_directory_integration as eyemed_directory
 from process import nomi_directory_integration as nomi_directory
 from process import provider_directory_profile as profile_artifact
 from process.delta_dental_directory_json import SOURCE_ENDPOINT as DELTA_DENTAL_ENDPOINT
@@ -164,6 +165,41 @@ def _append_observation_entries(items, observations):
     )
 
 
+def _append_locator_sources(catalog_items):
+    """Expose search directories only when their named routes are available."""
+    for adapter, owner, name, warning in (
+        (
+            nomi_directory,
+            "nomi-health",
+            "Nomi Health",
+            "Provider and facility results are scoped to the configured group and searches.",
+        ),
+        (
+            eyemed_directory,
+            "eyemed",
+            "EyeMed",
+            "Network memberships come from ranked searches for the configured ZIP codes.",
+        ),
+    ):
+        if has_fresh_source_route(adapter.SOURCE_ID, adapter.ENDPOINT_SCOPE):
+            catalog_items.append(
+                {
+                    "entry_id": adapter.ENTRY_ID,
+                    "display_name": f"{name} Provider Directory",
+                    "owner_id": owner,
+                    "source_ids": [adapter.SOURCE_ID],
+                    "canonical_base": adapter.ENDPOINT_SCOPE,
+                    "classification": "acquisition",
+                    "resource_profile": "M5",
+                    "resources": list(adapter.RESOURCE_TYPES),
+                    "supported_resources": list(adapter.RESOURCE_TYPES),
+                    "profile_enabled": False,
+                    "runnable": True,
+                    "coverage_warning": warning,
+                }
+            )
+
+
 def provider_directory_source_catalog(
     manifest_path: Path = DEFAULT_MANIFEST,
 ) -> dict[str, Any]:
@@ -194,25 +230,8 @@ def provider_directory_source_catalog(
         NETWORK_SNAPSHOT_SOURCE_ID, NETWORK_SNAPSHOT_API_BASE
     ):
         catalog_items = [entry for entry in catalog_items if entry["source_ids"] != [NETWORK_SNAPSHOT_SOURCE_ID]]
-    if manifest_path == DEFAULT_MANIFEST and has_fresh_source_route(
-        nomi_directory.SOURCE_ID, nomi_directory.ENDPOINT_SCOPE
-    ):
-        catalog_items.append(
-            {
-                "entry_id": nomi_directory.ENTRY_ID,
-                "display_name": "Nomi Health Provider Directory",
-                "owner_id": "nomi-health",
-                "source_ids": [nomi_directory.SOURCE_ID],
-                "canonical_base": nomi_directory.ENDPOINT_SCOPE,
-                "classification": "acquisition",
-                "resource_profile": "M5",
-                "resources": list(nomi_directory.RESOURCE_TYPES),
-                "supported_resources": list(nomi_directory.RESOURCE_TYPES),
-                "profile_enabled": False,
-                "runnable": True,
-                "coverage_warning": "Provider and facility results are scoped to the configured group and searches.",
-            }
-        )
+    if manifest_path == DEFAULT_MANIFEST:
+        _append_locator_sources(catalog_items)
     _append_observation_entries(catalog_items, manifest.get("observation_entries", []))
     return {
         "schema_version": 1,

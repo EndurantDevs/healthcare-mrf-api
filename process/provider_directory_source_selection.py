@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from process import eyemed_directory_integration as eyemed_directory
 from process import nomi_directory_integration as nomi_directory
 from process import provider_directory_bcbs_minnesota as bcbs_minnesota
 from process import provider_directory_generic_source_policy as source_policy
@@ -449,17 +450,16 @@ def probe_flush_every():
         return 50
 
 
-DIRECTORY_SOURCE_IDS = frozenset({vsp_directory.SOURCE_ID, nomi_directory.SOURCE_ID})
-DIRECTORY_FETCH_MODES = frozenset({vsp_directory.TRANSPORT, nomi_directory.TRANSPORT})
+LOCATOR_ADAPTERS = (nomi_directory, eyemed_directory)
+DIRECTORY_SOURCE_IDS = frozenset(a.SOURCE_ID for a in (vsp_directory, *LOCATOR_ADAPTERS))
+DIRECTORY_FETCH_MODES = frozenset(a.TRANSPORT for a in (vsp_directory, *LOCATOR_ADAPTERS))
 
 
 def search_directory_adapter(source_record):
     """Match one supported publisher JSON adapter by its registered identity."""
     if vsp_directory.is_source(source_record):
         return vsp_directory
-    if nomi_directory.is_source(source_record):
-        return nomi_directory
-    return None
+    return next((adapter for adapter in LOCATOR_ADAPTERS if adapter.is_source(source_record)), None)
 
 
 def requested_directory_adapter(source_ids, source_query, census_request):
@@ -468,9 +468,7 @@ def requested_directory_adapter(source_ids, source_query, census_request):
         return None
     if vsp_directory.explicit_selection(source_ids, source_query):
         return vsp_directory
-    if nomi_directory.is_explicit_selection(source_ids):
-        return nomi_directory
-    return None
+    return next((adapter for adapter in LOCATOR_ADAPTERS if adapter.is_explicit_selection(source_ids)), None)
 
 
 def require_directory_task(adapter, task, *, test_mode):
@@ -478,7 +476,7 @@ def require_directory_task(adapter, task, *, test_mode):
     if adapter is vsp_directory:
         vsp_directory.require(not test_mode, "vsp_test_capture_forbidden")
     else:
-        nomi_directory.require_task(task, test_mode=test_mode)
+        adapter.require_task(task, test_mode=test_mode)
 
 
 def is_anonymous_directory_source(directory, source_record):
@@ -489,7 +487,7 @@ def is_anonymous_directory_source(directory, source_record):
     if directory._credential_spec_for_source(source_record):
         if adapter is vsp_directory:
             vsp_directory.require(False, "vsp_source_credentials_forbidden")
-        raise ValueError("nomi_directory_origin_credentials_forbidden")
+        raise ValueError(f"{adapter.capture.PREFIX}_origin_credentials_forbidden")
     return True
 
 
@@ -499,7 +497,7 @@ def require_directory_acquisition(source_record, source_ids, resources, is_unbou
     if source_ids != [adapter.SOURCE_ID] or set(resources) != set(adapter.RESOURCE_TYPES) or not is_unbounded_deferred:
         if adapter is vsp_directory:
             vsp_directory.require(False, "vsp_full_deferred_acquisition_required")
-        raise ValueError("nomi_directory_full_deferred_acquisition_required")
+        raise ValueError(f"{adapter.capture.PREFIX}_full_deferred_acquisition_required")
 
 
 def resource_endpoint_signature(directory, source_record):
@@ -1023,8 +1021,7 @@ async def qualify_stale_isolated_source(directory, source_rows, task, *, timeout
         or directory.current_version_census_contract(source_record) is not None
         or directory._uses_alohr_graphql_connector(source_record)
         or directory._uses_uhc_official_file_connector(source_record)
-        or vsp_directory.is_source(source_record)
-        or nomi_directory.is_source(source_record)
+        or search_directory_adapter(source_record)
     ):
         return source_rows
     decision = directory._resource_import_source_decision(
