@@ -205,7 +205,6 @@ class CMSPreparedWorkspace:
         self._task, self._transaction = asyncio.current_task(), session.get_transaction()
         self._active, self._indexed = True, False
         self._readonly = False
-        self._payload_postimages = None
 
     @property
     def receipts(self):
@@ -232,12 +231,6 @@ class CMSPreparedWorkspace:
         _require(self._active, "scope_ended")
         _require(asdict(self.source_binding) == self._inputs["source_storage"], "source_binding_changed")
         await context._physical(self.database, self.session, self.connection, self._task, self._transaction)
-        if self._payload_postimages is not None:
-            from process.provider_directory_cms_snapshot_readback import verify_sealed_cms_workspace
-
-            _require(self._readonly and self._indexed, "readonly_workspace")
-            await verify_sealed_cms_workspace(self, **self._payload_postimages)
-            return self.receipts
         actor_by_field = await context._origin(self.connection, self.source_binding, self.policy)
         _require(actor_by_field == self._inputs["origin"], "original_publisher_changed")
         names = _names(self._binding)
