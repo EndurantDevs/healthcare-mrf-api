@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Kaiser Permanente public Provider Directory: sparse offset windows, _include crawl and reference repair."""
 
+from sqlalchemy import and_, func, literal, or_
+
 from process import provider_directory_uhc_scan as uhc_scan
 
 API_BASE = "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc"
@@ -22,6 +24,11 @@ REPAIR_ROUNDS = 4
 TOTAL_DRIFT_ERROR = "kaiser_advertised_total_drift"
 ROWS_BELOW_MINIMUM_ERROR = "kaiser_rows_below_previous_edition"
 REFERENCE_REPAIR_ERROR = "kaiser_reference_repair_incomplete"
+# Activation evidence of the retired manual census; its database guard pins the row's sealed metadata.
+REVIEWED_SUBSET_ACTIVATION_KEYS = (
+    "provider_directory_reviewed_subset_activation_v1",
+    "provider_directory_reviewed_subset_activation_v2",
+)
 _TOTALS = {}
 _STORED_INCLUDES = {}
 
@@ -30,6 +37,27 @@ def is_source(directory, source_record):
     """Match the one public Kaiser base."""
     return (
         directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")) == API_BASE
+    )
+
+
+def kept_activated_row_sql(target_metadata, incoming_metadata):
+    """An activated manual census row keeps its stored metadata when its seed becomes an ordinary acquisition."""
+    activated = " OR ".join(
+        f"pg_catalog.jsonb_typeof({target_metadata} -> '{key}') = 'object'" for key in REVIEWED_SUBSET_ACTIVATION_KEYS
+    )
+    return f"({activated}) AND {incoming_metadata} ->> 'provider_directory_manual_only' = 'false'"
+
+
+def kept_activated_row_expression(target_metadata, incoming_metadata):
+    """Expression twin of kept_activated_row_sql for VALUES upserts."""
+    return and_(
+        or_(
+            *(
+                func.jsonb_typeof(target_metadata.op("->")(literal(key))) == literal("object")
+                for key in REVIEWED_SUBSET_ACTIVATION_KEYS
+            )
+        ),
+        incoming_metadata.op("->>")(literal("provider_directory_manual_only")) == literal("false"),
     )
 
 
