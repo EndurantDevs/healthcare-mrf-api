@@ -403,15 +403,8 @@ async def test_shared_audit_worker_keeps_native_pricing_authorization(monkeypatc
     with pytest.raises(RuntimeError) as caught:
         await workers.guarded_ensure_worker(request)
     assert caught.value is failure
-    native_connection, run_id, admitted = admission.await_args.args
+    native_connection, run_id = admission.await_args.args
     assert callable(native_connection.fetchrow) and run_id == recorded["run_id"]
-    assert admitted.admitted_job == (
-        recorded["run_id"],
-        recorded["importer"],
-        recorded["metrics"]["queue"],
-        recorded["metrics"]["function"],
-        recorded["metrics"]["job_id"],
-    )
     admission.assert_awaited_once()
     launch.assert_not_called()
 

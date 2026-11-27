@@ -3445,7 +3445,6 @@ async def test_nested_retry_normalization_is_limited_to_provider_directory(monke
     monkeypatch.setattr(control_imports.mrf_acquisition, "require_acquisition", AsyncMock())
     _install_provider_admission_stubs(monkeypatch, [])
     monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", AsyncMock(return_value=None))
-    monkeypatch.setattr(control_imports, "_has_isolated_pricing_admission", AsyncMock(return_value=False))
     admission = AsyncMock(return_value=None)
     enqueue = AsyncMock(return_value={})
     monkeypatch.setattr(control_imports, "_admit_import_row", admission)

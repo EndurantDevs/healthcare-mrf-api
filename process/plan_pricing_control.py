@@ -3,58 +3,18 @@
 
 import hashlib
 import json
-import re
 
 from sqlalchemy import and_, case, cast, func, literal
 from sqlalchemy.dialects.postgresql import JSONB
 
 PRICING_IMPORTERS = frozenset({"plan-pricing-projection", "plan-pricing-prewarm", "plan-pricing-em-distance"})
 DELIVERY_FIELD = "plan_pricing_enqueue_delivery"
-_MANAGED_KEY = re.compile(r"plan-pricing-projection(?:-retry)?:[0-9a-f]{64}")
 
 
 def pricing_control_digest(payload, *, domain=None):
     """Keep the existing protected journal's canonical JSON and key domains."""
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     return hashlib.sha256((body if domain is None else domain + ":" + body).encode()).hexdigest()
-
-
-def is_managed_pricing_key(key):
-    """Require one complete canonical base or retry key."""
-    return type(key) is str and _MANAGED_KEY.fullmatch(key) is not None
-
-
-def projection_admission_key(request):
-    """Derive the existing journal's complete publication-attempt key."""
-    return "plan-pricing-projection:" + pricing_control_digest(
-        {
-            name: request[name]
-            for name in (
-                "binding_manifest_digest",
-                "projection_contract",
-                "publication_identity",
-                "publication_attempt_identity",
-            )
-        },
-        domain="plan_pricing_projection_admission_v2",
-    )
-
-
-def projection_retry_key(base_key, parent_run_id):
-    """Bind an authorized child to its original admission and exact parent."""
-    return "plan-pricing-projection-retry:" + pricing_control_digest(
-        {"admission_key": base_key, "retry_of_run_id": parent_run_id}, domain="plan_pricing_projection_retry_v1"
-    )
-
-
-def projection_attempt_fence_key(publication_identity, attempt_identity):
-    """Share the existing native fence with the protected terminal CAS."""
-    if any(
-        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
-        for value in (publication_identity, attempt_identity)
-    ):
-        raise ValueError("pricing control attempt identity is invalid")
-    return "control-plan-pricing-attempt:v1:" + publication_identity + ":" + attempt_identity
 
 
 def require_pricing_replay(existing, expected):

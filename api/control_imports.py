@@ -87,6 +87,7 @@ from process.live_progress import (
     read_live_progress,
 )
 from process.places_zcta_handoff import HANDOFF_FORMAT, is_protected_places_publication_enabled
+from process.plan_pricing_admission import require_unreserved_pricing_run
 from process.plan_pricing_control import (
     DELIVERY_FIELD,
     PRICING_IMPORTERS,
@@ -95,7 +96,6 @@ from process.plan_pricing_control import (
     preserve_delivery,
     require_pricing_replay,
 )
-from process.plan_pricing_control_transaction import pricing_admission_transaction
 from process.provider_directory_fhir_census_contract import (
     ProviderDirectoryFHIRAcquisitionStrategy,
     is_retained_pagination_reset_allowed,
@@ -3497,15 +3497,9 @@ async def _admit_import_row(
         return await _admit_npi_import_run(import_run_values_by_name)
     if importer == "massachusetts-borim-profile":
         return await _admit_massachusetts_import_run(import_run_values_by_name)
-    async with pricing_admission_transaction(import_run_values_by_name, action="create"):
-        await db.execute(insert(ImportRun).values(**import_run_values_by_name))
+    require_unreserved_pricing_run(import_run_values_by_name)
+    await db.execute(insert(ImportRun).values(**import_run_values_by_name))
     return None
-
-
-async def _has_isolated_pricing_admission(request_by_field):
-    """Bypass importer-wide serialization only with exact native admission."""
-    async with pricing_admission_transaction(request_by_field, action="create") as admission:
-        return admission is not None
 
 
 async def create_import_run(
@@ -3639,9 +3633,9 @@ async def create_import_run(
         replayed_run = await _idempotent_import_run(importer, idempotency_key, params=normalized_params_by_name)
         if replayed_run:
             require_pricing_replay(replayed_run, pricing_request_by_field)
-            async with pricing_admission_transaction(replayed_run, action="replay"):
-                _validate_massachusetts_request(importer, normalized_params_by_name, replayed_run)
-                return normalize_run(replayed_run), False
+            require_unreserved_pricing_run(replayed_run)
+            _validate_massachusetts_request(importer, normalized_params_by_name, replayed_run)
+            return normalize_run(replayed_run), False
     if (
         importer not in {"provider-directory-fhir", "hospital-prices"}
         and not is_ptg_source_file_admission
@@ -3650,8 +3644,8 @@ async def create_import_run(
             request_payload_map,
             idempotency_key,
         )
-        and not await _has_isolated_pricing_admission(pricing_request_by_field)
     ):
+        require_unreserved_pricing_run(pricing_request_by_field)
         active_importer = await find_earliest_active_run_by_importer(importer)
         if active_importer:
             await recheck_collection_replay(normalized_params_by_name, active_importer)
@@ -3737,8 +3731,8 @@ async def create_import_run(
                     replayed_run,
                 ):
                     raise ValueError("hospital-price idempotency key belongs to a different import request")
-                async with pricing_admission_transaction(replayed_run, action="replay"):
-                    return normalize_run(replayed_run), False
+                require_unreserved_pricing_run(replayed_run)
+                return normalize_run(replayed_run), False
         raise
     if importer == "nucc":
         return await _enqueue_nucc_run(import_run_values_by_name, param_views.enqueue_by_name), True

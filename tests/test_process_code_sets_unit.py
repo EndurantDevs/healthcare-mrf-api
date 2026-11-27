@@ -810,7 +810,6 @@ async def test_code_sets_create_persists_queue_identity_before_dispatch(monkeypa
         control_imports, "db", SimpleNamespace(_transaction_binding=lambda: None, _reader_binding=lambda: None)
     )
     monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", AsyncMock(return_value=None))
-    monkeypatch.setattr(control_imports, "_has_isolated_pricing_admission", AsyncMock(return_value=False))
     monkeypatch.setattr(control_imports, "enqueue_status_event", Mock())
     monkeypatch.setattr(control_imports, "_write_run_live_progress", Mock())
     admissions = []

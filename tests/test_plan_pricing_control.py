@@ -7,13 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import control_imports
-from process.plan_pricing_control import (
-    is_managed_pricing_key,
-    projection_admission_key,
-    projection_attempt_fence_key,
-    projection_retry_key,
-    require_pricing_replay,
-)
+from process.plan_pricing_control import require_pricing_replay
 from tests.test_plan_pricing_idempotency import _durable_import_request
 
 
@@ -72,26 +66,3 @@ async def test_changed_request_never_replays_or_enqueues_even_after_unique_race(
     with pytest.raises(ValueError, match="different request"):
         await control_imports.create_import_run(request)
     enqueue.assert_not_awaited()
-
-
-def test_managed_keys_are_exact_and_domain_bound():
-    request_by_field = {
-        "binding_manifest_digest": "a" * 64,
-        "projection_contract": "plan_pricing_factorized_v4",
-        "publication_identity": "b" * 64,
-        "publication_attempt_identity": "c" * 64,
-    }
-    key = projection_admission_key(request_by_field)
-    retry = projection_retry_key(key, "original-run")
-    assert key != retry and is_managed_pricing_key(key) and is_managed_pricing_key(retry)
-    assert not is_managed_pricing_key(key + " ")
-    assert not is_managed_pricing_key(key.upper())
-    assert projection_attempt_fence_key("b" * 64, "c" * 64) == (
-        "control-plan-pricing-attempt:v1:" + "b" * 64 + ":" + "c" * 64
-    )
-
-
-@pytest.mark.parametrize("identity", ("", "a" * 63, "A" * 64, True, None))
-def test_attempt_fence_refuses_partial_or_changed_identity(identity):
-    with pytest.raises(ValueError, match="invalid"):
-        projection_attempt_fence_key("a" * 64, identity)
