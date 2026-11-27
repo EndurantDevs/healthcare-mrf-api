@@ -192,7 +192,11 @@ def _authorized_plan():
     if not manifest or not Path(manifest).is_absolute():
         raise ValueError("delta_dental_finder_authorized_manifest_required")
     with Path(manifest).open("rb") as manifest_file:
-        raw = manifest_file.read(1024 * 1024 + 1)
+        return decode_finder_plan(manifest_file.read(1024 * 1024 + 1))
+
+
+def decode_finder_plan(raw):
+    """Validate the encoded search scope and derive its immutable edition identity."""
     try:
         if len(raw) > 1024 * 1024:
             raise ValueError

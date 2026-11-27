@@ -2,6 +2,7 @@
 """Postal ZIP+4 descent, transport shaping and reference closure for the capped UHC FHIR search."""
 
 import asyncio
+import hashlib
 import re
 import time
 import urllib.parse
@@ -10,9 +11,11 @@ from functools import lru_cache, partial
 from itertools import batched, islice
 
 from db.plan_release_storage import storage_relation
+from process import geo_import
 from process import provider_directory_optum_pages as optum_pages
 from process import provider_directory_source_proxy as source_proxy
 from process.provider_directory_resource_hash import RESOURCE_TRANSPORT_PAYLOAD_FIELDS
+from process.provider_directory_zip_inventory import national_zip_codes
 
 POSTAL_SEARCH_PARAMS = {
     "PractitionerRole": "location.address-postalcode",
@@ -113,21 +116,53 @@ def postal_child_prefixes(prefix):
     return []
 
 
+@lru_cache(maxsize=1)
+def location_zip_codes():
+    """Freeze the national and geographic reference ZIPs shipped with this worker."""
+    codes = set(national_zip_codes())
+    for values in geo_import._geo_rows(geo_import.DEFAULT_SOURCE):
+        if _ZIP5.fullmatch(values["zip_code"]):
+            codes.add(values["zip_code"])
+    return tuple(sorted(codes))
+
+
+def _has_postal_filter(start_url):
+    return "address-postalcode" in urllib.parse.parse_qs(urllib.parse.urlsplit(start_url).query, keep_blank_values=True)
+
+
+@lru_cache(maxsize=1)
+def _location_zip_digest():
+    return hashlib.sha256("\n".join(location_zip_codes()).encode("ascii")).hexdigest()
+
+
+def location_plan_identity(directory, source_record):
+    """Bind unrestricted Location checkpoints to the image's exact ZIP plan."""
+    start_url = directory._resource_start_url(source_record, "Location", page_count=1)
+    return _location_zip_digest() if start_url and not _has_postal_filter(start_url) else None
+
+
 async def location_start_urls(directory, source_record, page_count):
-    """Search only five-digit ZIPs from the existing geographic reference inventory."""
+    """Check the live reference at initial intake, then reuse the worker's immutable ZIP plan."""
     start_url = directory._resource_start_url(source_record, "Location", page_count=page_count)
     if not start_url:
         return []
-    query_by_name = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(start_url).query, keep_blank_values=True))
-    if "address-postalcode" in query_by_name:
+    if _has_postal_filter(start_url):
         return [start_url]
-    relation = storage_relation(directory._schema(), "geo_zip_lookup")
-    zip_rows = await directory.db.all(
-        f"SELECT DISTINCT zip_code FROM {relation} WHERE zip_code ~ '^[0-9]{{5}}$' ORDER BY zip_code"
-    )
-    if not zip_rows:
-        raise RuntimeError("provider_directory_uhc_location_zip_inventory_empty")
-    return [directory._url_with_query_item(start_url, "address-postalcode", zip_row[0]) for zip_row in zip_rows]
+    codes = location_zip_codes()
+    context = source_record.get("_pagination_checkpoint_context")
+    if context and context.retry_of_run_id:
+        if not context.lineage_verified:
+            raise RuntimeError("provider_directory_uhc_location_zip_retry_unverified")
+    else:
+        relation = storage_relation(directory._schema(), "geo_zip_lookup")
+        zip_rows = await directory.db.all(
+            f"SELECT DISTINCT zip_code FROM {relation} WHERE zip_code ~ '^[0-9]{{5}}$' ORDER BY zip_code"
+        )
+        if not zip_rows:
+            raise RuntimeError("provider_directory_uhc_location_zip_inventory_empty")
+        if {row[0] for row in zip_rows}.difference(codes):
+            raise RuntimeError("provider_directory_uhc_location_zip_inventory_changed")
+    return [directory._url_with_query_item(start_url, "address-postalcode", code) for code in codes]
 
 
 def location_partition_predicate_error(directory, source_record, resource_type, url, bundle):

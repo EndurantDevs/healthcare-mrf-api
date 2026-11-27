@@ -217,7 +217,8 @@ def test_uhc_affiliation_uses_postal_partitions():
 
 
 @pytest.mark.asyncio
-async def test_uhc_location_scan_uses_only_reference_zip_codes(monkeypatch):
+async def test_uhc_location_scan_includes_national_zip_codes(monkeypatch):
+    monkeypatch.setattr(uhc_scan, "location_zip_codes", lambda: ("00501", "00926", "11372"))
     zip_lookup = AsyncMock(return_value=[("00501",), ("11372",)])
     partitioned_fetch = AsyncMock(return_value=None)
     monkeypatch.setattr(importer.db, "all", zip_lookup)
@@ -231,6 +232,7 @@ async def test_uhc_location_scan_uses_only_reference_zip_codes(monkeypatch):
     assert '"geo_zip_lookup"' in zip_lookup.await_args.args[0]
     assert [_query(url) for url in partitioned_fetch.await_args.args[3]] == [
         {"_count": "100", "address-postalcode": "00501"},
+        {"_count": "100", "address-postalcode": "00926"},
         {"_count": "100", "address-postalcode": "11372"},
     ]
 
@@ -241,6 +243,57 @@ async def test_uhc_location_scan_fails_if_reference_zip_inventory_is_empty(monke
 
     with pytest.raises(RuntimeError, match="provider_directory_uhc_location_zip_inventory_empty"):
         await uhc_scan.location_start_urls(importer, SOURCE, 100)
+
+
+def test_optum_zip_plan_includes_legacy_and_territories():
+    codes = uhc_scan.location_zip_codes()
+    assert len(codes) == 41527
+    assert {"31084", "00926", "96913", "96799", "99747"} <= set(codes)
+
+
+def test_optum_checkpoint_scope_binds_location_plan(monkeypatch):
+    target_by_field = {
+        **SOURCE,
+        importer.RESOURCE_ENDPOINT_FIELDS["Location"]: f"{BASE}/Location?address-postalcode=60654",
+    }
+    monkeypatch.setattr(uhc_scan, "_location_zip_digest", lambda: "first")
+    first = importer._pagination_checkpoint_scope_identity(SOURCE, [SOURCE["source_id"]])
+    targeted = importer._pagination_checkpoint_scope_identity(target_by_field, [SOURCE["source_id"]])
+    monkeypatch.setattr(uhc_scan, "_location_zip_digest", lambda: "second")
+    assert importer._pagination_checkpoint_scope_identity(SOURCE, [SOURCE["source_id"]]) != first
+    assert importer._pagination_checkpoint_scope_identity(target_by_field, [SOURCE["source_id"]]) == targeted
+
+
+@pytest.mark.asyncio
+async def test_optum_zip_plan_replay_and_targeted_filter(monkeypatch):
+    monkeypatch.setattr(uhc_scan, "location_zip_codes", lambda: ("00926", "11372"))
+    lookup = AsyncMock(return_value=[("99999",)])
+    monkeypatch.setattr(importer.db, "all", lookup)
+    with pytest.raises(RuntimeError, match="uhc_location_zip_inventory_changed"):
+        await uhc_scan.location_start_urls(importer, SOURCE, 100)
+    lookup.reset_mock()
+    retry_by_field = {
+        **SOURCE,
+        "_pagination_checkpoint_context": SimpleNamespace(retry_of_run_id="old", lineage_verified=True),
+    }
+    assert [
+        _query(url)["address-postalcode"] for url in await uhc_scan.location_start_urls(importer, retry_by_field, 100)
+    ] == [
+        "00926",
+        "11372",
+    ]
+    target_by_field = {
+        **SOURCE,
+        importer.RESOURCE_ENDPOINT_FIELDS["Location"]: f"{BASE}/Location?address-postalcode=60654",
+    }
+    assert [
+        _query(url)["address-postalcode"] for url in await uhc_scan.location_start_urls(importer, target_by_field, 100)
+    ] == ["60654"]
+    retry_by_field["_pagination_checkpoint_context"].lineage_verified = False
+    with pytest.raises(RuntimeError, match="uhc_location_zip_retry_unverified"):
+        await uhc_scan.location_start_urls(importer, retry_by_field, 100)
+    assert uhc_scan.location_plan_identity(importer, target_by_field) is None
+    lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

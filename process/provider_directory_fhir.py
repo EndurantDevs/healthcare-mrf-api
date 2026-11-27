@@ -56478,6 +56478,10 @@ def _pagination_checkpoint_scope_identity(
         "source_ids": sorted(set(source_ids)),
         "resource_group": _resource_import_group_key(source_record),
     }
+    if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE and (
+        zip_plan := uhc_scan.location_plan_identity(sys.modules[__name__], source_record)
+    ):
+        scope_payload_dict["location_zip_plan"] = zip_plan
     if _source_metadata(source_record).get("provider_directory_network_snapshot") is not None:
         scope_payload_dict["network_snapshot"] = _source_metadata(source_record)["provider_directory_network_snapshot"]
     if _source_metadata(source_record).get("provider_directory_pagination_same_collection") is True:
@@ -56486,12 +56490,7 @@ def _pagination_checkpoint_scope_identity(
         scope_payload_dict["last_updated_partition_config"] = last_updated_partition_config
     if census_contract is not None:
         scope_payload_dict["current_version_census_identity"] = census_contract.identity()
-    scope_payload = json.dumps(
-        scope_payload_dict,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    scope_payload = json.dumps(scope_payload_dict, sort_keys=True, separators=(",", ":"), default=str)
     return canonical_api_base, hashlib.sha256(scope_payload.encode("utf-8")).hexdigest()
 
 
