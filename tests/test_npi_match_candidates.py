@@ -6,6 +6,8 @@ import types
 
 import pytest
 import sanic.exceptions
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from api.endpoint import npi as npi_module
 
@@ -500,3 +502,99 @@ async def test_fetch_match_candidate_rows_rolls_back_session_after_cancellation(
         await npi_module._fetch_match_candidate_rows({"address_key": "x"}, session=session)
 
     assert session.rollback_called is True
+
+
+class _StageSession:
+    def __init__(self):
+        self.events = []
+        self.rollback_called = False
+
+    async def execute(self, stmt, params=None):
+        self.events.append(("execute", str(stmt), params))
+
+    async def rollback(self):
+        self.rollback_called = True
+
+
+def _statement_timeouts(session):
+    return [
+        int(params["timeout_ms"])
+        for kind, statement, params in session.events
+        if kind == "execute" and "set_config('statement_timeout'" in statement
+    ]
+
+
+async def _run_stage(operation, session=None):
+    return await npi_module._run_match_candidate_stage_bounded(
+        operation,
+        started_at=npi_module.time.monotonic(),
+        stage_name="candidate lookup",
+        database_session=session,
+    )
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_stage_sets_statement_timeout_before_operation():
+    session = _StageSession()
+
+    async def operation():
+        session.events.append(("operation", "", None))
+        return "ok"
+
+    assert await _run_stage(operation, session) == "ok"
+    assert [event[0] for event in session.events] == ["execute", "operation"]
+    assert 0 < _statement_timeouts(session)[0] <= npi_module._MATCH_CANDIDATES_TIMEOUT_SECONDS * 1000
+
+
+@pytest.mark.asyncio
+async def test_later_stage_statement_gets_only_the_remaining_budget():
+    session = _StageSession()
+
+    async def operation():
+        await asyncio.sleep(0.05)
+        await npi_module._execute_stmt(text("SELECT 1"), session=session)
+
+    await _run_stage(operation, session)
+
+    stage_start_ms, statement_ms = _statement_timeouts(session)
+    assert statement_ms <= stage_start_ms - 40
+    assert session.events[-1][1] == "SELECT 1"
+
+
+@pytest.mark.asyncio
+async def test_statements_after_the_stage_are_not_capped():
+    session = _StageSession()
+
+    async def operation():
+        return None
+
+    await _run_stage(operation, session)
+    session.events.clear()
+    await npi_module._execute_stmt(text("SELECT 1"), session=session)
+
+    assert _statement_timeouts(session) == []
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_stage_maps_statement_timeout_to_budget_error():
+    session = _StageSession()
+
+    async def operation():
+        raise DBAPIError("SELECT 1", {}, types.SimpleNamespace(sqlstate="57014"))
+
+    with pytest.raises(sanic.exceptions.ServiceUnavailable, match="exceeded the .* second endpoint budget"):
+        await _run_stage(operation, session)
+
+    assert session.rollback_called is True
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_stage_without_session_issues_no_statement():
+    calls = []
+
+    async def operation():
+        calls.append("operation")
+        return "ok"
+
+    assert await _run_stage(operation) == "ok"
+    assert calls == ["operation"]
