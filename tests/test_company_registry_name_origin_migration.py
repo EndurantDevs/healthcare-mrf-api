@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261126120000_stored_id_lookups_by_name"
+CURRENT_HEAD = "20261127120000_retire_reviewed_subset_source_guards"
 _ORIGIN_UPGRADE_REVISIONS = [
     REVISION,
     "20261013010000_registry_custom_history_events",
@@ -89,6 +89,7 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261121050000_custom_import_rooted_text",
     "20261123182000_custom_import_root_boolean_index",
     "20261104020000_custom_import_family_blocks",
+    "20261126120000_stored_id_lookups_by_name",
     CURRENT_HEAD,
 ]
 

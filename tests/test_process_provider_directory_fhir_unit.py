@@ -6102,7 +6102,7 @@ def test_provider_directory_source_seed_upsert_preserves_serving_endpoint():
         incoming_prefix="stage_row",
     )
 
-    assert sql == ('COALESCE(target_row."endpoint_id", stage_row."endpoint_id")')
+    assert sql.endswith('ELSE COALESCE(target_row."endpoint_id", stage_row."endpoint_id") END')
 
     statement = importer.pg_insert(table).values(
         source_id="source_a",

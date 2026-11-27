@@ -178,6 +178,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261123182000_custom_import_root_boolean_index",
     "20261104020000_custom_import_family_blocks",
     "20261126120000_stored_id_lookups_by_name",
+    "20261127120000_retire_reviewed_subset_source_guards",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",

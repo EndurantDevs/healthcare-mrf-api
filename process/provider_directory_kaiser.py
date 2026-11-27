@@ -1,7 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Kaiser Permanente public Provider Directory: sparse offset windows, _include crawl and reference repair."""
 
-from sqlalchemy import and_, func, literal, or_
+from sqlalchemy import Text, and_, case, func, literal, or_
+from sqlalchemy.dialects.postgresql import JSONB, array
 
 from process import provider_directory_uhc_scan as uhc_scan
 
@@ -40,16 +41,41 @@ def is_source(directory, source_record):
     )
 
 
-def kept_activated_row_sql(target_metadata, incoming_metadata):
-    """An activated manual census row keeps its stored metadata when its seed becomes an ordinary acquisition."""
+RETIRED_CENSUS_KEYS = (
+    *REVIEWED_SUBSET_ACTIVATION_KEYS,
+    "provider_directory_acquisition_blocked_reason",
+    "provider_directory_candidate_status",
+    "provider_directory_override",
+    "provider_directory_reviewed_root_policy_v1",
+    "provider_directory_server_issued_subset_resources",
+    "provider_directory_verification_campaign_id",
+    *(
+        f"provider_directory_current_version_census_{name}"
+        for name in (
+            "canonicalization_version",
+            "completion_scopes",
+            "continuation_strategy",
+            "contract_version",
+            "page_count",
+            "start_urls",
+            "strategy",
+            "strategy_version",
+            "traversal_version",
+        )
+    ),
+)
+
+
+def _retired_census_row_sql(target_metadata, incoming_metadata):
+    """An activated manual census row whose seed is now an ordinary acquisition."""
     activated = " OR ".join(
         f"pg_catalog.jsonb_typeof({target_metadata} -> '{key}') = 'object'" for key in REVIEWED_SUBSET_ACTIVATION_KEYS
     )
-    return f"({activated}) AND {incoming_metadata} ->> 'provider_directory_manual_only' = 'false'"
+    return f"(({activated}) AND {incoming_metadata} ->> 'provider_directory_manual_only' = 'false')"
 
 
-def kept_activated_row_expression(target_metadata, incoming_metadata):
-    """Expression twin of kept_activated_row_sql for VALUES upserts."""
+def _retired_census_row_expression(target_metadata, incoming_metadata):
+    """Expression twin of _retired_census_row_sql for VALUES upserts."""
     return and_(
         or_(
             *(
@@ -59,6 +85,36 @@ def kept_activated_row_expression(target_metadata, incoming_metadata):
         ),
         incoming_metadata.op("->>")(literal("provider_directory_manual_only")) == literal("false"),
     )
+
+
+def retired_metadata_sql(target_metadata, incoming_metadata, otherwise):
+    """A retired census row drops its census state and takes the seed metadata."""
+    keys = ", ".join(f"'{key}'" for key in RETIRED_CENSUS_KEYS)
+    retired = f"({target_metadata} - ARRAY[{keys}]::text[]) || {incoming_metadata}"
+    return (
+        f"CASE WHEN {_retired_census_row_sql(target_metadata, incoming_metadata)} THEN {retired} ELSE {otherwise} END"
+    )
+
+
+def retired_metadata_expression(target_metadata, incoming_metadata, otherwise):
+    """Expression twin of retired_metadata_sql for VALUES upserts."""
+    retired = target_metadata.op("-")(array(RETIRED_CENSUS_KEYS, type_=Text)).op("||")(incoming_metadata)
+    return case((_retired_census_row_expression(target_metadata, incoming_metadata), retired), else_=otherwise)
+
+
+def retired_endpoint_sql(target_prefix, incoming_prefix):
+    """A retired census row moves to the seed endpoint; every other row keeps its stored endpoint."""
+    row = _retired_census_row_sql(
+        f'{target_prefix}."metadata_json"::jsonb', f'{incoming_prefix}."metadata_json"::jsonb'
+    )
+    incoming = f'{incoming_prefix}."endpoint_id"'
+    return f'CASE WHEN {row} THEN {incoming} ELSE COALESCE({target_prefix}."endpoint_id", {incoming}) END'
+
+
+def retired_endpoint_expression(table, excluded):
+    """Expression twin of retired_endpoint_sql for VALUES upserts."""
+    row = _retired_census_row_expression(table.c.metadata_json.cast(JSONB), excluded.metadata_json.cast(JSONB))
+    return case((row, excluded.endpoint_id), else_=func.coalesce(table.c.endpoint_id, excluded.endpoint_id))
 
 
 def seed_rows():
