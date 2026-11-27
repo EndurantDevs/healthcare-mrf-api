@@ -86,13 +86,13 @@ async def _check_status(response, binding, route, pause, on_hold, allow_retry):
         raise SourceProxyError("delta_dental_finder_response_status_invalid")
 
 
-async def _json_body(response, *, max_bytes=None, error_prefix="delta_dental_finder"):
+async def _json_body(response, *, max_bytes=None, error_prefix="delta_dental_finder", allow_gzip=False):
     """Bound the wire response before giving retained bytes to the parser."""
     if max_bytes is None:
         max_bytes = MAX_PAGE_BYTES
-    if (
-        response.content_type != "application/json"
-        or response.headers.get("Content-Encoding", "identity") != "identity"
+    encoding = response.headers.get("Content-Encoding", "identity")
+    if response.content_type != "application/json" or encoding not in (
+        {"identity", "gzip"} if allow_gzip else {"identity"}
     ):
         raise SourceProxyError(f"{error_prefix}_response_content_invalid")
     if response.content_length is not None and response.content_length > max_bytes:
@@ -102,6 +102,10 @@ async def _json_body(response, *, max_bytes=None, error_prefix="delta_dental_fin
         raw.extend(part)
         if len(raw) > max_bytes:
             raise SourceProxyError(f"{error_prefix}_response_too_large")
+    if encoding == "gzip":
+        from process.provider_directory_fhir_response import decode_bounded_response_body
+
+        return decode_bounded_response_body(bytes(raw), encoding, max_bytes)
     return bytes(raw)
 
 

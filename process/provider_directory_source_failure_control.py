@@ -4,6 +4,7 @@
 import json
 
 from db.plan_release_storage import storage_relation
+from process import eyemed_directory_capture as eyemed
 from process import nomi_directory_capture as nomi
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_fetch_types import empty_capture_retry_matches
@@ -13,18 +14,21 @@ from process.vsp_directory_integration import is_failed_capture_retry, is_rearme
 from process.vsp_directory_store import is_artifact_root_failure, is_artifact_tmp_permission_failure
 
 
-def is_nomi_capture_retry(checkpoint):
-    """Match only retries scoped to the configured Nomi adapter."""
-    return bool(
-        getattr(checkpoint, "source_ids", ()) == (nomi.SOURCE_ID,)
-        and checkpoint.canonical_api_base == nomi.ENDPOINT_SCOPE
-        and checkpoint.retry_of_run_id
-    )
+def retry_locator(checkpoint):
+    """Resolve a retained locator only for its own selected source and scope."""
+    for adapter in (nomi, eyemed):
+        if (
+            getattr(checkpoint, "source_ids", ()) == (adapter.SOURCE_ID,)
+            and checkpoint.canonical_api_base == adapter.ENDPOINT_SCOPE
+            and checkpoint.retry_of_run_id
+        ):
+            return adapter
+    return None
 
 
-def is_failed_nomi_capture_retry(existing_by_field, checkpoint):
-    """Select only a stopped Nomi candidate belonging to the immediate parent."""
-    return is_nomi_capture_retry(checkpoint) and empty_capture_retry_matches(
+def is_failed_locator_capture_retry(existing_by_field, checkpoint):
+    """Select only a stopped locator candidate belonging to the immediate parent."""
+    return retry_locator(checkpoint) is not None and empty_capture_retry_matches(
         existing_by_field, checkpoint, checkpoint.retry_of_run_id, "failed"
     )
 
@@ -33,10 +37,10 @@ def allows_initial_nomi_capture(existing_by_field, checkpoint):
     """Recognize the original worker's artifact failure before origin access."""
     metadata = existing_by_field.get("publication_metadata_json")
     return (
-        is_failed_nomi_capture_retry(existing_by_field, checkpoint)
+        is_failed_locator_capture_retry(existing_by_field, checkpoint)
         and checkpoint.retry_of_run_id == checkpoint.acquisition_root_run_id
         and isinstance(metadata, dict)
-        and is_artifact_tmp_permission_failure(metadata.get("error"), nomi.SOURCE_ID)
+        and is_artifact_tmp_permission_failure(metadata.get("error"), checkpoint.source_ids[0])
     )
 
 
@@ -51,8 +55,8 @@ def should_repair_empty_orphan(
     status = directory._clean_text(existing_by_field.get("status"))
     if existing_by_field.get("is_current") is True or status in directory.IMMUTABLE_ENDPOINT_DATASET_STATUSES:
         raise RuntimeError("provider_directory_endpoint_dataset_root_already_finalized")
-    if existing_by_field and is_nomi_capture_retry(checkpoint):
-        if checkpoint_id is not None or not is_failed_nomi_capture_retry(existing_by_field, checkpoint):
+    if existing_by_field and retry_locator(checkpoint):
+        if checkpoint_id is not None or not is_failed_locator_capture_retry(existing_by_field, checkpoint):
             raise RuntimeError("provider_directory_endpoint_dataset_uncheckpointed_candidate_exists")
         return True
     if existing_by_field and checkpoint_id is None:
@@ -85,12 +89,12 @@ def is_retained_vsp_capture_retry(candidate):
 async def orphan_candidate_status(directory, existing_by_field, candidate):
     """Return the expected status and whether the isolated empty proof passed."""
     checkpoint = candidate.checkpoint_context
-    if is_nomi_capture_retry(checkpoint):
+    if adapter := retry_locator(checkpoint):
         if (
-            not is_failed_nomi_capture_retry(existing_by_field, checkpoint)
+            not is_failed_locator_capture_retry(existing_by_field, checkpoint)
             or allows_initial_nomi_capture(existing_by_field, checkpoint) != checkpoint.allow_initial_nomi_capture
-            or candidate.selected_resources != nomi.RESOURCE_TYPES
-            or candidate.expected_resources != nomi.RESOURCE_TYPES
+            or candidate.selected_resources != adapter.RESOURCE_TYPES
+            or candidate.expected_resources != adapter.RESOURCE_TYPES
             or not await storage.has_empty_named_root_storage(directory, candidate, existing_by_field)
         ):
             raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
