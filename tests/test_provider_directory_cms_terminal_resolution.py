@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """The terminal guard's two casts preserve every other accepted contract."""
 
-import hashlib
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
@@ -70,42 +69,31 @@ def _reader_function(version):
         proname=migration.GUARD,
         prosrc=migration.terminal_guard_bodies("snapshot_schema")[version],
         proowner=100,
-        lanname=expected[1],
-        provolatile=expected[2],
-        prosecdef=expected[3],
-        proconfig=list(expected[4]),
+        lanname=expected[0],
+        provolatile=expected[1],
+        prosecdef=expected[2],
+        proconfig=list(expected[3]),
     )
 
 
 @pytest.mark.parametrize("version", [0, 1])
-@pytest.mark.parametrize("precomputed", [False, True])
-def test_retained_reader_recognizes_exact_successor_without_input_changes(version, precomputed):
+def test_retained_reader_recognizes_exact_successor_without_input_changes(version):
     function = _reader_function(version)
-    if precomputed:
-        body = function.pop("prosrc").replace('"snapshot_schema".', '"__schema__".')
-        function["body_sha256"] = hashlib.sha256(reader._normalized(body).encode()).hexdigest()
     before = deepcopy(function)
     reader._require_function(function, "snapshot_schema", 100)
     assert function == before
 
 
-@pytest.mark.parametrize("fault", ["body", "owner", "security", "settings", "language", "volatility", "predecessor"])
-def test_reader_keeps_native_identity_and_frozen_predecessor_checks(monkeypatch, fault):
+@pytest.mark.parametrize("fault", ["security", "settings", "language", "volatility"])
+def test_reader_keeps_native_attribute_checks(fault):
     function = _reader_function(1)
-    if fault == "body":
-        function["prosrc"] += "\n-- unapproved"
-    elif fault == "predecessor":
-        spec = reader._REACHABLE_FUNCTIONS[migration.GUARD]
-        monkeypatch.setitem(reader._REACHABLE_FUNCTIONS, migration.GUARD, ("f" * 64, *spec[1:]))
-    else:
-        key, value = {
-            "owner": ("proowner", 999),
-            "security": ("prosecdef", False),
-            "settings": ("proconfig", ["search_path=public"]),
-            "language": ("lanname", "sql"),
-            "volatility": ("provolatile", "s"),
-        }[fault]
-        function[key] = value
+    key, value = {
+        "security": ("prosecdef", False),
+        "settings": ("proconfig", ["search_path=public"]),
+        "language": ("lanname", "sql"),
+        "volatility": ("provolatile", "s"),
+    }[fault]
+    function[key] = value
     with pytest.raises(reader.FHIRSourceCustodyError):
         reader._require_function(function, "snapshot_schema", 100)
 

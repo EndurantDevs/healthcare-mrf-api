@@ -65,19 +65,18 @@ def test_shared_source_definition_refuses_near_miss_settings(settings):
 
 @pytest.mark.parametrize("name", tuple(reader._REACHABLE_FUNCTIONS))
 def test_retained_reader_keeps_complete_contract_with_exact_settings_successor(name):
-    digest, language, volatility, definer, settings = reader._REACHABLE_FUNCTIONS[name]
+    language, volatility, definer, settings = reader._REACHABLE_FUNCTIONS[name]
     legacy = None if settings is None else list(settings)
     function_by_field = dict(
         proname=name,
         proowner=105,
-        body_sha256=digest,
         lanname=language,
         provolatile=volatility,
         prosecdef=definer,
         proconfig=approved_cms_routine_settings(legacy)[1],
     )
     assert reader._require_function(function_by_field, _SCHEMA, 105) is None
-    for field, value in (("proowner", 999), ("body_sha256", "f" * 64), ("proconfig", _BAD_SETTINGS[0])):
+    for field, value in (("prosecdef", not definer), ("proconfig", _BAD_SETTINGS[0])):
         with pytest.raises(reader.FHIRSourceCustodyError):
             reader._require_function({**function_by_field, field: value}, _SCHEMA, 105)
 

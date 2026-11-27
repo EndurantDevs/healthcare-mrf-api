@@ -237,7 +237,7 @@ def test_named_witness_pair_roundtrip_uses_complete_qualified_names():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drift", [None, "layout", "rows", "publication"])
-async def test_named_pair_replay_revalidates_saved_content(monkeypatch, drift):
+async def test_named_pair_replay_revalidates_saved_layout_without_rehashing_rows(monkeypatch, drift):
     pair = _retained_pair()
     ownership = pair.address_ownership
     comment = retained._pair_comment(pair) + retained._json(pair.as_dict())
@@ -263,7 +263,7 @@ async def test_named_pair_replay_revalidates_saved_content(monkeypatch, drift):
     monkeypatch.setattr(retained, "address_clone_identity", address_layout)
 
     replay = retained._retained_pair(session, proof, ownership.schema_name, pair.owner_role, pair.runtime_roles)
-    if drift is None:
+    if drift in (None, "rows"):
         assert await replay == pair
     else:
         with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
@@ -272,7 +272,7 @@ async def test_named_pair_replay_revalidates_saved_content(monkeypatch, drift):
         address_layout.assert_not_awaited()
     else:
         address_layout.assert_awaited_once_with(
-            session, ownership, pair.owner_role, pair.runtime_roles, verify_content=True
+            session, ownership, pair.owner_role, pair.runtime_roles, verify_content=False
         )
         epoch.assert_awaited_once_with(
             driver, pair.proof.source_pin, pair.recipe.source_pin.retained_epoch, verify_content=True

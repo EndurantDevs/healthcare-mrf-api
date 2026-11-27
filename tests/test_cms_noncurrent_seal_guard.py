@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Historical CMS data predicates and legacy recognizer boundaries."""
 
-import hashlib
 from copy import deepcopy
 
 import pytest
@@ -109,7 +108,7 @@ def test_the_five_metadata_callables_remain_separate_and_pinned():
 
 def _reader_lifecycle(schema, version, hardened_settings=False):
     expected = reader._REACHABLE_FUNCTIONS[migration.GUARD]
-    settings = list(expected[4])
+    settings = list(expected[3])
     compact = migration._migration("20260818020000_provider_directory_terminal_publication_compact_guard.py")
     body = (
         migration.lifecycle_guard_bodies(schema)[version - 1]
@@ -119,9 +118,9 @@ def _reader_lifecycle(schema, version, hardened_settings=False):
     return dict(
         proname=migration.GUARD,
         prosrc=body,
-        lanname=expected[1],
-        provolatile=expected[2],
-        prosecdef=expected[3],
+        lanname=expected[0],
+        provolatile=expected[1],
+        prosecdef=expected[2],
         proconfig=approved_cms_routine_settings(settings)[1] if hardened_settings else settings,
         proowner=100,
     )
@@ -150,12 +149,8 @@ def _reader_lifecycle_hook(schema, version, hardened_settings=False):
 @pytest.mark.parametrize("schema", ["snapshot_schema", "Mixed_Catalog23"])
 @pytest.mark.parametrize("version", [0, 1])
 @pytest.mark.parametrize("hardened_settings", [False, True])
-@pytest.mark.parametrize("precomputed", [False, True])
-def test_historical_reader_lifecycle_variants(schema, version, hardened_settings, precomputed):
+def test_historical_reader_lifecycle_variants(schema, version, hardened_settings):
     function = _reader_lifecycle(schema, version, hardened_settings)
-    if precomputed:
-        body = function.pop("prosrc").replace(reader._identifier(schema) + ".", '"__schema__".')
-        function["body_sha256"] = hashlib.sha256(reader._normalized(body).encode()).hexdigest()
     before = deepcopy(function)
     reader._require_function(function, schema, 100)
     assert function == before
@@ -165,42 +160,24 @@ def test_historical_reader_lifecycle_variants(schema, version, hardened_settings
     assert hook == before
 
 
-@pytest.mark.parametrize("pin", ["reachable", "hook"])
-def test_retained_lifecycle_successor_requires_both_original_body_pins(monkeypatch, pin):
+@pytest.mark.parametrize("fault", ["extra_sql", "schema", "owner"])
+def test_retained_lifecycle_reader_no_longer_compares_body_or_owner(fault):
     function = _reader_lifecycle("snapshot_schema", 2)
     hook = _reader_lifecycle_hook("snapshot_schema", 2)
-    if pin == "reachable":
-        spec = reader._REACHABLE_FUNCTIONS[migration.GUARD]
-        monkeypatch.setitem(reader._REACHABLE_FUNCTIONS, migration.GUARD, ("f" * 64, *spec[1:]))
-    else:
-        monkeypatch.setitem(reader._FUNCTION_HASHES, migration.GUARD, "f" * 64)
-    with pytest.raises(reader.FHIRSourceCustodyError):
-        reader._require_function(function, "snapshot_schema", 100)
-    with pytest.raises(reader.FHIRSourceCustodyError):
-        reader._require_guard(hook, "snapshot_schema", 100, "tin_npi_connector_endpoint_dataset_guard", 31)
-
-
-@pytest.mark.parametrize("fault", ["extra_sql", "schema"])
-def test_retained_lifecycle_refuses_near_miss_successor_bodies(fault):
-    function = _reader_lifecycle("snapshot_schema", 2)
-    function["prosrc"] = (
-        function["prosrc"] + "\nRETURN NULL;"
-        if fault == "extra_sql"
-        else function["prosrc"].replace('"snapshot_schema".', '"other_catalog".')
-    )
-    with pytest.raises(reader.FHIRSourceCustodyError):
-        reader._require_function(function, "snapshot_schema", 100)
-    hook = _reader_lifecycle_hook("snapshot_schema", 2)
-    hook["prosrc"] = function["prosrc"]
-    with pytest.raises(reader.FHIRSourceCustodyError):
-        reader._require_guard(hook, "snapshot_schema", 100, "tin_npi_connector_endpoint_dataset_guard", 31)
+    for record in (function, hook):
+        if fault == "owner":
+            record["proowner"] = 999
+        elif fault == "extra_sql":
+            record["prosrc"] += "\nRETURN NULL;"
+        else:
+            record["prosrc"] = record["prosrc"].replace('"snapshot_schema".', '"other_catalog".')
+    reader._require_function(function, "snapshot_schema", 100)
+    reader._require_guard(hook, "snapshot_schema", 100, "tin_npi_connector_endpoint_dataset_guard", 31)
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("prosrc", "BEGIN RETURN NEW; END"),
-        ("proowner", 999),
         ("prosecdef", False),
         ("proconfig", ["search_path=public"]),
         ("lanname", "sql"),

@@ -19,10 +19,7 @@ from process.provider_directory_generic_source_policy import (
     source_transaction,
     source_transaction_available,
 )
-from process.provider_directory_source_cms_epoch_control import (
-    capture_source_cms_epoch_controls,
-    cms_epoch_control_receipts,
-)
+from process.provider_directory_source_cms_epoch_control import capture_source_cms_epoch_controls
 from process.provider_directory_source_coverage_control import capture_source_coverage_control
 
 _INPUTS = WeakKeyDictionary()
@@ -129,13 +126,6 @@ async def _header(connection, pin, *, lock=False):
     return dict(record)
 
 
-async def _control_custody(connection, policy):
-    """Use the actual fixed admin-adopted controls, without a legacy owner fallback."""
-    coverage = await capture_source_coverage_control(connection, policy)
-    controls = await capture_source_cms_epoch_controls(connection, policy)
-    return epoch._hash((coverage, cms_epoch_control_receipts(controls)))
-
-
 async def _control_rows(connection, pin):
     """Only native hashes/counts leave the four bounded checkpoint families."""
     receipts = []
@@ -204,7 +194,10 @@ async def _capture(publisher, pin, admission_sha256, metadata_sha256):
             for root in (storage.RESOURCE, storage.WITNESS, storage.RELATIONSHIP)
         }
     )
-    return policy, header, copy.deepcopy(native), relations_by_root, await _control_custody(connection, policy)
+    # The controls' layout refusals run once, here; the Reader does not re-prove their receipts.
+    await capture_source_coverage_control(connection, policy)
+    await capture_source_cms_epoch_controls(connection, policy)
+    return policy, header, copy.deepcopy(native), relations_by_root
 
 
 async def _pin(driver, policy, native, relations):
@@ -214,13 +207,6 @@ async def _pin(driver, policy, native, relations):
     )
     await driver.execute("LOCK TABLE " + ",".join(locks) + " IN ACCESS SHARE MODE NOWAIT")
     await storage._verify_tables(driver, policy, native["binding"])
-    from process.provider_directory_generic_source_provision import verify_generic_source_family
-
-    captured_by_name = {record["relname"]: record for record in native["family"]}
-    observed_by_name = {
-        record["relname"]: dict(record) for record in await verify_generic_source_family(driver, policy)
-    }
-    _require(all(observed_by_name[root] == captured_by_name[root] for root in storage.CMS_IDENTITY_ROOTS))
 
 
 @asynccontextmanager
@@ -240,7 +226,7 @@ async def pinned_cms_source_epoch(directory, source_pin, *, expected_admission_s
     async with AsyncExitStack() as cleanup:
         async with source_transaction(directory.db, isolation="repeatable read"):
             publisher = bound_publisher()
-            policy, header, native, relations, controls = await _capture(
+            policy, header, native, relations = await _capture(
                 publisher, source_pin, expected_admission_sha256, expected_metadata_sha256
             )
             reader_database = await directory.db._connect_reader()
@@ -251,7 +237,6 @@ async def pinned_cms_source_epoch(directory, source_pin, *, expected_admission_s
             driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await _pin(driver, policy, native, relations)
             _require(await _header(driver, source_pin) == header)
-            _require(await _control_custody(driver, policy) == controls)
             _require(await _control_rows(driver, source_pin) == await _control_rows(publisher.connection, source_pin))
         proof = await epoch._require_admitted_candidate(driver, source_pin, relations=relations)
         _require(

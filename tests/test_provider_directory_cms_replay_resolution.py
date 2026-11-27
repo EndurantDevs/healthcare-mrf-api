@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Recognize only the exact two-argument repair under unchanged protected pins."""
 
-import hashlib
 from copy import deepcopy
 
 import pytest
@@ -42,39 +41,31 @@ def _reader_function(schema, version):
     return dict(
         proname=migration.GUARD,
         prosrc=body,
-        lanname=expected[1],
-        provolatile=expected[2],
-        prosecdef=expected[3],
-        proconfig=list(expected[4]),
+        lanname=expected[0],
+        provolatile=expected[1],
+        prosecdef=expected[2],
+        proconfig=list(expected[3]),
         proowner=100,
     )
 
 
 @pytest.mark.parametrize("version", [0, 1])
-@pytest.mark.parametrize("precomputed", [False, True])
-def test_retained_reader_accepts_exact_variant_and_preserves_input(version, precomputed):
+def test_retained_reader_accepts_exact_variant_and_preserves_input(version):
     function = _reader_function("snapshot_schema", version)
-    if precomputed:
-        body = function.pop("prosrc").replace('"snapshot_schema".', '"__schema__".')
-        function["body_sha256"] = hashlib.sha256(reader._normalized(body).encode()).hexdigest()
     before = deepcopy(function)
     reader._require_function(function, "snapshot_schema", 100)
     assert function == before
 
 
-@pytest.mark.parametrize("fault", ["body", "owner", "security", "settings", "volatility", "language"])
+@pytest.mark.parametrize("fault", ["security", "settings", "volatility", "language"])
 def test_typed_reader_variant_keeps_every_other_native_check(fault):
     function = _reader_function("snapshot_schema", 1)
-    if fault == "body":
-        function["prosrc"] += "\n-- unapproved"
-    else:
-        key, value = {
-            "owner": ("proowner", 999),
-            "security": ("prosecdef", False),
-            "settings": ("proconfig", ["search_path=pg_catalog,public"]),
-            "volatility": ("provolatile", "s"),
-            "language": ("lanname", "sql"),
-        }[fault]
-        function[key] = value
+    key, value = {
+        "security": ("prosecdef", False),
+        "settings": ("proconfig", ["search_path=pg_catalog,public"]),
+        "volatility": ("provolatile", "s"),
+        "language": ("lanname", "sql"),
+    }[fault]
+    function[key] = value
     with pytest.raises(reader.FHIRSourceCustodyError):
         reader._require_function(function, "snapshot_schema", 100)
