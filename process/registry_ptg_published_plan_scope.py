@@ -34,10 +34,10 @@ TABLE = "registry_ptg_published_plan_scope"
 CONTRACT = "registry_ptg_published_plan_scope.v1"
 
 
-async def resolve_published_plan(session, schema_name, intent_by_field, ownership, actor, *, pin_writer=False):
+async def resolve_published_plan(session, schema_name, intent_by_field, ownership, actor):
     """Resolve an exact real plan and complete files without company/cohort relabeling."""
     intent_by_field = validated_intent(intent_by_field)
-    await require_published_lock_privileges(session, schema_name, pin_writer=pin_writer)
+    await require_published_lock_privileges(session, schema_name)
     inventory_loader = published_plan_inventory
     if intent_by_field["review_type"] == "published_allowed_amount_plan":
         from process.registry_ptg_allowed_plan_source import allowed_plan_inventory
@@ -218,7 +218,6 @@ async def approve_published_plan(service, envelope, deadline, state):
             intent_by_field,
             envelope["command"]["ownership"],
             envelope["actor"],
-            pin_writer=True,
         )
         if full != envelope["command"]:
             raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
@@ -270,7 +269,7 @@ async def read_registry_ptg_published_plan_scope(session, *, scope_id, client_id
     return await _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256)
 
 
-async def _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256, *, pin_writer=False):
+async def _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256):
     """Reconstruct the original proof after a caller verified the exact store role."""
     from process.ptg_parts.result_archive_published_authority import (
         lock_ptg_published_result_for_clone,
@@ -304,7 +303,6 @@ async def _read_protected_published_scope(session, table, scope_id, client_id, a
         {name: full[name] for name in INTENT_FIELDS},
         full["ownership"],
         document["actor"],
-        pin_writer=pin_writer,
     )
     if current != full or _document(full, document["actor"], evidence) != document:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")

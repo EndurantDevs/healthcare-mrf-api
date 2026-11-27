@@ -81,11 +81,11 @@ async def read_original_generic_capture_metadata(driver, coordinates, read_budge
         coordinates.dataset_id,
     ):
         raise RegistryRefreshAnchorMismatch("registry_refresh_generic_capture_origin_differs")
-    return await require_retained_fhir_capture(driver, capture, verify_content=False)
+    return await require_retained_fhir_capture(driver, capture)
 
 
 async def read_original_generic_capture(driver, coordinates, read_budget):
-    """Issue the transaction-local read capability only after complete native content admission."""
+    """Issue the transaction-local read capability after validating the named edition."""
     from process.network_fhir_retained_capture import pin_retained_fhir_read
 
     capture = await read_original_generic_capture_metadata(driver, coordinates, read_budget)

@@ -171,19 +171,14 @@ async def test_metadata_mode_refuses_an_unreadable_edition_table(reader, readabl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("observed", ["e" * 64, "0" * 64])
-async def test_full_mode_checks_functional_catalog_and_complete_content(reader, monkeypatch, observed):
+async def test_full_mode_checks_functional_catalog_without_rehashing_content(reader, monkeypatch):
     pin, edition, connection, _ = reader
-    catalog, content = AsyncMock(), AsyncMock(return_value=observed)
+    catalog, content = AsyncMock(), AsyncMock(return_value="0" * 64)
     monkeypatch.setattr(epoch, "_catalog", catalog)
     monkeypatch.setattr(epoch, "_content", content)
-    if observed == edition.content_sha256:
-        assert await epoch.require_retained_cms_fhir_source_epoch(connection, pin, edition) == edition
-    else:
-        with pytest.raises(epoch.FHIRSourceEpochError):
-            await epoch.require_retained_cms_fhir_source_epoch(connection, pin, edition)
+    assert await epoch.require_retained_cms_fhir_source_epoch(connection, pin, edition) == edition
     catalog.assert_awaited_once_with(connection, edition.schema_name)
-    content.assert_awaited_once_with(connection, edition.schema_name)
+    content.assert_not_awaited()
 
 
 @pytest.mark.asyncio

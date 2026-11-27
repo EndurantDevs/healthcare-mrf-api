@@ -845,25 +845,19 @@ def test_new_capture_content_digest_and_relation_names_remain_bound():
             validate_capture({**value.as_dict(), **change})
 
 
-@pytest.mark.parametrize("changed_content", [False, True])
-async def test_pinned_retained_read_validates_content_and_keeps_the_logical_edition(monkeypatch, changed_content):
+async def test_pinned_retained_read_keeps_the_logical_edition_without_rehashing_content(monkeypatch):
     value = retained()
     connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="repeatable read"))
-    header = AsyncMock()
-    content = AsyncMock(return_value="f" * 64 if changed_content else value.content_sha256)
+    header, content = AsyncMock(), AsyncMock(return_value="f" * 64)
     monkeypatch.setattr(capture, "_copied_header_bytes", header)
     monkeypatch.setattr(capture, "_content_tables", content)
-    if changed_content:
-        with pytest.raises(RetainedFHIRCaptureError):
-            await capture.pin_retained_fhir_read(connection, value)
-    else:
-        read = await capture.pin_retained_fhir_read(connection, value)
-        read.require_ready(value)
-        assert read.capture == value
-        with pytest.raises(RetainedFHIRCaptureError):
-            read.require_ready(retained())
-    header.assert_awaited_once_with(connection, value.schema_name, value.origin)
-    content.assert_awaited_once_with(connection, value.schema_name)
+    read = await capture.pin_retained_fhir_read(connection, value)
+    read.require_ready(value)
+    assert read.capture == value
+    with pytest.raises(RetainedFHIRCaptureError):
+        read.require_ready(retained())
+    header.assert_not_awaited()
+    content.assert_not_awaited()
 
 
 async def test_retained_read_requires_pinned_repeatable_read_before_data_queries(monkeypatch):

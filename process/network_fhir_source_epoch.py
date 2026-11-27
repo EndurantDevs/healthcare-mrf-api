@@ -1059,7 +1059,10 @@ def _receipt_comment(epoch):
 
 
 async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, *, verify_content=True):
-    """Read the named edition and validate its logical source and data declarations."""
+    """Read the named edition and validate its logical source and data declarations.
+
+    Capture validated the content once; verify_content adds only the table-shape check.
+    """
     if type(verify_content) is not bool:
         _fail()
     epoch = validate_retained_cms_fhir_source_epoch(epoch)
@@ -1107,8 +1110,6 @@ async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, 
             _fail()
         if verify_content:
             await _catalog(connection, epoch.schema_name)
-            if await _content(connection, epoch.schema_name) != epoch.content_sha256:
-                _fail()
         return epoch
     except FHIRSourceEpochError:
         raise

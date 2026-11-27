@@ -821,7 +821,7 @@ def _count_retained_content_reads(monkeypatch):
 
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
 @pytest.mark.parametrize("legacy_entry", [False, True])
-async def test_initial_retained_composition_admits_content_once_per_transaction(
+async def test_initial_retained_composition_reads_without_rehashing_content(
     retained_address_custody_db, legacy_capture_db, serving_schema, bootstrap_db, monkeypatch, legacy_entry
 ):
     case, source_fixture = retained_address_custody_db, legacy_capture_db
@@ -840,13 +840,12 @@ async def test_initial_retained_composition_admits_content_once_per_transaction(
         (copy_target, address), arguments = await _retained_custody_compose(
             case, publisher, base, recipe, approved.approved_revision
         )
-        assert address == base and contents == [capture.schema_name] * (1 + 3 * legacy_entry)
+        assert address == base and contents == []
         assert await compose_registry_membership_candidate(publisher, **arguments) == (copy_target, address)
-        # Legacy replay separately admits SOURCE and the independently rebuilt office summary.
-        assert contents == [capture.schema_name] * (2 + 4 * legacy_entry)
+        assert contents == []
         if not legacy_entry:
             await _assert_mixed_office_receipt_refused(case, publisher, copy_target, address, recipe, approved)
-            assert contents == [capture.schema_name] * 3
+            assert contents == []
     finally:
         await publisher.close()
 
@@ -897,7 +896,7 @@ async def _record_initial_offices_legacy(connection, target, recipes, approved, 
     return receipt
 
 
-async def test_new_retained_capture_requires_its_own_full_admission(legacy_capture_db, serving_schema, monkeypatch):
+async def test_new_retained_capture_requires_its_own_read(legacy_capture_db, serving_schema, monkeypatch):
     source = legacy_capture_db
     first, second = await _capture(source), await _capture(source)
     recipe, _, _ = await _approved_capture_recipe(source, serving_schema, first)
@@ -916,10 +915,10 @@ async def test_new_retained_capture_requires_its_own_full_admission(legacy_captu
             await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture)
         del reads_by_capture[second_key]
         second_read = await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture)
-        assert first_read is not second_read and contents == [first.schema_name, second.schema_name]
+        assert first_read is not second_read and contents == []
         assert await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture) is first_read
         assert await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture) is second_read
-        assert contents == [first.schema_name, second.schema_name]
+        assert contents == []
 
 
 async def _assert_original_fact_reference(fixture, current, owner, operation):

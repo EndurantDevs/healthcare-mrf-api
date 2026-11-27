@@ -538,19 +538,19 @@ class _VerifiedACABatchRead:
     source_generations: tuple
 
 
-_READ_TRANSACTION_SQL = """SELECT virtualtransaction,current_user::text,
- session_user::text,pg_catalog.current_setting('transaction_isolation')
+# The virtual transaction keeps one verified decode on the snapshot it was made in.
+_READ_TRANSACTION_SQL = """SELECT virtualtransaction,pg_catalog.current_setting('transaction_isolation')
  FROM pg_catalog.pg_locks WHERE pid=pg_catalog.pg_backend_pid()
  AND locktype='virtualxid' AND mode='ExclusiveLock' AND granted
  AND virtualxid=virtualtransaction LIMIT 2"""
 
 
 async def _batch_read_transaction(connection):
-    """Identify a read transaction without assigning a permanent transaction ID."""
+    """Name the current repeatable snapshot without assigning a permanent transaction ID."""
     if not connection.is_in_transaction():
         _invalid()
     transactions = await connection.fetch(_READ_TRANSACTION_SQL)
-    if len(transactions) != 1 or transactions[0][3] not in {"repeatable read", "serializable"}:
+    if len(transactions) != 1 or transactions[0][1] not in {"repeatable read", "serializable"}:
         _invalid()
     return tuple(transactions[0])
 

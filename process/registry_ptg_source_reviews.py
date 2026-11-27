@@ -198,7 +198,7 @@ def _bounded_reviews(approval_records, schema_name, ownership, selection, invent
 async def read_registry_ptg_source_reviews(session, schema_name, ownership, selection, store):
     """Read one source-bound page; caller must authorize the whole returned batch."""
     table = await _protected_store(session, store, write=False, table_name=TABLE)
-    await require_published_lock_privileges(session, schema_name, pin_writer=False)
+    await require_published_lock_privileges(session, schema_name)
     from process.registry_ptg_allowed_plan_source import allowed_plan_inventory, is_allowed_snapshot
 
     inventory_loader = published_plan_inventory

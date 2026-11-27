@@ -122,7 +122,7 @@ async def read_registry_ptg_source_choices(session, schema_name, ownership, sele
     from process.registry_ptg_published_provisioning import require_published_lock_privileges
 
     if await is_allowed_snapshot(session, schema_name, ownership["snapshot_id"]):
-        await require_published_lock_privileges(session, schema_name, pin_writer=False)
+        await require_published_lock_privileges(session, schema_name)
         inventory_by_field = await allowed_plan_inventory(
             session, schema_name, ownership, operation_id="registry_ptg_inventory_" + _digest(ownership)
         )

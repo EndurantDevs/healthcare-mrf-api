@@ -173,7 +173,7 @@ async def test_preview_resolves_complete_role_inventory_after_protected_privileg
     )
     assert actual == command and authority == inventory["authority"]
     assert evidence_by_field["selection_mode"] == contract.SELECTION_MODE
-    protected.assert_awaited_once_with(None, "synthetic_ptg", pin_writer=False)
+    protected.assert_awaited_once_with(None, "synthetic_ptg")
     protected.side_effect = ValueError("unsafe role")
     inventory_loader.reset_mock()
     with pytest.raises(ValueError):

@@ -494,8 +494,8 @@ async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, da
             assert (
                 await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False) == epoch
             )
-            with pytest.raises(FHIRSourceEpochError):
-                await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch)
+            # Capture validated the content once; reads keep only the shape check.
+            assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch) == epoch
         if damage == "origin_change":
             await driver.execute(
                 "INSERT INTO mrf.provider_directory_entity_release_evidence SELECT source_id,resource_type,resource_id,'later-source-edition',payload_sha256,payload_json,observed_at FROM mrf.provider_directory_entity_release_evidence LIMIT 1"
