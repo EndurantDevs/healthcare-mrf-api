@@ -26,7 +26,7 @@ REFERENCE_SOURCE_TYPES = ("InsurancePlan", "PractitionerRole", "OrganizationAffi
 REFERENCE_TARGET_TYPES = ("Practitioner", "Organization", "Location")
 REFERENCE_BATCH_SIZE = {"Practitioner": 15, "Organization": 15, "Location": 10}
 ROLE_LINK_FIELDS = {"Practitioner": "practitioner_ref", "Organization": "organization_ref", "Location": "location_refs"}
-LEAF_RETRY_DELAYS_SECONDS = (5.0, 30.0)
+LEAF_RETRY_DELAYS_SECONDS = (5.0, 30.0, 120.0, 300.0)
 RETRY_ROUNDS = 2
 RETRY_DELAY_SECONDS = 2.0
 REFERENCE_FLUSH_ROWS = 500
@@ -227,11 +227,31 @@ async def split_guard_error(directory, request):
     return None
 
 
+def _rollback_deferred_unreadable_counts(request):
+    """Revert tentative per-leaf unreadable counts before an in-run leaf re-walk."""
+    if not request.unreadable_page_counts:
+        return
+    reverted_pages = len(request.unreadable_page_counts)
+    reverted_slots = sum(request.unreadable_page_counts)
+    state = request.state
+    state.unreadable_optum_page_count = max(0, state.unreadable_optum_page_count - reverted_pages)
+    state.unreadable_optum_slot_count = max(0, state.unreadable_optum_slot_count - reverted_slots)
+    state.partition_error_count = max(0, state.partition_error_count - reverted_pages)
+    if state.partition_error_count == 0:
+        state.error_message = None
+    elif state.error_message and state.error_message.startswith("partition_errors_"):
+        parts = state.error_message.split("_", 3)
+        if len(parts) == 4:
+            state.error_message = f"partition_errors_{state.partition_error_count}_{parts[3]}"
+    request.unreadable_page_counts.clear()
+
+
 def defer_failed_leaf(directory, request, fetch_error):
     """Queue the whole leaf for a later in-run retry and forget its page identities so the re-walk is not a loop."""
     if request.is_residual_only:
         # shortcut: a name parent's residual walk is a best-effort bulk pass; by-id closure reads referenced rows.
         return
+    _rollback_deferred_unreadable_counts(request)
     for page_identity in request.page_identities:
         request.state.seen_urls.discard(page_identity)
     request.state.retry_leaf_urls[request.partition_start_url] = fetch_error
@@ -244,7 +264,10 @@ async def retry_failed_leaves(directory, source_record, resource_type, start_url
             break
         deadline_at = fetch_options.deadline_at
         if deadline_at is not None:
-            delay_seconds = min(delay_seconds, max(0.0, deadline_at - time.monotonic()))
+            remaining_seconds = deadline_at - time.monotonic()
+            if remaining_seconds <= 0.0:
+                break
+            delay_seconds = min(delay_seconds, remaining_seconds)
         await asyncio.sleep(delay_seconds)
         retry_urls = list(state.retry_leaf_urls)
         state.retry_leaf_urls.clear()

@@ -47135,7 +47135,7 @@ async def _partition_page_bounded_outcome(
 
 async def _fetch_valid_partition_bundle(
     request: PartitionPageRequest,
-) -> dict[str, Any] | optum_pages.RecoveredPage | None:
+) -> dict[str, Any] | optum_pages.RecoveredPage | object | None:
     """Fetch one page and record bounded protocol failures."""
     fetch_result = await fhir_response.fetch_partition_response(sys.modules[__name__], request)
     status_code, fhir_payload, fetch_error, _elapsed = fetch_result
@@ -47215,6 +47215,8 @@ async def _fetch_partition_page(
 ) -> PartitionPageFetchResult:
     """Fetch, validate, and consume one partition page."""
     fhir_payload = await _fetch_valid_partition_bundle(request)
+    if fhir_payload is optum_pages.SPLIT_FIRST_PAGE:
+        return PartitionPageFetchResult(next_url=None, outcome="split")
     if fhir_payload is None:
         return PartitionPageFetchResult(next_url=None, outcome="failed")
     if isinstance(fhir_payload, optum_pages.RecoveredPage):
@@ -47285,10 +47287,7 @@ async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
     )
     if partition_identity in request.state.completed_partition_identities:
         return
-    is_partition_complete = False
-    is_partition_failed = False
-    has_split_children = False
-    is_residual_only = False
+    is_partition_complete = is_partition_failed = has_non_slot_failure = has_split_children = is_residual_only = False
     rows_fetched = 0
     expected_total = None
     current_url: str | None = request.request_url
@@ -47302,28 +47301,26 @@ async def _fetch_partition_url_chain(request: PartitionChainRequest) -> None:
         current_url = page_fetch_result.next_url
         rows_fetched += page_fetch_result.rows_fetched
         is_partition_failed = is_partition_failed or page_fetch_result.outcome == "failed"
+        has_non_slot_failure = has_non_slot_failure or (
+            page_fetch_result.outcome == "failed" and page_fetch_result.unreadable_slot_count == 0
+        )
         if page_fetch_result.outcome == "split":
+            has_split_children = True
             break
         if page_fetch_result.outcome == "split_residual":
-            has_split_children = True
-            is_residual_only = True
+            has_split_children = is_residual_only = True
         if not current_url and not is_partition_failed:
             is_partition_complete = True
-    await _flush_partition_resource_rows(
-        request.state,
-        request.fetch_options.row_batch_handler,
-        pending_resource_rows,
+    await _flush_partition_resource_rows(request.state, request.fetch_options.row_batch_handler, pending_resource_rows)
+    await postal_checkpoint.record_chain_checkpoint(
+        sys.modules[__name__],
+        request,
+        is_complete=is_partition_complete,
+        has_split_children=has_split_children,
+        has_non_slot_failure=has_non_slot_failure,
+        current_url=current_url,
+        rows_fetched=rows_fetched,
     )
-    if is_partition_complete and not has_split_children:
-        await _record_partition_checkpoint(
-            request.state,
-            request.source_record,
-            request.resource_type,
-            request.request_url,
-            request.fetch_options.run_id,
-            pages_fetched=len(request.page_identities),
-            rows_fetched=rows_fetched,
-        )
 
 
 async def _run_partition_fetch_worker(

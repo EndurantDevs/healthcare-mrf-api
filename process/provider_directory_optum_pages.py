@@ -8,6 +8,7 @@ from process.provider_directory_fetch_types import PartitionPageFetchResult
 from process.provider_directory_optum_outage import is_page_error
 
 MAX_RECOVERY_REQUESTS = 96
+SPLIT_FIRST_PAGE = object()
 RECOVERABLE_RESOURCE_TYPES = frozenset(
     {"Location", "Organization", "Practitioner", "OrganizationAffiliation", "PractitionerRole"}
 )
@@ -125,6 +126,86 @@ async def recover_page(url, total, resource_type, send):
     return RecoveredPage(recovered_batches, next_url, tuple(unreadable_offsets))
 
 
+def _summary_count_url(url):
+    parsed = urlsplit(url)
+    query_items = [
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if name not in {"_count", "_summary"}
+    ]
+    query_items.append(("_summary", "count"))
+    return parsed._replace(query=urlencode(query_items)).geturl()
+
+
+async def _recover_first_page(directory, request, send):
+    """Verify a single-row partition whose only record fails page-1 serialization."""
+    if request.current_url != request.partition_start_url or directory._has_fhir_continuation_query(
+        request.current_url
+    ):
+        return None
+    summary_status, summary_bundle, summary_error, _elapsed = await send(_summary_count_url(request.current_url))
+    if (
+        summary_status != 200
+        or summary_error
+        or not isinstance(summary_bundle, dict)
+        or summary_bundle.get("resourceType") != "Bundle"
+        or summary_bundle.get("type") != "searchset"
+    ):
+        return None
+    if directory._bundle_total(summary_bundle) != 1:
+        return None
+    single_url = directory._url_with_replaced_query_item(request.current_url, "_count", "1")
+    if not is_page_error(await send(single_url)):
+        return None
+    return RecoveredPage([], None, (0,))
+
+
+def split_unreadable_first_page(directory, request, fetch_result):
+    """Split a page-1 serialization failure into child prefixes to recover sibling records."""
+    if (
+        request.resource_type not in RECOVERABLE_RESOURCE_TYPES
+        or request.resource_type == "Location"
+        or request.is_residual_only
+        or request.current_url != request.partition_start_url
+        or directory._has_fhir_continuation_query(request.current_url)
+        or not directory.uhc_scan.is_source(directory, request.source_record)
+        or not is_page_error(fetch_result)
+    ):
+        return False
+    query_by_name = dict(parse_qsl(urlsplit(request.current_url).query, keep_blank_values=True))
+    search_param = {
+        "Practitioner": "family",
+        "Organization": "name",
+        **directory.uhc_scan.POSTAL_SEARCH_PARAMS,
+    }.get(request.resource_type)
+    prefix = directory._uhc_query_prefix(query_by_name, search_param or "")
+    if not search_param or not prefix:
+        return False
+    if request.resource_type in directory.uhc_scan.POSTAL_SEARCH_PARAMS:
+        if len(prefix) >= 5 or not prefix.isascii() or not prefix.isdigit():
+            return False
+        child_prefixes = directory.uhc_scan.postal_child_prefixes(prefix)
+    else:
+        max_prefix_length = directory._env_int(
+            "HLTHPRT_PROVIDER_DIRECTORY_UHC_MAX_PREFIX_LENGTH",
+            directory.UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH,
+        )
+        if len(prefix) >= max_prefix_length:
+            return False
+        child_prefixes = [prefix + character for character in directory.UHC_TEXT_SEARCH_ALPHABET]
+    child_urls = [
+        directory._url_with_replaced_query_item(request.current_url, search_param, child_prefix)
+        for child_prefix in child_prefixes
+    ]
+    queue = request.start_url_queue
+    ordered_urls = reversed(child_urls) if isinstance(queue, directory.asyncio.LifoQueue) else child_urls
+    for child_url in ordered_urls:
+        child_identity = directory._uhc_partition_identity(request.source_record, request.resource_type, child_url)
+        if child_identity not in request.state.completed_partition_identities:
+            queue.put_nowait(child_url)
+    return bool(child_urls)
+
+
 async def recover_partition_page(directory, request, fetch_result):
     """Read bounded subpages through the original source request admission."""
     if (
@@ -144,7 +225,12 @@ async def recover_partition_page(directory, request, fetch_result):
             return None, None, "deadline_reached", 0
         return await directory.fhir_response.fetch_partition_response(directory, replace(request, current_url=url))
 
-    recovered = await recover_page(request.current_url, request.expected_total, request.resource_type, send)
+    if request.current_url == request.partition_start_url:
+        recovered = await _recover_first_page(directory, request, send)
+        if recovered is None and split_unreadable_first_page(directory, request, fetch_result):
+            return SPLIT_FIRST_PAGE
+    else:
+        recovered = await recover_page(request.current_url, request.expected_total, request.resource_type, send)
     if recovered is not None:
         await directory._mark_partition_page_fetched(request.state)
     return recovered
@@ -162,9 +248,11 @@ async def consume_recovered_page(directory, request, recovered):
         await directory._mark_partition_fetch_error(request.state, predicate_error)
         return PartitionPageFetchResult(next_url=None, outcome="failed")
     state = request.state
-    if recovered.unreadable_offsets:
+    unreadable_slot_count = len(recovered.unreadable_offsets)
+    if unreadable_slot_count:
+        request.unreadable_page_counts.append(unreadable_slot_count)
         async with state.state_lock:
-            state.unreadable_optum_slot_count += len(recovered.unreadable_offsets)
+            state.unreadable_optum_slot_count += unreadable_slot_count
             state.unreadable_optum_page_count += 1
             if len(state.unreadable_optum_pages) < 25:
                 state.unreadable_optum_pages.append(
@@ -186,9 +274,9 @@ async def consume_recovered_page(directory, request, recovered):
             request.fetch_options,
         )
     page_result = await directory._partition_page_next_result(
-        request.source_record, request.current_url, recovered.next_url, state, bool(recovered.unreadable_offsets)
+        request.source_record, request.current_url, recovered.next_url, state, bool(unreadable_slot_count)
     )
-    return replace(page_result, rows_fetched=fetched_rows)
+    return replace(page_result, rows_fetched=fetched_rows, unreadable_slot_count=unreadable_slot_count)
 
 
 def unreadable_diagnostic(state):

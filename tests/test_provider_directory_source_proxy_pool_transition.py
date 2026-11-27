@@ -257,7 +257,7 @@ async def test_retained_proxy_first_launch_and_retry_preserve_lineage(direct_act
 
 @pytest.mark.parametrize(
     ("key", "value"),
-    [("partition_concurrency", 33), ("last_direct_run_id", ""), ("secret_name", _source_route_config()["secret_name"])],
+    [("partition_concurrency", 65), ("last_direct_run_id", ""), ("secret_name", _source_route_config()["secret_name"])],
 )
 def test_retained_proxy_rejects_invalid_route_config(monkeypatch, direct_activation, key, value):
     routes = json.loads(workers.os.environ[source.ROUTES_ENV])
@@ -265,6 +265,14 @@ def test_retained_proxy_rejects_invalid_route_config(monkeypatch, direct_activat
     monkeypatch.setenv(source.ROUTES_ENV, json.dumps(routes))
     with pytest.raises(ValueError, match="fhir_source_worker_route_invalid"):
         source._configured_routes()
+
+
+def test_retained_proxy_accepts_expanded_partition_concurrency(monkeypatch, direct_activation):
+    routes = json.loads(workers.os.environ[source.ROUTES_ENV])
+    routes[1]["retained_proxy"]["partition_concurrency"] = 64
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps(routes))
+    configured_routes = source._configured_routes()
+    assert source._retained_proxy_activation(configured_routes[1]).partition_concurrency == 64
 
 
 @pytest.mark.parametrize("invalid", ["missing-boundary", "already-proxied", "missing-proxy-audit"])

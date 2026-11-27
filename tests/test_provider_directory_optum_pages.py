@@ -171,3 +171,106 @@ async def test_recover_page_handles_multiple_unreadable_slots_in_full_100_row_wi
     assert recovered is not None
     assert recovered.unreadable_offsets == (112, 147, 189)
     assert sum(len(entries) for _, entries in recovered.batches) == 97
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary_total", [1, 2])
+async def test_first_page_error_recovers_only_verified_single_row_leaf(monkeypatch, summary_total):
+    start_url = f"{BASE}/Organization?name=ABZZ&_count=100"
+    calls = []
+
+    async def fetch(_directory, request):
+        calls.append(request.current_url)
+        query = parse_qs(urlsplit(request.current_url).query)
+        if query.get("_summary") == ["count"]:
+            return 200, {"resourceType": "Bundle", "type": "searchset", "total": summary_total}, None, 1
+        return PAGE_ERROR
+
+    monkeypatch.setattr(importer.fhir_response, "fetch_partition_response", fetch)
+    state = PartitionFetchState(result_model=importer.ProviderDirectoryOrganization, retained_resource_rows=[])
+    options = PartitionFetchOptions(5, "run", None, 2, False, None, 0)
+    request = PartitionChainRequest(
+        {"source_id": "test-source", "api_base": BASE}, "Organization", asyncio.Queue(), state, start_url, options
+    )
+    await importer._fetch_partition_url_chain(request)
+    if summary_total == 1:
+        assert state.unreadable_optum_slot_count == 1
+        assert state.unreadable_optum_page_count == 1
+        assert state.error_message == "partition_errors_1_last_optum_unreadable_search_slots"
+        assert not state.retry_leaf_urls
+    else:
+        assert state.unreadable_optum_slot_count == 0
+        assert start_url in state.retry_leaf_urls
+    assert any("_summary=count" in requested_url for requested_url in calls)
+
+
+@pytest.mark.asyncio
+async def test_first_page_error_splits_splittable_prefix_to_recover_siblings(monkeypatch):
+    start_url = f"{BASE}/Organization?name=AB&_count=100"
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def fetch(_directory, request):
+        query = parse_qs(urlsplit(request.current_url).query)
+        if query.get("_summary") == ["count"]:
+            return 200, {"resourceType": "Bundle", "type": "searchset", "total": 12}, None, 1
+        return PAGE_ERROR
+
+    monkeypatch.setattr(importer.fhir_response, "fetch_partition_response", fetch)
+    checkpoint = AsyncMock()
+    unreadable_checkpoint = AsyncMock()
+    monkeypatch.setattr(importer, "_record_partition_checkpoint", checkpoint)
+    monkeypatch.setattr(importer.postal_checkpoint, "record_unreadable_partition", unreadable_checkpoint)
+    state = PartitionFetchState(result_model=importer.ProviderDirectoryOrganization, retained_resource_rows=[])
+    options = PartitionFetchOptions(5, "run", None, 2, False, None, 0)
+    await importer._fetch_partition_url_chain(
+        PartitionChainRequest(
+            {"source_id": "test-source", "api_base": BASE}, "Organization", queue, state, start_url, options
+        )
+    )
+    queued_urls = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert len(queued_urls) == len(importer.UHC_TEXT_SEARCH_ALPHABET)
+    assert f"{BASE}/Organization?_count=100&name=ABA" in queued_urls
+    assert not state.retry_leaf_urls
+    assert state.error_message is None
+    checkpoint.assert_not_awaited()
+    unreadable_checkpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deferred_leaf_rolls_back_tentative_unreadable_counts_before_retry(monkeypatch):
+    monkeypatch.setattr(importer.uhc_scan, "LEAF_RETRY_DELAYS_SECONDS", (0.0,))
+    second_page = f"{BASE}?_getpages=synthetic%2Bhandle&_getpagesoffset=2&_count=2&_pagetype=opaque"
+    third_page = f"{BASE}?_getpages=synthetic%2Bhandle&_getpagesoffset=4&_count=2&_pagetype=opaque"
+    gateway_failures = ["http_502"]
+
+    async def fetch(_directory, request):
+        if request.current_url == START:
+            return _search_page(0, 2, second_page)
+        query = parse_qs(urlsplit(request.current_url).query)
+        start, count = int(query["_getpagesoffset"][0]), int(query["_count"][0])
+        if start <= 3 < start + count:
+            return PAGE_ERROR
+        if start == 4 and gateway_failures:
+            gateway_failures.pop()
+            return 502, {}, None, 1
+        stop = min(start + count, 6)
+        next_url = third_page if stop == 4 else None
+        return _search_page(start, stop, next_url)
+
+    monkeypatch.setattr(importer.fhir_response, "fetch_partition_response", fetch)
+    monkeypatch.setattr(importer, "_load_partition_checkpoints", AsyncMock(return_value=set()))
+    monkeypatch.setattr(importer, "_record_partition_checkpoint", AsyncMock())
+    options = PartitionFetchOptions(5, "run", None, 2, True, None, 0)
+    fetch_result = await importer._fetch_partitioned_resource_rows(
+        {"source_id": "test-source", "api_base": BASE},
+        "Location",
+        importer.ProviderDirectoryLocation,
+        [START],
+        options,
+    )
+    assert not gateway_failures
+    assert fetch_result.error == "partition_errors_1_last_optum_unreadable_search_slots"
+    assert fetch_result.fetch_diagnostic["unreadable_optum_page_count"] == 1
+    assert fetch_result.fetch_diagnostic["unreadable_optum_slot_count"] == 1
+    diagnostic = importer._resource_fetch_diagnostic(fetch_result, rows_written=fetch_result.rows_written)
+    assert pages.has_only_unreadable_slots(diagnostic)

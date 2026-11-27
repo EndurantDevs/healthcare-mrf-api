@@ -207,6 +207,7 @@ class PartitionPageFetchResult:
     outcome: str
     rows_fetched: int = 0
     reported_total: int | None = None
+    unreadable_slot_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -224,6 +225,7 @@ class PartitionPageRequest:
     fetch_options: PartitionFetchOptions
     page_identities: list[str] = field(default_factory=list)
     expected_total: int | None = None
+    unreadable_page_counts: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -237,6 +239,7 @@ class PartitionChainRequest:
     request_url: str
     fetch_options: PartitionFetchOptions
     page_identities: list[str] = field(default_factory=list)
+    unreadable_page_counts: list[int] = field(default_factory=list)
 
     def page_request(self, current_url, is_residual_only, pending_resource_rows, expected_total):
         """Bind a page to the current chain, write buffer, and first-page total."""
@@ -252,6 +255,7 @@ class PartitionChainRequest:
             fetch_options=self.fetch_options,
             page_identities=self.page_identities,
             expected_total=expected_total,
+            unreadable_page_counts=self.unreadable_page_counts,
         )
 
 

@@ -106,6 +106,9 @@ def _route_proxy_pool(route):
     return pool["revision"], pool["secret_name"]
 
 
+MAX_RETAINED_PROXY_PARTITION_CONCURRENCY = 64
+
+
 def _retained_proxy_activation(route):
     """Read an explicit proxy activation on a retained HTTP route."""
     if route is None or "retained_proxy" not in route:
@@ -128,7 +131,7 @@ def _retained_proxy_activation(route):
         or len(activation["secret_name"]) > 253
         or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", activation["secret_name"])
         or type(activation["partition_concurrency"]) is not int
-        or not 1 <= activation["partition_concurrency"] <= 32
+        or not 1 <= activation["partition_concurrency"] <= MAX_RETAINED_PROXY_PARTITION_CONCURRENCY
     ):
         raise ValueError("fhir_source_worker_route_invalid")
     return RetainedProxyActivation(**activation)
