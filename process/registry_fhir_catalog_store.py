@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from asyncpg import InsufficientPrivilegeError, InvalidSchemaNameError, UndefinedTableError
 
 from db.plan_release_storage import storage_identifier
-from db.registry_fhir_catalog import table_sql
+from db.registry_fhir_catalog import NETWORK_COMPANY_TABLE, network_company_sql, table_sql
 from process.registry_fhir_catalog_custody import (
     PHYSICAL_TABLES,
     FHIRCatalogTarget,
@@ -338,6 +338,8 @@ async def has_discarded_fhir_catalog_candidate(connection, target, *, loader_rol
     await connection.execute("LOCK TABLE " + heaps + " IN ACCESS EXCLUSIVE MODE")
     await _unregistered(connection, target, control_schema)
     await connection.execute("DROP TABLE " + heaps)
+    # Built at the index step, so an interrupted candidate may not have it yet.
+    await connection.execute(f"DROP TABLE IF EXISTS {namespace}.{NETWORK_COMPANY_TABLE}")
     await connection.execute("DROP SCHEMA " + namespace)
     return True
 
@@ -359,6 +361,15 @@ async def create_fhir_catalog_indexes(connection, target, *, loader_role, contro
                 await connection.execute(statement)
                 count += 1
             await connection.execute(f"ANALYZE {namespace}.{table}")
+        # The document grouping sorts every edge once; keep it in memory instead of spilling.
+        await connection.execute("SET LOCAL work_mem = '256MB'")
+        create, *summary = network_company_sql(namespace, trigram_schema=trigram)
+        await connection.execute(create)
+        await connection.execute(
+            f"ALTER TABLE {namespace}.{NETWORK_COMPANY_TABLE} OWNER TO {storage_identifier(loader_role)}"
+        )
+        for statement in summary:
+            await connection.execute(statement)
     return count
 
 

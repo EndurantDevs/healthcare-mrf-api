@@ -156,6 +156,7 @@ def network_document():
 
 @pytest.fixture
 def page_boundary(monkeypatch):
+    monkeypatch.setattr(catalog, "_NETWORK_COMPANY_SCHEMAS", {})
     connection = SimpleNamespace(
         fetchrow=AsyncMock(), fetchval=AsyncMock(return_value=True), is_in_transaction=lambda: True
     )
@@ -747,13 +748,41 @@ def test_page_sql_guards_search_materialized_ctes_when_unfiltered():
     assert "AND ($7::text IS NOT NULL OR $10::text IS NOT NULL)" in catalog._PAGE_SQL
 
 
-def test_page_sql_reads_filtered_networks_by_index():
-    edge_networks = catalog._PAGE_SQL.split("edge_networks AS MATERIALIZED (")[1].split("), visible_edges")[0]
+@pytest.mark.parametrize("summarized", [False, True])
+def test_page_sql_reads_filtered_networks_by_index(summarized):
+    sql, _ = catalog._catalog_page_statement({"schema_name": "sample_metadata"}, None, summarized=summarized)
+    edge_networks = sql.split("edge_networks AS MATERIALIZED (")[1].split("), visible_edges")[0]
     assert "$5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL" in edge_networks
     # A label disjunction here would hide the company trigram index from the planner.
     assert "source_companies" not in edge_networks and "EXISTS" not in edge_networks
-    assert "network.network_id IN (SELECT network_id FROM edge_networks)" in catalog._PAGE_SQL
-    assert "candidate.document_json->>'evidence_id') COLLATE \"C\">=company.source_generation" in catalog._PAGE_SQL
+    assert ("registry_fhir_catalog_network_company" in sql) is summarized
+    assert "network.network_id IN (SELECT network_id FROM edge_networks)" in sql
+    assert "candidate.document_json->>'evidence_id') COLLATE \"C\">=company.source_generation" in sql
+    # Shared documents, redaction and nested offsets keep the grouped read for that page row.
+    assert "GROUP BY network_id,visible_document" in sql
+    assert ("WHERE NOT summary.exact" in sql) is summarized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exists", "plan_search", "summarized"),
+    [(True, None, True), (True, "Gold Plan", False), (False, None, False)],
+)
+async def test_summary_statement_needs_the_table_and_no_plan_filter(page_boundary, exists, plan_search, summarized):
+    connection, _, _ = page_boundary
+    connection.fetchval.side_effect = lambda sql, *args: exists if "to_regclass" in sql else True
+    for _ in range(2):
+        await catalog.read_fhir_catalog(
+            connection,
+            catalog.FHIRCatalogQuery(company_search="Example", plan_search=plan_search),
+            excluded_network_ids=(),
+            control_schema="sample_control",
+        )
+        sql = connection.fetchrow.call_args.args[0]
+        assert ('"sample_metadata".registry_fhir_catalog_network_company' in sql) is summarized
+    lookups = [call for call in connection.fetchval.call_args_list if "to_regclass" in call.args[0]]
+    # One lookup per published schema; a plan filter never needs it.
+    assert len(lookups) == (0 if plan_search else 1)
 
 
 @pytest.mark.asyncio
