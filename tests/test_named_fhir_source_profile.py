@@ -208,6 +208,41 @@ async def test_typed_recipe_selects_configured_catalog(monkeypatch, state):
 
 
 @pytest.mark.asyncio
+async def test_typed_read_checks_imported_catalog_through_current_edition(monkeypatch):
+    """A retained capture is checked against the catalog's own descriptor for the same edition."""
+    from process import registry_imported_catalog_bindings as imported
+    from tests.test_registry_typed_source_recipe import _recipe
+
+    recipe = _recipe()
+    origin = source_origin(recipe.source_pin.capture["graph"]["origin"])
+    scope = imported.PublishedFHIRCatalogBindingScope("d" * 64, "e" * 64)
+    runtime = composition.SourceWitnessRuntime(
+        Mock(), _configured_profiles(origin, "matching"), "capture_owner", ("capture_reader",), catalog_bindings=scope
+    )
+    current_descriptor_by_field = {"edition": "current catalog form"}
+    resolve = AsyncMock(return_value=current_descriptor_by_field)
+    check = AsyncMock()
+    monkeypatch.setattr(imported, "current_catalog_descriptor", resolve)
+    monkeypatch.setattr(imported, "published_fhir_catalog_bindings_sql", check)
+    connection, approved = object(), object()
+    pin, _profile, selected = await composition._typed_source_read_scope(
+        connection, recipe, approved, "control_example", runtime, False
+    )
+    assert pin is recipe.source_pin and selected == origin
+    resolve.assert_awaited_once_with(
+        connection, scope, approved, recipe.source_pin.catalog_descriptor, control_schema="control_example"
+    )
+    check.assert_awaited_once_with(
+        connection,
+        scope,
+        approved,
+        recipe.binding_coordinates,
+        current_descriptor_by_field,
+        control_schema="control_example",
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["matching", "wrong", "ambiguous"])
 async def test_witness_recipe_selects_configured_catalog(monkeypatch, state):
     """Keep approval and fresh Source verification on the selected configured profile."""
