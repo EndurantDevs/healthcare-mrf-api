@@ -70,6 +70,7 @@ from process.ext.utils import (
     return_checksum,
 )
 from process.live_progress import enqueue_live_progress
+from process.mrf_network_identity import publish_network_identities, record_fragments
 from process.mrf_publication_receipt import begin_publication
 from process.mrf_workbook import read_mrf_workbook
 from process.openaddresses import refresh_archive_geocodes_from_openaddresses
@@ -1967,26 +1968,28 @@ async def process_provider(ctx, task):
                         or not 0 < int(npi_raw) < 4294967295
                     ):
                         continue
+                    provider_plan_links = []
                     for plan in provider_record["plans"]:
                         scope = await _mrf_provider_plan_scope(plan, task, myimportlog, current_year)
                         if scope is None:
                             continue
                         plan_id, issuer_id, my_years = scope
-                        for year in my_years:
-                            checksum_plan = return_checksum([plan_id, plan["network_tier"], issuer_id, year])
-                            checksum_network = return_checksum([plan["network_tier"], issuer_id, year])
-                            plan_networks_by_checksum[checksum_plan] = {
+                        provider_plan_links.extend(
+                            (plan_id, plan["network_tier"], issuer_id, year) for year in my_years
+                        )
+                    # Fragment keys are rewritten to final network keys during finalization.
+                    for fragment, fragment_scope in record_fragments(provider_plan_links).items():
+                        network_scope_by_field = {
+                            "network_tier": fragment_scope["network_tier"],
+                            "issuer_id": fragment_scope["issuer_id"],
+                            "year": fragment_scope["year"],
+                            "checksum_network": fragment,
+                        }
+                        network_tiers_by_checksum[fragment] = network_scope_by_field
+                        for plan_id in fragment_scope["plan_ids"]:
+                            plan_networks_by_checksum[(plan_id, fragment)] = {
                                 "plan_id": plan_id,
-                                "network_tier": plan["network_tier"],
-                                "issuer_id": issuer_id,
-                                "year": year,
-                                "checksum_network": checksum_network,
-                            }
-                            network_tiers_by_checksum[checksum_network] = {
-                                "network_tier": plan["network_tier"],
-                                "issuer_id": issuer_id,
-                                "year": year,
-                                "checksum_network": checksum_network,
+                                **network_scope_by_field,
                             }
                     if not network_tiers_by_checksum:
                         continue
@@ -3549,6 +3552,17 @@ async def publish_initial_generation(ctx, task):
 
     mrf_address_stage = make_class(MRFAddress, import_date, schema_override=db_schema)
     mrf_evidence_stage = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
+    network_identity = await timed_finalize_phase(
+        "mrf_network_identity",
+        publish_network_identities(
+            db,
+            db_schema,
+            npi_cls=make_class(PlanNPIRaw, import_date, schema_override=db_schema),
+            tier_cls=make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema),
+            evidence_cls=mrf_evidence_stage,
+        ),
+    )
+    logger.info("MRF network identities published: %s", network_identity)
     await timed_finalize_phase(
         "plan_drug_statistics",
         _refresh_all_plan_drug_statistics(import_date, db_schema),

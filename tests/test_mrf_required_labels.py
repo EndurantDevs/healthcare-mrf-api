@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import initial
+from process.mrf_network_identity import assign_networks
 from tests.test_mrf_import_lifecycle_contracts import (
     _configure_import_boundary,
     _import_context,
@@ -120,6 +121,15 @@ async def test_cost_sharing_skips_invalid_pharmacy_types(monkeypatch, label_valu
     _assert_invalid_label_logged("pharmacy_type")
 
 
+def _published_network_keys(network_rows):
+    """Return the keys finalization publishes for staged plan links."""
+    staged_link_rows = [
+        (row["plan_id"], row["network_tier"], row["issuer_id"], row["year"], row["checksum_network"])
+        for row in network_rows
+    ]
+    return {tier_row[1] for tier_row in assign_networks(staged_link_rows).tier_rows}
+
+
 def _provider_source(plans, npi):
     return {
         "npi": npi,
@@ -157,9 +167,9 @@ async def test_provider_network_skips_invalid_links(monkeypatch, label_value):
     networks = _stage_rows(duplicate_tolerant, "PlanNetworkTierRaw")
     assert len(networks) == 1
     assert networks[0]["network_tier"] == "Source-Tier"
-    assert networks[0]["checksum_network"] == initial.return_checksum(
-        ["Source-Tier", 12345, datetime.datetime.now().year]
-    )
+    assert _published_network_keys(networks) == {
+        initial.return_checksum(["Source-Tier", 12345, datetime.datetime.now().year])
+    }
     _assert_invalid_label_logged("network_tier")
 
 
@@ -200,8 +210,10 @@ async def test_provider_network_preserves_valid_siblings_of_invalid_plans(monkey
     providers = _stage_rows(batches, "PlanNPIRaw")
     assert {row["npi"] for row in providers} == {1000000001, 1000000002, 1000000003}
     assert {row["year"] for row in providers} == {year}
-    assert {row["checksum_network"] for row in providers} == {initial.return_checksum(["Source-Tier", 12345, year])}
-    assert {row["plan_id"] for row in _stage_rows(batches, "PlanNetworkTierRaw")} == {valid_plan_by_field["plan_id"]}
+    networks = _stage_rows(batches, "PlanNetworkTierRaw")
+    assert {row["checksum_network"] for row in providers} == {row["checksum_network"] for row in networks}
+    assert _published_network_keys(networks) == {initial.return_checksum(["Source-Tier", 12345, year])}
+    assert {row["plan_id"] for row in networks} == {valid_plan_by_field["plan_id"]}
     _assert_invalid_label_logged(field)
 
 
