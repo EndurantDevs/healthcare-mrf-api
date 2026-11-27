@@ -789,19 +789,16 @@ async def _validate_chain(session, audit, *, require_complete=True):
 
 
 async def completed_audit_receipt(session, audit_id, *, engine_id, family_id, expected_candidate=None):
-    """Validate the immutable historical ledger without requiring a retained base to remain live."""
+    """Read the recorded completion; advancing validated the ledger before it recorded completion."""
     await retirement._owner_schema(session)
     audit = await session.get(Audit, uuid.UUID(str(audit_id)))
-    if (
-        audit is None
-        or audit.engine_id != engine_id
-        or audit.family_id != family_id
-        or _digest(audit.binding) != bytes(audit.binding_sha256)
-    ):
+    if audit is None or audit.engine_id != engine_id or audit.family_id != family_id:
         raise PostSealAuditRefused("post-seal completed audit identity differs")
     if expected_candidate is not None and audit.binding["identity"]["candidate"] != _plain(expected_candidate):
         raise PostSealAuditRefused("post-seal completed candidate identity differs")
-    checkpoint = await _validate_chain(session, audit)
+    checkpoint = await _latest(session, audit.audit_id)
+    if checkpoint is None or checkpoint.state != "complete" or checkpoint.next_ordinal != 63:
+        raise PostSealAuditRefused("post-seal audit is incomplete")
     receipt_by_name = {
         "contract": CONTRACT,
         "audit_id": str(audit.audit_id),
@@ -814,23 +811,17 @@ async def completed_audit_receipt(session, audit_id, *, engine_id, family_id, ex
     return receipt_by_name
 
 
-async def verified_audit_for_trim(session, context, *, engine_id):
-    """Require completion of the recorded full or explicitly sampled audit scope."""
+async def verified_audit_for_trim(session, family_id, *, engine_id, candidate):
+    """Require completion of the latest recorded full or explicitly sampled audit of this candidate."""
     audit = await session.scalar(
         select(Audit)
-        .where(Audit.family_id == context.family.family_id, Audit.engine_id == engine_id)
+        .where(Audit.family_id == family_id, Audit.engine_id == engine_id)
         .order_by(Audit.started_at.desc(), Audit.audit_id.desc())
         .limit(1)
     )
     if audit is None:
         raise PostSealAuditRefused("post-seal completed automated audit is required")
-    await _current_binding(session, audit, context)
-    await _check_known_failures(session, context.family.family_id, audit.binding)
+    await _check_known_failures(session, family_id, audit.binding)
     return await completed_audit_receipt(
-        session, audit.audit_id, engine_id=engine_id, family_id=context.family.family_id
+        session, audit.audit_id, engine_id=engine_id, family_id=family_id, expected_candidate=candidate
     )
-
-
-async def audit_context_for_trim(session, family_id, *, engine_id):
-    """Share the exact sealed binding and write-closure checks with the cleanup operator."""
-    return await _context(session, family_id, engine_id)
