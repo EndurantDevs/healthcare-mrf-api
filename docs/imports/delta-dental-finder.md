@@ -35,3 +35,21 @@ python -m process.delta_dental_directory_observations --capture edition.sqlite3 
 ```
 
 The export includes the search, dentist, office address, reported networks and available publisher identifiers. Each row represents a source observation and may recur across searches. The command writes a new private file and prints aggregate counts. A saved rendered page can also be examined offline with `--rendered-html`.
+
+## Preparing the next national edition
+
+The shared five-digit inventory in `support/zip/usps_zip5_2026_11.txt` contains the 41,515 distinct ZIPs in the November 2026 USPS Area/District ZIP5 file. Each line preserves leading zeroes. For a later vintage, reproduce the list from the last five digits of each PostalPro ZIP5 record and verify its count and content before updating the reference. [USPS Area/District ZIP5](https://postalpro.usps.com/areadist_ZIP5)
+
+Prepare a fresh nationwide Delta manifest from the preceding national manifest. Set the new edition and its authorized request budget. Existing ZIP order is preserved, followed by newly listed codes. The loader validates the budget against ZIPs times selectors. The example uses the single combined `all-only` selector.
+
+```sh
+python -m process.provider_directory_national_plan delta previous.json next.json --edition next-edition --max-origin-requests 50000
+```
+
+For Nomi, use the preceding national radius plan. The generator preserves its group, request limits and existing searches, then fills the verified Alaska, Caribbean and Pacific gaps. Use a fresh acquisition root and keep the previous plan with its retained root.
+
+```sh
+python -m process.provider_directory_national_plan nomi previous.json next.json
+```
+
+Exact-postal-code consumers can use `process.provider_directory_zip_inventory.national_zip_codes()`. VSP covers these areas through its global search tiles and publisher count reconciliation.

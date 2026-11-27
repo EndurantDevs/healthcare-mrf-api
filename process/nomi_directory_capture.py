@@ -84,6 +84,27 @@ def load_search_plan():
         manifest = strict_json(raw)
     except (OSError, ValueError) as _error:
         raise ValueError("nomi_directory_authorized_manifest_invalid") from None
+    windows = validated_search_windows(manifest)
+    configured_root = os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "")
+    root = Path(configured_root)
+    if (
+        not root.is_absolute()
+        or root.resolve() == Path("/")
+        or root.resolve().is_relative_to(Path(gettempdir()).resolve())
+    ):
+        raise ValueError("nomi_directory_artifact_root_invalid")
+    return SearchPlan(
+        _directory(root.resolve() / SOURCE_ID),
+        manifest["group_id"],
+        windows,
+        manifest["page_size"],
+        float(manifest["requests_per_second"]),
+        manifest["max_origin_requests"],
+    )
+
+
+def validated_search_windows(manifest):
+    """Check the complete search scope before planning or opening a capture."""
     fields = {"group_id", "searches", "page_size", "requests_per_second", "max_origin_requests"}
     if type(manifest) is not dict or manifest.keys() != fields:
         raise ValueError("nomi_directory_authorized_manifest_invalid")
@@ -121,15 +142,7 @@ def load_search_plan():
         windows.append((zip_code, miles))
     if len(windows) != len(set(windows)):
         raise ValueError("nomi_directory_duplicate_search")
-    configured_root = os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "")
-    root = Path(configured_root)
-    if (
-        not root.is_absolute()
-        or root.resolve() == Path("/")
-        or root.resolve().is_relative_to(Path(gettempdir()).resolve())
-    ):
-        raise ValueError("nomi_directory_artifact_root_invalid")
-    return SearchPlan(_directory(root.resolve() / SOURCE_ID), group, tuple(sorted(windows)), size, float(rate), budget)
+    return tuple(sorted(windows))
 
 
 def _integer(value):
