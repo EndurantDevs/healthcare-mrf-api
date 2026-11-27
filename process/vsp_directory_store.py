@@ -73,8 +73,11 @@ def configured_root():
 
 def is_artifact_root_failure(error):
     """Recognize root validation or the legacy failure before capture identity creation."""
-    if error == "vsp_artifact_root_invalid":
-        return True
+    return error == "vsp_artifact_root_invalid" or is_artifact_tmp_permission_failure(error, "vsp-directory")
+
+
+def is_artifact_tmp_permission_failure(error, source_directory):
+    """Recognize the configured store's failure before the acquisition lock opens."""
     if type(error) is not str or not error.startswith(f"[Errno {errno.EACCES}] {os.strerror(errno.EACCES)}: "):
         return False
     configured = os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "")
@@ -82,7 +85,7 @@ def is_artifact_root_failure(error):
         return False
     root = Path(configured).resolve()
     return root != Path("/") and error == str(
-        PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(root / "vsp-directory" / "tmp"))
+        PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(root / source_directory / "tmp"))
     )
 
 

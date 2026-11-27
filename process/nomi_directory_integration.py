@@ -4,6 +4,7 @@
 from datetime import date
 from itertools import batched
 
+from process import provider_directory_source_proxy as source_proxy
 from process.nomi_directory_capture import (
     ADAPTER_ID,
     ENDPOINT_SCOPE,
@@ -132,8 +133,6 @@ async def _persist_capture(directory, capture, as_of, run_id, persist, cancel_ch
 
 async def import_group(directory, source_record, *, run_id, persist, progress_callback, cancel_check):
     """COPY the bounded normalized families after all authorized searches terminate."""
-    from process.provider_directory_source_proxy import current_run
-
     checkpoint = source_record.get("_pagination_checkpoint_context")
     if (
         checkpoint is None
@@ -142,7 +141,7 @@ async def import_group(directory, source_record, *, run_id, persist, progress_ca
         or not source_record.get("_resource_hash_contract")
     ):
         raise ValueError("nomi_directory_prepared_candidate_required")
-    scope = current_run()
+    scope = source_proxy.current_run()
     binding = scope.bindings.get(SOURCE_ID) if scope is not None else None
     if binding is None or scope.credentials.get(SOURCE_ID):
         raise ValueError("nomi_directory_authenticated_proxy_required")
@@ -158,6 +157,7 @@ async def import_group(directory, source_record, *, run_id, persist, progress_ca
         cancel_check=cancel_check,
         progress=progress_callback,
         pause=pause,
+        require_retained=bool(checkpoint.retry_of_run_id and not checkpoint.allow_initial_nomi_capture),
     ) as (capture, proof):
         written = await _persist_capture(
             directory, capture, source_record.get("_semantic_projection_as_of"), run_id, persist, cancel_check
