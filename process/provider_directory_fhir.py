@@ -27529,42 +27529,19 @@ async def _profile_capacity_remaining_ms(
     admission: _ProviderDirectoryProfileCapacityAdmission,
 ) -> int:
     """Return the signed build time remaining inside PostgreSQL."""
-    from process.provider_directory_profile_temp_limit import _require_bounded_temp_file_limit_capability
-
     deadline_row = await db.first(
         """
-        WITH capability AS MATERIALIZED (
-            SELECT pg_catalog.has_parameter_privilege(
-                current_user, 'temp_file_limit', 'SET'
-            ) AS can_set_temp
-        )
-        SELECT can_set_temp,
-               CASE WHEN can_set_temp IS TRUE THEN
-                   floor(EXTRACT(epoch FROM (
-                       CAST(:max_build_deadline AS timestamptz)
-                       - clock_timestamp()
-                   )) * 1000)::bigint
-               END AS remaining_ms
-        FROM capability;
+        SELECT floor(
+                   EXTRACT(
+                       epoch FROM (
+                           CAST(:max_build_deadline AS timestamptz)
+                           - clock_timestamp()
+                       )
+                   ) * 1000
+               )::bigint AS remaining_ms;
         """,
         max_build_deadline=admission.lease.max_build_deadline,
     )
-    capability = _pagination_checkpoint_row_mapping(deadline_row) if deadline_row is not None else {}
-    if capability.get("can_set_temp") is not True:
-        await _require_bounded_temp_file_limit_capability(db)
-        deadline_row = await db.first(
-            """
-            SELECT floor(
-                       EXTRACT(
-                           epoch FROM (
-                               CAST(:max_build_deadline AS timestamptz)
-                               - clock_timestamp()
-                           )
-                       ) * 1000
-                   )::bigint AS remaining_ms;
-            """,
-            max_build_deadline=admission.lease.max_build_deadline,
-        )
     remaining_ms = (
         int(_pagination_checkpoint_row_mapping(deadline_row)["remaining_ms"]) if deadline_row is not None else 0
     )

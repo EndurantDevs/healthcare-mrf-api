@@ -695,23 +695,6 @@ async def _capture(connection, policy, names, *, private=True):
     return references_by_name
 
 
-_PRIVATE_READERS_CLOSED_SQL = (
-    "SELECT NOT EXISTS(SELECT FROM unnest($1::oid[]) relations(oid),unnest($2::oid[]) readers(oid) "
-    "WHERE has_table_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
-    "OR has_any_column_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,REFERENCES'))"
-)
-
-
-async def require_private_source_readers_closed(connection, relation_oids, reader_oids):
-    """Private loading storage grants no direct or inherited runtime access."""
-    closed = await connection.fetchval(
-        _PRIVATE_READERS_CLOSED_SQL,
-        list(relation_oids),
-        list(reader_oids),
-    )
-    _require(closed is True, "private_reader_access")
-
-
 async def _verify_tables(connection, policy, binding_by_field):
     """Check the logical group before resolving its SQL relations."""
     _validate_binding_tables(binding_by_field, binding_by_field["identity"])
@@ -2448,17 +2431,4 @@ def _table_proof(row, *, private):
         and all(constraint["type"] in {"c", "p", "u"} and constraint["valid"] for constraint in constraints)
         and all(index["valid"] for index in indexes),
         "storage_custody_changed",
-    )
-    return _layout_proof(row)
-
-
-def _layout_proof(row):
-    """Hash the native layout only after the caller authenticates its exact storage shape."""
-    layout_by_field = {key: _json(row[key]) for key in ("columns", "constraints", "indexes")}
-    layout_by_field["parents"] = list(row["parents"])
-    return dict(
-        name=row["relname"],
-        oid=row["oid"],
-        owner=row["relowner"],
-        layout_sha256=hashlib.sha256(_encoded(layout_by_field).encode()).hexdigest(),
     )
