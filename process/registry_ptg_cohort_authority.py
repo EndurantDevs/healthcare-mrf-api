@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
@@ -419,36 +419,6 @@ async def _validate_frozen_assignments(
         raise RegistryPTGCohortAuthorityError("registry_ptg_source_changed") from None
 
 
-async def _office_relation(session: Any, specification: Any, office_assertion_table_oid: int):
-    schema_name = _specification(specification)
-    if type(office_assertion_table_oid) is not int or not 1 <= office_assertion_table_oid <= 4294967295:
-        raise RegistryPTGCohortAuthorityError("registry_ptg_custody_changed")
-    relation = _identifier(schema_name) + '."office_assertion"'
-    await session.execute(text(f"LOCK TABLE {relation} IN SHARE MODE NOWAIT"))
-    matches = (
-        await session.execute(
-            text("""
-        SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-          WHERE c.oid=CAST(:oid AS oid) AND n.nspname=:schema AND c.relname='office_assertion'
-            AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity)
-    """),
-            {"oid": office_assertion_table_oid, "schema": schema_name},
-        )
-    ).scalar_one()
-    if matches is not True:
-        raise RegistryPTGCohortAuthorityError("registry_ptg_custody_changed")
-    census = (
-        await session.execute(
-            text(f"""
-        SELECT count(*)::bigint,count(DISTINCT ordinal)::bigint,min(ordinal),max(ordinal) FROM {relation}
-    """)
-        )
-    ).one()
-    if tuple(census) != (specification.expected_rows, specification.expected_rows, 1, specification.expected_rows):
-        raise RegistryPTGCohortAuthorityError("registry_ptg_accounting_invalid")
-    return relation
-
-
 _WITNESS_PAGE_SQL = """
 WITH page AS MATERIALIZED (
   SELECT ordinal,binding_source_key,company_key,cohort_id,snapshot_id,provider_system,provider_id,
@@ -524,77 +494,3 @@ def _checked_page(page: Mapping[str, Any], after: int):
     if count and not edge_count:
         raise RegistryPTGCohortAuthorityError("registry_ptg_provider_unresolved")
     return count, payload
-
-
-async def read_registry_ptg_source_witness_pages(
-    session: Any,
-    specification: Any,
-    *,
-    frozen_authority: Mapping[str, Any],
-    graph_identity: Mapping[str, Any],
-    office_assertion_table_oid: int,
-    selected_dense_source_keys: tuple[int, ...],
-) -> AsyncIterator[dict[str, Any]]:
-    """Yield native source-correlated edge requests; exhaustion proves the census.
-
-    Each payload contains sorted unique big-endian uint32 group/NPI dictionary
-    pairs. These requests do not prove packed edges or a producer-admitted scope.
-    """
-    _specification(specification)
-    await _require_frozen_source(session, specification, frozen_authority)
-    graph_by_field, source_records = await _source_state(session, specification, graph_identity)
-    selected_sources = _selected_sources(selected_dense_source_keys, len(source_records))
-    office = await _office_relation(session, specification, office_assertion_table_oid)
-    binding = await _physical_binding(session, specification)
-    schema = _identifier(binding.schema_name if binding is not None else specification.ptg_schema_name)
-    payload_id = binding.payload_snapshot_id if binding is not None else specification.snapshot_id
-    if binding is not None and binding.payload_snapshot_key != graph_by_field["snapshot_key"]:
-        raise RegistryPTGCohortAuthorityError("registry_ptg_source_changed")
-    query = text(_WITNESS_PAGE_SQL.format(office=office, schema=schema))
-    after = 0
-    while True:
-        query_parameters_by_name = {
-            "after": after,
-            "page_rows": _PAGE_ROWS,
-            "snapshot_key": graph_by_field["snapshot_key"],
-            "snapshot_id": specification.snapshot_id,
-            "payload_snapshot_id": payload_id,
-            "binding_source_key": specification.binding_source_key,
-            "company_key": specification.company_key,
-            "cohort_id": specification.cohort_id,
-            "selected_sources": selected_sources,
-        }
-        page = (await session.execute(query, query_parameters_by_name)).mappings().one()
-        count, selected_edge_bytes = _checked_page(page, after)
-        if not count:
-            if after != specification.expected_rows:
-                raise RegistryPTGCohortAuthorityError("registry_ptg_accounting_invalid")
-            return
-        if after + count > specification.expected_rows:
-            raise RegistryPTGCohortAuthorityError("registry_ptg_accounting_invalid")
-        yield {
-            "contract": "registry_ptg_source_witness_page.v1",
-            "graph_identity": graph_by_field,
-            "after_ordinal": after,
-            "last_ordinal": after + count,
-            "row_count": count,
-            "edge_count": page["edge_count"],
-            "selected_edges": selected_edge_bytes,
-        }
-        after += count
-
-
-async def require_registry_ptg_cohort_authority(
-    session: Any,
-    specification: Any,
-    *,
-    frozen_authority: Mapping[str, Any],
-    graph_identity: Mapping[str, Any],
-    office_assertion_table_oid: int,
-) -> Mapping[str, Any]:
-    """Refuse admission until a durable authenticated scope producer exists."""
-    source = await _require_frozen_source(session, specification, frozen_authority)
-    if source["contract"] == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT:
-        raise RegistryPTGCohortAuthorityError("registry_ptg_published_scope_unavailable")
-    # shortcut: no admitted company/cohort producer store exists; connect it before allowing capture admission.
-    raise RegistryPTGCohortAuthorityError("registry_ptg_scope_unavailable")

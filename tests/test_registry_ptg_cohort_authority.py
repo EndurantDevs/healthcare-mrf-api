@@ -76,32 +76,6 @@ def _session(*results, transaction=True):
 
 
 @pytest.mark.asyncio
-async def test_no_supplied_scope_receipt_can_admit_a_cohort(monkeypatch):
-    prepared = AsyncMock(return_value=_frozen_source())
-    monkeypatch.setattr(authority, "prepare_ptg_result_archive_source_authority", prepared)
-    specification = _specification()
-    specification.scope_assertion = {"contract": "registry_ptg_cohort_scope.v1", "admitted": True}
-    specification.scope_authority = True
-    specification.scope_resolver = AsyncMock(return_value=specification.scope_assertion)
-    session = _session(_Result(scalar="repeatable read"))
-    with pytest.raises(authority.RegistryPTGCohortAuthorityError, match="registry_ptg_scope_unavailable"):
-        await authority.require_registry_ptg_cohort_authority(
-            session,
-            specification,
-            frozen_authority=_frozen_source().as_dict(),
-            graph_identity={},
-            office_assertion_table_oid=42,
-        )
-    prepared.assert_awaited_once_with(
-        session,
-        schema_name="synthetic_ptg",
-        operation_id=authority._specification(specification),
-        snapshot_id="synthetic-snapshot",
-    )
-    specification.scope_resolver.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("isolation", ["read committed", "read uncommitted"])
 async def test_source_corroboration_requires_one_stable_snapshot(monkeypatch, isolation):
     prepared = AsyncMock()
@@ -235,58 +209,6 @@ def test_unresolved_source_occurrence_or_dictionary_fails_the_page():
         authority._checked_page(_page() | {"scope_mismatch_count": 1}, 0)
     assert authority._checked_page(_page(), 0) == (2, struct.pack(">II", 4, 9))
     assert authority._checked_page(_page(count=0), 2) == (0, b"")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("census", [(2, 2, 0, 1), (3, 3, 0, 2), (2, 1, 1, 2), (1, 1, 1, 1)])
-async def test_full_landing_census_cannot_hide_nonpositive_or_extra_ordinals(census):
-    session = _session(_Result(), _Result(scalar=True), _Result(rows=[census]))
-    with pytest.raises(authority.RegistryPTGCohortAuthorityError, match="registry_ptg_accounting_invalid"):
-        await authority._office_relation(session, _specification(), 42)
-
-
-@pytest.mark.asyncio
-async def test_stream_exhaustion_requires_exact_census_and_advancing_pages(monkeypatch):
-    graph_by_field = {"snapshot_key": 31}
-    monkeypatch.setattr(authority, "_require_frozen_source", AsyncMock())
-    monkeypatch.setattr(authority, "_source_state", AsyncMock(return_value=(graph_by_field, [_source()])))
-    monkeypatch.setattr(authority, "_office_relation", AsyncMock(return_value='"synthetic_capture".office_assertion'))
-    session = _session(
-        _Result(rows=[_page(count=1)]), _Result(rows=[_page(after=1, count=1)]), _Result(rows=[_page(count=0)])
-    )
-    pages = [
-        page
-        async for page in authority.read_registry_ptg_source_witness_pages(
-            session,
-            _specification(),
-            frozen_authority={},
-            graph_identity=graph_by_field,
-            office_assertion_table_oid=42,
-            selected_dense_source_keys=(0,),
-        )
-    ]
-    assert [(page["after_ordinal"], page["last_ordinal"], page["row_count"]) for page in pages] == [
-        (0, 1, 1),
-        (1, 2, 1),
-    ]
-    assert [call.args[1]["after"] for call in session.execute.await_args_list] == [0, 1, 2]
-    assert all(
-        "source_record_ordinal=page.source_record_ordinal" in str(call.args[0])
-        for call in session.execute.await_args_list
-    )
-    short_session = _session(_Result(rows=[_page(count=1)]), _Result(rows=[_page(count=0)]))
-    with pytest.raises(authority.RegistryPTGCohortAuthorityError, match="registry_ptg_accounting_invalid"):
-        short_pages = [
-            page
-            async for page in authority.read_registry_ptg_source_witness_pages(
-                short_session,
-                _specification(),
-                frozen_authority={},
-                graph_identity=graph_by_field,
-                office_assertion_table_oid=42,
-                selected_dense_source_keys=(0,),
-            )
-        ]
 
 
 @pytest.mark.asyncio

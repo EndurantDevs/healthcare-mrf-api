@@ -225,15 +225,6 @@ async def test_published_assignments_keep_sealed_occurrence_proof(monkeypatch):
 @pytest.mark.asyncio
 async def test_published_source_never_confers_producer_scope(monkeypatch):
     specification, published_authority, _, graph_by_field = _case()
-    monkeypatch.setattr(authority, "_require_frozen_source", AsyncMock(return_value=published_authority.as_dict()))
-    with pytest.raises(authority.RegistryPTGCohortAuthorityError, match="published_scope_unavailable"):
-        await authority.require_registry_ptg_cohort_authority(
-            _session(),
-            specification,
-            frozen_authority=published_authority.as_dict(),
-            graph_identity=graph_by_field,
-            office_assertion_table_oid=42,
-        )
     monkeypatch.setattr(producer, "_require_frozen_source", AsyncMock(return_value=published_authority.as_dict()))
     source_state = AsyncMock()
     monkeypatch.setattr(producer, "_source_state", source_state)
