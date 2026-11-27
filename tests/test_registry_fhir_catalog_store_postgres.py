@@ -289,9 +289,10 @@ async def test_copy_batches_are_bounded(storage_database):
             )
             == 11
         )
+    # Six heap indexes, eleven secondary indexes and four on the derived network company summary.
     assert (
         await fixture.connection.fetchval("SELECT count(*) FROM pg_indexes WHERE schemaname=$1", candidate.schema_name)
-        == 17
+        == 21
     )
     await _assert_catalog_source_indexes(fixture.connection, candidate.schema_name)
     assert (
@@ -301,6 +302,24 @@ async def test_copy_batches_are_bounded(storage_database):
         )
         == 1000
     )
+    await _assert_network_company_summary(fixture, candidate)
+
+
+async def _assert_network_company_summary(fixture, candidate):
+    """The derived summary is owned by the loader, counts every visible document and leaves with the candidate."""
+    summary = await fixture.connection.fetchrow(
+        f"SELECT (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=$1::regclass) AS owner,"
+        f"(SELECT coalesce(sum(relationship_count),0) FROM {candidate.schema_name}.registry_fhir_catalog_network_company) AS documents,"
+        f"(SELECT count(*) FROM (SELECT DISTINCT network_id,document_json-'relationship_id' "
+        f"FROM {candidate.schema_name}.registry_fhir_catalog_relationship) visible) AS visible",
+        candidate.schema_name + ".registry_fhir_catalog_network_company",
+    )
+    assert summary["owner"] == fixture.loader and summary["documents"] == summary["visible"]
+    async with fixture.connection.transaction():
+        assert await store.discard_fhir_catalog_candidate(
+            fixture.connection, candidate, loader_role=fixture.loader, control_schema=fixture.control
+        )
+    assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", candidate.schema_name) is None
 
 
 async def native_files(connection, schema_name):

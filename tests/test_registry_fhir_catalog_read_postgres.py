@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 import asyncpg
 import pytest
 
-from db.registry_fhir_catalog import MAX_CORE_BYTES, table_sql
+from db.registry_fhir_catalog import MAX_CORE_BYTES, NETWORK_COMPANY_TABLE, network_company_sql, table_sql
 from process import registry_fhir_catalog_read as catalog
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_catalog_policy import RegistryOrganizationVisibility
@@ -63,6 +63,7 @@ async def catalog_database(monkeypatch):
     fixture.manifest = manifest
     monkeypatch.setattr(catalog, "read_published_api_pin", AsyncMock(return_value=(manifest, None, None)))
     monkeypatch.setattr(catalog, "_metadata_pin", AsyncMock(return_value=snapshot_by_field))
+    monkeypatch.setattr(catalog, "_NETWORK_COMPANY_SCHEMAS", {})
     try:
         await connection.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         await connection.execute(f'CREATE SCHEMA "{metadata}"; CREATE SCHEMA "{memberships}"')
@@ -162,16 +163,32 @@ async def _source_binding(fixture, network_id, source_id):
     return await _binding(fixture, network_id, document)
 
 
+async def _summarize(fixture):
+    namespace = '"' + fixture.metadata + '"'
+    await fixture.connection.execute(f"DROP TABLE IF EXISTS {namespace}.{NETWORK_COMPANY_TABLE}")
+    for statement in network_company_sql(namespace):
+        await fixture.connection.execute(statement)
+
+
 async def _read(fixture, query=None, policy=None, network_id=None, *, control_schema="sample_control"):
-    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
-        return await catalog.read_fhir_catalog(
-            fixture.connection,
-            query or catalog.FHIRCatalogQuery(),
-            excluded_network_ids=(),
-            organization_policy=policy,
-            control_schema=control_schema,
-            network_id=network_id,
-        )
+    """Read through the grouped and the summarized statement and require the same page."""
+    await _summarize(fixture)
+    pages = []
+    for summarized in (False, True):
+        catalog._NETWORK_COMPANY_SCHEMAS[fixture.metadata] = summarized
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            pages.append(
+                await catalog.read_fhir_catalog(
+                    fixture.connection,
+                    query or catalog.FHIRCatalogQuery(),
+                    excluded_network_ids=(),
+                    organization_policy=policy,
+                    control_schema=control_schema,
+                    network_id=network_id,
+                )
+            )
+    assert pages[0] == pages[1]
+    return pages[1]
 
 
 def _registered_source(generation, source_id, name, *, status="current"):
@@ -460,7 +477,8 @@ async def test_company_projection_covers_every_network_with_batched_reads(catalo
         source_index = (network["network_id"] - 10000) % source_count
         assert network["source_companies"] == fixture.snapshot["source_vector_json"][source_index]["source_companies"]
         assert network["directory_available"] is False
-    assert len(statements) == (network_count + 3 + 99) // 100
+    # Each page is read once through the grouped and once through the summarized statement.
+    assert len(statements) == 2 * ((network_count + 3 + 99) // 100)
     filtered_page = await _read(fixture, catalog.FHIRCatalogQuery(company_search="Carrier 07", plan_search="PPO"))
     expected_count = sum(index % source_count == 7 and index % 2 == 0 for index in range(network_count))
     assert filtered_page["total"] == expected_count
@@ -945,9 +963,56 @@ async def test_explicit_directory_generation_uses_its_retained_catalog(catalog_d
     assert page["items"] == original["items"]
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
         await _read(fixture, replace(query, generation_id=11), control_schema=fixture.metadata)
-    pin.assert_awaited_once_with(fixture.connection, 10, fixture.metadata)
+    # Both statement variants pin the same directory generation; generation 11 is refused before pinning.
+    assert pin.await_args_list == [((fixture.connection, 10, fixture.metadata),)] * 2
 
 
 @pytest.mark.asyncio
 async def test_copied_catalog_preserves_named_api_reader(indexed_api_db, monkeypatch):
     await assert_copied_fhir_view(indexed_api_db, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_summary_keeps_grouped_rows_for_merged_documents(catalog_database):
+    """A duplicate inside one edge key stays summarized; shared, redacted and offset documents read grouped rows."""
+    fixture = catalog_database
+    await _edge(
+        fixture,
+        7,
+        relationship_document() | {"relationship_id": "c" * 64},
+        binding_id=UUID(binding_document()["binding_id"]),
+    )
+    for ordinal in range(7):
+        document = relationship_document() | {"relationship_id": f"{ordinal + 16:064x}"}
+        document["plan"] = document["plan"] | {"resource_id": f"plan-{ordinal}"}
+        await _edge(fixture, 8, document)
+    await _edge(fixture, 8, relationship_document() | {"relationship_id": "d" * 64})
+    second_binding = await _binding(fixture, 8, binding_document() | {"binding_id": str(uuid4())})
+    await _edge(fixture, 8, relationship_document() | {"relationship_id": "e" * 64}, binding_id=second_binding)
+    listed = await _read(fixture, catalog.FHIRCatalogQuery(company_search="Example Insurance"))
+    relationships_by_network = {network["network_id"]: network["matching_relationships"] for network in listed["items"]}
+    first, shared = relationships_by_network[7], relationships_by_network[8]
+    assert first["total"] == 1 and [entry["relationship_id"] for entry in first["items"]] == ["b" * 64]
+    assert shared["total"] == 8 and shared["next_offset"] == 5
+    summaries = await fixture.connection.fetch(
+        f'SELECT network_id,relationship_count,shared_documents FROM "{fixture.metadata}".{NETWORK_COMPANY_TABLE} '
+        "ORDER BY network_id,relationship_count"
+    )
+    assert [tuple(summary) for summary in summaries] == [(7, 1, False), (8, 1, True), (8, 8, True)]
+    redacted = await _read(fixture, policy=RegistryOrganizationVisibility((), (GROUP,)))
+    assert {network["network_id"]: network["matching_relationships"]["total"] for network in redacted["items"]} == {
+        7: 1,
+        8: 8,
+        9: 0,
+    }
+    continued = await _read(
+        fixture,
+        catalog.FHIRCatalogQuery(
+            limit=1,
+            metadata_generation=GENERATION,
+            relationship_offset=5,
+            continuation_scope_sha256=(await _read(fixture, network_id=8))["continuation_scope_sha256"],
+        ),
+        network_id=8,
+    )
+    assert len(continued["items"][0]["matching_relationships"]["items"]) == 3

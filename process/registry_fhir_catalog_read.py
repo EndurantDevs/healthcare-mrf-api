@@ -14,7 +14,7 @@ from uuid import UUID
 import asyncpg
 
 from db.plan_release_storage import storage_identifier
-from db.registry_fhir_catalog import MAX_CORE_BYTES, NESTED_LIMIT, SNAPSHOT_COLUMNS, VIEW
+from db.registry_fhir_catalog import MAX_CORE_BYTES, NESTED_LIMIT, NETWORK_COMPANY_TABLE, SNAPSHOT_COLUMNS, VIEW
 from db.registry_schema import registry_schema
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_compact_layout import CompactNetworkLayout
@@ -539,11 +539,7 @@ WITH source_companies AS MATERIALIZED (
        WHERE company.source_generation=edge.source_generation
          AND company.source_generation=edge.evidence_generation
          AND lower(company.display_name) LIKE $7 ESCAPE '\'))
-), edge_networks AS MATERIALIZED (
- -- A source-labelled edge always has its network in source_label_networks, so only direct matches are read here.
- SELECT DISTINCT network_id FROM joined_edges edge
- WHERE ($5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL OR $8::text IS NOT NULL)
-   AND ($7::text IS NULL OR edge.company_search LIKE $7 ESCAPE '\')
+), {edge_networks}
 ), visible_edges AS NOT MATERIALIZED (
  SELECT network_id,visible_document,(CASE WHEN bool_or(redacted)
      THEN encode(sha256(convert_to(visible_document::text,'UTF8')),'hex')
@@ -613,15 +609,7 @@ WITH source_companies AS MATERIALIZED (
        CASE WHEN $17+jsonb_array_length(bindings.documents)<bindings.total
          THEN $17+jsonb_array_length(bindings.documents) END)) AS document
  FROM page
- CROSS JOIN LATERAL (
-   SELECT count(*) AS total,coalesce(jsonb_agg(numbered.visible_document
-       || jsonb_build_object('relationship_id',numbered.relationship_id) ORDER BY numbered.relationship_id)
-     FILTER (WHERE numbered.position>$16 AND numbered.position<=$16+5),'[]'::jsonb) AS documents
-   FROM (SELECT edge.visible_document,edge.relationship_id,
-       row_number() OVER (ORDER BY edge.relationship_id) AS position
-     FROM visible_edges edge WHERE edge.network_id=page.network_id) numbered
- ) relationships
- CROSS JOIN LATERAL (
+{relationships} CROSS JOIN LATERAL (
    SELECT (SELECT count(*) FROM {control}.registry_fhir_catalog_binding binding
      WHERE binding.metadata_generation=$1 AND binding.network_id=page.network_id) AS total,
      coalesce((SELECT jsonb_agg(selected.document_json ORDER BY selected.binding_id)
@@ -639,7 +627,70 @@ SELECT (SELECT count(*) FROM filtered)::bigint AS total,
 """
 
 
-def _catalog_page_statement(snapshot, manifest):
+_EDGE_NETWORKS_SQL = r"""edge_networks AS MATERIALIZED (
+ -- A source-labelled edge always has its network in source_label_networks, so only direct matches are read here.
+ SELECT DISTINCT network_id FROM joined_edges edge
+ WHERE ($5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL OR $8::text IS NOT NULL)
+   AND ($7::text IS NULL OR edge.company_search LIKE $7 ESCAPE '\')"""
+
+_GROUPED_RELATIONSHIPS_SQL = r"""SELECT count(*) AS total,coalesce(jsonb_agg(numbered.visible_document
+       || jsonb_build_object('relationship_id',numbered.relationship_id) ORDER BY numbered.relationship_id)
+     FILTER (WHERE numbered.position>$16 AND numbered.position<=$16+5),'[]'::jsonb) AS documents
+   FROM (SELECT edge.visible_document,edge.relationship_id,
+       row_number() OVER (ORDER BY edge.relationship_id) AS position
+     FROM visible_edges edge WHERE edge.network_id=page.network_id) numbered"""
+
+_RELATIONSHIPS_SQL = " CROSS JOIN LATERAL (\n   {grouped}\n ) relationships\n"
+
+# The summary holds matching_edges' filter columns per edge key, so it answers plan-free filters exactly.
+_SUMMARY_EDGE_NETWORKS_SQL = r"""label_generations AS MATERIALIZED (
+ SELECT DISTINCT source_generation FROM source_companies company
+ WHERE $7::text IS NOT NULL AND $5::uuid IS NULL AND $6::uuid IS NULL
+   AND lower(company.display_name) LIKE $7 ESCAPE '\'
+), company_keys AS NOT MATERIALIZED (
+ SELECT summary.* FROM {control}.registry_fhir_catalog_network_company summary
+ WHERE summary.metadata_generation=$1
+   AND (summary.company_id IS NULL OR NOT summary.company_id=ANY($3::uuid[]))
+   AND ($5::uuid IS NULL OR summary.company_id=$5)
+   AND ($6::uuid IS NULL OR (summary.group_id=$6 AND NOT summary.group_id=ANY($4::uuid[])))
+   AND ($12::text[] IS NULL OR EXISTS(SELECT FROM {control}.registry_fhir_catalog_binding binding
+     WHERE (binding.metadata_generation,binding.network_id,binding.binding_id,binding.source_id)=
+       (summary.metadata_generation,summary.network_id,summary.binding_id,summary.source_id)
+       AND ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
+         binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
+         binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12))
+   AND ($7::text IS NULL OR summary.company_search LIKE $7 ESCAPE '\'
+     OR (summary.source_id<>'registry-manual' AND summary.source_generation=summary.evidence_generation
+       AND summary.source_generation IN (SELECT source_generation FROM label_generations)))
+), edge_networks AS MATERIALIZED (
+ SELECT DISTINCT network_id FROM company_keys summary
+ WHERE ($5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL)
+   AND ($7::text IS NULL OR summary.company_search LIKE $7 ESCAPE '\')"""
+
+# Keys never share a document unless flagged, so totals add up and each key's first ids hold its first documents.
+# Redaction can merge documents across keys and nested offsets need every document, so both keep the grouped read.
+_SUMMARY_RELATIONSHIPS_SQL = r""" CROSS JOIN LATERAL (
+   SELECT coalesce(sum(summary.relationship_count),0)::bigint AS total,
+     $16=0 AND NOT coalesce(bool_or(summary.shared_documents OR summary.group_id=ANY($4::uuid[])),false) AS exact
+   FROM company_keys summary WHERE summary.network_id=page.network_id
+ ) summary
+ CROSS JOIN LATERAL (
+   SELECT summary.total,coalesce((SELECT jsonb_agg((edge.document_json-'relationship_id')
+       || jsonb_build_object('relationship_id',edge.relationship_id) ORDER BY edge.relationship_id)
+     FROM (SELECT first.relationship_id FROM company_keys summary
+       CROSS JOIN unnest(summary.first_relationship_ids) first(relationship_id)
+       WHERE summary.network_id=page.network_id ORDER BY first.relationship_id LIMIT 5) first
+     JOIN {control}.registry_fhir_catalog_relationship edge
+       ON edge.metadata_generation=$1 AND edge.relationship_id=first.relationship_id),'[]'::jsonb) AS documents
+   WHERE summary.exact
+   UNION ALL
+   SELECT grouped.* FROM ({grouped}) grouped
+   WHERE NOT summary.exact
+ ) relationships
+"""
+
+
+def _catalog_page_statement(snapshot, manifest, *, summarized=False):
     parameters = ()
     directory_available = "false"
     if manifest is not None:
@@ -658,10 +709,34 @@ def _catalog_page_statement(snapshot, manifest):
             directory_available = _DIRECTORY_AVAILABLE_SQL.format(
                 candidate=storage_identifier(manifest.schema_name), addresses=addresses
             )
+    control = storage_identifier(snapshot["schema_name"])
+    edge_networks, relationships = (
+        (_SUMMARY_EDGE_NETWORKS_SQL, _SUMMARY_RELATIONSHIPS_SQL)
+        if summarized
+        else (_EDGE_NETWORKS_SQL, _RELATIONSHIPS_SQL)
+    )
     return (
-        _PAGE_SQL.format(control=storage_identifier(snapshot["schema_name"]), directory_available=directory_available),
+        _PAGE_SQL.format(
+            control=control,
+            directory_available=directory_available,
+            edge_networks=edge_networks.format(control=control),
+            relationships=relationships.format(control=control, grouped=_GROUPED_RELATIONSHIPS_SQL),
+        ),
         parameters,
     )
+
+
+_NETWORK_COMPANY_SCHEMAS = {}
+
+
+async def _has_network_companies(connection, schema_name):
+    """Published schemas never change, so one lookup per schema decides the summarized statement."""
+    if schema_name not in _NETWORK_COMPANY_SCHEMAS:
+        relation = storage_identifier(schema_name) + "." + NETWORK_COMPANY_TABLE
+        _NETWORK_COMPANY_SCHEMAS[schema_name] = (
+            await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", relation) is True
+        )
+    return _NETWORK_COMPANY_SCHEMAS[schema_name]
 
 
 def _source_company_parameters(snapshot, policy):
@@ -769,7 +844,8 @@ async def read_fhir_catalog(
         continuation_scope_sha256 = _continuation_scope(
             query, manifest, snapshot, exclusions, policy, access_scope_sha256
         )
-        sql, address_parameters = _catalog_page_statement(snapshot, manifest)
+        summarized = query.plan_search is None and await _has_network_companies(connection, snapshot["schema_name"])
+        sql, address_parameters = _catalog_page_statement(snapshot, manifest, summarized=summarized)
         entry = await connection.fetchrow(
             sql,
             *(
