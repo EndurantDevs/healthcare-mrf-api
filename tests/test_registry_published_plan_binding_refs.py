@@ -13,7 +13,7 @@ from process import registry_published_plan_binding_refs as bindings
 from process.ptg_parts.result_archive_published_authority import (
     PtgPublishedResultSourceAuthority,
 )
-from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+from process.registry_ptg_producer_scope import _TABLE_SHAPE_SQL, RegistryPTGProducerScopeStore
 from process.registry_ptg_published_plan_contract import AUTHORITY_CONTRACT, OPERATION
 from process.registry_ptg_published_plan_scope import _digest, _document
 from tests.test_registry_ptg_published_plan import identity, intent
@@ -172,6 +172,12 @@ async def test_set_read_same_driver_and_canonical_path():
     assert driver.fetchval.await_args.args == (
         "SELECT pg_catalog.set_config('search_path',$1,true)",
         "ordinary,pg_catalog",
+    )
+    # Only table shape and the caller's own read privileges; no owner, ACL or role-closure audit.
+    assert driver.fetchval.await_args_list[3].args == (
+        _TABLE_SHAPE_SQL,
+        "synthetic_control",
+        "registry_ptg_published_plan_scope",
     )
 
 

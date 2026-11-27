@@ -35,8 +35,8 @@ application credentials or owner membership. The owner must already satisfy
 source custody, including its existing native system-identity read permission.
 The command validates the old layouts and executes the five protected changes in
 one transaction with bounded timeouts. It checks complete native columns,
-defaults, constraints, indexes, ownership and bounded ACLs, preserves existing
-object identities and grants, and creates owner-only notification storage.
+defaults, constraints, indexes, ownership and bounded ACLs, leaves existing
+object grants unchanged, and creates owner-only notification storage.
 Unexpected default grants cause refusal. It writes no migration version.
 Failure rolls back the whole preparation. A successful preparation is not a
 command to repeat: proceed through ordinary Alembic adoption, or verify the exact

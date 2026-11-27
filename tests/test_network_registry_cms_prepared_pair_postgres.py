@@ -1632,7 +1632,7 @@ async def _install_notification_inbox(database, retained, attempt, publisher_rol
         )
     async with database.session_factory() as session, session.begin():
         await session.execute(text("SET LOCAL lock_timeout='1s'"))
-        await _verify_notification_operator_refusals(session, store, foreign)
+        await _verify_notification_plan_revokes_existing_grants(session, store, foreign)
         driver = await native_driver(session)
         statements = await notifications.plan_registry_cms_source_notification_grants(
             driver, control_schema=schema, owner_role=owner, publisher_role=publisher
@@ -1642,53 +1642,23 @@ async def _install_notification_inbox(database, retained, attempt, publisher_rol
     return store
 
 
-async def _verify_notification_operator_refusals(session, store, foreign_role):
-    """Refuse unknown ACLs and created-at insertion without clearing either grant."""
+async def _verify_notification_plan_revokes_existing_grants(session, store, foreign_role):
+    """An existing foreign grant does not refuse the plan; the plan revokes it before granting."""
     from process.network_cms_registry_address_capture import native_driver
     from process.registry_cms_source_notifications import plan_registry_cms_source_notification_grants
 
     driver = await native_driver(session)
-
-    async def grant_plan():
-        return await plan_registry_cms_source_notification_grants(
-            driver,
-            control_schema=store.control_schema,
-            owner_role=store.owner_role,
-            publisher_role=store.publisher_role,
-        )
-
-    await session.execute(
-        text(f'GRANT SELECT ON {store.control_schema}.registry_cms_source_notification TO "{foreign_role}"')
+    table = f"{store.control_schema}.registry_cms_source_notification"
+    await session.execute(text(f'GRANT SELECT ON {table} TO "{foreign_role}"'))
+    statements = await plan_registry_cms_source_notification_grants(
+        driver,
+        control_schema=store.control_schema,
+        owner_role=store.owner_role,
+        publisher_role=store.publisher_role,
     )
-    with pytest.raises(ValueError, match="source_notification_invalid"):
-        await grant_plan()
-    assert await session.scalar(
-        text(
-            f"SELECT has_table_privilege(CAST(:role AS name),'{store.control_schema}.registry_cms_source_notification','SELECT')"
-        ),
-        {"role": foreign_role},
-    )
-    await session.execute(
-        text(f'REVOKE SELECT ON {store.control_schema}.registry_cms_source_notification FROM "{foreign_role}"')
-    )
-    await session.execute(
-        text(
-            f'GRANT INSERT(created_at) ON {store.control_schema}.registry_cms_source_notification TO "{store.publisher_role}"'
-        )
-    )
-    with pytest.raises(ValueError, match="source_notification_invalid"):
-        await grant_plan()
-    assert await session.scalar(
-        text(
-            f"SELECT has_column_privilege(CAST(:role AS name),'{store.control_schema}.registry_cms_source_notification','created_at','INSERT')"
-        ),
-        {"role": store.publisher_role},
-    )
-    await session.execute(
-        text(
-            f'REVOKE INSERT(created_at) ON {store.control_schema}.registry_cms_source_notification FROM "{store.publisher_role}"'
-        )
-    )
+    revokes = [statement for statement in statements if statement.startswith("REVOKE ALL PRIVILEGES ON ")]
+    assert len(statements) == 7 and revokes == [revokes[0]] and revokes[0].endswith(f'FROM "{foreign_role}"')
+    await session.execute(text(f'REVOKE SELECT ON {table} FROM "{foreign_role}"'))
 
 
 def _notification_callback(original_bind, stores, recorded_notifications):

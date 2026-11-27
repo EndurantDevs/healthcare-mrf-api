@@ -18,7 +18,6 @@ from process.network_cms_registry_source_pair import (
     require_registry_cms_source_pair,
     resolve_committed_registry_cms_source_pair,
 )
-from process.network_membership_writer_closure import _NATIVE_RUNTIME_ROLE_UNSAFE_SQL
 from process.network_registry_cms_source_attempt import RegistryCMSSourceAttempt
 
 CONTRACT = "registry-cms-source-notification/v1"
@@ -122,45 +121,6 @@ def decode_registry_cms_source_notification(encoded, digest):
         return notification
     except ValueError, TypeError, KeyError, RecursionError, AttributeError:
         _invalid()
-
-
-_PRIVILEGES_SQL = """WITH closure_scope AS (
- SELECT n.oid AS schema_oid,o.oid AS owner_oid,$3::text[] AS role_names
- FROM pg_namespace n JOIN pg_roles o ON o.rolname=$2 WHERE n.nspname=$1
-), runtime_roles AS (
- SELECT r.* FROM closure_scope s CROSS JOIN unnest(s.role_names) configured(name)
- LEFT JOIN pg_roles r ON r.rolname=configured.name
-), target AS (
- SELECT c.* FROM pg_class c JOIN closure_scope s ON c.relnamespace=s.schema_oid
- WHERE c.relname='registry_cms_source_notification'
-), acl AS (
- SELECT a.grantee,a.privilege_type,a.is_grantable,NULL::text AS column_name FROM target c
- CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a
- UNION ALL SELECT a.grantee,a.privilege_type,a.is_grantable,att.attname FROM target c
- JOIN pg_attribute att ON att.attrelid=c.oid AND att.attnum>0 AND NOT att.attisdropped
- CROSS JOIN LATERAL aclexplode(att.attacl) a
-)
-SELECT EXISTS(SELECT 1 FROM target c CROSS JOIN closure_scope s JOIN pg_roles o ON o.oid=s.owner_oid
- WHERE c.relkind='r' AND c.relpersistence='p' AND c.relowner=s.owner_oid
- AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relhastriggers AND NOT c.relhasrules
- AND NOT o.rolcanlogin AND NOT o.rolsuper AND NOT o.rolcreatedb AND NOT o.rolcreaterole
- AND NOT o.rolreplication AND NOT o.rolbypassrls)
- AND NOT EXISTS(SELECT 1 FROM runtime_roles r CROSS JOIN closure_scope s WHERE {unsafe}
- OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls
- OR has_parameter_privilege(r.oid,'session_replication_role','SET'))
- AND NOT EXISTS(SELECT 1 FROM runtime_roles r CROSS JOIN closure_scope s
- WHERE has_schema_privilege(r.oid,s.schema_oid,'CREATE') OR NOT has_schema_privilege(r.oid,s.schema_oid,'USAGE'))
- AND NOT EXISTS(SELECT 1 FROM acl a CROSS JOIN closure_scope s WHERE a.grantee<>s.owner_oid AND
-   (a.is_grantable OR NOT(a.grantee=ANY(SELECT oid FROM runtime_roles))
-    OR NOT(a.privilege_type='SELECT' OR (a.grantee=(SELECT oid FROM pg_roles WHERE rolname=$4)
-      AND a.privilege_type='INSERT' AND a.column_name=ANY($5::text[])))))
- AND NOT EXISTS(SELECT 1 FROM runtime_roles r CROSS JOIN target c
- WHERE NOT has_table_privilege(r.oid,c.oid,'SELECT')
- OR has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
- OR has_any_column_privilege(r.oid,c.oid,'UPDATE,REFERENCES'))
- AND (SELECT bool_and(has_column_privilege($4::name,c.oid,name,'INSERT'))
- FROM target c CROSS JOIN unnest($5::text[]) columns(name))
-""".format(unsafe=_NATIVE_RUNTIME_ROLE_UNSAFE_SQL)
 
 
 # Shape refusal for an inbox table this code reads and writes; PostgreSQL grants enforce access.
@@ -357,10 +317,10 @@ async def _require_current_publication(session, connection, pair):
 async def plan_registry_cms_source_notification_grants(
     connection, *, control_schema, owner_role, publisher_role, reader_roles=()
 ):
-    """Return operator-only SQL after native role/ACL preflight; execute no DDL.
+    """Return operator-only SQL after an inbox shape preflight; execute no DDL.
 
     Apply the returned statements in this same explicit operator transaction.
-    No role is created or altered, and unknown or unsafe existing grants refuse.
+    No role is created or altered; PostgreSQL enforces who may apply the grants.
     """
     for name in (control_schema, owner_role, publisher_role):
         _identifier(name)
@@ -371,51 +331,29 @@ async def plan_registry_cms_source_notification_grants(
     roles = tuple(sorted({publisher_role, *reader_roles}))
     if owner_role in roles or not connection.is_in_transaction():
         _invalid()
-    if not await connection.fetchval(
-        _OPERATOR_PREFLIGHT_SQL, control_schema, owner_role, roles, publisher_role, INSERT_COLUMNS
-    ):
+    if not await connection.fetchval(_INBOX_SHAPE_SQL, control_schema, TABLE):
         _invalid()
+    from process.plan_release_storage_provision import _GRANTEES_SQL
+
     table = _identifier(control_schema) + "." + TABLE
     configured = ",".join(_identifier(role) for role in roles)
     columns = ",".join(_identifier(column) for column in INSERT_COLUMNS)
+    # Close every existing grant so only the configured profile can read or write the inbox.
+    grants = await connection.fetch(_GRANTEES_SQL, await connection.fetchval("SELECT to_regclass($1)::oid", table))
+    revokes = tuple(
+        "REVOKE ALL PRIVILEGES"
+        + ("" if grant["column_name"] is None else f" ({_identifier(grant['column_name'])})")
+        + f" ON {table} FROM "
+        + ("PUBLIC" if grant["grantee"] == 0 else _identifier(grant["rolname"]))
+        for grant in grants
+        if grant["rolname"] != owner_role
+    )
     return (
         f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE",
         f"ALTER TABLE {table} OWNER TO {_identifier(owner_role)}",
         f"REVOKE ALL ON {table} FROM PUBLIC",
+        *revokes,
         f"GRANT USAGE ON SCHEMA {_identifier(control_schema)} TO {configured}",
         f"GRANT SELECT ON {table} TO {configured}",
         f"GRANT INSERT ({columns}) ON {table} TO {_identifier(publisher_role)}",
     )
-
-
-_OPERATOR_PREFLIGHT_SQL = """WITH closure_scope AS (
- SELECT n.oid AS schema_oid,o.oid AS owner_oid,$3::text[] AS role_names
- FROM pg_namespace n JOIN pg_roles o ON o.rolname=$2 WHERE n.nspname=$1
-), runtime_roles AS (
- SELECT r.* FROM closure_scope s CROSS JOIN unnest(s.role_names) configured(name)
- LEFT JOIN pg_roles r ON r.rolname=configured.name
-), target AS (
- SELECT c.* FROM pg_class c JOIN closure_scope s ON c.relnamespace=s.schema_oid
- WHERE c.relname='registry_cms_source_notification'
-), acl AS (
- SELECT a.grantee,a.privilege_type,a.is_grantable,NULL::text AS column_name FROM target c
- CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a
- UNION ALL SELECT a.grantee,a.privilege_type,a.is_grantable,att.attname FROM target c
- JOIN pg_attribute att ON att.attrelid=c.oid AND att.attnum>0 AND NOT att.attisdropped
- CROSS JOIN LATERAL aclexplode(att.attacl) a
-)
-SELECT EXISTS(SELECT 1 FROM target c CROSS JOIN closure_scope s JOIN pg_roles o ON o.oid=s.owner_oid
- WHERE c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
- AND NOT c.relhastriggers AND NOT c.relhasrules
- AND NOT o.rolcanlogin AND NOT o.rolsuper AND NOT o.rolcreatedb AND NOT o.rolcreaterole
- AND NOT o.rolreplication AND NOT o.rolbypassrls)
- AND NOT EXISTS(SELECT 1 FROM runtime_roles r CROSS JOIN closure_scope s WHERE {unsafe}
- OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls
- OR has_parameter_privilege(r.oid,'session_replication_role','SET')
- OR has_schema_privilege(r.oid,s.schema_oid,'CREATE'))
- AND NOT EXISTS(SELECT 1 FROM acl a CROSS JOIN target c CROSS JOIN closure_scope s
- WHERE a.grantee NOT IN (c.relowner,s.owner_oid) AND
-   (a.is_grantable OR NOT(a.grantee=ANY(SELECT oid FROM runtime_roles))
-    OR NOT(a.privilege_type='SELECT' OR (a.grantee=(SELECT oid FROM pg_roles WHERE rolname=$4)
-      AND a.privilege_type='INSERT' AND a.column_name=ANY($5::text[])))))
-""".format(unsafe=_NATIVE_RUNTIME_ROLE_UNSAFE_SQL)

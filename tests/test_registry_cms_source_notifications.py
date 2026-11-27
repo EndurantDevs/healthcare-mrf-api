@@ -65,9 +65,10 @@ def test_digest_mismatch_and_untyped_pair_refuse_without_native_calls():
 
 
 class _OperatorConnection:
-    def __init__(self, permitted=True, transaction=True):
+    def __init__(self, permitted=True, transaction=True, grants=()):
         self.permitted = permitted
         self.transaction = transaction
+        self.grants = list(grants)
         self.queries = []
 
     def is_in_transaction(self):
@@ -77,10 +78,14 @@ class _OperatorConnection:
         self.queries.append((query, arguments))
         return self.permitted
 
+    async def fetch(self, query, *arguments):
+        self.queries.append((query, arguments))
+        return self.grants
+
 
 @pytest.mark.asyncio
 async def test_operator_plan_only_returns_exact_configured_narrow_grants():
-    from process.registry_cms_source_notifications import plan_registry_cms_source_notification_grants
+    from process.registry_cms_source_notifications import _INBOX_SHAPE_SQL, plan_registry_cms_source_notification_grants
 
     connection = _OperatorConnection()
     statements = await plan_registry_cms_source_notification_grants(
@@ -90,7 +95,9 @@ async def test_operator_plan_only_returns_exact_configured_narrow_grants():
         publisher_role="publisher",
         reader_roles=("consumer",),
     )
-    assert len(connection.queries) == 1 and len(statements) == 6
+    assert len(statements) == 6
+    # Only the inbox shape is checked; PostgreSQL enforces who may apply the grants.
+    assert connection.queries[0] == (_INBOX_SHAPE_SQL, ("registry_control", "registry_cms_source_notification"))
     assert statements[1] == 'ALTER TABLE "registry_control".registry_cms_source_notification OWNER TO "protected_owner"'
     assert statements[3] == 'GRANT USAGE ON SCHEMA "registry_control" TO "consumer","publisher"'
     assert (
@@ -104,6 +111,29 @@ async def test_operator_plan_only_returns_exact_configured_narrow_grants():
     assert all(
         token not in " ".join(statements) for token in ("CREATE ROLE", "ALTER ROLE", "created_at", "ArchiveReader")
     )
+
+
+@pytest.mark.asyncio
+async def test_operator_plan_revokes_stale_grants_before_the_configured_profile():
+    from process.registry_cms_source_notifications import plan_registry_cms_source_notification_grants
+
+    stale_grants = [
+        {"grantee": 41, "rolname": "stale_reader", "column_name": None},
+        {"grantee": 0, "rolname": None, "column_name": "notification_json"},
+        {"grantee": 42, "rolname": "protected_owner", "column_name": None},
+    ]
+    statements = await plan_registry_cms_source_notification_grants(
+        _OperatorConnection(grants=stale_grants),
+        control_schema="registry_control",
+        owner_role="protected_owner",
+        publisher_role="publisher",
+    )
+    table = '"registry_control".registry_cms_source_notification'
+    assert statements[3:5] == (
+        f'REVOKE ALL PRIVILEGES ON {table} FROM "stale_reader"',
+        f'REVOKE ALL PRIVILEGES ("notification_json") ON {table} FROM PUBLIC',
+    )
+    assert statements[5].startswith("GRANT USAGE ON SCHEMA") and len(statements) == 8
 
 
 @pytest.mark.asyncio

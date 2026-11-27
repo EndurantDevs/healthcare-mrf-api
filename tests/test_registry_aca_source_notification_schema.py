@@ -11,7 +11,7 @@ from db.models.registry_aca_source_notification import RegistryACASourceNotifica
 from db.registry_aca_source_notification import CREATE_TABLE_SQL, INSERT_COLUMNS, TABLE
 from process import registry_aca_source_notification_permissions as permissions
 from process import registry_management_permissions as management
-from process.registry_cms_source_notifications import _OPERATOR_PREFLIGHT_SQL
+from process.registry_cms_source_notifications import _INBOX_SHAPE_SQL
 
 REVISION = "20261018040000_registry_aca_source_notifications"
 FLAGS = ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
@@ -142,7 +142,6 @@ async def test_operator_plan_preserves_exact_publisher_columns_and_reader_only_a
         reader_roles=("reader",),
         runtime_roles=("publisher", "reader", "worker"),
     )
-    assert permissions._PREFLIGHT_SQL == _OPERATOR_PREFLIGHT_SQL.replace("registry_cms_source_notification", TABLE)
     assert len(plan) == 6 and plan[0].startswith("LOCK TABLE")
     assert (
         plan[-1]
@@ -154,37 +153,20 @@ async def test_operator_plan_preserves_exact_publisher_columns_and_reader_only_a
     )
     assert '"created_at"' not in plan[-1]
     assert all("UPDATE" not in sql and "DELETE" not in sql and "TRUNCATE" not in sql for sql in plan)
-    assert connection.calls[-1][1] == (
-        ("publisher", "reader", "worker"),
-        11,
-        "registry_control",
-        "publisher",
-        ("reader",),
-        INSERT_COLUMNS,
-    )
-    assert connection.calls[-2][1] == (
-        "registry_control",
-        "protected_owner",
-        ("publisher", "reader"),
-        "publisher",
-        INSERT_COLUMNS,
-    )
+    assert connection.calls == [
+        (permissions._OWNER_SQL, ("registry_control",)),
+        (_INBOX_SHAPE_SQL, ("registry_control", TABLE)),
+    ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "changes",
-    (
-        {"rolcanlogin": True},
-        {"rolsuper": True},
-        {"original_actor": False},
-        {"can_assume_owner": False},
-        {"actor": "publisher"},
-        {"rolname": "reader"},
-    ),
+    (None, {"can_assume_owner": False}, {"schema_usage": False}, {"rolname": "reader"}),
 )
 async def test_operator_rejects_unsafe_owner_actor_and_authority_before_acl(changes):
-    connection = Connection(owner=_owner(**changes))
+    connection = Connection()
+    connection.owner = None if changes is None else _owner(**changes)
     with pytest.raises(ValueError):
         await permissions.plan_registry_aca_source_notification_grants(
             connection,
@@ -194,6 +176,24 @@ async def test_operator_rejects_unsafe_owner_actor_and_authority_before_acl(chan
             runtime_roles=("publisher", "reader", "worker"),
         )
     assert len(connection.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    ({"rolcanlogin": True}, {"rolsuper": True}, {"original_actor": False}, {"actor": "publisher"}),
+)
+async def test_operator_no_longer_audits_owner_role_flags_or_original_actor(changes):
+    connection = Connection(owner=_owner(**changes))
+    plan = await permissions.plan_registry_aca_source_notification_grants(
+        connection,
+        control_schema="registry_control",
+        publisher_role="publisher",
+        reader_roles=("reader",),
+        runtime_roles=("publisher", "reader", "worker"),
+    )
+    assert plan[1] == 'ALTER TABLE "registry_control".' + TABLE + ' OWNER TO "protected_owner"'
+    assert "session_user" not in permissions._OWNER_SQL and "original_actor" not in permissions._OWNER_SQL
 
 
 @pytest.mark.asyncio
@@ -212,7 +212,7 @@ async def test_operator_rejects_unclosed_role_configuration(reader_roles):
 
 
 @pytest.mark.asyncio
-async def test_operator_rejects_native_acl_bypass_without_any_mutation():
+async def test_operator_rejects_unexpected_inbox_shape_without_any_mutation():
     connection = Connection(allowed=False)
     with pytest.raises(ValueError):
         await permissions.plan_registry_aca_source_notification_grants(
@@ -223,7 +223,7 @@ async def test_operator_rejects_native_acl_bypass_without_any_mutation():
             runtime_roles=("publisher", "reader", "worker"),
         )
     assert len(connection.calls) == 2
-    assert "att.attacl" in connection.calls[-1][0] and "pg_has_role" in connection.calls[-1][0]
+    assert connection.calls[-1] == (_INBOX_SHAPE_SQL, ("registry_control", TABLE))
 
 
 def _control(**changes):
@@ -319,7 +319,7 @@ async def test_operator_requires_complete_bounded_typed_runtime_census(runtime_r
 
 
 @pytest.mark.asyncio
-async def test_native_protected_owner_exclusion_occurs_after_owner_identity_proof():
+async def test_operator_runs_no_runtime_role_census():
     connection = Connection()
     await permissions.plan_registry_aca_source_notification_grants(
         connection,
@@ -328,14 +328,12 @@ async def test_native_protected_owner_exclusion_occurs_after_owner_identity_proo
         reader_roles=("reader",),
         runtime_roles=("protected_owner", "publisher", "reader", "worker"),
     )
-    assert connection.calls[-1][1][0] == ("publisher", "reader", "worker")
-    assert "pg_has_role" in permissions._RUNTIME_SQL
-    assert all(privilege in permissions._RUNTIME_SQL for privilege in ("'MEMBER'", "'USAGE'", "'SET'"))
-    assert "session_replication_role" in permissions._RUNTIME_SQL
+    assert [sql for sql, _arguments in connection.calls] == [permissions._OWNER_SQL, _INBOX_SHAPE_SQL]
+    assert not hasattr(permissions, "_RUNTIME_SQL") and not hasattr(permissions, "_CLOSED_SQL")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", (None, "grant", "postcheck", "cancel"))
+@pytest.mark.parametrize("failure", (None, "grant", "cancel"))
 async def test_installer_keeps_grants_atomic_under_caller_transaction(failure):
     import asyncio
     from contextlib import asynccontextmanager
@@ -366,7 +364,7 @@ async def test_installer_keeps_grants_atomic_under_caller_transaction(failure):
 
         async def is_permitted(self, sql, *arguments):
             self.calls.append((sql, arguments))
-            return not (failure == "postcheck" and sql == permissions._CLOSED_SQL)
+            return 30 if "to_regclass" in sql else True
 
         fetchval = is_permitted
 
@@ -378,9 +376,7 @@ async def test_installer_keeps_grants_atomic_under_caller_transaction(failure):
         runtime_roles=("publisher", "reader", "worker"),
     )
     if failure:
-        exception = (
-            asyncio.CancelledError if failure == "cancel" else (RuntimeError if failure == "grant" else ValueError)
-        )
+        exception = asyncio.CancelledError if failure == "cancel" else RuntimeError
         with pytest.raises(exception):
             await permissions.install_registry_aca_source_notification_permissions(connection, **arguments_by_name)
         assert connection.rolled_back and connection.statements == []
@@ -391,8 +387,12 @@ async def test_installer_keeps_grants_atomic_under_caller_transaction(failure):
         assert receipt["table_oid"] == 30 and receipt["runtime_role_count"] == 3
         assert len(connection.statements) == 6
         assert connection.statements[0].startswith("LOCK TABLE")
-        assert connection.calls[-2][0] == permissions._CLOSED_SQL
-        assert connection.calls[-1][0] == permissions._RUNTIME_SQL
+        # One plan, no before/after owner compare, replan or permission post-check.
+        assert [sql for sql, _arguments in connection.calls] == [
+            permissions._OWNER_SQL,
+            _INBOX_SHAPE_SQL,
+            "SELECT to_regclass($1)::oid",
+        ]
 
 
 def _operator_cli_arguments():
@@ -461,35 +461,6 @@ def test_operator_cli_passes_explicit_census_inside_existing_config_transaction(
     assert permissions.run_command(_operator_cli_arguments()) == 0
     assert events[-1] == "disconnect"
     assert '"status":"ok"' in capsys.readouterr().out
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("bypass", ("publisher_reach", "owner_reach"))
-async def test_operator_denies_runtime_role_graph_bypass_before_any_grant(bypass):
-    class UnsafeRuntime(Connection):
-        async def is_permitted(self, sql, *arguments):
-            self.calls.append((sql, arguments))
-            if sql == permissions._RUNTIME_SQL:
-                assert (
-                    "pg_has_role(r.oid,s.owner_oid,'SET')"
-                    if bypass == "owner_reach"
-                    else "(SELECT oid FROM pg_roles WHERE rolname=$4)"
-                ) in sql
-                return False
-            return True
-
-        fetchval = is_permitted
-
-    connection = UnsafeRuntime()
-    with pytest.raises(ValueError):
-        await permissions.plan_registry_aca_source_notification_grants(
-            connection,
-            control_schema="registry_control",
-            publisher_role="publisher",
-            reader_roles=("reader",),
-            runtime_roles=("publisher", "reader", "worker"),
-        )
-    assert len(connection.calls) == 3 and connection.calls[-1][0] == permissions._RUNTIME_SQL
 
 
 @pytest.mark.asyncio

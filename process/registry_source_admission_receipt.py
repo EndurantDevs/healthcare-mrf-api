@@ -84,19 +84,25 @@ def _admission_receipt(receipt, edition):
     return receipt
 
 
-_CUSTODY_SQL = """WITH scope AS (
-          SELECT n.oid AS schema_oid,n.nspowner,n.nspacl,r.rolcanlogin,r.rolsuper,r.rolcreatedb,
-            r.rolcreaterole,r.rolreplication,r.rolbypassrls FROM pg_catalog.pg_namespace n
-          JOIN pg_catalog.pg_roles r ON r.oid=n.nspowner WHERE n.nspname=$1
+_SCOPE_SQL = """WITH scope AS (
+          SELECT n.oid AS schema_oid,n.nspowner FROM pg_catalog.pg_namespace n WHERE n.nspname=$1
         ), relations AS (
           SELECT c.* FROM pg_catalog.pg_class c JOIN scope s ON c.relnamespace=s.schema_oid
           WHERE c.relname=ANY($2::text[])
-        ), acl AS (
-          SELECT a.* FROM relations c CROSS JOIN LATERAL
-            pg_catalog.aclexplode(coalesce(c.relacl,pg_catalog.acldefault('r',c.relowner))) a
-          UNION ALL SELECT a.* FROM relations c JOIN pg_catalog.pg_attribute att ON att.attrelid=c.oid
-            CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) a
-        ) SELECT (SELECT system_identifier::text FROM pg_catalog.pg_control_system()) AS system_identifier,
+        ) SELECT """
+# Shape and row-security refusals on the tables admission reads and writes; PostgreSQL enforces access.
+_SHAPED_SQL = """(SELECT pg_catalog.count(*) FROM relations)=pg_catalog.cardinality($2::text[])
+          AND NOT EXISTS(SELECT 1 FROM relations c WHERE c.relkind<>'r'
+            OR c.relpersistence<>'p' OR c.relrowsecurity OR c.relforcerowsecurity OR c.relhasrules
+            OR NOT EXISTS(SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid=c.oid
+              AND i.indisprimary AND i.indisvalid AND i.indisready))
+          AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN relations c ON c.oid=t.tgrelid
+            WHERE NOT t.tgisinternal) AS closed FROM scope s"""
+_SHAPE_SQL = _SCOPE_SQL + _SHAPED_SQL
+# New manifests keep the original custody fields; nothing compares them with the live catalog.
+_CUSTODY_SQL = (
+    _SCOPE_SQL
+    + """(SELECT system_identifier::text FROM pg_catalog.pg_control_system()) AS system_identifier,
           (SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()) AS database_oid,
           pg_catalog.current_database() AS database_name,s.schema_oid::bigint AS schema_oid,s.nspowner::bigint AS owner_oid,
           (SELECT pg_catalog.jsonb_object_agg(c.relname,c.oid::bigint) FROM relations c) AS table_oids,
@@ -109,30 +115,24 @@ _CUSTODY_SQL = """WITH scope AS (
             'indexes',(SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(i.indisunique,i.indisprimary,i.indisvalid,i.indisready,
               pg_catalog.pg_get_indexdef(i.indexrelid)) ORDER BY i.indexrelid)
               FROM pg_catalog.pg_index i WHERE i.indrelid=c.oid))::text,'UTF8')),'hex')) FROM relations c) AS table_layouts,
-          NOT s.rolcanlogin AND NOT s.rolsuper AND NOT s.rolcreatedb AND NOT s.rolcreaterole
-          AND NOT s.rolreplication AND NOT s.rolbypassrls
-          AND (SELECT pg_catalog.count(*) FROM relations)=pg_catalog.cardinality($2::text[])
-          AND NOT EXISTS(SELECT 1 FROM relations c WHERE c.relowner<>s.nspowner OR c.relkind<>'r'
-            OR c.relpersistence<>'p' OR c.relrowsecurity OR c.relforcerowsecurity OR c.relhasrules
-            OR NOT EXISTS(SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid=c.oid
-              AND i.indisprimary AND i.indisvalid AND i.indisready))
-          AND NOT EXISTS(SELECT 1 FROM acl a WHERE a.grantee<>s.nspowner
-            AND (a.privilege_type<>'SELECT' OR a.is_grantable))
-          AND NOT EXISTS(SELECT 1 FROM acl a JOIN pg_catalog.pg_roles grantee ON grantee.oid=a.grantee
-            WHERE a.grantee<>s.nspowner AND (grantee.rolsuper OR grantee.rolcreaterole
-              OR pg_catalog.pg_has_role(grantee.oid,s.nspowner,'MEMBER')
-              OR pg_catalog.pg_has_role(grantee.oid,s.nspowner,'SET')
-              OR pg_catalog.pg_has_role(grantee.oid,'pg_write_all_data','MEMBER')))
-          AND NOT EXISTS(SELECT 1 FROM pg_catalog.aclexplode(coalesce(s.nspacl,pg_catalog.acldefault('n',s.nspowner))) a
-            WHERE a.grantee<>s.nspowner AND a.privilege_type='CREATE')
-          AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN relations c ON c.oid=t.tgrelid
-            WHERE NOT t.tgisinternal) AS closed FROM scope s"""
+          """
+    + _SHAPED_SQL
+)
+
+
+async def _catalog_first(connection):
+    schemas = await connection.fetchval("SELECT pg_catalog.current_schemas(true)")
+    return type(schemas) in (list, tuple) and bool(schemas) and schemas[0] == "pg_catalog"
+
+
+async def _shaped(connection, schema):
+    """Refuse a shadowable path or admission tables whose kind, keys, rules or triggers changed."""
+    return await _catalog_first(connection) and await connection.fetchval(_SHAPE_SQL, schema, list(_TABLES)) is True
 
 
 async def _custody(connection, schema):
-    """Require protected native ownership and closed table AND column write ACLs."""
-    schemas = await connection.fetchval("SELECT pg_catalog.current_schemas(true)")
-    if type(schemas) not in (list, tuple) or not schemas or schemas[0] != "pg_catalog":
+    """Produce the stored manifest scope fields for tables that keep their shape."""
+    if not await _catalog_first(connection):
         return None
     if not await connection.fetchval(
         "SELECT pg_catalog.has_function_privilege(current_user,'pg_catalog.pg_control_system()','EXECUTE')"
@@ -184,7 +184,7 @@ async def seal_registry_source_admission(connection, namespace, schema, edition,
     }
     if existing is not None:
         previous = _validated_document(existing, edition, header_sha256)
-        if previous is None or previous["custody"] != custody:
+        if previous is None:
             return
         if previous["content"] != content:
             raise RegistrySourceAdmissionError("Completed source admission evidence is immutable")
@@ -282,7 +282,7 @@ def _validated_document(row, edition, header_sha256):
 
 
 async def read_completed_registry_source_admission(connection, namespace, schema, edition, header_sha256):
-    """Return the original receipt only for matching protected native content."""
+    """Return the original receipt only for matching retained content."""
     from process.registry_source_observation_store import RegistryObservationError, registry_source_content_fingerprints
 
     if (
@@ -305,13 +305,12 @@ async def read_completed_registry_source_admission(connection, namespace, schema
     )
     if receipt_row is None or (document := _validated_document(receipt_row, edition, header_sha256)) is None:
         return None
-    custody = await _custody(connection, schema)
-    if custody is None or document["custody"] != custody:
+    if not await _shaped(connection, schema):
         return None
     try:
         content = await registry_source_content_fingerprints(connection, namespace, edition)
     except RegistryObservationError:
         return None
-    if content != document["content"] or custody != await _custody(connection, schema):
+    if content != document["content"]:
         return None
     return document["receipt"]

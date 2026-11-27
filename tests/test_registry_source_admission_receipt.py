@@ -143,7 +143,7 @@ async def test_refetch_time_preserves_original_identity_and_completed_receipt(mo
     document = _document(first)
     connection = _connection(document)
     connection.fetchrow.side_effect = [asdict(first), _row(document)]
-    monkeypatch.setattr(witness, "_custody", AsyncMock(return_value=document["custody"]))
+    monkeypatch.setattr(witness, "_shaped", AsyncMock(return_value=True))
     monkeypatch.setattr(
         observations, "registry_source_content_fingerprints", AsyncMock(return_value=document["content"])
     )
@@ -338,37 +338,34 @@ async def test_absent_migration_or_historical_witness_requires_real_replay():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "drift", [None, "database", "header", "receipt_hash", "content", "custody_changed", "oversized"]
-)
-async def test_lookup_uses_actual_custody_and_complete_content(monkeypatch, drift):
+@pytest.mark.parametrize("drift", [None, "shape", "header", "receipt_hash", "content", "oversized"])
+async def test_lookup_uses_table_shape_and_complete_content_not_stored_ids(monkeypatch, drift):
     document = _document()
     connection = _connection(document)
-    custody = copy.deepcopy(document["custody"])
     content = copy.deepcopy(document["content"])
-    if drift == "database":
-        custody["database_oid"] += 1
     if drift == "content":
         content[0]["sha256"] = "f" * 64  # Same count cannot authorize changed rows.
     if drift == "receipt_hash":
         bad = _row(document) | {"manifest_sha256": "0" * 64}
         connection.fetchrow.side_effect = [asdict(_edition()), bad]
-    custody_read = AsyncMock(return_value=custody)
-    if drift == "custody_changed":
-        custody_read.side_effect = [custody, custody | {"schema_oid": 3}]
+    # Stored database, schema and table ids are never re-read for comparison, so a copy still serves.
+    custody_read = AsyncMock(side_effect=AssertionError("stored ids are not compared"))
+    shaped = AsyncMock(return_value=drift != "shape")
     content_read = AsyncMock(return_value=content)
     if drift == "oversized":
         content_read.side_effect = observations.RegistryObservationError(
             "Retained source evidence exceeds its row bound"
         )
     monkeypatch.setattr(witness, "_custody", custody_read)
+    monkeypatch.setattr(witness, "_shaped", shaped)
     monkeypatch.setattr(observations, "registry_source_content_fingerprints", content_read)
     result = await admission.read_registry_source_admission_receipt(
         connection, _edition(), header_sha256="f" * 64 if drift == "header" else _HEADER, control_schema="synthetic"
     )
     assert result == (document["receipt"] if drift is None else None)
+    custody_read.assert_not_awaited()
     if drift is None:
-        assert custody_read.await_count == 2 and content_read.await_count == 1
+        assert shaped.await_args.args == (connection, "synthetic") and content_read.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -590,8 +587,9 @@ async def test_custody_requires_native_identity_privilege_and_closed_ownership(a
         sql, schema, names = connection.fetchrow.await_args.args
         assert schema == "synthetic" and names == list(witness._TABLES)
         assert "pg_control_system" in sql and "pg_attribute" in sql and "pg_get_constraintdef" in sql
-        assert "attacl" in sql and "relhasrules" in sql and "rolcanlogin" in sql
-        assert "pg_catalog.aclexplode(att.attacl)" in sql
+        assert "relhasrules" in sql and "relrowsecurity" in sql and "tgisinternal" in sql
+        # No owner role flags, owner match or permission closure.
+        assert all(token not in sql for token in ("attacl", "aclexplode", "rolcanlogin", "relowner", "pg_has_role"))
 
 
 @pytest.mark.asyncio
@@ -729,6 +727,36 @@ async def test_sealing_refuses_missing_or_changed_custody_without_overwriting(mo
         )
     connection.execute.assert_not_awaited()
     assert content.await_count == int(fault != "migration")
+
+
+@pytest.mark.asyncio
+async def test_sealing_compares_content_not_stored_ids(monkeypatch):
+    document = _document()
+    connection = _connection()
+    connection.fetchrow.side_effect = None
+    connection.fetchrow.return_value = _row(document)
+    copied = copy.deepcopy(document["custody"]) | {"database_oid": 99, "system_identifier": "987654321"}
+    changed = copy.deepcopy(document["content"])
+    changed[0]["sha256"] = "f" * 64
+    monkeypatch.setattr(witness, "_custody", AsyncMock(return_value=copied))
+    monkeypatch.setattr(observations, "registry_source_content_fingerprints", AsyncMock(return_value=changed))
+    with pytest.raises(admission.RegistrySourceAdmissionError, match="immutable"):
+        await witness.seal_registry_source_admission(
+            connection, '"synthetic"', "synthetic", _edition(), _HEADER, _receipt()
+        )
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "schemas,shape", [(["pg_catalog", "public"], True), (["pg_catalog"], None), (["public"], True)]
+)
+async def test_lookup_shape_refuses_shadowable_path_or_changed_tables(schemas, shape):
+    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=[schemas, shape]))
+    assert await witness._shaped(connection, "synthetic") is (schemas[0] == "pg_catalog" and shape is True)
+    if schemas[0] == "pg_catalog":
+        assert connection.fetchval.await_args.args == (witness._SHAPE_SQL, "synthetic", list(witness._TABLES))
+        assert "pg_control_system" not in witness._SHAPE_SQL and "relrowsecurity" in witness._SHAPE_SQL
 
 
 def test_admission_witness_bound_refuses_before_hashing():
