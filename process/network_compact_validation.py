@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Set-based data checks before compact candidate publication."""
 
-from math import ceil
 from uuid import UUID
 
 from process.network_address_projection import PinnedAddressSource, _has_binding_location_index, _identifier
@@ -19,8 +18,6 @@ from process.registry_typed_membership_parity import (
 )
 
 _VALIDATION_CHUNK_ROWS = 50_000
-_VALIDATION_MEGA_NETWORK_ROWS = 100_000
-_BUCKET_COUNT = 64
 
 
 def _actual_memberships(layout):
@@ -83,29 +80,15 @@ async def _membership_sets_differ(connection, namespace, layout):
 
 
 def _validation_chunks(ref_counts):
-    """Partition all network IDs into disjoint bounded ranges; split mega-networks by bucket."""
-    if not ref_counts:
-        return [(None, None, None)]
+    """Partition all network IDs into disjoint ranges of about one row budget; a larger network gets its own range."""
     chunks, lo, acc, prev_id = [], None, 0, None
     for network_id, rows in ref_counts:
-        if rows > _VALIDATION_MEGA_NETWORK_ROWS:
-            if prev_id is not None:
-                chunks.append((lo, prev_id, None))
-                lo, acc, prev_id = prev_id, 0, None
-            if lo is None or lo < network_id - 1:
-                chunks.append((lo, network_id - 1, None))
-            stride = max(1, _BUCKET_COUNT // max(2, ceil(rows / _VALIDATION_CHUNK_ROWS)))
-            for start in range(0, _BUCKET_COUNT, stride):
-                end = min(_BUCKET_COUNT - 1, start + stride - 1)
-                chunks.append((network_id, network_id, (start, end, start == 0)))
-            lo = network_id
-            continue
         if acc + rows > _VALIDATION_CHUNK_ROWS and prev_id is not None:
-            chunks.append((lo, prev_id, None))
+            chunks.append((lo, prev_id))
             lo, acc = prev_id, 0
         acc += rows
         prev_id = network_id
-    chunks.append((lo, None, None))
+    chunks.append((lo, None))
     return chunks
 
 
@@ -124,22 +107,7 @@ def _actual_chunk_sql(layout, ref_condition):
     )
 
 
-def _chunk_conditions(lo, hi, bucket_slice, first_param):
-    if bucket_slice is not None:
-        start, end, is_first = bucket_slice
-        p_net, p_lo, p_hi = first_param, first_param + 1, first_param + 2
-        if start == 0:
-            ref_bucket_cond = f"r.office_bucket<=${p_hi}::integer"
-        elif end == _BUCKET_COUNT - 1:
-            ref_bucket_cond = f"r.office_bucket>=${p_lo}::integer"
-        else:
-            ref_bucket_cond = f"r.office_bucket BETWEEN ${p_lo}::integer AND ${p_hi}::integer"
-        return (
-            f"m.network_id=${p_net}::integer",
-            f"r.network_id=${p_net}::integer AND {ref_bucket_cond}",
-            (lo, start, end),
-            (p_lo, p_hi, is_first),
-        )
+def _chunk_conditions(lo, hi, first_param):
     params = []
     clauses = []
     if lo is not None:
@@ -149,62 +117,31 @@ def _chunk_conditions(lo, hi, bucket_slice, first_param):
         clauses.append(f"m.network_id<=${first_param + len(params)}::integer")
         params.append(hi)
     m_cond = " AND ".join(clauses) or "TRUE"
-    return m_cond, m_cond.replace("m.network_id", "r.network_id"), tuple(params), None
+    return m_cond, m_cond.replace("m.network_id", "r.network_id"), tuple(params)
 
 
-async def _mega_network_summary(connection, namespace, network_id):
-    """Stream evidence count and binding validity for one mega-network without materializing all edges."""
-    return await connection.fetchrow(
-        f"""WITH subjects AS NOT MATERIALIZED (
-          SELECT m.network_id,m.provider_system COLLATE "C" AS provider_system,
-            m.provider_id COLLATE "C" AS provider_id,m.location_id,count(*)::bigint AS ev_rows
-          FROM {namespace}.network_membership m WHERE m.network_id=$1::integer
-          GROUP BY m.network_id,m.provider_system COLLATE "C",m.provider_id COLLATE "C",m.location_id
-        ) SELECT coalesce(sum(s.ev_rows),0)::bigint AS ev_total,
-          coalesce(bool_and(s.network_id>0 AND b.location_key IS NOT NULL AND length(b.location_key) BETWEEN 1 AND 64),true) AS bindings_ok
-        FROM subjects s LEFT JOIN LATERAL (
-          SELECT b.location_key FROM {namespace}.provider_location_binding b
-          WHERE (b.provider_system,b.provider_id,b.location_id)
-              =(s.provider_system COLLATE "default",s.provider_id COLLATE "default",s.location_id)
-          OFFSET 0
-        ) b ON TRUE""",
-        network_id,
-    )
-
-
-def _chunk_query_sql(namespace, layout, m_cond, r_cond, bucket_params):
-    """Build the bounded set-comparison SQL for a normal range or mega-network bucket slice."""
-    if bucket_params is None:
-        bound_mat, bucket_col = "MATERIALIZED", ""
-        summary_sql = (
-            "SELECT coalesce(sum(ev_rows),0)::bigint AS ev_total,"
-            "coalesce(bool_and(network_id>0 AND location_key IS NOT NULL AND length(location_key) BETWEEN 1 AND 64),true) AS bindings_ok "
-            "FROM bound"
-        )
-        expected_filter = "location_key IS NOT NULL"
-    else:
-        p_lo, p_hi, _is_first = bucket_params
-        bound_mat = "NOT MATERIALIZED"
-        bucket_col = ",(get_byte(sha256(convert_to(b.location_key,'UTF8')),0)&63)::integer AS office_bucket"
-        summary_sql = "SELECT 0::bigint AS ev_total,true AS bindings_ok"
-        expected_filter = f"location_key IS NOT NULL AND office_bucket BETWEEN ${p_lo}::integer AND ${p_hi}::integer"
+def _chunk_query_sql(namespace, layout, m_cond, r_cond):
+    """Build the bounded set-comparison SQL for one network range."""
     actual_sql = _actual_chunk_sql(layout, r_cond)
     return f"""WITH subjects AS NOT MATERIALIZED (
       SELECT m.network_id,m.provider_system COLLATE "C" AS provider_system,
         m.provider_id COLLATE "C" AS provider_id,m.location_id,count(*)::bigint AS ev_rows
       FROM {namespace}.network_membership m WHERE {m_cond}
       GROUP BY m.network_id,m.provider_system COLLATE "C",m.provider_id COLLATE "C",m.location_id
-    ), bound AS {bound_mat} (
-      SELECT s.network_id,s.ev_rows,b.location_key{bucket_col}
+    ), bound AS MATERIALIZED (
+      SELECT s.network_id,s.ev_rows,b.location_key
       FROM subjects s LEFT JOIN LATERAL (
         SELECT b.location_key FROM {namespace}.provider_location_binding b
         WHERE (b.provider_system,b.provider_id,b.location_id)
             =(s.provider_system COLLATE "default",s.provider_id COLLATE "default",s.location_id)
         OFFSET 0
       ) b ON TRUE
-    ), bound_summary AS ({summary_sql}),
-    expected_edges AS (
-      SELECT DISTINCT network_id,location_key FROM bound WHERE {expected_filter}
+    ), bound_summary AS (
+      SELECT coalesce(sum(ev_rows),0)::bigint AS ev_total,
+        coalesce(bool_and(network_id>0 AND location_key IS NOT NULL AND length(location_key) BETWEEN 1 AND 64),true) AS bindings_ok
+      FROM bound
+    ), expected_edges AS (
+      SELECT DISTINCT network_id,location_key FROM bound WHERE location_key IS NOT NULL
     ), actual_raw AS MATERIALIZED ({actual_sql})
     SELECT bs.ev_total,bs.bindings_ok,
       NOT EXISTS(SELECT FROM actual_raw WHERE office_bucket<>(get_byte(sha256(convert_to(location_key,'UTF8')),0)&63)) AS buckets_ok,
@@ -217,29 +154,13 @@ def _chunk_query_sql(namespace, layout, m_cond, r_cond, bucket_params):
 
 
 async def _check_typed_chunk(connection, namespace, layout, artifact_args, chunk):
-    """Verify bindings, bucket hashes and covering edges for one bounded network chunk."""
-    lo, hi, bucket_slice = chunk
-    m_cond, r_cond, bound_args, bucket_params = _chunk_conditions(lo, hi, bucket_slice, len(artifact_args) + 1)
-    mega_summary = (
-        await _mega_network_summary(connection, namespace, lo)
-        if bucket_params is not None and bucket_params[2]
-        else None
-    )
-    if mega_summary is not None and not mega_summary["bindings_ok"]:
-        return {"ev_total": 0, "bindings_ok": False, "buckets_ok": True, "sets_match": True}
-    outcome = await connection.fetchrow(
-        _chunk_query_sql(namespace, layout, m_cond, r_cond, bucket_params),
+    """Verify bindings, bucket hashes and covering edges for one network range in a single pass."""
+    m_cond, r_cond, bound_args = _chunk_conditions(*chunk, len(artifact_args) + 1)
+    return await connection.fetchrow(
+        _chunk_query_sql(namespace, layout, m_cond, r_cond),
         *artifact_args,
         *bound_args,
     )
-    if mega_summary is not None:
-        return {
-            "ev_total": mega_summary["ev_total"],
-            "bindings_ok": mega_summary["bindings_ok"],
-            "buckets_ok": outcome["buckets_ok"],
-            "sets_match": outcome["sets_match"],
-        }
-    return outcome
 
 
 async def _typed_memberships_match(connection, namespace, layout, expected_rows):
