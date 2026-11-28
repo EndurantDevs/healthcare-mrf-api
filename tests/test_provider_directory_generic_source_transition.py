@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import eyemed_directory_capture as eyemed
+from process import guardian_directory_capture as guardian
 from process import nomi_directory_capture as nomi
 from process import provider_directory_generic_source_policy as policy_module
 from process import provider_directory_generic_source_storage as storage
@@ -1944,15 +1946,17 @@ async def test_unstarted_named_root_rejects_retained_data_or_unproven_failure(un
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("is_nomi", [False, True])
-async def test_named_root_adoption_requires_empty_storage(unstarted_named_root, monkeypatch, is_nomi):
+@pytest.mark.parametrize(
+    "capture_contract", [None, nomi, eyemed, guardian], ids=["generic", "nomi", "eyemed", "guardian"]
+)
+async def test_named_root_adoption_requires_empty_storage(unstarted_named_root, monkeypatch, capture_contract):
     """Check the worker's empty-orphan path against the same retained table group."""
     case = unstarted_named_root
-    resource_scope = nomi.RESOURCE_TYPES if is_nomi else ("Organization",)
-    if is_nomi:
+    resource_scope = capture_contract.RESOURCE_TYPES if capture_contract else ("Organization",)
+    if capture_contract:
         metadata = case.header["candidate_storage_json"]["identity"]["metadata"]
         metadata.update(
-            source_ids=[nomi.SOURCE_ID],
+            source_ids=[capture_contract.SOURCE_ID],
             selected_resources=list(resource_scope),
             expected_resources=list(resource_scope),
         )
@@ -1984,19 +1988,19 @@ async def test_named_root_adoption_requires_empty_storage(unstarted_named_root, 
             acquisition_root_run_id=ROOT,
             retry_of_run_id=ROOT,
             owner_run_id=FAILED,
-            source_ids=(nomi.SOURCE_ID,) if is_nomi else ("example-source",),
-            canonical_api_base=nomi.ENDPOINT_SCOPE,
+            source_ids=(capture_contract.SOURCE_ID,) if capture_contract else ("example-source",),
+            canonical_api_base=capture_contract.ENDPOINT_SCOPE if capture_contract else "https://example.test",
             require_retained_vsp_capture=False,
             allow_initial_nomi_capture=False,
         ),
         repair_empty_orphan=True,
     )
-    status = "failed" if is_nomi else "acquiring"
+    status = "failed" if capture_contract else "acquiring"
     assert await failure_control.orphan_candidate_status(directory, case.header, candidate) == (status, True)
     case.checkpoints.append({"resource_type": "Organization"})
     with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
         await failure_control.orphan_candidate_status(directory, case.header, candidate)
-    assert len(case.writes) == (0 if is_nomi else 1)
+    assert len(case.writes) == (0 if capture_contract else 1)
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import json
 
 from db.plan_release_storage import storage_relation
 from process import eyemed_directory_capture as eyemed
+from process import guardian_directory_capture as guardian
 from process import nomi_directory_capture as nomi
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_fetch_types import empty_capture_retry_matches
@@ -16,7 +17,7 @@ from process.vsp_directory_store import is_artifact_root_failure, is_artifact_tm
 
 def retry_locator(checkpoint):
     """Resolve a retained locator only for its own selected source and scope."""
-    for adapter in (nomi, eyemed):
+    for adapter in (nomi, eyemed, guardian):
         if (
             getattr(checkpoint, "source_ids", ()) == (adapter.SOURCE_ID,)
             and checkpoint.canonical_api_base == adapter.ENDPOINT_SCOPE
