@@ -770,8 +770,8 @@ def _assert_selection_input_grants(statements):
 def _assert_profile_read_grants(statements, driver, policy):
     """Match both SQL readiness calls and the existing configured metadata reader projection."""
     from db.plan_release_storage import storage_identifier
-    from process.provider_directory_cms_control_privileges import READ_COLUMN_GRANTS, cms_control_read_roles
     from process.provider_directory_profile_uhc_flex_store import _profile_selection_dataset_sql
+    from tests.cms_control_privileges_support import READ_COLUMN_GRANTS, cms_control_read_roles
 
     query = _profile_selection_dataset_sql('"mrf"."provider_directory_endpoint_dataset"', '"mrf"')
     readiness_names = set(re.findall(r'"([^\"]+)"\(dataset\.dataset_id\)', query))
@@ -1031,8 +1031,8 @@ async def test_native_registration_enrolls_only_archive_writer_before_registerin
 @pytest.mark.parametrize("readers", [(), ("metadata_reader",)])
 @pytest.mark.parametrize("invalid", [False, True])
 async def test_named_source_fixture_requires_current_guards_before_metadata_grants(monkeypatch, readers, invalid):
-    from process import provider_directory_cms_control_privileges as controls
     from process import provider_directory_cms_native_registration as registration
+    from tests import cms_control_privileges_support as controls
 
     events = []
     driver = object()

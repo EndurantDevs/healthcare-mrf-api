@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 
 from db import migration_cms_snapshot_allocator as migration
 from db.plan_release_storage import storage_identifier, storage_relation
-from tests.test_provider_directory_cms_canonical_layout_postgres import _reader, native_layout
+from tests.cms_native_layout_postgres_support import _reader, native_layout
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 _GUARD = storage_relation("mrf", "guard_pd_generic_dataset_finalization") + "()"

@@ -10,7 +10,7 @@ import pytest
 from db import migration_cms_snapshot_allocator as migration
 from db.migration_provider_directory_dataset_candidates import TABLES
 from db.plan_release_storage import storage_relation
-from tests.test_provider_directory_cms_allocation_semantics_postgres import _native_allocations
+from tests.cms_native_layout_postgres_support import _native_allocations
 
 _CMS_METADATA = {
     "source_ids": ["cms-npd"],

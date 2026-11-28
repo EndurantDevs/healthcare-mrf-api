@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests import test_provider_directory_cms_allocation_semantics_postgres as fixture
+from tests import cms_native_layout_postgres_support as fixture
 
 
 @pytest.fixture

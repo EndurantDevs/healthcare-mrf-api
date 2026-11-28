@@ -1,10 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Fixed final-publication grants for a separately attested native-admin cut.
-
-This internal fragment does not enroll a profile or establish table custody.
-The caller must verify the complete control family, its immutable guards and
-all affected writers before and after these grants in its original transaction.
-"""
+"""Fixed CMS control and metadata-read grants that PostgreSQL fixtures apply as administrator."""
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -415,22 +410,6 @@ def cms_origin_metadata_read_roles(policy, roles):
     return tuple(sorted(roles))
 
 
-def cms_origin_metadata_read_oids(policy, role_graph, roles):
-    """Resolve declared existing identities without inferring recipients from ACLs."""
-    roles = cms_origin_metadata_read_roles(policy, roles)
-    selected_roles = [entry for entry in role_graph["roles"] if entry["rolname"] in roles]
-    if len(selected_roles) != len(roles) or {entry["rolname"] for entry in selected_roles} != set(roles):
-        raise ValueError("cms_origin_metadata_read_roles_changed")
-    if any(
-        entry[key]
-        for entry in selected_roles
-        for key in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-    ):
-        raise ValueError("cms_origin_metadata_read_authority_changed")
-    by_name = {entry["rolname"]: int(entry["oid"]) for entry in selected_roles}
-    return tuple(by_name[role] for role in roles)
-
-
 async def grant_cms_origin_metadata_read_privileges(connection, policy, *, metadata_read_roles):
     """Apply only the fixed receipt projection inside the attested original-admin read cut."""
     roles = cms_origin_metadata_read_roles(policy, metadata_read_roles)
@@ -447,25 +426,6 @@ def cms_control_read_roles(policy):
     if type(policy) is not GenericSourcePolicy:
         raise ValueError("cms_control_read_policy_required")
     return (policy.publisher_role, *(role for role in policy.runtime_roles if role not in policy.control_runtime_roles))
-
-
-def cms_control_read_oids(policy, role_graph):
-    """Resolve only the declared grantees in the unchanged native role capture."""
-    roles = cms_control_read_roles(policy)
-    selected_roles = [entry for entry in role_graph["roles"] if entry["rolname"] in roles]
-    if len(selected_roles) != len(roles) or {entry["rolname"] for entry in selected_roles} != set(roles):
-        raise ValueError("cms_control_read_roles_changed")
-    by_name = {entry["rolname"]: int(entry["oid"]) for entry in selected_roles}
-    return tuple(by_name[role] for role in roles)
-
-
-def cms_control_read_edges(root, attributes, grantees, owner):
-    """The five fixed metadata projections, with this heap's authentic grantor."""
-    columns = READ_COLUMN_GRANTS.get(root, ())
-    number_by_name = {entry["attname"]: entry["attnum"] for entry in attributes}
-    if not set(columns) <= number_by_name.keys():
-        raise ValueError("cms_control_read_columns_changed")
-    return {(number_by_name[column], grantee, owner, "SELECT", False) for column in columns for grantee in grantees}
 
 
 async def grant_cms_control_read_privileges(connection, policy):

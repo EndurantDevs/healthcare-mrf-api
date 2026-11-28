@@ -22,8 +22,7 @@ from process import provider_directory_source_callable_custody as source_callabl
 from process import provider_directory_source_cohort_custody as cohort
 from process.nppes_public_evidence_control_custody import adopt_nppes_control_custody
 from process.provider_directory_cms_control_custody import _RIGHTS as control_rights
-from process.provider_directory_cms_control_privileges import grant_cms_origin_metadata_read_privileges
-from process.provider_directory_cms_receipt_custody import provision_cms_serving_receipt_custody
+from tests.cms_control_privileges_support import grant_cms_origin_metadata_read_privileges
 from tests.cms_npd_admission_postgres_support import (
     _owned_database,
     _provision_cms_epoch_controls,
@@ -35,7 +34,6 @@ from tests.provider_directory_source_postgres_support import (
     native_source_component,
     provision_source_component,
     source_component_migrations,
-    verify_native_source_profile,
 )
 from tests.public_evidence_storage_postgres_support import database_url
 
@@ -234,26 +232,6 @@ async def loading_family(connection, schema, admission_ref):
     binding = json.loads(value) if isinstance(value, str) else value
     assert binding["phase"] == "loading"
     return {root: proof["name"] for root, proof in binding["tables"].items()}
-
-
-async def _provision_component_receipt(driver, policy, migrator, metadata_read_roles):
-    """Protect an unprotected receipt before declaring independent metadata recipients."""
-    receipt_read_roles = metadata_read_roles
-    if metadata_read_roles:
-        protected = await driver.fetchval(
-            "SELECT relrowsecurity FROM pg_class WHERE oid=to_regclass($1)",
-            f'"{policy.schema}".provider_directory_cms_serving_receipt',
-        )
-        assert type(protected) is bool
-        if not protected:
-            receipt_read_roles = ()
-    await provision_cms_serving_receipt_custody(
-        driver,
-        policy,
-        migration_role=migrator,
-        verify_role_profile=verify_native_source_profile,
-        metadata_read_roles=receipt_read_roles,
-    )
 
 
 async def _adopt_acquisition_family(driver, policy):

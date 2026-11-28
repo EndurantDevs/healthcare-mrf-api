@@ -159,29 +159,6 @@ def _require_canonical_copy_guard_inputs(connection, schema, preparation_schema,
     )
 
 
-async def verify_generic_source_canonical_copy_guard(
-    connection, schema, *, preparation_schema="hp_snapshot_retention", require_cms=False
-):
-    """Read the installed guard on the publisher's original transaction; never repair it."""
-    from process.network_cms_registry_address_capture import NativeReceiptSession
-
-    if not connection.is_in_transaction():
-        raise RuntimeError("provider_directory_canonical_copy_guard_transaction_required")
-    if await connection.fetchval("SELECT current_setting('session_replication_role')='origin'") is not True:
-        raise RuntimeError("provider_directory_canonical_copy_statement_guards_required")
-    session = NativeReceiptSession(connection)
-    signature = storage_relation(schema, "guard_pd_dataset_candidate_parent") + "()"
-    observed = (await session.execute(_COPY_GUARD_SNAPSHOT, {"signature": signature})).one_or_none()
-    generic = _canonical_copy_guard_bodies(schema, preparation_schema)[1]
-    cms = _cms_canonical_copy_guard_body(schema, preparation_schema)
-    if observed is None or observed["body"] not in ((cms,) if require_cms else (generic, cms)):
-        raise RuntimeError("provider_directory_canonical_copy_guard_changed")
-    reader, triggers = _canonical_copy_guard_input_parameters(schema, preparation_schema, observed["identity"])
-    _require_canonical_copy_guard_observations(
-        await session.scalar(_COPY_GUARD_READER, reader), await session.execute(_COPY_GUARD_TRIGGERS, triggers)
-    )
-
-
 def upgrade_generic_source_canonical_copy_guard(
     connection, schema, *, preparation_schema="hp_snapshot_retention", include_cms=False
 ):

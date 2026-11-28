@@ -1,8 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Fixed acquisition storage and migration metadata checks for SOURCE custody."""
 
-import re
-
 from sqlalchemy import CheckConstraint, PrimaryKeyConstraint, UniqueConstraint
 
 from db.plan_release_storage import storage_identifier, storage_relation
@@ -225,23 +223,6 @@ async def require_acquisition_model_layout(database, model, schema):
     _require_parent_indexes(root, model, indexes, partial_indexes)
 
 
-def _require_practitioner_migration_plan(practitioner, roots):
-    """Bind the unchanged practitioner singleton to its five original/current OIDs."""
-    expected_plan_by_field = dict(
-        singleton=True,
-        acquisition_oid=roots[ACQUISITION_ROOTS[2]]["oid"],
-        work_oid=roots[HISTORY_ROOTS[0]]["oid"],
-        resource_oid=roots[HISTORY_ROOTS[1]]["oid"],
-        parent_oid=roots[BULK_ROOTS[1]]["oid"],
-        work_parent_oid=roots[BULK_ROOTS[0]]["oid"],
-    )
-    _require(len(practitioner) == 1 and practitioner[0] == expected_plan_by_field, "practitioner_migration_changed")
-    _require(
-        all(type(value) is int and value > 0 for key, value in practitioner[0].items() if key != "singleton"),
-        "practitioner_migration_changed",
-    )
-
-
 def _expression_table_sql(model, table, schema):
     """Compile only trusted model types and checks; copy no native expressions or rows."""
     from process.provider_directory_cms_control_custody import _model_columns
@@ -354,56 +335,6 @@ def _writer_rights(root, columns, *, history=False, loading=False):
     return tables, by_right
 
 
-def _partition_values(definition):
-    if definition is None:
-        return None
-    _require(
-        re.fullmatch(r"FOR VALUES IN \('[a-z0-9_]+(?:', '[a-z0-9_]+)*'\)", definition) is not None,
-        "partition_bounds_changed",
-    )
-    values = re.findall(r"'([a-z0-9_]+)'", definition)
-    _require(len(set(values)) == len(values), "partition_bounds_changed")
-    return values
-
-
-def _require_plan_columns(root, column_rows):
-    expected_by_name = {
-        "singleton": ("boolean", True),
-        **(
-            {"complete": ("boolean", True)}
-            if root == METADATA_ROOTS[1]
-            else {
-                key: ("oid", key not in {"parent_oid", "work_parent_oid"})
-                for key in ("acquisition_oid", "work_oid", "resource_oid", "parent_oid", "work_parent_oid")
-            }
-        ),
-    }
-    _require(
-        {row["name"]: (row["type"], row["required"]) for row in column_rows} == expected_by_name
-        and all(not row["identity"] and not row["generated"] for row in column_rows),
-        "plan_columns_changed",
-    )
-
-
-def _require_defaults(root, catalog, native):
-    from db.migration_expression_adoption import _normalized_expression
-
-    expected_by_column = {
-        column.name: str(column.server_default.arg) if column.server_default else ""
-        for column in _models()[root].__table__.columns
-    }
-    actual_by_column = {
-        entry["attname"]: _normalized_expression(entry["default_expression"])
-        for entry in catalog["attributes"]
-        if entry["attrelid"] == native["oid"]
-    }
-    _require(
-        actual_by_column
-        == {name: _normalized_expression(expression) for name, expression in expected_by_column.items()},
-        "defaults_changed",
-    )
-
-
 def _require_acquisition_scope(expression, scope_values):
     from process.provider_directory_source_cohort_custody import _simple_check
 
@@ -415,25 +346,6 @@ def _require_acquisition_scope(expression, scope_values):
         else "acquisition_id=anyarray[" + ",".join("'" + value + "'" for value in scope_values) + "]"
     )
     _require(_simple_check(expression) == "check" + comparison, "scope_expression_changed")
-
-
-def _require_metadata_layout(catalog, native):
-    from db.migration_expression_adoption import _normalized_expression
-
-    primary_rows = [entry for entry in catalog["constraints"] or () if entry["contype"] == "p"]
-    check_rows = [entry for entry in catalog["constraints"] or () if entry["contype"] == "c"]
-    _require(
-        len(primary_rows) == len(check_rows) == 1
-        and primary_rows[0]["conkey"] == [1]
-        and not primary_rows[0]["condeferrable"]
-        and not primary_rows[0]["condeferred"]
-        and _normalized_expression(check_rows[0]["constraint_definition"]) == "check(singleton)"
-        and all(entry["contype"] in {"p", "c", "n"} for entry in catalog["constraints"] or ())
-        and all(
-            not entry["default_expression"] for entry in catalog["attributes"] if entry["attrelid"] == native["oid"]
-        ),
-        "metadata_constraints_changed",
-    )
 
 
 def _require_dataset_relationships(plan, schema):

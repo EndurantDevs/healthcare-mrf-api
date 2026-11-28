@@ -13,7 +13,7 @@ from db.migration_cms_noncurrent_seal import GUARD, lifecycle_guard_bodies
 from db.migration_cms_replay_resolution import replay_guard_bodies
 from db.migration_cms_snapshot_allocator import allocator_bodies, generic_finalization_bodies
 from process import provider_directory_cms_callable_custody as callables
-from process import provider_directory_cms_dependency_policy as dependencies
+from process import provider_directory_cms_preparation_custody as preparation
 from process import provider_directory_cms_transition_routines as transition
 from process import provider_directory_source_callable_custody as source
 from tests.test_acquisition_validator_argument_types_migration import _current_functions as acquisition_functions
@@ -118,16 +118,6 @@ def test_full_fixed_frontier_optional_guards_and_additions_are_checked_together(
     assert _verify(rows) is None and rows == before
 
 
-def test_callback_frontier_reuses_exact_existing_source_signature_contracts():
-    specs = transition._contracts(_SCHEMA, _PREPARATION_SCHEMA)
-    assert len(dependencies._CALLBACK_CALLEES) == 14
-    for name, arguments in dependencies._CALLBACK_CALLEES.items():
-        signature = name + "(" + ",".join(arguments) + ")"
-        assert specs[name] == source._CONTRACTS[signature]
-    assert dependencies._CALLBACK_CALLEES["ptg_wave_canonical_json_ascii_v1"] == ("jsonb",)
-    assert specs["ptg_wave_canonical_json_ascii_v1"] != source._CONTRACTS["ptg_wave_canonical_json_ascii_v1(json)"]
-
-
 def _checkpoint_function(schema):
     migration = _load("20260810010000_provider_directory_reviewed_subset_terminal_disposition.py")
     name = migration._abandonment()._CHECKPOINT_GUARD
@@ -218,7 +208,7 @@ def test_checkpoint_invocations_and_literal_closure_are_already_fixed_and_authen
         assert function in fixed_callees and function in functions
         visited.add(function)
         pending.extend(expression.findall(functions[function][-1]))
-    assert len(fixed_callees) == 32 and set(dependencies.custody._CALLEE_FRONTIER) == fixed_callees
+    assert len(fixed_callees) == 32 and set(preparation._CALLEE_FRONTIER) == fixed_callees
     assert "target_dataset_id text;" in spec[-1]
 
 

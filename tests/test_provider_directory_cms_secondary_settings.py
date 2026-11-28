@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db import migration_generic_source_candidates as candidates
-from process import provider_directory_cms_allocator_callables as allocator
 from process import provider_directory_source_checkpoint_catalog as checkpoint
 from process import provider_directory_terminal_root_retirement_controls as retirement
 from process.provider_directory_generic_candidate import GenericCandidateError
@@ -26,37 +25,6 @@ _UNAPPROVED = (
     ["search_path=pg_catalog, pg_temp", "TimeZone=UTC"],
     ["search_path=pg_catalog, public, pg_temp"],
 )
-
-
-def _allocator_case(name):
-    bodies = allocator._source_bodies("synthetic", "preparation")
-    definition, language = allocator._expected_properties(name, 31, 41, bodies[name])
-    definition.update(oid="51", prolang="14" if language == "sql" else "15", proacl=None)
-    entry_by_field = dict(
-        definition=definition, language=language, trusted_language=True, acl=[[41, 41, "EXECUTE", False]]
-    )
-    return entry_by_field, {name: 41}, bodies
-
-
-@pytest.mark.parametrize("name", allocator._SPECS)
-@pytest.mark.parametrize("settings", [_OLD, _NEW])
-def test_allocator_fixed_definitions_accept_only_exact_settings_pair(name, settings):
-    row, owners, bodies = _allocator_case(name)
-    row["definition"]["proconfig"] = deepcopy(settings)
-    original = deepcopy(row)
-    assert allocator._require_definition(row, 31, owners, bodies) == original["definition"]
-    assert row == original
-    row["definition"]["prosrc"] += "\nRETURN NULL;"
-    with pytest.raises(ValueError, match="definition_changed"):
-        allocator._require_definition(row, 31, owners, bodies)
-
-
-@pytest.mark.parametrize("settings", _UNAPPROVED)
-def test_allocator_settings_near_misses_refuse(settings):
-    row, owners, bodies = _allocator_case("pd_dataset_candidate_tables")
-    row["definition"]["proconfig"] = deepcopy(settings)
-    with pytest.raises(ValueError, match="definition_changed"):
-        allocator._require_definition(row, 31, owners, bodies)
 
 
 def _checkpoint_case(monkeypatch, root, settings):

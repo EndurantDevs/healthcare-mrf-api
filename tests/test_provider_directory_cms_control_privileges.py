@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process import provider_directory_cms_control_privileges as privileges
+from tests import cms_control_privileges_support as privileges
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -413,31 +413,6 @@ async def test_read_fragment_refuses_unadmitted_policy_before_sql():
             ),
         )
     connection.execute.assert_not_awaited()
-
-
-@pytest.mark.parametrize("change", ["missing", "duplicate", "foreign"])
-def test_read_role_resolution_requires_exact_declared_native_identities(change):
-    from process.provider_directory_generic_source_policy import GenericSourcePolicy
-
-    policy = GenericSourcePolicy(
-        "control_schema",
-        "control_owner",
-        "control_publisher",
-        ("control_builder", "control_reader"),
-        ("control_builder",),
-    )
-    graph_by_field = {
-        "roles": [{"rolname": "control_publisher", "oid": "18"}, {"rolname": "control_reader", "oid": "20"}]
-    }
-    assert privileges.cms_control_read_oids(policy, graph_by_field) == (18, 20)
-    if change == "missing":
-        graph_by_field["roles"].pop()
-    elif change == "duplicate":
-        graph_by_field["roles"].append(graph_by_field["roles"][0])
-    else:
-        graph_by_field["roles"][-1]["rolname"] = "archive_reader"
-    with pytest.raises(ValueError, match="cms_control_read_roles_changed"):
-        privileges.cms_control_read_oids(policy, graph_by_field)
 
 
 @pytest.mark.asyncio

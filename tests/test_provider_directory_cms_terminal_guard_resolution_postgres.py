@@ -14,14 +14,13 @@ from db import migration_cms_snapshot_allocator as finalization
 from db import migration_cms_terminal_resolution as terminal
 from db.migration_generic_source_candidates import (
     upgrade_generic_source_canonical_copy_guard,
-    verify_generic_source_canonical_copy_guard,
 )
 from db.plan_release_storage import storage_identifier
 from process import provider_directory_cms_callable_custody as callables
 from process import provider_directory_cms_preparation_custody as custody
+from tests.cms_native_layout_postgres_support import _reader
+from tests.cms_native_layout_postgres_support import native_layout as core_layout
 from tests.test_provider_dataset_candidates_postgres import _prepare_copy_guard_catalog
-from tests.test_provider_directory_cms_canonical_layout_postgres import _reader
-from tests.test_provider_directory_cms_canonical_layout_postgres import native_layout as core_layout
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 _NAMES = ("guard_pd_generic_dataset_finalization", replay.GUARD)
@@ -40,8 +39,6 @@ async def _generic_copy_baseline(admin, roles):
                 sync, "mrf", preparation_schema=_PREPARATION_SCHEMA
             )
         )
-    async with admin.transaction(readonly=True):
-        await verify_generic_source_canonical_copy_guard(admin, "mrf", preparation_schema=_PREPARATION_SCHEMA)
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")

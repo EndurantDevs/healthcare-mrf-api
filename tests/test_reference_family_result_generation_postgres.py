@@ -445,7 +445,7 @@ async def _create_reader_compatibility_metadata(connection, schema):
 
 async def _grant_compatibility_reader(connection, schema, reader, *, named):
     """Use the published CMS column contract without granting tracking or physical fields."""
-    from process.provider_directory_cms_control_privileges import READ_COLUMN_GRANTS
+    from tests.cms_control_privileges_support import READ_COLUMN_GRANTS
 
     named_columns = {"serving_schema", "serving_relation_names"}
     reference_columns = tuple(

@@ -6,34 +6,16 @@ issuer record. Shared FHIR enrollment, task input and a detached handoff cannot
 supply that provenance. Equality here is evidence, never a write capability.
 """
 
-import hashlib
 import json
 import re
 from dataclasses import asdict
 
-from db.migration_provider_directory_dataset_candidates import TABLES
 from db.plan_release_storage import storage_relation
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_generic_source_provision import ISOLATED_FHIR_ROOTS as ISOLATED_FHIR_ROOTS
 from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
 
 CONTRACT = "cms-preparation-custody-evidence-v1"
-CANONICAL_ROOTS = (
-    "provider_directory_endpoint_dataset",
-    *TABLES[:4],
-    "provider_directory_entity_source_binding",
-    "provider_directory_entity_release_evidence",
-    "provider_directory_insurance_network_source_binding",
-    "provider_directory_insurance_network_plan_evidence",
-    "provider_directory_resource_identity",
-    "provider_directory_organization_identity",
-    "provider_directory_site_identity",
-    "provider_directory_insurance_network_identity",
-    "provider_directory_cms_npd_resource_witness",
-    "provider_directory_cms_npd_relationship",
-    "provider_directory_cms_npd_relationship_receipt",
-    "provider_directory_cms_candidate_coverage",
-)
 _DIGEST_FIELDS = ("canonical_sha256", "private_sha256", "routines_sha256", "roles_sha256")
 # Fixed source-reviewed PL/pgSQL callees; pg_depend does not record these calls.
 # Keep serving callees until a separately enforced noncurrent boundary exists.
@@ -94,49 +76,6 @@ _ACTOR_SQL = """SELECT session_user::text AS session,current_user::text AS curre
  pg_catalog.current_setting('session_replication_role') AS replication,
  (SELECT virtualtransaction FROM pg_catalog.pg_locks
  WHERE pid=pg_catalog.pg_backend_pid() AND locktype='virtualxid' AND granted) AS transaction"""
-_COORDINATES_SQL = """SELECT jsonb_build_object(
- 'database_oid',(SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()),
- 'catalog_schema_oid',c.oid::bigint,'storage_schema_oid',s.oid::bigint,'namespace_owner_oid',s.nspowner::bigint,
- 'owner_oid',o.oid::bigint,'owner_login',o.rolcanlogin,'publisher_login',p.rolcanlogin)
- FROM pg_catalog.pg_namespace c,pg_catalog.pg_namespace s,pg_catalog.pg_roles o,pg_catalog.pg_roles p
- WHERE c.nspname=$1 AND s.nspname=$2 AND o.rolname=$3 AND p.rolname=$4"""
-_CATALOG_SQL = """WITH RECURSIVE family(oid) AS (
- SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
- WHERE n.nspname=$1 AND c.relname=ANY($2::text[])
- UNION SELECT child.inhrelid FROM pg_catalog.pg_inherits child JOIN family parent ON parent.oid=child.inhparent
-)
-SELECT c.oid::bigint,n.nspname,c.relname,c.relowner::bigint,c.relkind::text,c.relpersistence::text,
- jsonb_build_object(
- 'namespace',jsonb_build_array(n.oid::bigint,n.nspname,n.nspowner::bigint,n.nspacl::text),
- 'relation',jsonb_build_array(c.oid::bigint,c.relname,c.relkind::text,c.relpersistence::text,
-  c.relowner::bigint,c.relispartition,c.relrowsecurity,c.relforcerowsecurity,c.reloftype::bigint,
-  c.reloptions,c.relacl::text,pg_catalog.pg_get_expr(c.relpartbound,c.oid),pg_catalog.pg_get_partkeydef(c.oid)),
- 'parents',ARRAY(SELECT inhparent::bigint FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid ORDER BY inhparent),
- 'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('attribute',to_jsonb(a)-'attstattarget',
-  'default',to_jsonb(d),'type',to_jsonb(t),'collation',to_jsonb(coll)) ORDER BY a.attnum)
-  FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid
-  LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
-  LEFT JOIN pg_catalog.pg_collation coll ON coll.oid=a.attcollation
-  WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),
- 'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(to_jsonb(k),pg_catalog.pg_get_constraintdef(k.oid))
-  ORDER BY k.oid) FROM pg_catalog.pg_constraint k WHERE k.conrelid=c.oid),'[]'::jsonb),
- 'indexes',COALESCE((SELECT jsonb_agg(jsonb_build_object('index',to_jsonb(i),
-  'class',jsonb_build_array(idx.oid::bigint,idx.relowner::bigint,idx.relacl::text,idx.reloptions),
-  'definition',pg_catalog.pg_get_indexdef(i.indexrelid),
-  'opclasses',ARRAY(SELECT to_jsonb(op) FROM unnest(i.indclass::oid[]) WITH ORDINALITY key(oid,n)
-    JOIN pg_catalog.pg_opclass op ON op.oid=key.oid ORDER BY key.n)) ORDER BY i.indexrelid)
-  FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class idx ON idx.oid=i.indexrelid
-  WHERE i.indrelid=c.oid),'[]'::jsonb),
- 'triggers',COALESCE((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.oid) FROM pg_catalog.pg_trigger t
-  WHERE t.tgrelid=c.oid),'[]'::jsonb),
- 'rules',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY r.oid) FROM pg_catalog.pg_rewrite r
-  WHERE r.ev_class=c.oid),'[]'::jsonb),
- 'dependencies',COALESCE((SELECT jsonb_agg(to_jsonb(d) ORDER BY d.classid,d.objid,d.objsubid,
-  d.refclassid,d.refobjid,d.refobjsubid,d.deptype) FROM pg_catalog.pg_depend d
-  WHERE d.classid='pg_catalog.pg_class'::regclass AND d.objid=c.oid),'[]'::jsonb)
- ) AS native
-FROM family f JOIN pg_catalog.pg_class c ON c.oid=f.oid
-JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace ORDER BY c.oid"""
 _ROUTINES_SQL = """WITH RECURSIVE objects(classid,objid) AS (
  SELECT 'pg_catalog.pg_trigger'::regclass,t.oid FROM pg_catalog.pg_trigger t WHERE t.tgrelid=ANY($1::oid[])
  UNION SELECT 'pg_catalog.pg_attrdef'::regclass,d.oid FROM pg_catalog.pg_attrdef d WHERE d.adrelid=ANY($1::oid[])
@@ -158,60 +97,6 @@ SELECT p.oid::bigint,jsonb_build_object('definition',to_jsonb(p),'language',to_j
  FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid),'[]'::jsonb)) AS native
 FROM routines r JOIN pg_catalog.pg_proc p ON p.oid=r.oid
 JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace JOIN pg_catalog.pg_language l ON l.oid=p.prolang ORDER BY p.oid"""
-_ROLES_SQL = """WITH acl_targets(oid) AS (
- SELECT c.relowner FROM pg_catalog.pg_class c WHERE c.oid=ANY($1::oid[])
- UNION SELECT acl.grantee FROM pg_catalog.pg_class c,
- LATERAL pg_catalog.aclexplode(COALESCE(c.relacl,pg_catalog.acldefault('r',c.relowner))) acl
- WHERE c.oid=ANY($1::oid[]) AND acl.grantee<>0
- UNION SELECT acl.grantee FROM pg_catalog.pg_attribute a,
- LATERAL pg_catalog.aclexplode(a.attacl) acl WHERE a.attrelid=ANY($1::oid[]) AND acl.grantee<>0
- UNION SELECT n.nspowner FROM pg_catalog.pg_namespace n WHERE n.nspname=ANY($2::text[])
- UNION SELECT acl.grantee FROM pg_catalog.pg_namespace n,
- LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,pg_catalog.acldefault('n',n.nspowner))) acl
- WHERE n.nspname=ANY($2::text[]) AND acl.grantee<>0
- UNION SELECT p.proowner FROM pg_catalog.pg_proc p WHERE p.oid=ANY($3::oid[])
- UNION SELECT acl.grantee FROM pg_catalog.pg_proc p,
- LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) acl
- WHERE p.oid=ANY($3::oid[]) AND acl.grantee<>0
-), targets AS (
- SELECT oid FROM acl_targets UNION SELECT oid FROM pg_catalog.pg_roles WHERE rolname=ANY($4::text[])
- OR EXISTS(SELECT FROM pg_catalog.pg_class c,
- unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER','MAINTAIN']) privilege
- WHERE c.oid=ANY($1::oid[]) AND pg_catalog.has_table_privilege(pg_roles.oid,c.oid,privilege)
- AND NOT EXISTS(SELECT FROM pg_catalog.aclexplode(COALESCE(c.relacl,pg_catalog.acldefault('r',c.relowner))) acl
- WHERE acl.grantee=0 AND acl.privilege_type=privilege))
-), connected AS (
- SELECT DISTINCT actor.oid FROM pg_catalog.pg_roles actor,targets target
- WHERE (actor.rolcanlogin OR actor.rolname=ANY($4::text[]))
- AND (pg_catalog.pg_has_role(actor.oid,target.oid,'SET') OR pg_catalog.pg_has_role(actor.oid,target.oid,'USAGE'))
-), related AS (
- SELECT oid FROM targets UNION SELECT oid FROM connected
- UNION SELECT r.oid FROM pg_catalog.pg_roles r
- WHERE EXISTS(SELECT FROM connected actor,targets target
- WHERE (pg_catalog.pg_has_role(actor.oid,r.oid,'SET') OR pg_catalog.pg_has_role(actor.oid,r.oid,'USAGE'))
- AND (pg_catalog.pg_has_role(r.oid,target.oid,'SET') OR pg_catalog.pg_has_role(r.oid,target.oid,'USAGE')))
-)
-SELECT jsonb_build_object(
- 'roles',(SELECT jsonb_agg(to_jsonb(r)-'rolpassword' ORDER BY r.oid)
- FROM pg_catalog.pg_roles r JOIN related ON related.oid=r.oid),
- 'memberships',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.roleid,m.member) FROM pg_catalog.pg_auth_members m
- WHERE m.roleid IN(SELECT oid FROM related) AND m.member IN(SELECT oid FROM related)),
- 'reach',(SELECT jsonb_agg(jsonb_build_array(actor.oid::bigint,target.oid::bigint,
- pg_catalog.pg_has_role(actor.oid,target.oid,'SET'),pg_catalog.pg_has_role(actor.oid,target.oid,'USAGE'))
- ORDER BY actor.oid,target.oid) FROM connected actor,targets target),
- 'relation_rights',(SELECT jsonb_agg(jsonb_build_array(r.oid::bigint,c.oid::bigint,
- ARRAY(SELECT privilege FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER','MAINTAIN']) privilege
- WHERE pg_catalog.has_table_privilege(r.oid,c.oid,privilege)),
- ARRAY(SELECT jsonb_build_array(a.attnum,privilege) FROM pg_catalog.pg_attribute a,
- unnest(ARRAY['SELECT','INSERT','UPDATE','REFERENCES']) privilege WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
- AND pg_catalog.has_column_privilege(r.oid,c.oid,a.attnum,privilege) ORDER BY a.attnum,privilege)) ORDER BY r.oid,c.oid)
- FROM related r,unnest($1::oid[]) c(oid)),
- 'namespace_rights',(SELECT jsonb_agg(jsonb_build_array(r.oid::bigint,n.name,
- pg_catalog.has_schema_privilege(r.oid,n.name,'USAGE'),pg_catalog.has_schema_privilege(r.oid,n.name,'CREATE'))
- ORDER BY r.oid,n.name) FROM related r,unnest($2::text[]) n(name)),
- 'routine_rights',(SELECT jsonb_agg(jsonb_build_array(r.oid::bigint,p.oid::bigint,
- pg_catalog.has_function_privilege(r.oid,p.oid,'EXECUTE')) ORDER BY r.oid,p.oid)
- FROM related r,unnest($3::oid[]) p(oid)))"""
 
 
 def _require(condition, code):
@@ -221,12 +106,6 @@ def _require(condition, code):
 
 def _decoded(value):
     return json.loads(value) if isinstance(value, str) else value
-
-
-def _digest(value):
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    ).hexdigest()
 
 
 def _profile(profile, storage_binding, policy):
@@ -246,16 +125,6 @@ def _profile(profile, storage_binding, policy):
         "digest_required",
     )
     return json.loads(json.dumps(profile, allow_nan=False))
-
-
-async def _inventory(connection, schema, roots):
-    rows = [dict(row) for row in await connection.fetch(_CATALOG_SQL, schema, list(roots))]
-    _require({row["relname"] for row in rows if row["relname"] in roots} == set(roots), "roots_missing")
-    _require(
-        all(row["nspname"] == schema and row["relkind"] in {"r", "p"} and row["relpersistence"] == "p" for row in rows),
-        "native_relation_changed",
-    )
-    return [{**row, "native": _decoded(row["native"])} for row in rows]
 
 
 async def _callee_frontier(connection, schema):
@@ -401,7 +270,3 @@ SELECT NOT EXISTS(SELECT FROM pg_catalog.pg_event_trigger WHERE evtenabled<>'D')
  WHERE p.oid IS NULL OR p.oid>=16384 OR p.proowner<>10 OR p.pronamespace<>11 OR p.prolang<>13
  OR p.prosrc<>h.name OR p.probin IS DISTINCT FROM '$libdir/plpgsql'))))
 """
-
-
-def _evidence_digests(evidence_by_kind):
-    return {kind + "_sha256": _digest(value) for kind, value in evidence_by_kind.items()}

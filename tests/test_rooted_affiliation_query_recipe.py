@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db import migration_rooted_publication_freeze as freeze
-from process import provider_directory_rooted_graph_history_validation as history
 from process import provider_directory_rooted_graph_publication_candidate as candidate
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_rooted_graph_http import rebind_provider_directory_rooted_graph_query
@@ -24,9 +23,11 @@ from process.provider_directory_rooted_graph_result_contract import (
     validate_rooted_graph_query_result,
 )
 from process.provider_directory_rooted_graph_store_contract import build_provider_directory_rooted_graph_work_spec
+from process.provider_directory_rooted_graph_store_identity import _canonical_json
 from process.provider_directory_rooted_graph_terminal import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID,
     rooted_graph_query_filter_validation_sql,
+    validate_rooted_graph_missing_response,
 )
 from tests.test_provider_directory_rooted_graph_frozen_validation import (
     _seal,
@@ -39,7 +40,6 @@ from tests.test_provider_directory_rooted_graph_frozen_validation import (
     frozen as frozen,
 )
 from tests.test_provider_directory_rooted_graph_handoff import rooted_handoff as rooted_handoff
-from tests.test_provider_directory_rooted_graph_history_validation import _family, _policy
 from tests.test_provider_directory_rooted_graph_native_adapter import (
     _materialize,
 )
@@ -213,13 +213,27 @@ def test_final_and_ancestor_proofs_require_recipe_in_recorded_parent_handoff():
     assert "payload" not in audit and "FOR SHARE" not in audit
 
 
-def test_history_adoption_preserves_legacy_terminal_validation_without_authorizing_publication():
-    sql, _members = history._render(_policy(), _family())
-    assert PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID in sql
-    assert "terminal_record_sha256 IS DISTINCT FROM terminal_digest\n" in sql
-    assert "AND terminal_record_sha256 IS DISTINCT FROM legacy_terminal_digest" in sql
-    assert "convert_to(terminal_input,'UTF8')" in sql
-    assert "__" not in sql
+_MISSING_OUTCOME = '{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"not-found"}],"x":%s}'
+
+
+def _missing_witness(text):
+    encoded = text.encode("utf-8")
+    return 404, hashlib.sha256(encoded).hexdigest(), len(encoded), text
+
+
+def test_missing_response_accepts_a_valid_absence_witness():
+    validate_rooted_graph_missing_response(*_missing_witness(_MISSING_OUTCOME % "1"))
+
+
+@pytest.mark.parametrize("number", ["Infinity", "1e-7", "1e999"])
+def test_missing_response_refuses_non_canonical_numbers(number):
+    with pytest.raises(ValueError, match="missing_invalid"):
+        validate_rooted_graph_missing_response(*_missing_witness(_MISSING_OUTCOME % number))
+
+
+def test_store_json_refuses_non_finite_values():
+    with pytest.raises(ValueError, match="json_invalid"):
+        _canonical_json({"x": float("nan")})
 
 
 def test_work_guard_preserves_all_original_checks_and_only_extends_completed_affiliation():
