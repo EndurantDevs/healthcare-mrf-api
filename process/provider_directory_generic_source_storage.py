@@ -959,8 +959,9 @@ def _is_empty_vsp_checkpoint_failure(
     )
 
 
-async def _locked_transition_header(connection, policy, identity_by_field):
+async def _locked_transition_header(connection, policy, identity_by_field, *, lock="UPDATE"):
     """Fence the endpoint and stopped worker before inspecting the exact header."""
+    _require(lock in {"UPDATE", "SHARE"}, "header_lock_invalid")
     endpoint_id = identity_by_field["endpoint_id"]
     failed_run_id = identity_by_field["failed_run_id"]
     endpoint_lock_acquired = await connection.fetchval(
@@ -976,7 +977,7 @@ async def _locked_transition_header(connection, policy, identity_by_field):
         "SELECT dataset_id,endpoint_id,acquisition_root_run_id,import_run_id,status,is_current,published_at,resource_count,"
         "publication_metadata_json,candidate_storage_json FROM "
         + storage_relation(policy.schema, HEADER)
-        + " WHERE dataset_id=$1 FOR UPDATE NOWAIT",
+        + f" WHERE dataset_id=$1 FOR {lock} NOWAIT",
         identity_by_field["dataset_id"],
     )
     _require(
@@ -1073,10 +1074,18 @@ def _is_unstarted_named_root(header, binding, identity, expected_counts, manifes
 
 
 async def _locked_transition_candidate(
-    connection, policy, identity_by_field, old_storage, new_storage, expected_counts, *, manifest_replay=False
+    connection,
+    policy,
+    identity_by_field,
+    old_storage,
+    new_storage,
+    expected_counts,
+    *,
+    manifest_replay=False,
+    lock="UPDATE",
 ):
     """Verify the stopped acquisition and its declared storage."""
-    header = await _locked_transition_header(connection, policy, identity_by_field)
+    header = await _locked_transition_header(connection, policy, identity_by_field, lock=lock)
     raw_candidate, candidate_by_field = _transition_candidate_document(
         header["candidate_storage_json"], old_storage, new_storage
     )
@@ -1093,11 +1102,9 @@ async def _locked_transition_candidate(
     metadata_status = "failed" if is_unstarted_named_root else header["status"]
     has_identity_metadata = _transition_metadata_matches(metadata, stored_identity["metadata"], metadata_status)
     has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
-    candidate_storage_by_field = candidate_by_field.get("storage")
     source_ids = stored_identity["metadata"].get("source_ids")
     if is_unstarted_named_root or (source_ids != [VSP_SOURCE_ID] and named_source_resources(source_ids) is not None):
         _require_named_source_identity(stored_identity)
-    expected_storage_by_field = {key: old_storage[key] for key in ("catalog_schema", "storage_schema")}
     _require(
         candidate_by_field["contract"] in (ISOLATED_CONTRACT, *NAMED_CONTRACTS)
         and (not has_changed_header_owner or is_empty_vsp_failure)
@@ -1112,7 +1119,8 @@ async def _locked_transition_candidate(
         == set(stored_identity["metadata"].get("expected_resources", ()))
         == {name for name in expected_counts if not name.startswith("LU:")}
         == {_resource_family(name) for name in expected_counts}
-        and candidate_storage_by_field == expected_storage_by_field,
+        and candidate_by_field.get("storage")
+        == {key: old_storage[key] for key in ("catalog_schema", "storage_schema")},
         "transition_candidate_changed",
     )
     await _verify_tables(connection, policy, candidate_by_field)
@@ -1834,6 +1842,39 @@ def _require_rest_transition_checkpoints(
     )
 
 
+def _transition_observation_relation(policy, candidate_by_field):
+    """Read compact observation metadata directly from the indexed alias table."""
+    tables = candidate_by_field["tables"]
+    root = (
+        "resource_aliases"
+        if candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT and "resource_aliases" in tables
+        else "resource_input"
+    )
+    return storage_relation(policy.schema, tables[root]["name"])
+
+
+async def _verify_compact_observation_bounds(connection, resource_relation, dataset_id, ordinal):
+    """Confirm via PK endpoints that no foreign or post-ordinal batch appeared since preflight."""
+    bounds = await connection.fetchrow(
+        f"SELECT "
+        f"(SELECT dataset_id FROM {resource_relation} ORDER BY dataset_id ASC LIMIT 1) AS min_dataset_id,"
+        f"(SELECT dataset_id FROM {resource_relation} ORDER BY dataset_id DESC LIMIT 1) AS max_dataset_id,"
+        f"(SELECT batch_ordinal FROM {resource_relation} WHERE dataset_id=$1 ORDER BY batch_ordinal ASC,row_ordinal ASC LIMIT 1) AS min_ordinal,"
+        f"(SELECT batch_ordinal FROM {resource_relation} WHERE dataset_id=$1 ORDER BY batch_ordinal DESC,row_ordinal DESC LIMIT 1) AS max_ordinal",
+        dataset_id,
+    )
+    _require(
+        bounds is not None
+        and bounds["min_dataset_id"] == dataset_id
+        and bounds["max_dataset_id"] == dataset_id
+        and type(bounds["min_ordinal"]) is int
+        and bounds["min_ordinal"] > 0
+        and type(bounds["max_ordinal"]) is int
+        and bounds["max_ordinal"] <= ordinal,
+        "transition_input_changed",
+    )
+
+
 async def _verify_transition_inputs(
     connection,
     policy,
@@ -1841,12 +1882,16 @@ async def _verify_transition_inputs(
     identity_by_field,
     expected_counts,
     run_evidence,
+    *,
+    skip_census=False,
 ):
     """Compare completed or resumable checkpoints with every active detached input row."""
     if candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT:
-        from process.provider_directory_compact_source_completion import validate_storage
-
-        await validate_storage(connection, policy, candidate_by_field)
+        witness_relation = storage_relation(policy.schema, candidate_by_field["tables"]["witness_input"]["name"])
+        _require(
+            await connection.fetchval(f"SELECT NOT EXISTS(SELECT FROM {witness_relation})") is True,
+            "compact_witness_unsupported",
+        )
     renewals, companion_starts = await _verify_transition_checkpoints(
         connection,
         policy,
@@ -1856,30 +1901,36 @@ async def _verify_transition_inputs(
         candidate_by_field,
     )
     dataset_id = identity_by_field["dataset_id"]
-    resource_relation = storage_relation(policy.schema, candidate_by_field["tables"]["resource_input"]["name"])
-    has_retired_observations = (
-        candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT or "payload_conversion" in candidate_by_field
-    )
-    input_rows = await connection.fetch(
-        "SELECT dataset_id,resource_type,count(*) AS total,"
-        "count(*) FILTER (WHERE batch_ordinal<=0 OR batch_ordinal>$3::bigint "
-        "OR row_ordinal<0 OR row_ordinal>=4096) AS invalid,"
-        "count(*) FILTER (WHERE batch_ordinal > greatest($1::bigint,"
-        "coalesce(($2::jsonb->>resource_type)::bigint,0)) AND batch_ordinal <= $3::bigint) AS active "
-        "FROM " + resource_relation + " GROUP BY dataset_id,resource_type",
-        candidate_by_field["resets"].get("*", 0),
-        _encoded(candidate_by_field["resets"]),
-        candidate_by_field["ordinal"],
-    )
-    _require_transition_census(input_rows, dataset_id, expected_counts, has_retired_observations)
-    for resource, _checkpoint, _payload, _observed_count in renewals:
-        _require(
-            not any(
-                input_row["resource_type"] == resource or input_row["resource_type"].startswith(f"LU:{resource}:")
-                for input_row in input_rows
-            ),
-            "transition_partition_input_changed",
+    resource_relation = _transition_observation_relation(policy, candidate_by_field)
+    if skip_census and not renewals and any(expected_counts.values()):
+        if candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT:
+            await _verify_compact_observation_bounds(
+                connection, resource_relation, dataset_id, candidate_by_field["ordinal"]
+            )
+    else:
+        has_retired_observations = (
+            candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT or "payload_conversion" in candidate_by_field
         )
+        input_rows = await connection.fetch(
+            "SELECT dataset_id,resource_type,count(*) AS total,"
+            "count(*) FILTER (WHERE batch_ordinal<=0 OR batch_ordinal>$3::bigint "
+            "OR row_ordinal<0 OR row_ordinal>=4096) AS invalid,"
+            "count(*) FILTER (WHERE batch_ordinal > greatest($1::bigint,"
+            "coalesce(($2::jsonb->>resource_type)::bigint,0)) AND batch_ordinal <= $3::bigint) AS active "
+            "FROM " + resource_relation + " GROUP BY dataset_id,resource_type",
+            candidate_by_field["resets"].get("*", 0),
+            _encoded(candidate_by_field["resets"]),
+            candidate_by_field["ordinal"],
+        )
+        _require_transition_census(input_rows, dataset_id, expected_counts, has_retired_observations)
+        for resource, _checkpoint, _payload, _observed_count in renewals:
+            _require(
+                not any(
+                    input_row["resource_type"] == resource or input_row["resource_type"].startswith(f"LU:{resource}:")
+                    for input_row in input_rows
+                ),
+                "transition_partition_input_changed",
+            )
     await _verify_transition_witness(
         connection, policy, candidate_by_field, dataset_id, run_evidence.get("require_empty_checkpoints", False)
     )
@@ -2019,33 +2070,48 @@ def _transition_catalog_schema(policy, old_storage, new_storage):
     return old_storage["catalog_schema"]
 
 
-async def _validate_transition_payloads(connection, policy, candidate_by_field):
-    """Validate each retained observation in bounded reads without reducing or rewriting it."""
-    from process import provider_directory_generic_source_completion as completion
-
+def _require_transition_hash_contract(candidate_by_field):
+    """Confirm retained observations still declare a supported hash contract."""
     directory = import_module("process.provider_directory_fhir")
-    identity = candidate_by_field["identity"]
-    metadata = identity["metadata"]
-    contract = metadata.get(directory.RESOURCE_HASH_CONTRACT_METADATA_KEY)
+    contract = candidate_by_field["identity"]["metadata"].get(directory.RESOURCE_HASH_CONTRACT_METADATA_KEY)
     _require(contract in directory.RESOURCE_HASH_CONTRACTS, "hash_contract_changed")
-    candidate = _StoredCandidate(identity, contract, metadata.get(directory.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY))
-    prepare, _merge = completion._resource_callbacks(directory, candidate)
-    for key, columns, validate in (
-        ("resource_input", RESOURCE_COLUMNS, prepare),
-        ("witness_input", WITNESS_COLUMNS, completion._witness),
-    ):
-        async for row in completion._active_rows(connection, policy, candidate_by_field, key, columns, ordered=False):
-            _require(row["dataset_id"] == identity["dataset_id"], "transition_input_changed")
-            validate(row)
+
+
+def _validate_transition_preflight(
+    verified_preflight, identity_by_field, raw_candidate, expected_resource_counts, run_evidence_by_field
+):
+    """Ensure candidate bytes, expected counts and lineage did not drift since preflight."""
+    _require(
+        type(verified_preflight) is dict
+        and set(verified_preflight) == {"dataset_id", "candidate_sha256", "expected_resource_counts", "lineage_run_ids"}
+        and verified_preflight["dataset_id"] == identity_by_field["dataset_id"]
+        and verified_preflight["candidate_sha256"] == hashlib.sha256(_encoded(raw_candidate).encode()).hexdigest()
+        and verified_preflight["expected_resource_counts"] == expected_resource_counts
+        and verified_preflight["lineage_run_ids"] == run_evidence_by_field["lineage_run_ids"],
+        "transition_preflight_changed",
+    )
 
 
 async def _verify_stopped_candidate(
-    connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
+    connection,
+    policy,
+    catalog_schema,
+    identity_by_field,
+    locked_candidate,
+    expected_resource_counts,
+    *,
+    verified_preflight=None,
 ):
     """Check the failed acquisition lineage and candidate contents before changing storage."""
-    candidate_by_field, _, is_empty_vsp_failure, has_changed_header_owner, failure_error, _, is_unstarted_named_root = (
-        locked_candidate
-    )
+    (
+        candidate_by_field,
+        _,
+        is_empty_vsp_failure,
+        has_changed_header_owner,
+        failure_error,
+        raw_candidate,
+        is_unstarted_named_root,
+    ) = locked_candidate
     run_evidence_by_field = await _verify_transition_run(
         connection,
         catalog_schema,
@@ -2055,6 +2121,10 @@ async def _verify_stopped_candidate(
         is_empty_vsp_failure=is_empty_vsp_failure,
         expected_failure_error=failure_error,
     )
+    if verified_preflight is not None:
+        _validate_transition_preflight(
+            verified_preflight, identity_by_field, raw_candidate, expected_resource_counts, run_evidence_by_field
+        )
     run_evidence_by_field["is_unstarted_named_root"] = is_unstarted_named_root
     run_evidence_by_field["require_empty_checkpoints"] = is_empty_vsp_failure
     _require(not is_empty_vsp_failure or run_evidence_by_field["status"] == "failed", "transition_checkpoint_changed")
@@ -2065,14 +2135,54 @@ async def _verify_stopped_candidate(
         identity_by_field,
         expected_resource_counts,
         run_evidence_by_field,
+        skip_census=verified_preflight is not None,
     )
     if any(expected_resource_counts.values()):
-        await _validate_transition_payloads(connection, policy, candidate_by_field)
+        _require_transition_hash_contract(candidate_by_field)
     return run_evidence_by_field, transitions
 
 
-async def transition_isolated_loading_candidate_storage(
+async def preflight_isolated_loading_candidate_storage(
     connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts, manifest_replay=False
+):
+    """Verify one stopped private intake outside the global admission lock."""
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+
+    _require(type(manifest_replay) is bool, "transition_replay_invalid")
+    _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction(), "transition_transaction_required")
+    _validated_transition_identity(identity_by_field, expected_resource_counts)
+    catalog_schema = _transition_catalog_schema(policy, old_storage, new_storage)
+    locked_candidate = await _locked_transition_candidate(
+        connection,
+        policy,
+        identity_by_field,
+        old_storage,
+        new_storage,
+        expected_resource_counts,
+        manifest_replay=manifest_replay,
+        lock="SHARE",
+    )
+    run_evidence_by_field, _transitions = await _verify_stopped_candidate(
+        connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
+    )
+    return {
+        "dataset_id": identity_by_field["dataset_id"],
+        "candidate_sha256": hashlib.sha256(_encoded(locked_candidate[5]).encode()).hexdigest(),
+        "expected_resource_counts": dict(expected_resource_counts),
+        "lineage_run_ids": run_evidence_by_field["lineage_run_ids"],
+    }
+
+
+async def transition_isolated_loading_candidate_storage(
+    connection,
+    *,
+    policy,
+    identity_by_field,
+    old_storage,
+    new_storage,
+    expected_resource_counts,
+    manifest_replay=False,
+    verified_preflight=None,
 ):
     """Move one verified stopped private intake to an admin-issued successor producer."""
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -2094,18 +2204,20 @@ async def transition_isolated_loading_candidate_storage(
     )
     candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate, _ = locked_candidate
     run_evidence_by_field, transitions = await _verify_stopped_candidate(
-        connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
+        connection,
+        policy,
+        catalog_schema,
+        identity_by_field,
+        locked_candidate,
+        expected_resource_counts,
+        verified_preflight=verified_preflight,
     )
     if run_evidence_by_field["is_postal_start_failure"]:
         from process.provider_directory_postal_checkpoint import provision
 
         await provision(connection, policy)
     successor_by_field, receipt_by_field = _transition_result(
-        candidate_by_field,
-        old_storage,
-        new_storage,
-        expected_resource_counts,
-        run_evidence_by_field,
+        candidate_by_field, old_storage, new_storage, expected_resource_counts, run_evidence_by_field
     )
     is_unstarted_named_root = run_evidence_by_field["is_unstarted_named_root"]
     should_rearm = is_unstarted_named_root or is_empty_vsp_failure and failure_error not in _RETAINED_VSP_CAPTURE_ERRORS
@@ -2115,13 +2227,7 @@ async def transition_isolated_loading_candidate_storage(
         and not (is_unstarted_named_root and previous_status == "failed")
     )
     await _store_transition_successor(
-        connection,
-        policy,
-        identity_by_field,
-        successor_by_field,
-        raw_candidate,
-        previous_status,
-        should_rearm,
+        connection, policy, identity_by_field, successor_by_field, raw_candidate, previous_status, should_rearm
     )
     await apply_partition_transitions(connection, policy.schema, transitions)
     return {**receipt_by_field, "already_applied": is_already_applied}

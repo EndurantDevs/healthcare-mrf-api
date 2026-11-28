@@ -161,3 +161,52 @@ async def test_prepared_count_uses_verified_completed_output_without_raw_duplica
     query, dataset_id = case.native.fetchval.await_args.args
     assert '"pdgs_' + "b" * 32 + '_r"' in query and dataset_id == "dataset" and "DISTINCT" not in query
     failure.storage._verify_tables.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase,expected_suffix", [("loading", "_ra"), ("prepared", "_oa")])
+async def test_compact_failure_count_uses_physical_alias_tables(case, phase, expected_suffix):
+    prefix = "pdgs_" + "c" * 32
+    metadata = {
+        "source_ids": ["example-source"],
+        "selected_resources": ["Organization"],
+        "expected_resources": ["Organization"],
+        "resource_hash_contract": "contract",
+    }
+    case.directory._endpoint_dataset_candidate_metadata = lambda _: deepcopy(metadata)
+    case.header["publication_metadata_json"] = deepcopy(metadata)
+    binding = case.header["candidate_storage_json"]
+    binding["identity"]["metadata"] = deepcopy(metadata)
+    binding.update(
+        contract=failure.storage.NAMED_COMPACT_CONTRACT,
+        payload_format="provider-directory-shared-bodies-v1",
+        phase=phase,
+        admission=None,
+        auxiliary=None,
+        relationship_sha256=None,
+        storage={"catalog_schema": "catalog", "storage_schema": "source_schema"},
+        tables={
+            "resource_input": {"schema": "source_schema", "name": prefix + "_ri"},
+            "witness_input": {"schema": "source_schema", "name": prefix + "_wi"},
+            "resource_aliases": {"schema": "source_schema", "name": prefix + "_ra"},
+            "resource_body_blocks": {"schema": "source_schema", "name": prefix + "_rb"},
+            "resource_reference_sets": {"schema": "source_schema", "name": prefix + "_rs"},
+            "resource_shared_bodies": {"schema": "source_schema", "name": prefix + "_sb"},
+            "resource_reference_tokens": {"schema": "source_schema", "name": prefix + "_rt"},
+        },
+    )
+    if phase == "prepared":
+        binding["tables"]["resource_output_aliases"] = {"schema": "source_schema", "name": prefix + "_oa"}
+        for root in failure.storage.RELATIONS:
+            binding["tables"][root] = {
+                "schema": "source_schema",
+                "name": prefix + "_" + failure.storage._SUFFIXES[root],
+            }
+    from process.provider_directory_source_storage_binding import SharedBodyFHIRSourceStorage
+
+    case.directory._schema = lambda: "catalog"
+    case.publisher.storage_binding = SharedBodyFHIRSourceStorage("catalog", "source_schema")
+    await failure.mark_source_candidate(case.directory, case.candidate, "failed", {})
+    query = case.native.fetchval.await_args.args[0]
+    assert f'"{prefix}{expected_suffix}"' in query
+    assert f'"{prefix}_ri"' not in query and f'"{prefix}_r"' not in query
