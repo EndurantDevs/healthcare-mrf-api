@@ -237,7 +237,11 @@ async def test_profile_dataset_reads_keep_existing_locks_or_repeatable_snapshot(
         yield object()
 
     edition = SimpleNamespace(
-        catalog_schema="mrf", endpoint_id="endpoint-a", dataset_id="dataset-a", schema_name="published_edition"
+        catalog_schema="mrf",
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        schema_name="published_edition",
+        source_ids=("source-a",),
     )
     reader = AsyncMock(return_value=(edition,) if has_named_input else ())
     dataset_rows = AsyncMock(return_value=[{"dataset_id": "dataset-a"}])
