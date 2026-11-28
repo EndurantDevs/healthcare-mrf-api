@@ -295,7 +295,7 @@ def _assert_initial_import_queue_result(progress_events, redis):
     shutdown_call = redis.enqueue_job.await_args_list[-1]
     assert shutdown_call.args[0] == "shutdown"
     assert shutdown_call.kwargs == {
-        "_job_id": "shutdown_mrf_20260724",
+        "_job_id": "shutdown_mrf_run-contract",
         "_queue_name": initial.MRF_FINISH_QUEUE_NAME,
     }
     assert [event["phase"] for event in progress_events] == [

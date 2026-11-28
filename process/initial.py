@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import functools
 import glob
 import hashlib
 import json
@@ -115,6 +116,15 @@ logger = logging.getLogger(__name__)
 MRF_QUEUE_NAME = "arq:MRF"
 MRF_FINISH_QUEUE_NAME = "arq:MRF_finish"
 MRF_RECOVERABLE_FUNCTIONS = frozenset({"process_json_index", "process_plan", "process_provider", "process_formulary"})
+MRF_RUN_STATE_NAMES = (
+    "total_work",
+    "done_work",
+    "expected_work",
+    "pending_work",
+    "recovery_attempts",
+    "finalize_lock",
+    "finalized",
+)
 _POSTGRES_SETTING_RE = re.compile(r"^\d+(?:\.\d+)?\s*[A-Za-z]*$")
 _MRF_ADDRESS_SUMMARY_DEFERRED_INDEX_NAMES = {
     "address_sources",
@@ -226,16 +236,16 @@ def _decode_redis_text(value) -> str:
     return str(value)
 
 
-def _is_mrf_finalize_job_id(job_id: str, import_date: str) -> bool:
-    base = f"shutdown_mrf_{import_date}"
+def _is_mrf_finalize_job_id(job_id: str, run_scope: str) -> bool:
+    base = f"shutdown_mrf_{run_scope}"
     return job_id == base or job_id.startswith(f"{base}_wait_") or job_id.startswith(f"{base}_lock_wait_")
 
 
-async def _cleanup_mrf_finalize_jobs(redis, import_date: str) -> int:
-    """Remove obsolete MRF finish jobs for an import date after finalization."""
-    if not redis or not import_date:
+async def _cleanup_mrf_finalize_jobs(redis, run_scope: str) -> int:
+    """Remove obsolete MRF finish jobs for one run after finalization."""
+    if not redis or not run_scope:
         return 0
-    base_job_id = f"shutdown_mrf_{import_date}"
+    base_job_id = f"shutdown_mrf_{run_scope}"
     job_ids = {base_job_id}
     try:
         queued_job_ids = await redis.zrange(MRF_FINISH_QUEUE_NAME, 0, -1)
@@ -244,7 +254,7 @@ async def _cleanup_mrf_finalize_jobs(redis, import_date: str) -> int:
         queued_job_ids = []
     for raw_job_id in queued_job_ids or []:
         job_id = _decode_redis_text(raw_job_id)
-        if _is_mrf_finalize_job_id(job_id, import_date):
+        if _is_mrf_finalize_job_id(job_id, run_scope):
             job_ids.add(job_id)
 
     removed = 0
@@ -276,21 +286,7 @@ async def _init_mrf_run_state(redis, run_id: str) -> None:
     if not redis or not run_id:
         return
     total_key = _mrf_state_key(run_id, "total_work")
-    done_key = _mrf_state_key(run_id, "done_work")
-    expected_key = _mrf_state_key(run_id, "expected_work")
-    pending_key = _mrf_state_key(run_id, "pending_work")
-    recovery_attempts_key = _mrf_state_key(run_id, "recovery_attempts")
-    lock_key = _mrf_state_key(run_id, "finalize_lock")
-    finalized_key = _mrf_state_key(run_id, "finalized")
-    await redis.delete(
-        total_key,
-        done_key,
-        expected_key,
-        pending_key,
-        recovery_attempts_key,
-        lock_key,
-        finalized_key,
-    )
+    await redis.delete(*(_mrf_state_key(run_id, name) for name in MRF_RUN_STATE_NAMES))
     await redis.set(total_key, "0")
     await redis.expire(total_key, _mrf_run_state_ttl_seconds())
 
@@ -408,6 +404,40 @@ async def _is_mrf_arq_job_active(redis, work_id: str) -> bool:
     if await redis.exists(f"arq:job:{work_id}", f"arq:in-progress:{work_id}"):
         return True
     return await redis.zscore(MRF_QUEUE_NAME, work_id) is not None
+
+
+async def _purge_stale_mrf_run(redis, run_id: str) -> None:
+    """Drop a superseded run's recovery state and queued jobs so nothing can requeue its work."""
+    await redis.delete(*(_mrf_state_key(run_id, name) for name in MRF_RUN_STATE_NAMES))
+    for queue_name in (MRF_QUEUE_NAME, MRF_FINISH_QUEUE_NAME):
+        queued_job_ids = [_decode_redis_text(raw_job_id) for raw_job_id in await redis.zrange(queue_name, 0, -1)]
+        stale_job_ids = [
+            job_id for job_id in queued_job_ids if f":{run_id}:" in job_id or _is_mrf_finalize_job_id(job_id, run_id)
+        ]
+        if stale_job_ids:
+            await redis.zrem(queue_name, *stale_job_ids)
+            await redis.delete(*(f"arq:job:{job_id}" for job_id in stale_job_ids))
+
+
+def _current_mrf_run_job(job):
+    """Skip MRF jobs left behind by another control run instead of re-running its work."""
+
+    @functools.wraps(job)
+    async def run_current_job(ctx, task, *args, **kwargs):
+        """Run the job when it belongs to this worker's control run, or has no run to compare."""
+        worker_run_id = os.environ.get("HLTHPRT_CONTROL_RUN_ID", "").strip()
+        task_context = task.get("context") if isinstance(task, dict) else None
+        task_run_id = str((task_context or {}).get("control_run_id") or "").strip()
+        if not worker_run_id or not task_run_id or task_run_id == worker_run_id:
+            return await job(ctx, task, *args, **kwargs)
+        purged_run_ids = ctx.setdefault("mrf_purged_run_ids", set())
+        if task_run_id not in purged_run_ids and ctx.get("redis"):
+            await _purge_stale_mrf_run(ctx["redis"], task_run_id)
+            purged_run_ids.add(task_run_id)
+            logger.warning("Dropped queued work of superseded MRF run %s (worker run %s)", task_run_id, worker_run_id)
+        return None
+
+    return run_current_job
 
 
 async def mrf_worker_shutdown(ctx: dict) -> None:
@@ -1474,6 +1504,7 @@ async def _has_valid_mrf_label(entry, field, task, source, import_log):
     return False
 
 
+@_current_mrf_run_job
 async def process_plan(ctx, task):
     """
     The process_plan function is responsible for downloading the plan data from the CMS PUF,
@@ -1870,6 +1901,7 @@ async def _mrf_provider_plan_scope(plan, task, import_log, current_year):
     return plan_id, int(plan_id[:5]), years
 
 
+@_current_mrf_run_job
 async def process_provider(ctx, task):
     """
     The process_provider function is responsible for downloading the provider data from the CMS PUF website,
@@ -1951,7 +1983,6 @@ async def process_provider(ctx, task):
             plan_networks_by_checksum = {}
             mrf_address_obj_dict = {}
             mrf_address_evidence_dict = {}
-            count = 0
             processed_providers = 0
             try:
                 async for provider_record in ijson.items(afp, "item", use_float=True):
@@ -2113,8 +2144,14 @@ async def process_provider(ctx, task):
                         mrf_address_evidence_dict[str(evidence_row["evidence_checksum"])] = evidence_row
 
                     processed_providers += 1
-                    count += 1
-                    if count > provider_flush_rows:
+                    # One record fans out into rows per plan, network fragment and address.
+                    staged_row_count = (
+                        len(plan_npi_obj_dict)
+                        + len(plan_networks_by_checksum)
+                        + len(mrf_address_obj_dict)
+                        + len(mrf_address_evidence_dict)
+                    )
+                    if staged_row_count >= provider_flush_rows:
                         await asyncio.gather(
                             _push_mrf_duplicate_tolerant_rows(list(plan_npi_obj_dict.values()), myplan_npi),
                             _push_mrf_duplicate_tolerant_rows(
@@ -2126,7 +2163,6 @@ async def process_provider(ctx, task):
                                 mymrfaddressevidence,
                             ),
                         )
-                        count = 0
                         plan_npi_obj_dict.clear()
                         plan_networks_by_checksum.clear()
                         mrf_address_obj_dict.clear()
@@ -2496,6 +2532,7 @@ async def _is_formulary_file_imported(
     return True
 
 
+@_current_mrf_run_job
 async def process_formulary(ctx, task):
     """
     Download and store formulary (drugs.json) data for an issuer.
@@ -2551,6 +2588,7 @@ async def process_formulary(ctx, task):
     return 1
 
 
+@_current_mrf_run_job
 async def save_mrf_data(ctx, task):
     """Persist one queued batch of normalized MRF records."""
     if "context" in task:
@@ -2705,6 +2743,7 @@ async def _has_enqueued_mrf_index_file(ctx, task, tmp_filename, import_log, stre
     return False
 
 
+@_current_mrf_run_job
 async def process_json_index(ctx, task):
     """Download an MRF JSON index and enqueue its plan, formulary, and provider URLs."""
     print(f"CTX: {ctx} \n TASK: {task}")
@@ -3292,7 +3331,7 @@ async def init_file(ctx, task=None):
                 message=f"enqueued {idx + 1}/{len(selected_urls)} index job(s)",
             )
 
-        shutdown_job_id = f"shutdown_mrf_{ctx['context']['import_date']}"
+        shutdown_job_id = f"shutdown_mrf_{state_run_id}"
         await redis.enqueue_job(
             "shutdown",
             {"context": ctx["context"], "test_mode": is_test_mode_enabled},
@@ -3377,6 +3416,7 @@ async def _publish_mrf_table_generation(import_date: str, db_schema: str):
         return publication_generation
 
 
+@_current_mrf_run_job
 async def publish_initial_generation(ctx, task):
     """
     The shutdown function is called after the import process has completed.
@@ -3397,7 +3437,7 @@ async def publish_initial_generation(ctx, task):
         finalized_key = _mrf_state_key(state_run_id, "finalized")
         if await redis.get(finalized_key):
             logger.info("MRF run %s already finalized; skipping duplicate shutdown", state_run_id)
-            await _cleanup_mrf_finalize_jobs(redis, import_date)
+            await _cleanup_mrf_finalize_jobs(redis, state_run_id)
             return 1
 
         total_work, done_work = await _get_mrf_run_progress(redis, state_run_id)
@@ -3489,7 +3529,7 @@ async def publish_initial_generation(ctx, task):
                     "test_mode": is_test_mode_enabled,
                     "mrf_finalize_waits": wait_count + 1,
                 },
-                _job_id=f"shutdown_mrf_{import_date}_wait_{wait_count + 1}",
+                _job_id=f"shutdown_mrf_{state_run_id}_wait_{wait_count + 1}",
                 _queue_name=MRF_FINISH_QUEUE_NAME,
                 _defer_by=delay_seconds,
             )
@@ -3505,7 +3545,7 @@ async def publish_initial_generation(ctx, task):
                     "test_mode": is_test_mode_enabled,
                     "mrf_finalize_waits": wait_count + 1,
                 },
-                _job_id=f"shutdown_mrf_{import_date}_lock_wait_{wait_count + 1}",
+                _job_id=f"shutdown_mrf_{state_run_id}_lock_wait_{wait_count + 1}",
                 _queue_name=MRF_FINISH_QUEUE_NAME,
                 _defer_by=delay_seconds,
             )
@@ -3721,7 +3761,7 @@ async def publish_initial_generation(ctx, task):
         },
     )
     if redis:
-        await _cleanup_mrf_finalize_jobs(redis, import_date)
+        await _cleanup_mrf_finalize_jobs(redis, state_run_id or import_date)
 
 
 shutdown = publish_initial_generation

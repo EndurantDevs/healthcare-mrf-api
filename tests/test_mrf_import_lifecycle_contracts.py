@@ -453,3 +453,30 @@ async def test_import_chunk_handoff_finishes_parent_work_without_parsing(
     initial._has_enqueued_mrf_file_chunks.assert_awaited_once()
     initial._mark_mrf_work_done.assert_awaited_once()
     initial.flush_error_log.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_import_flushes_on_buffered_rows_not_records(monkeypatch):
+    """Bound provider buffers by staged rows, since one record fans out into many rows."""
+
+    current_year = datetime.datetime.now().year
+    _pushed, duplicate_tolerant = _configure_import_boundary(monkeypatch, _provider_contract_fixture(current_year))
+    monkeypatch.setattr(initial, "_mrf_provider_flush_rows", lambda _test_mode: 4)
+    monkeypatch.setattr(initial.db, "select", lambda *_args: SimpleNamespace(all=AsyncMock(return_value=[])))
+
+    def address_rows(record, *_args, **_kwargs):
+        # Two plan rows, two plan-network rows and one address row per record: every buffer counts.
+        return [{"npi": int(record["npi"]), "checksum": 1, "type": "practice"}], []
+
+    monkeypatch.setattr(initial, "_build_mrf_address_rows", address_rows)
+    monkeypatch.setattr(initial, "_push_mrf_address_rows", AsyncMock())
+    monkeypatch.setattr(initial, "_mark_mrf_provider_file_progress", AsyncMock())
+
+    assert await initial.process_provider(_import_context(), _import_task("providers")) == 1
+
+    provider_npi_sets = [
+        {provider_row["npi"] for provider_row in row_dicts}
+        for label, row_dicts in duplicate_tolerant
+        if label == "PlanNPIRaw" and row_dicts
+    ]
+    assert provider_npi_sets == [{1000000002}, {1000000003}]
