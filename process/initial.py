@@ -22,8 +22,8 @@ import ijson
 from aiocsv import AsyncDictReader
 from aiofile import async_open
 from aiofiles import open as async_text_open
-from arq import create_pool
-from asyncpg import DuplicateTableError
+from arq import Retry, create_pool
+from asyncpg import CannotConnectNowError, DuplicateTableError, TooManyConnectionsError
 from dateutil.parser import parse as parse_date
 from sqlalchemy import func, literal, or_, select, text
 from sqlalchemy.exc import IntegrityError, ProgrammingError
@@ -433,6 +433,18 @@ async def _purge_other_mrf_runs(redis, run_id: str) -> None:
         logger.warning("Dropped queued work of %s other MRF run(s) before run %s", len(other_run_ids), run_id)
 
 
+async def _run_mrf_job_with_transient_retry(job, ctx, task, *args, **kwargs):
+    """Retry a parser job whose database connection timed out while its worker can still run it."""
+    try:
+        return await job(ctx, task, *args, **kwargs)
+    except (TimeoutError, CannotConnectNowError, TooManyConnectionsError) as error:
+        job_try = _safe_int(ctx.get("job_try"), 1)
+        if job.__name__ not in MRF_RECOVERABLE_FUNCTIONS or job_try >= _env_int("HLTHPRT_MRF_TRANSIENT_MAX_TRIES", 3):
+            raise
+        logger.warning("Retrying MRF %s after transient %s (try %s)", job.__name__, type(error).__name__, job_try)
+        raise Retry(defer=60 * job_try) from error
+
+
 def _current_mrf_run_job(job):
     """Skip MRF jobs left behind by another control run instead of re-running its work."""
 
@@ -443,7 +455,7 @@ def _current_mrf_run_job(job):
         task_context = task.get("context") if isinstance(task, dict) else None
         task_run_id = str((task_context or {}).get("control_run_id") or "").strip()
         if not worker_run_id or not task_run_id or task_run_id == worker_run_id:
-            return await job(ctx, task, *args, **kwargs)
+            return await _run_mrf_job_with_transient_retry(job, ctx, task, *args, **kwargs)
         purged_run_ids = ctx.setdefault("mrf_purged_run_ids", set())
         if task_run_id not in purged_run_ids and ctx.get("redis"):
             await _purge_stale_mrf_run(ctx["redis"], task_run_id)
