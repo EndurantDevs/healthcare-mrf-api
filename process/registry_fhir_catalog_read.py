@@ -35,6 +35,7 @@ from process.registry_network_catalog_read import (
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _FHIR_ID = re.compile(r"[A-Za-z0-9.-]{1,64}\Z")
+_STATE_CODE = re.compile(r"[A-Z0-9]{2,8}\Z")
 _MAX_NESTED_OFFSET = 1_000_000
 _RELATIONSHIP_FIELDS = {
     "relationship_id",
@@ -82,6 +83,28 @@ def _search_text(text):
     return text
 
 
+def _normalize_state_codes(raw_state) -> tuple[str, ...]:
+    if raw_state is None or raw_state == ():
+        return ()
+    if type(raw_state) is str:
+        if not raw_state or len(raw_state) > 512:
+            _invalid("request_invalid")
+        tokens = [part.strip().upper() for part in raw_state.split(",")]
+    elif type(raw_state) in (list, tuple):
+        if not raw_state or any(type(entry) is not str for entry in raw_state):
+            _invalid("request_invalid")
+        tokens = list(raw_state)
+    else:
+        _invalid("request_invalid")
+    if (
+        not 1 <= len(tokens) <= 60
+        or len(set(tokens)) != len(tokens)
+        or any(_STATE_CODE.fullmatch(code) is None for code in tokens)
+    ):
+        _invalid("request_invalid")
+    return tuple(sorted(tokens))
+
+
 @dataclass(frozen=True)
 class FHIRCatalogQuery:
     limit: int = 25
@@ -100,10 +123,27 @@ class FHIRCatalogQuery:
     binding_offset: int = 0
     continuation_scope_sha256: str | None = None
     include_stats: bool | None = None
+    state: tuple[str, ...] = ()
+    state_mode: str = "any"
+    state_scope: str = "any"
 
     def __post_init__(self):
         if self.include_stats is not None and type(self.include_stats) is not bool:
             _invalid("request_invalid")
+        normalized_states = _normalize_state_codes(self.state)
+        object.__setattr__(self, "state", normalized_states)
+        mode = "any" if self.state_mode is None else self.state_mode
+        scope_kind = "any" if self.state_scope is None else self.state_scope
+        if (
+            type(mode) is not str
+            or mode not in {"any", "all"}
+            or type(scope_kind) is not str
+            or scope_kind not in {"any", "core"}
+            or (not normalized_states and (mode != "any" or scope_kind != "any"))
+        ):
+            _invalid("request_invalid")
+        object.__setattr__(self, "state_mode", mode)
+        object.__setattr__(self, "state_scope", scope_kind)
         RegistryNetworkCatalogQuery(
             self.limit, self.offset, self.generation_id, self.search, self.archived, self.source, self.benefit_code
         )
@@ -341,6 +381,17 @@ def _network_item(document, query):
                 validate_network_stats_summary_document(document["network_stats"])
             except ValueError:
                 _invalid()
+            if query.state:
+                stats_states = set(
+                    document["network_stats"]["core_states" if query.state_scope == "core" else "states"]
+                )
+                matched = (
+                    set(query.state).issubset(stats_states)
+                    if query.state_mode == "all"
+                    else bool(stats_states.intersection(query.state))
+                )
+                if not matched:
+                    _invalid()
     legacy_by_field = {
         key: entry
         for key, entry in document.items()
@@ -494,6 +545,10 @@ def _continuation_scope(query, manifest, snapshot, exclusions, policy, access_sc
             "plan_search": query.plan_search.lower() if query.plan_search else None,
         },
     }
+    if query.state:
+        scope_by_field["query"]["state"] = list(query.state)
+        scope_by_field["query"]["state_mode"] = query.state_mode
+        scope_by_field["query"]["state_scope"] = query.state_scope
     actual = hashlib.sha256(
         json.dumps(scope_by_field, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     ).hexdigest()
@@ -594,7 +649,7 @@ WITH source_companies AS MATERIALIZED (
        AND ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
          binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
          binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12))
-   AND ($13::integer IS NULL OR network.network_id=$13)
+   AND ($13::integer IS NULL OR network.network_id=$13){network_stats_filter}
    AND (($5::uuid IS NULL AND $6::uuid IS NULL AND $7::text IS NULL AND $8::text IS NULL)
      OR network.network_id IN (SELECT network_id FROM edge_networks)
      OR ($7::text IS NOT NULL AND network.network_id IN (SELECT network_id FROM source_label_networks)))
@@ -751,7 +806,24 @@ def _network_stats_projection_sql(layout, *, include_stats=None):
     )
 
 
-def _catalog_page_statement(snapshot, manifest, *, summary="", include_stats=None):
+def _network_stats_filter_sql(layout, query, first_parameter: int) -> tuple[str, tuple]:
+    if query is None or not query.state:
+        return "", ()
+    if layout is None or layout.network_stats_state_search is None:
+        _invalid("stats_unavailable")
+    from process.network_stats_contract import SUMMARY_TABLE
+
+    stats_rel = storage_identifier(layout.network_stats_state_search) + "." + storage_identifier(SUMMARY_TABLE)
+    col = "core_states" if query.state_scope == "core" else "states"
+    op = "@>" if query.state_mode == "all" else "&&"
+    return (
+        f"\n   AND network.network_id IN (SELECT st.network_id FROM ONLY {stats_rel} st "
+        f'WHERE st.{col} {op} (${first_parameter}::text[] COLLATE "C"))',
+        (list(query.state),),
+    )
+
+
+def _catalog_page_statement(snapshot, manifest, *, summary="", include_stats=None, query=None):
     """summary is "" for the grouped read, "company" for a summary without plan_search, "plan" with it."""
     parameters = ()
     directory_available = "false"
@@ -772,6 +844,8 @@ def _catalog_page_statement(snapshot, manifest, *, summary="", include_stats=Non
             directory_available = _DIRECTORY_AVAILABLE_SQL.format(
                 candidate=storage_identifier(manifest.schema_name), addresses=addresses
             )
+    stats_filter, stats_params = _network_stats_filter_sql(layout, query, 20 + len(parameters))
+    parameters = parameters + stats_params
     stats_projection = _network_stats_projection_sql(layout, include_stats=include_stats)
     control = storage_identifier(snapshot["schema_name"])
     edge_networks, relationships, label_edges = (
@@ -784,6 +858,7 @@ def _catalog_page_statement(snapshot, manifest, *, summary="", include_stats=Non
         _PAGE_SQL.format(
             control=control,
             directory_available=directory_available,
+            network_stats_filter=stats_filter,
             network_stats_projection=stats_projection,
             edge_networks=edge_networks.format(control=control, plan_filter=plan_filter, plan_networks=plan_networks),
             relationships=relationships.format(control=control, grouped=_GROUPED_RELATIONSHIPS_SQL),
@@ -885,6 +960,28 @@ def _page_document(entry, manifest, snapshot, query, exclusions, policy, continu
     return page_by_field
 
 
+def _prepare_read_query(query, network_id):
+    if type(query) is not FHIRCatalogQuery:
+        _invalid("request_invalid")
+    if network_id is not None:
+        catalog_integer(network_id, 2147483647)
+        if query.offset:
+            _invalid("request_invalid")
+        return replace(query, limit=1)
+    if query.relationship_offset or query.binding_offset:
+        _invalid("request_invalid")
+    return query
+
+
+def _require_state_search_manifest(query: FHIRCatalogQuery, manifest) -> None:
+    if query.state and (
+        manifest is None
+        or manifest.compact_layout is None
+        or manifest.compact_layout.network_stats_state_search is None
+    ):
+        _invalid("stats_unavailable")
+
+
 async def read_fhir_catalog(
     connection,
     query,
@@ -896,15 +993,7 @@ async def read_fhir_catalog(
     access_scope_sha256=None,
 ):
     """Pin retained metadata and its optional directory attachment without publication locks."""
-    if type(query) is not FHIRCatalogQuery:
-        _invalid("request_invalid")
-    if network_id is not None:
-        catalog_integer(network_id, 2147483647)
-        if query.offset:
-            _invalid("request_invalid")
-        query = replace(query, limit=1)
-    elif query.relationship_offset or query.binding_offset:
-        _invalid("request_invalid")
+    query = _prepare_read_query(query, network_id)
     exclusions = catalog_exclusions(excluded_network_ids)
     policy = organization_policy if organization_policy is not None else RegistryOrganizationVisibility()
     if type(policy) is not RegistryOrganizationVisibility:
@@ -913,6 +1002,7 @@ async def read_fhir_catalog(
     try:
         snapshot = await _metadata_pin(connection, query, namespace)
         manifest = await _directory_manifest(connection, query, snapshot, control_schema or registry_schema())
+        _require_state_search_manifest(query, manifest)
         continuation_scope_sha256 = _continuation_scope(
             query, manifest, snapshot, exclusions, policy, access_scope_sha256
         )
@@ -920,7 +1010,7 @@ async def read_fhir_catalog(
         if query.plan_search is not None and summary != "plan":
             summary = ""
         sql, address_parameters = _catalog_page_statement(
-            snapshot, manifest, summary=summary, include_stats=query.include_stats
+            snapshot, manifest, summary=summary, include_stats=query.include_stats, query=query
         )
         entry = await connection.fetchrow(
             sql,

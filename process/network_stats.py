@@ -459,5 +459,5 @@ async def prepare_network_stats(connection, copy_target: MembershipCopyTarget, l
             ],
         }
         descriptor_by_field["sha256"] = stats_digest(descriptor_by_field)
-        require_network_stats_index_records(index_entries, descriptor_by_field)
+        require_network_stats_index_records(index_entries, descriptor_by_field, require_state_gin=True)
         return descriptor_by_field

@@ -36,6 +36,9 @@ def parse_fhir_catalog_query(document, kind):
         "group_id",
         "company_search",
         "plan_search",
+        "state",
+        "state_mode",
+        "state_scope",
         "include_stats",
     }
     if kind == "list":
@@ -46,6 +49,8 @@ def parse_fhir_catalog_query(document, kind):
         raise ValueError("unsupported metadata catalog operation")
     if type(document) is not dict or set(document) - fields or document.get("view") != VIEW:
         raise ValueError("invalid metadata catalog query")
+    if ("state_mode" in document or "state_scope" in document) and "state" not in document:
+        raise ValueError("state filter is required when state_mode or state_scope is set")
     arguments_by_name = {
         key: query_value
         for key, query_value in document.items()

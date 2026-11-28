@@ -1,5 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Immutable receipt, schema contract and validators for precomputed network statistics."""
+"""Immutable receipt, schema contract and validators for precomputed network statistics.
+
+Persisted `network_stats.postgres.v1` receipts carrying the nine original B-tree indexes
+remain valid for unfiltered reads and `/stats` endpoints. Newly prepared candidates emit
+eleven indexes (adding GIN array indexes on `states` and `core_states`), and operating-state
+list/search filters require `has_network_stats_state_gin` before querying those GIN indexes,
+returning 503 until a GIN-indexed generation is published.
+"""
 
 from __future__ import annotations
 
@@ -57,6 +64,10 @@ STATS_INDEX_PATHS = (
     (STATE_SPECIALTY_TABLE, ["network_id", "state_code", "specialty_id"], True, True),
     (STATE_SPECIALTY_TABLE, ["state_code", "specialty_id", "network_id"], False, False),
 )
+STATS_GIN_INDEX_PATHS = (
+    (SUMMARY_TABLE, ["states"]),
+    (SUMMARY_TABLE, ["core_states"]),
+)
 
 _SCOPE_FIELDS = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
 _RECEIPT_FIELDS = {"contract", "scope", "tables", "counts", "input_layout", "indexes", "sha256"}
@@ -109,7 +120,7 @@ def network_stats_relations(schema_name: str) -> tuple[CompactAddressRelation, .
     return tuple(CompactAddressRelation(schema_name, table_name) for table_name in STATS_TABLE_ORDER)
 
 
-def _expected_index_map(schema_name: str) -> dict[str, tuple[str, str]]:
+def _expected_btree_index_map(schema_name: str) -> dict[str, tuple[str, str]]:
     prefix = f"{schema_name}."
     return {
         f"{DIM_TABLE}_pkey": (
@@ -151,12 +162,31 @@ def _expected_index_map(schema_name: str) -> dict[str, tuple[str, str]]:
     }
 
 
+def _expected_gin_index_map(schema_name: str) -> dict[str, tuple[str, str]]:
+    prefix = f"{schema_name}."
+    return {
+        f"{SUMMARY_TABLE}_states_gin_idx": (
+            SUMMARY_TABLE,
+            f"CREATE INDEX {SUMMARY_TABLE}_states_gin_idx ON {prefix}{SUMMARY_TABLE} USING gin (states)",
+        ),
+        f"{SUMMARY_TABLE}_core_states_gin_idx": (
+            SUMMARY_TABLE,
+            f"CREATE INDEX {SUMMARY_TABLE}_core_states_gin_idx ON {prefix}{SUMMARY_TABLE} USING gin (core_states)",
+        ),
+    }
+
+
+def _expected_index_map(schema_name: str) -> dict[str, tuple[str, str]]:
+    return {**_expected_btree_index_map(schema_name), **_expected_gin_index_map(schema_name)}
+
+
 def _normalized_btree_def(definition: str) -> str:
     stripped = re.sub(r"::(?:character varying|text)(?:\[\])?", "", definition)
+    stripped = re.sub(r'COLLATE\s+"C"', "", stripped)
     return re.sub(r'[()\s"]+', "", stripped)
 
 
-def _validated_descriptor(receipt_by_field) -> dict:
+def _validated_descriptor(receipt_by_field, *, require_state_gin: bool = False) -> dict:
     require_stats_condition(
         type(receipt_by_field) is dict
         and set(receipt_by_field) == _RECEIPT_FIELDS
@@ -187,12 +217,18 @@ def _validated_descriptor(receipt_by_field) -> dict:
     )
     require_stats_condition(layout.ref_map.schema_name == scope_pin.schema_name)
     indexes = receipt_by_field["indexes"]
+    btree_by_name = _expected_btree_index_map(scope_pin.schema_name)
     expected_by_name = _expected_index_map(scope_pin.schema_name)
-    require_stats_condition(type(indexes) is list and len(indexes) == len(expected_by_name))
+    require_stats_condition(type(indexes) is list)
     normalized_indexes = [
         {field: index_entry[field] for field in ("table_name", "name", "definition")} for index_entry in indexes
     ]
-    require_stats_condition({entry["name"] for entry in normalized_indexes} == set(expected_by_name))
+    present_names = {entry["name"] for entry in normalized_indexes}
+    require_stats_condition(len(normalized_indexes) == len(present_names))
+    if require_state_gin:
+        require_stats_condition(present_names == set(expected_by_name))
+    else:
+        require_stats_condition(present_names in (set(expected_by_name), set(btree_by_name)))
     for index_entry in normalized_indexes:
         expected_table, expected_def = expected_by_name[index_entry["name"]]
         require_stats_condition(
@@ -206,6 +242,15 @@ def _validated_descriptor(receipt_by_field) -> dict:
         "input_layout": json.loads(json.dumps(asdict(layout))),
         "indexes": normalized_indexes,
     }
+
+
+def has_network_stats_state_gin(descriptor_by_field: dict | None) -> bool:
+    """Return whether a validated network_stats receipt includes both state GIN indexes."""
+    if descriptor_by_field is None:
+        return False
+    schema_name = descriptor_by_field["scope"]["schema_name"]
+    present_names = {entry["name"] for entry in descriptor_by_field["indexes"]}
+    return set(_expected_gin_index_map(schema_name)) <= present_names
 
 
 def network_stats_receipt(candidate) -> dict | None:
@@ -233,9 +278,11 @@ def network_stats_schema(candidate) -> str | None:
     return candidate["schema_name"]
 
 
-def require_network_stats_index_records(index_entries: list[dict], descriptor_by_field: dict) -> None:
+def require_network_stats_index_records(
+    index_entries: list[dict], descriptor_by_field: dict, *, require_state_gin: bool = False
+) -> None:
     """Verify native catalog index definitions against the validated network_stats receipt."""
-    validated_by_field = _validated_descriptor(descriptor_by_field)
+    validated_by_field = _validated_descriptor(descriptor_by_field, require_state_gin=require_state_gin)
     actual_by_name = {entry["name"]: entry for entry in index_entries}
     for expected_entry in validated_by_field["indexes"]:
         actual_entry = actual_by_name.get(expected_entry["name"])

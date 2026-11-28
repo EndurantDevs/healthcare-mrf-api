@@ -473,6 +473,8 @@ def create_stats_indexes_sql(schema_name: str) -> tuple[str, ...]:
         f"ALTER TABLE {dim} ADD PRIMARY KEY (specialty_id)",
         f"CREATE UNIQUE INDEX {DIM_TABLE}_key_idx ON {dim} (specialty_kind, specialty_key)",
         f"ALTER TABLE {summary} ADD PRIMARY KEY (network_id)",
+        f"CREATE INDEX {SUMMARY_TABLE}_states_gin_idx ON {summary} USING gin (states)",
+        f"CREATE INDEX {SUMMARY_TABLE}_core_states_gin_idx ON {summary} USING gin (core_states)",
         f"ALTER TABLE {state} ADD PRIMARY KEY (network_id, state_code)",
         f"CREATE INDEX {STATE_TABLE}_code_idx ON {state} (state_code, network_id)",
         f"ALTER TABLE {spec} ADD PRIMARY KEY (network_id, specialty_id)",
