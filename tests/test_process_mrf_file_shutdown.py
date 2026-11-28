@@ -255,6 +255,7 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
     assert args[1]["mrf_finalize_waits"] == 1
     assert kwargs["_queue_name"] == process_initial.MRF_FINISH_QUEUE_NAME
     assert kwargs["_defer_by"] == 60
+    assert kwargs["_job_id"] == "shutdown_mrf_run_mrf_wait_wait_1"
     mark_run.assert_awaited_once()
     assert mark_run.await_args.kwargs["phase_detail"] == "mrf parser recovery queued"
 
@@ -305,7 +306,7 @@ async def test_mrf_shutdown_fails_after_unrecoverable_work_wait(monkeypatch):
 
 
 def _finalized_mrf_redis():
-    """Model a completed import with stale finish jobs from two dates."""
+    """Model a completed import with stale finish jobs from two runs."""
 
     class FakeRedis:
         def __init__(self):
@@ -320,10 +321,10 @@ def _finalized_mrf_redis():
         async def zrange(self, *args):
             assert args == (process_initial.MRF_FINISH_QUEUE_NAME, 0, -1)
             return [
-                b"shutdown_mrf_20260626",
-                b"shutdown_mrf_20260626_wait_12",
-                b"shutdown_mrf_20260626_lock_wait_13",
-                b"shutdown_mrf_20260625_wait_4",
+                b"shutdown_mrf_run_mrf_done",
+                b"shutdown_mrf_run_mrf_done_wait_12",
+                b"shutdown_mrf_run_mrf_done_lock_wait_13",
+                b"shutdown_mrf_run_mrf_other_wait_4",
             ]
 
         async def zrem(self, *args):
@@ -355,26 +356,21 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
     )
     assert outcome_by_field == 1
     assert set(context_by_field["redis"].zrem_calls) == {
-        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626"),
-        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626_wait_12"),
-        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626_lock_wait_13"),
+        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_run_mrf_done"),
+        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_run_mrf_done_wait_12"),
+        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_run_mrf_done_lock_wait_13"),
     }
     assert context_by_field["redis"].delete_calls == [
         (
-            "arq:job:shutdown_mrf_20260626",
-            "arq:result:shutdown_mrf_20260626",
-            "arq:retry:shutdown_mrf_20260626",
-        ),
-        (
-            "arq:job:shutdown_mrf_20260626_lock_wait_13",
-            "arq:result:shutdown_mrf_20260626_lock_wait_13",
-            "arq:retry:shutdown_mrf_20260626_lock_wait_13",
-        ),
-        (
-            "arq:job:shutdown_mrf_20260626_wait_12",
-            "arq:result:shutdown_mrf_20260626_wait_12",
-            "arq:retry:shutdown_mrf_20260626_wait_12",
-        ),
+            f"arq:job:{job_id}",
+            f"arq:result:{job_id}",
+            f"arq:retry:{job_id}",
+        )
+        for job_id in (
+            "shutdown_mrf_run_mrf_done",
+            "shutdown_mrf_run_mrf_done_lock_wait_13",
+            "shutdown_mrf_run_mrf_done_wait_12",
+        )
     ]
     mark_run.assert_not_awaited()
 
@@ -464,3 +460,91 @@ async def test_mrf_shutdown_does_not_publish_when_fast_path_index_build_fails(mo
 
     assert not any(operation[0] == "sql" and "ALTER TABLE" in operation[1] for operation in operations)
     process_initial.prepare_local_native_input_publication.assert_not_awaited()
+
+
+class _StaleRunRedis:
+    """Hold queued jobs of a failed run next to the current run's jobs."""
+
+    def __init__(self):
+        self.queue_job_ids_by_name = {
+            process_initial.MRF_QUEUE_NAME: [
+                "mrf:provider:run_old:aa",
+                "mrf:provider-chunk:run_old:bb",
+                "mrf:provider:run_new:cc",
+            ],
+            process_initial.MRF_FINISH_QUEUE_NAME: [
+                "shutdown_mrf_run_old_wait_3",
+                "shutdown_mrf_run_new",
+            ],
+        }
+        self.deleted_keys = []
+
+    async def zrange(self, queue_name, _start, _stop):
+        return [job_id.encode() for job_id in self.queue_job_ids_by_name[queue_name]]
+
+    async def zrem(self, queue_name, *job_ids):
+        self.queue_job_ids_by_name[queue_name] = [
+            job_id for job_id in self.queue_job_ids_by_name[queue_name] if job_id not in job_ids
+        ]
+        return len(job_ids)
+
+    async def delete(self, *keys):
+        self.deleted_keys.extend(keys)
+        return len(keys)
+
+    async def enqueue_job(self, *_args, **_kwargs):
+        raise AssertionError("a superseded run must not enqueue work")
+
+
+@pytest.mark.asyncio
+async def test_superseded_run_finalizer_purges_instead_of_recovering(monkeypatch):
+    """A finalizer of a failed run drops that run's state and jobs and never recovers them."""
+    monkeypatch.setenv("HLTHPRT_CONTROL_RUN_ID", "run_new")
+    recover = AsyncMock()
+    monkeypatch.setattr(process_initial, "_recover_missing_mrf_work", recover)
+    redis = _StaleRunRedis()
+    old_context_by_field = {"import_date": "20261128", "control_run_id": "run_old", "test_mode": True}
+    ctx_by_field = {"redis": redis, "context": {"import_date": "20261128", "control_run_id": "run_new"}}
+
+    outcome = await process_initial.shutdown(ctx_by_field, {"context": old_context_by_field, "test_mode": True})
+
+    assert outcome is None
+    recover.assert_not_awaited()
+    assert ctx_by_field["context"]["control_run_id"] == "run_new"
+    assert redis.queue_job_ids_by_name == {
+        process_initial.MRF_QUEUE_NAME: ["mrf:provider:run_new:cc"],
+        process_initial.MRF_FINISH_QUEUE_NAME: ["shutdown_mrf_run_new"],
+    }
+    assert "mrf:run:run_old:pending_work" in redis.deleted_keys
+    assert "arq:job:mrf:provider-chunk:run_old:bb" in redis.deleted_keys
+
+
+@pytest.mark.asyncio
+async def test_superseded_run_parser_job_returns_before_download(monkeypatch):
+    """Parser jobs of another run return before downloading and purge that run only once."""
+    monkeypatch.setenv("HLTHPRT_CONTROL_RUN_ID", "run_new")
+    download = AsyncMock()
+    monkeypatch.setattr(process_initial, "download_it_and_save", download)
+    purge = AsyncMock()
+    monkeypatch.setattr(process_initial, "_purge_stale_mrf_run", purge)
+    ctx_by_field = {"redis": _StaleRunRedis(), "context": {}}
+    task_by_field = {"url": "https://example.test/providers.json", "context": {"control_run_id": "run_old"}}
+
+    assert await process_initial.process_provider(ctx_by_field, task_by_field) is None
+    assert await process_initial.process_plan(ctx_by_field, task_by_field) is None
+
+    download.assert_not_awaited()
+    purge.assert_awaited_once_with(ctx_by_field["redis"], "run_old")
+    assert ctx_by_field["context"] == {}
+
+
+@pytest.mark.asyncio
+async def test_current_run_job_runs_without_worker_run_id(monkeypatch):
+    """CLI workers without a control run id keep running every queued job."""
+    monkeypatch.delenv("HLTHPRT_CONTROL_RUN_ID", raising=False)
+    job = AsyncMock(return_value=1)
+    guarded_job = process_initial._current_mrf_run_job(job)
+    task_by_field = {"context": {"control_run_id": "run_old"}}
+
+    assert await guarded_job({}, task_by_field) == 1
+    job.assert_awaited_once_with({}, task_by_field)
