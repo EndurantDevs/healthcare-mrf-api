@@ -669,17 +669,20 @@ _SUMMARY_EDGE_NETWORKS_SQL = r"""label_generations AS MATERIALIZED (
 
 # Keys never share a document unless flagged, so totals add up and each key's first ids hold its first documents.
 # Redaction can merge documents across keys and nested offsets need every document, so both keep the grouped read.
+# Each key's ids are sorted and disjoint from other keys', so the 5 keys with the lowest first id hold the first 5 ids.
 _SUMMARY_RELATIONSHIPS_SQL = r""" CROSS JOIN LATERAL (
    SELECT coalesce(sum(summary.relationship_count),0)::bigint AS total,
-     $16=0 AND NOT coalesce(bool_or(summary.shared_documents OR summary.group_id=ANY($4::uuid[])),false) AS exact
+     $16=0 AND NOT coalesce(bool_or(summary.shared_documents OR summary.group_id=ANY($4::uuid[])),false) AS exact,
+     ARRAY(SELECT first.relationship_id FROM (SELECT top.first_relationship_ids FROM company_keys top
+         WHERE top.network_id=page.network_id ORDER BY top.first_relationship_ids[1] LIMIT 5) top
+       CROSS JOIN unnest(top.first_relationship_ids) first(relationship_id)
+       ORDER BY first.relationship_id LIMIT 5) AS first_ids
    FROM company_keys summary WHERE summary.network_id=page.network_id
  ) summary
  CROSS JOIN LATERAL (
    SELECT summary.total,coalesce((SELECT jsonb_agg((edge.document_json-'relationship_id')
        || jsonb_build_object('relationship_id',edge.relationship_id) ORDER BY edge.relationship_id)
-     FROM (SELECT first.relationship_id FROM company_keys summary
-       CROSS JOIN unnest(summary.first_relationship_ids) first(relationship_id)
-       WHERE summary.network_id=page.network_id ORDER BY first.relationship_id LIMIT 5) first
+     FROM unnest(summary.first_ids) first(relationship_id)
      JOIN {control}.registry_fhir_catalog_relationship edge
        ON edge.metadata_generation=$1 AND edge.relationship_id=first.relationship_id),'[]'::jsonb) AS documents
    WHERE summary.exact
