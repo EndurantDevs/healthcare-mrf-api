@@ -1016,3 +1016,17 @@ async def test_summary_keeps_grouped_rows_for_merged_documents(catalog_database)
         network_id=8,
     )
     assert len(continued["items"][0]["matching_relationships"]["items"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_summary_first_relationships_merge_across_keys(catalog_database):
+    """The first summarized ids come from several keys, including later ids of a key that does not start first."""
+    fixture = catalog_database
+    for ordinal, key in enumerate("bacaaadefg"):
+        document = relationship_document() | {"relationship_id": f"{ordinal + 16:064x}"}
+        document["plan"] = document["plan"] | {"resource_id": f"plan-{ordinal}"}
+        await _edge(fixture, 8, document, company_search="carrier " + key)
+    listed = await _read(fixture, catalog.FHIRCatalogQuery(company_search="carrier"))
+    relationships = {network["network_id"]: network["matching_relationships"] for network in listed["items"]}[8]
+    assert relationships["total"] == 10 and relationships["next_offset"] == 5
+    assert [entry["relationship_id"] for entry in relationships["items"]] == [f"{n + 16:064x}" for n in range(5)]
