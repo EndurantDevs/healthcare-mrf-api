@@ -53,24 +53,10 @@ def _native_control_rows(case, monkeypatch):
     monkeypatch.setattr(case.connection.fetchval, "side_effect", value)
 
 
-def _duplicate_observation_cursor(case):
-    original = case.connection.cursor
-    directory = importlib.import_module("process.provider_directory_fhir")
-    case.observed_resource_keys = []
-
-    async def cursor(sql, *args, prefetch):
-        async for resource in original(sql, *args, prefetch=prefetch):
-            if resource["resource_type"] == "Organization" and resource["resource_id"] == "2":
-                payload = {"resourceType": "Organization", "id": "0"}
-                resource.update(
-                    resource_id="0",
-                    payload_json=payload,
-                    payload_hash=directory.resource_payload_sha256_for_contract(
-                        payload, directory.LEGACY_RESOURCE_HASH_CONTRACT, resource_type="Organization"
-                    ),
-                )
-            case.observed_resource_keys.append((resource["resource_type"], resource["resource_id"]))
-            yield resource
+def _forbid_observation_cursor():
+    async def cursor(*_args, **_kwargs):
+        raise AssertionError("successor transition must not stream retained observations")
+        yield  # pragma: no cover
 
     return cursor
 
@@ -104,7 +90,7 @@ def completion_case(case, monkeypatch):
     for checkpoint in case.checkpoints:
         checkpoint.update(owner_run_id=ROOT, source_ids=SOURCE_IDS, source_scope_hash="a" * 64)
     _native_control_rows(case, monkeypatch)
-    case.connection.cursor = _duplicate_observation_cursor(case)
+    case.connection.cursor = _forbid_observation_cursor()
     directory = importlib.import_module("process.provider_directory_fhir")
     monkeypatch.setattr(directory.db, "transaction", Mock(side_effect=AssertionError("use native admin transaction")))
     return case
@@ -128,8 +114,6 @@ async def test_completion_successor_preserves_ordinary_owner_and_observation_cen
     before = deepcopy(case.checkpoints)
     result = await _transition(case, OBSERVATIONS)
     assert result["rows"] == sum(OBSERVATIONS.values()) > sum(RETAINED.values())
-    assert len(case.observed_resource_keys) == sum(OBSERVATIONS.values())
-    assert len(set(case.observed_resource_keys)) == sum(RETAINED.values())
     assert case.header["import_run_id"] == FAILED and case.checkpoints == before
     assert case.control_reads == ([FAILED, ROOT] if hops == 1 else [FAILED, INTERMEDIATE, ROOT])
 

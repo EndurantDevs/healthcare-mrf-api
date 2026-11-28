@@ -230,14 +230,17 @@ def _is_mutable_header(previous, identity, immutable_statuses):
 
 async def _committed_resource_count(connection, policy, binding):
     """Fold complete keys with the same cutoffs as completion, in one aggregate."""
+    tables = binding["tables"]
     if binding["phase"] == "prepared":
-        table = storage_relation(policy.schema, binding["tables"][storage.RESOURCE]["name"])
+        root = "resource_output_aliases" if "resource_output_aliases" in tables else storage.RESOURCE
+        table = storage_relation(policy.schema, tables[root]["name"])
         count = await connection.fetchval(
             f"SELECT count(*) FROM {table} WHERE dataset_id=$1 AND resource_type NOT LIKE 'LU:%:pass:%'",
             binding["identity"]["dataset_id"],
         )
     else:
-        table = storage_relation(policy.schema, binding["tables"]["resource_input"]["name"])
+        root = "resource_aliases" if "resource_aliases" in tables else "resource_input"
+        table = storage_relation(policy.schema, tables[root]["name"])
         count = await connection.fetchval(
             f'SELECT count(*) FROM (SELECT DISTINCT ON (resource_type COLLATE "C",resource_id COLLATE "C") '
             f"resource_type,resource_id FROM {table} WHERE dataset_id=$1 AND batch_ordinal<= $4 "

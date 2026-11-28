@@ -2032,34 +2032,111 @@ async def test_manifest_replay_requires_an_explicit_boolean_before_io(case, inva
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["hash", "payload", "witness"])
-async def test_retained_payload_and_witness_hashes_are_validated_before_header_cas(case, change):
-    cursor = case.connection.cursor
+async def test_transition_checks_hash_contract_without_streaming_retained_payloads(case):
+    async def forbidden_cursor(*_args, **_kwargs):
+        raise AssertionError("successor transition must not stream retained payloads")
+        yield  # pragma: no cover
 
-    async def corrupted(sql, *arguments, prefetch):
-        if change == "witness" and "raw_payload_json" in sql:
-            yield dict(
-                dataset_id=DATASET,
-                source_id="example-source",
-                release_id="a" * 64,
-                resource_type="Organization",
-                resource_id="one",
-                raw_payload_sha256="0" * 64,
-                normalized_payload_hash="b" * 64,
-                raw_payload_json={"resourceType": "Organization", "id": "one"},
-            )
-        async for row in cursor(sql, *arguments, prefetch=prefetch):
-            if change == "hash":
-                row["payload_hash"] = "0" * 64
-            elif change == "payload":
-                row["payload_json"] = {**row["payload_json"], "changed": True}
-            yield row
+    case.connection.cursor = forbidden_cursor
+    result = await _transition(case)
+    assert result["rows"] == 3
 
-    case.connection.cursor = corrupted
+    case.header["candidate_storage_json"]["identity"]["metadata"]["resource_hash_contract"] = "unsupported-contract"
+    case.header["publication_metadata_json"]["resource_hash_contract"] = "unsupported-contract"
+    case.writes.clear()
     before = deepcopy(case.header)
-    with pytest.raises(GenericCandidateError, match="payload_hash_changed|raw_hash_changed"):
+    with pytest.raises(GenericCandidateError, match="hash_contract_changed"):
         await _transition(case)
     assert not case.writes and case.header == before
+
+
+def _configure_compact_transition_case(case):
+    prefix = "pdgs_" + "2" * 32
+    candidate_by_field = case.header["candidate_storage_json"]
+    candidate_by_field.update(
+        contract=storage.NAMED_COMPACT_CONTRACT,
+        payload_format="provider-directory-shared-bodies-v1",
+        storage={key: case.old[key] for key in ("catalog_schema", "storage_schema")},
+        ordinal=4,
+        tables={
+            "resource_input": {"schema": "source_schema", "name": prefix + "_ri"},
+            "witness_input": {"schema": "source_schema", "name": prefix + "_wi"},
+            "resource_aliases": {"schema": "source_schema", "name": prefix + "_ra"},
+            "resource_body_blocks": {"schema": "source_schema", "name": prefix + "_rb"},
+            "resource_reference_sets": {"schema": "source_schema", "name": prefix + "_rs"},
+            "resource_shared_bodies": {"schema": "source_schema", "name": prefix + "_sb"},
+            "resource_reference_tokens": {"schema": "source_schema", "name": prefix + "_rt"},
+        },
+    )
+    case.input_rows[0]["invalid"] = 0
+    case.tables.reset_mock()
+    case.connection.execute = AsyncMock(
+        side_effect=lambda sql, *args: (
+            "SELECT 0"
+            if sql.startswith("SELECT 1 FROM ")
+            else (case.writes.append((sql, args)) or _update_test_transition_header(case.header, args))
+        )
+    )
+    fetch_queries = []
+    original_fetch = case.connection.fetch.side_effect
+
+    async def recording_fetch(sql, *args):
+        fetch_queries.append(sql)
+        return await original_fetch(sql, *args)
+
+    async def fetchrow(sql, *args):
+        if "AS min_dataset_id" in sql:
+            assert prefix + "_ra" in sql and prefix + "_ri" not in sql
+            return dict(min_dataset_id=DATASET, max_dataset_id=DATASET, min_ordinal=1, max_ordinal=4)
+        return deepcopy(case.header)
+
+    case.connection.fetch = AsyncMock(side_effect=recording_fetch)
+    case.connection.fetchrow = AsyncMock(side_effect=fetchrow)
+    return prefix, fetch_queries
+
+
+@pytest.mark.asyncio
+async def test_compact_transition_queries_resource_aliases_and_preflight_skips_commit_census(case):
+    """Query compact aliases during preflight and check PK bounds instead of rescanning on commit."""
+    prefix, fetch_queries = _configure_compact_transition_case(case)
+    identity_by_field = dict(
+        dataset_id=DATASET, endpoint_id=ENDPOINT, acquisition_root_run_id=ROOT, failed_run_id=FAILED
+    )
+    preflight_by_field = await storage.preflight_isolated_loading_candidate_storage(
+        case.connection,
+        policy=case.policy,
+        identity_by_field=identity_by_field,
+        old_storage=case.old,
+        new_storage=case.new,
+        expected_resource_counts={"Organization": 3},
+    )
+    assert any(prefix + "_ra" in sql and "GROUP BY dataset_id,resource_type" in sql for sql in fetch_queries)
+    assert not any(prefix + "_ri" in sql for sql in fetch_queries)
+    assert not case.writes
+    fetch_queries.clear()
+
+    receipt_by_field = await storage.transition_isolated_loading_candidate_storage(
+        case.connection,
+        policy=case.policy,
+        identity_by_field=identity_by_field,
+        old_storage=case.old,
+        new_storage=case.new,
+        expected_resource_counts={"Organization": 3},
+        verified_preflight=preflight_by_field,
+    )
+    assert receipt_by_field["rows"] == 3 and len(case.writes) == 1
+    assert not any("GROUP BY dataset_id,resource_type" in sql for sql in fetch_queries)
+
+    with pytest.raises(GenericCandidateError, match="transition_preflight_changed"):
+        await storage.transition_isolated_loading_candidate_storage(
+            case.connection,
+            policy=case.policy,
+            identity_by_field=identity_by_field,
+            old_storage=case.old,
+            new_storage=case.new,
+            expected_resource_counts={"Organization": 3},
+            verified_preflight={**preflight_by_field, "candidate_sha256": "0" * 64},
+        )
 
 
 @pytest.mark.asyncio
