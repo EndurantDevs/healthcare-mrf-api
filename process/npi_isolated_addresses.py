@@ -5,15 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import re
-import time
-from dataclasses import asdict
 
-from db.models import AddressArchiveV2
 from process.ext import address_alias_sql as aliases
 from process.ext import address_canon as canon
-from process.ext.address_format import ADDRESS_FORMAT_VERSION, render_formatted_address_v2
-from process.npi_alias_witness import INPUTS, SETS, WITNESS_CONTRACT, observation_time, validate_npi_address_witness
-from process.npi_isolated_execution import INPUT_NAMES, NpiAddressPreparation, NpiInputRelation
+from process.ext.address_format import render_formatted_address_v2
+from process.npi_alias_witness import INPUTS, SETS, NpiInputRelation, observation_time, validate_npi_address_witness
 
 _BATCH = 2048
 _KEYED = '"npi_alias_keyed"'
@@ -22,14 +18,6 @@ _SELECTED = '"npi_alias_selected"'
 _EXPECTED = '"npi_alias_expected"'
 _FORMATTED = '"npi_alias_formatted"'
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z", re.ASCII)
-_FIELDS = {
-    "first_line": "first_line",
-    "second_line": "second_line",
-    "city": "city_name",
-    "state": "state_name",
-    "zip": "postal_code",
-    "country": "COALESCE(NULLIF(country_code, ''), 'US')",
-}
 _DISPLAY = ("first_line", "second_line", "city_name", "state_name", "postal_code")
 
 
@@ -43,15 +31,6 @@ def qualified(schema, table):
     _require(type(schema) is str and _IDENTIFIER.fullmatch(schema))
     _require(type(table) is str and _IDENTIFIER.fullmatch(table))
     return f'"{schema}"."{table}"'
-
-
-def require_runtime_inputs(pinned_inputs, *, openaddresses_backfill=False):
-    """Validate the complete issued inventory; unsupported backfill is never skipped."""
-    _require(set(pinned_inputs) == INPUT_NAMES and not openaddresses_backfill)
-    for name in INPUTS:
-        _require(len(pinned_inputs[name]) == 1 and type(pinned_inputs[name][0]) is NpiInputRelation)
-        _require(pinned_inputs[name][0].table_name == name)
-    _require(pinned_inputs[INPUTS[1]][0].schema_name == pinned_inputs[INPUTS[2]][0].schema_name)
 
 
 def _trim(value):
@@ -305,120 +284,6 @@ async def _projection_identity(connection, schema, table, baseline):
     }
 
 
-def _address_witness(ctx, scope, input_map, runtime_options, generation, counts, hashes):
-    """Seal the genuine attempt instant and the independently reproducible row sets."""
-    context = ctx.get("context") or {}
-    return validate_npi_address_witness(
-        {
-            "contract": WITNESS_CONTRACT,
-            "run_id": scope.run_id,
-            "attempt_id": context.get("_control_attempt_id"),
-            "attempt_started_at": context.get("_control_attempt_started_at"),
-            "observation_time": observation_time(runtime_options["observed_at"]).isoformat(timespec="microseconds"),
-            "input_receipt_sha256": runtime_options["input_receipt_sha256"],
-            "inputs": {name: asdict(relation) for name, relation in input_map.items()},
-            "alias_generation": generation,
-            "counts": counts,
-            "hashes": hashes,
-            "identity_version": canon.CURRENT_ADDRESS_IDENTITY_VERSION,
-            "ruleset_version": canon.CURRENT_ADDRESS_CANON_RULESET_VERSION,
-            "formatter_version": ADDRESS_FORMAT_VERSION,
-            "strict_observations": 0,
-        }
-    )
-
-
-async def _resolve_stats(connection, staging, baseline, counts, started):
-    """Count the same effective changes as the ordinary NPI resolver."""
-    inserted = await connection.fetchval(
-        f"SELECT count(*) FROM {_DEDUP} d WHERE NOT EXISTS(SELECT 1 FROM {baseline} b WHERE b.address_key=d.address_key)"
-    )
-    updated = await connection.fetchval(
-        f"SELECT count(*) FROM {_DEDUP} d JOIN {baseline} b USING(address_key) "
-        "WHERE (b.source_bits & 1)=0 OR b.display_priority>0"
-    )
-    return canon.ResolveStats(
-        counts["raw"],
-        counts["effective"],
-        inserted,
-        updated,
-        await connection.fetchval(f"SELECT count(*) FROM {staging} WHERE address_key IS NULL"),
-        eligible_key_rows=await connection.fetchval(f"SELECT count(*) FROM {staging} WHERE address_key IS NOT NULL"),
-        elapsed_seconds=time.monotonic() - started,
-    )
-
-
-def _validate_runtime_options(runtime_options):
-    _require(
-        {"observed_at", "input_receipt_sha256"}
-        <= set(runtime_options)
-        <= {
-            "observed_at",
-            "input_receipt_sha256",
-            "openaddresses_backfill",
-            "cancel_check",
-        }
-    )
-
-
-async def prepare_addresses(
-    ctx,
-    *,
-    scope,
-    connection,
-    staging_table,
-    field_map,
-    output_schema,
-    pinned_inputs,
-    **runtime_options,
-):
-    """Prepare private output using required observed_at/input_receipt_sha256 runtime options.
-
-    Optional openaddresses_backfill/cancel_check retain the existing resolver call shape.
-    """
-    _validate_runtime_options(runtime_options)
-    started = time.monotonic()
-    cancel_check = runtime_options.get("cancel_check")
-    require_runtime_inputs(pinned_inputs, openaddresses_backfill=runtime_options.get("openaddresses_backfill", False))
-    _require(dict(field_map) == _FIELDS and dict(pinned_inputs) == dict(scope.inputs))
-    _require(output_schema == scope.output_schema and staging_table == "npi_address")
-    await scope.verify(ctx, phase="addresses_core")
-    input_map = {name: pinned_inputs[name][0] for name in INPUTS}
-    async with connection.transaction():
-        await _restore_zip(connection, qualified(output_schema, staging_table), pinned_inputs, cancel_check)
-        generation = await _projection(
-            connection,
-            schema=output_schema,
-            table=staging_table,
-            input_map=input_map,
-            observed_at=observation_time(runtime_options["observed_at"]),
-            write_keys=True,
-            cancel_check=cancel_check,
-        )
-        columns = ",".join(column.name for column in AddressArchiveV2.__table__.columns)
-        canonical_table = qualified(output_schema, "npi_canonical_address")
-        await connection.execute("DELETE FROM " + canonical_table)
-        await connection.execute(f"INSERT INTO {canonical_table}({columns}) SELECT {columns} FROM {_EXPECTED}")
-        counts, hashes = await _projection_identity(
-            connection, output_schema, staging_table, input_map[INPUTS[0]].qualified
-        )
-        witness_data = _address_witness(ctx, scope, input_map, runtime_options, generation, counts, hashes)
-        relation_identity = await connection.fetchrow(
-            "SELECT oid::bigint,relfilenode::bigint FROM pg_catalog.pg_class WHERE oid=to_regclass($1)",
-            canonical_table,
-        )
-        stats = await _resolve_stats(
-            connection, qualified(output_schema, staging_table), input_map[INPUTS[0]].qualified, counts, started
-        )
-    return NpiAddressPreparation(
-        NpiInputRelation(
-            output_schema, "npi_canonical_address", relation_identity["oid"], relation_identity["relfilenode"]
-        ),
-        stats,
-        witness_data.as_dict(),
-    )
-
-
 async def verify_address_projection(connection, *, schema, witness):
     """Recompute all protected sets and full row parity without changing closed heaps."""
     witness_data = witness
@@ -445,73 +310,3 @@ async def verify_address_projection(connection, *, schema, witness):
         )
         is True
     )
-
-
-async def _restore_zip(connection, staging, pinned_inputs, cancel_check):
-    """Preserve the native single-distinct-ZIP match using only issued geography."""
-    needed = await connection.fetchval(
-        f"SELECT EXISTS(SELECT 1 FROM {staging} WHERE address_key IS NULL AND NULLIF(trim(postal_code),'') IS NULL "
-        "AND lat IS NOT NULL AND long IS NOT NULL)"
-    )
-    if not needed:
-        return
-    _require(len(pinned_inputs["geo_zip_lookup"]) == 1)
-    await _verify_inputs(
-        connection,
-        {
-            str(index): relation
-            for index, relation in enumerate((*pinned_inputs["tiger"], *pinned_inputs["geo_zip_lookup"]))
-        },
-    )
-    candidates = []
-    for relation in pinned_inputs["tiger"]:
-        columns = set(
-            await connection.fetchval(
-                "SELECT array_agg(attname::text) FROM pg_catalog.pg_attribute WHERE attrelid=$1 AND attnum>0 AND NOT attisdropped",
-                relation.relation_oid,
-            )
-        )
-        if {"zcta5ce", "the_geom"} <= columns:
-            candidates.append(relation)
-    _require(len(candidates) == 1)
-    await _copy_zip_candidates(connection, staging, cancel_check)
-    await connection.execute(
-        "WITH matches AS (SELECT r.source_ctid,z.zcta5ce AS zip5 FROM npi_zip_restore r JOIN "
-        + candidates[0].qualified
-        + " z ON public.ST_Covers(z.the_geom,public.ST_SetSRID(public.ST_Point(r.longitude,r.latitude),4269)) JOIN "
-        + pinned_inputs["geo_zip_lookup"][0].qualified
-        + " l ON l.zip_code=z.zcta5ce AND l.state=r.state_code "
-        "WHERE r.country_code='US' AND r.state_code IS NOT NULL),one_zip AS (SELECT source_ctid,min(zip5) AS zip5 "
-        "FROM matches GROUP BY source_ctid HAVING count(DISTINCT zip5)=1) UPDATE "
-        + staging
-        + " s SET postal_code=z.zip5 FROM one_zip z WHERE s.ctid=z.source_ctid::tid AND s.address_key IS NULL"
-    )
-    await connection.execute("DROP TABLE npi_zip_restore")
-
-
-async def _copy_zip_candidates(connection, staging, cancel_check):
-    """Normalize eligible coordinate rows through bounded native COPY."""
-    await connection.execute(
-        "CREATE TEMP TABLE npi_zip_restore(source_ctid text,state_code text,country_code text,latitude float8,longitude float8) ON COMMIT DROP"
-    )
-    query = (
-        f"SELECT ctid::text AS source_ctid,state_name,country_code,lat AS latitude,long AS longitude FROM {staging} "
-        "WHERE address_key IS NULL AND NULLIF(trim(postal_code),'') IS NULL AND lat IS NOT NULL AND long IS NOT NULL"
-    )
-    async for address_rows in _batches(connection, query):
-        if cancel_check is not None:
-            await cancel_check()
-        await connection.copy_records_to_table(
-            "npi_zip_restore",
-            schema_name="pg_temp",
-            records=[
-                (
-                    address_row["source_ctid"],
-                    canon.state_code(address_row["state_name"]),
-                    canon.country_code(address_row["country_code"]),
-                    float(address_row["latitude"]),
-                    float(address_row["longitude"]),
-                )
-                for address_row in address_rows
-            ],
-        )

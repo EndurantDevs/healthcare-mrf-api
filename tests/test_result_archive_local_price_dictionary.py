@@ -11,6 +11,7 @@ from sqlalchemy.schema import AddConstraint
 
 from db import models
 from process.ptg_parts import ptg2_physical_binding as native
+from process.ptg_parts import result_archive_candidate_preparation as preparation
 from process.ptg_parts import result_archive_closure as closure
 
 
@@ -47,7 +48,7 @@ def test_local_dictionary_selection_preserves_explicit_legacy_closure(does_drift
 def test_dictionary_native_model_and_layout_relationship_are_complete():
     """The shared heap engine preserves native typed uniqueness, not a new dictionary codec."""
     model = models.PTG2V3PriceAttr
-    assert model in native.physical_family_spec().model_types
+    assert model in preparation.physical_family_spec().model_types
     assert [(column.name, column.nullable) for column in model.__table__.columns] == [
         ("snapshot_key", False),
         ("attribute_kind", False),

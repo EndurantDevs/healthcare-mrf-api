@@ -141,9 +141,7 @@ async def test_public_collection_retry_preserves_admitted_selectors(tmp_path, mo
     params = _request(_subject(tmp_path).proof)
     public_run_map = {"importer": "ptg", "params": control_imports._params_for_import_run_response("ptg", params)}
     monkeypatch.setattr(control_imports, "get_import_run", AsyncMock(return_value=public_run_map))
-    monkeypatch.setattr(
-        control_imports.npi_execution, "read_control_run", AsyncMock(return_value=SimpleNamespace(params=params))
-    )
+    monkeypatch.setattr(control_imports, "_read_control_run", AsyncMock(return_value=SimpleNamespace(params=params)))
     monkeypatch.setattr(control_imports, "require_not_wave_owned_run", AsyncMock())
     create = AsyncMock(return_value=({"status": "queued"}, True))
     monkeypatch.setattr(control_imports, "create_import_run", create)

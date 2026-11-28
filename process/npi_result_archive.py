@@ -33,13 +33,11 @@ from db import models
 from process import entity_address_snapshot_receipt as catalog_identity
 from process import reference_family_archive as native_archive
 from process.mrf_address_publication import (
-    CanonicalSourceFence,
     canonical_contribution_model,
     canonical_reference_filter,
     canonical_schema_identity,
     canonical_spatial_index,
     merge_canonical_contribution,
-    require_canonical_source_fence,
     validate_canonical_closure,
 )
 from process.npi_result_generation import (
@@ -167,7 +165,6 @@ class NpiSourceCapture:
     schema_name: str
     postgres_snapshot: str
     canonical: bool = False
-    canonical_source_fence: CanonicalSourceFence | None = None
 
 
 @dataclass(frozen=True)
@@ -618,7 +615,6 @@ async def capture_npi_source(
     source_metadata: Mapping[str, Any] | None,
     source_metadata_factory: Callable[[Any], Awaitable[Mapping[str, Any]]] | None = None,
     canonical: bool = False,
-    canonical_source_fence: CanonicalSourceFence | None = None,
 ) -> NpiSourceCapture:
     """Capture one coherent live family while retaining its required source fences."""
 
@@ -629,7 +625,7 @@ async def capture_npi_source(
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     async with _bounded_catalog_work(session):
         if canonical:
-            await _lock_npi_canonical_source(session, schema, canonical_source_fence)
+            await _lock_npi_canonical_source(session, schema)
         await _lock_family(session, schema, "ACCESS SHARE")
         authority = await read_npi_result_generation_authority(
             session,
@@ -664,21 +660,14 @@ async def capture_npi_source(
         schema,
         snapshot,
         canonical,
-        canonical_source_fence,
     )
 
 
-async def _lock_npi_canonical_source(session, schema, canonical_source_fence):
-    """Fence and attest the complete canonical model before its SOURCE capture."""
+async def _lock_npi_canonical_source(session, schema):
+    """Lock and attest the complete canonical model before its SOURCE capture."""
     await _lock_family(
-        session,
-        schema,
-        "SHARE ROW EXCLUSIVE",
-        nowait=True,
-        names=RELATION_NAMES if canonical_source_fence is not None else (*RELATION_NAMES, "address_archive_v2"),
+        session, schema, "SHARE ROW EXCLUSIVE", nowait=True, names=(*RELATION_NAMES, "address_archive_v2")
     )
-    if canonical_source_fence is not None:
-        await require_canonical_source_fence(session, canonical_source_fence, schema)
     from process.mrf_address_publication import require_canonical_source_model, require_native_read_catalog
 
     await require_native_read_catalog(session, tuple(oid for _name, oid in await _relation_pairs(session, schema)))
@@ -825,8 +814,6 @@ async def _clone_source(
         raise NpiResultArchiveError("NPI source clone scope differs")
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
-    if capture.canonical_source_fence is not None:
-        await require_canonical_source_fence(session, capture.canonical_source_fence, capture.schema_name)
     ownership = await precreate_npi_restore(session, dataset_id=dataset_id, canonical=True)
     if ownership.schema_name != stage_schema:
         raise NpiResultArchiveError("NPI source clone scope differs")
@@ -1271,7 +1258,7 @@ async def prepare_npi_archive_source(
 
     if not callable(on_prepared):
         raise NpiResultArchiveError("NPI prepared-source callback is required")
-    if set(source_options) - {"source_copy", "on_precreated", "source_sessions", "canonical_source_fence"}:
+    if set(source_options) - {"source_copy", "on_precreated", "source_sessions"}:
         raise NpiResultArchiveError("NPI protected source COPY capability is unavailable")
     source_copy, on_precreated = source_options.get("source_copy"), source_options.get("on_precreated")
     _require_source_copy(source_copy, on_precreated)
@@ -1287,7 +1274,6 @@ async def prepare_npi_archive_source(
             source_metadata=source_metadata,
             source_metadata_factory=source_metadata_factory,
             canonical=True,
-            canonical_source_fence=source_options.get("canonical_source_fence"),
         )
         async with session_factory() as clone_session, clone_session.begin():
             await _clone_source(
@@ -1305,8 +1291,6 @@ async def prepare_npi_archive_source(
             )
             manifest = await _prepared_npi_source_manifest(clone_session, capture, stage_schema)
             prepared = NpiPreparedSource(manifest, ownership)
-            if capture.canonical_source_fence is not None:
-                await require_canonical_source_fence(clone_session, capture.canonical_source_fence, capture.schema_name)
             await on_prepared(clone_session, prepared)
     return prepared
 

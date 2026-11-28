@@ -67,14 +67,12 @@ from process.mrf_address_publication import (
     MODEL_CLOSURE_CONTRACT,
     MODEL_CLOSURE_CONTRACTS,
     STAGE_TABLE,
-    CanonicalSourceFence,
     _clone_model_table,
     canonical_contribution_model,
     canonical_reference_filter,
     canonical_schema_identity,
     merge_canonical_contribution,
     referenced_address_filter,
-    require_canonical_source_fence,
     require_native_read_catalog,
     validate_canonical_closure,
 )
@@ -385,7 +383,6 @@ class ReferenceFamilySourceCapture:
     manifest: ReferenceFamilyManifest
     schema_name: str
     postgres_snapshot: str
-    canonical_source_fence: CanonicalSourceFence | None = None
     frozen_source_projection: tuple | None = None
 
 
@@ -843,9 +840,7 @@ async def _lock_family(
     await session.execute(text(f"LOCK TABLE {relations} IN {mode} MODE{' NOWAIT' if nowait else ''}"))
 
 
-async def _lock_source_family(
-    session: Any, spec: ReferenceFamilySpec, schema_name: str, canonical_source_fence=None
-) -> None:
+async def _lock_source_family(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> None:
     """Pin source relations before summaries; repeatable read pins their row versions."""
 
     names = RELATION_NAMES_BY_IMPORTER["mrf"] if spec.importer_id == "mrf" else spec.table_names
@@ -855,15 +850,7 @@ async def _lock_source_family(
         )
         return
     if spec.importer_id == "mrf" and STAGE_TABLE in spec.table_names:
-        await _lock_family(
-            session,
-            schema_name,
-            names if canonical_source_fence is not None else (*names, archive_table_name()),
-            "SHARE ROW EXCLUSIVE",
-            nowait=True,
-        )
-        if canonical_source_fence is not None:
-            await require_canonical_source_fence(session, canonical_source_fence, schema_name)
+        await _lock_family(session, schema_name, (*names, archive_table_name()), "SHARE ROW EXCLUSIVE", nowait=True)
         return
     if spec.importer_id == "label":
         # Repeatable-read/exported snapshots pin rows; this lock blocks replacement DDL.
@@ -1370,7 +1357,6 @@ async def _capture_reference_family_source(
     dependencies: Mapping[str, str] | None = None,
     source_capture_contract: str | None = None,
     native_auxiliary: bool = False,
-    canonical_source_fence: CanonicalSourceFence | None = None,
 ) -> ReferenceFamilySourceCapture:
     """Capture under the caller's established isolation and source fences."""
 
@@ -1383,10 +1369,10 @@ async def _capture_reference_family_source(
     schema = _schema_name(schema_name)
     _source_metadata(source_metadata)
     if importer_id == "mrf" and STAGE_TABLE in spec.table_names:
-        await _lock_source_family(session, spec, schema, canonical_source_fence)
+        await _lock_source_family(session, spec, schema)
         await _require_canonical_source_catalog(session, spec, schema)
     async with _bounded_capture(session, lock_before_snapshot=spec.importer_id == "facility-anchors"):
-        await _lock_source_family(session, spec, schema, canonical_source_fence)
+        await _lock_source_family(session, spec, schema)
         publication = None
         if importer_id == "mrf":
             publication = await require_completed_publication(session, schema, native_set=native_auxiliary)
@@ -1420,7 +1406,7 @@ async def _capture_reference_family_source(
         snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
         if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
             raise ReferenceFamilyArchiveError("reference family source snapshot is invalid")
-    return ReferenceFamilySourceCapture(manifest, schema, snapshot, canonical_source_fence)
+    return ReferenceFamilySourceCapture(manifest, schema, snapshot)
 
 
 async def _require_canonical_source_catalog(session, spec, schema):
@@ -1588,8 +1574,6 @@ async def _clone_source(
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
     if authorize_creation is not None:
         await authorize_creation(session)
-    if capture.canonical_source_fence is not None:
-        await require_canonical_source_fence(session, capture.canonical_source_fence, capture.schema_name)
     spec = _manifest_family_spec(capture.manifest.as_dict())
     if spec.importer_id == "mrf" and STAGE_TABLE not in spec.table_names:
         raise ReferenceFamilyArchiveError("new MRF source requires the canonical model contract")
@@ -3573,9 +3557,8 @@ async def _capture_source_dependencies(
     source_metadata,
     source_metadata_factory,
     dependency_factory,
-    canonical_source_fence,
 ):
-    """Capture metadata and dependency packages under the original source-family fence."""
+    """Capture metadata and dependency packages under the original source-family lock."""
     effective_source_metadata = source_metadata
     package_by_dataset = {}
     if source_metadata_factory is not None or dependency_factory is not None:
@@ -3585,7 +3568,7 @@ async def _capture_source_dependencies(
             else reference_family_spec(importer_id)
         )
         async with _bounded_capture(source_session, lock_before_snapshot=importer_id == "facility-anchors"):
-            await _lock_source_family(source_session, spec, _schema_name(schema_name), canonical_source_fence)
+            await _lock_source_family(source_session, spec, _schema_name(schema_name))
             if source_metadata_factory is not None:
                 effective_source_metadata = await source_metadata_factory(source_session)
             if dependency_factory is not None:
@@ -3611,7 +3594,6 @@ async def prepare_reference_family_archive_source(
     source_metadata_factory, source_copy, on_precreated, source_sessions = _source_capture_options(
         session_factory, importer_id, source_options
     )
-    canonical_source_fence = source_options.get("canonical_source_fence")
     async with (
         asyncio.timeout(source_copy.timeout) as deadline,
         source_sessions() as source_session,
@@ -3623,7 +3605,6 @@ async def prepare_reference_family_archive_source(
                 source_session,
                 reference_family_spec(importer_id, canonical=True),
                 _schema_name(schema_name),
-                canonical_source_fence,
             )
         effective_source_metadata, package_by_dataset = await _capture_source_dependencies(
             source_session,
@@ -3632,7 +3613,6 @@ async def prepare_reference_family_archive_source(
             source_metadata,
             source_metadata_factory,
             dependency_factory,
-            canonical_source_fence,
         )
         capture = await _capture_reference_family_source(
             source_session,
@@ -3641,7 +3621,6 @@ async def prepare_reference_family_archive_source(
             source_metadata=effective_source_metadata,
             dependencies=package_by_dataset,
             native_auxiliary=True,
-            canonical_source_fence=canonical_source_fence,
         )
         return await _prepare_source_clone(
             session_factory,
@@ -3662,15 +3641,12 @@ def _source_capture_options(session_factory, importer_id, source_options):
         "source_copy",
         "on_precreated",
         "source_sessions",
-        "canonical_source_fence",
         "authorize_creation",
     }
     if set(source_options) - allowed_keys or (
         source_options.get("authorize_creation") is not None and not callable(source_options["authorize_creation"])
     ):
         raise ReferenceFamilyArchiveError("reference family source options are invalid")
-    if importer_id != "mrf" and source_options.get("canonical_source_fence") is not None:
-        raise ReferenceFamilyArchiveError("reference family canonical source fence scope differs")
     source_copy, on_precreated = source_options.get("source_copy"), source_options.get("on_precreated")
     _require_native_source_copy(source_copy, on_precreated)
     if importer_id == "nucc":
@@ -3703,8 +3679,6 @@ async def _prepare_source_clone(
         )
         prepared = ReferenceFamilyPreparedSource(capture.manifest, ownership)
         await _validate_stage_manifest(clone_session, ownership=ownership, manifest=capture.manifest)
-        if getattr(capture, "canonical_source_fence", None) is not None:
-            await require_canonical_source_fence(clone_session, capture.canonical_source_fence, capture.schema_name)
         await on_prepared(clone_session, prepared)
         return prepared
 

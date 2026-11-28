@@ -12,7 +12,7 @@ from process import mrf_address_publication as canonical
 from process import npi_alias_witness as witnesses
 from process import npi_isolated_addresses as addresses
 from process import npi_result_archive as archive
-from process.npi_isolated_execution import NpiInputRelation
+from process.npi_alias_witness import NpiInputRelation
 
 
 def _raw(street="100 OAK ST", key=None):

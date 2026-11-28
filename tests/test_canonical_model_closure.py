@@ -16,35 +16,6 @@ from process import npi_result_archive as npi
 from process import reference_family_archive as reference
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [None, "identity", "closed", "restarted", "schema", "flag"])
-async def test_canonical_fence_requires_exact_live_transaction_and_catalog_identity(fault):
-    transaction = SimpleNamespace(is_active=True)
-    holder = SimpleNamespace(get_transaction=lambda: transaction)
-    fence = canonical.CanonicalSourceFence(holder, transaction, 21, 22, 23, "24/25")
-    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(), scalar=AsyncMock(return_value=True))
-    schema = "mrf"
-    if fault == "identity":
-        session.scalar.return_value = False
-    elif fault == "closed":
-        transaction.is_active = False
-    elif fault == "restarted":
-        fence = replace(fence, transaction=SimpleNamespace(is_active=True))
-    elif fault == "schema":
-        schema = "foreign"
-    if fault is not None:
-        with pytest.raises(RuntimeError, match="source fence"):
-            await canonical.require_canonical_source_fence(session, True if fault == "flag" else fence, schema)
-        if fault != "identity":
-            session.execute.assert_not_awaited()
-        return
-    await canonical.require_canonical_source_fence(session, fence, schema)
-    assert str(session.execute.await_args.args[0]).endswith("IN ACCESS SHARE MODE NOWAIT")
-    statement, identity = session.scalar.await_args.args
-    assert identity == {"pid": 21, "database": 22, "relation": 23, "transaction": "24/25"}
-    assert all(part in str(statement) for part in ("virtualtransaction", "ShareRowExclusiveLock", "to_regclass"))
-
-
 @pytest.mark.parametrize("importer", ["npi", "mrf"])
 def test_contribution_is_complete_model_with_native_constraints_and_no_row_hooks(importer):
     table = canonical.canonical_contribution_model(importer).__table__
@@ -134,7 +105,6 @@ async def test_publication_attribution_is_direct_only_and_noop_rows_are_not_upda
     )
     assert "AND ((incumbent.source_bits &" in update and "FOR UPDATE" not in update
     assert "DROP" not in "\n".join(statements)
-    assert canonical.validate_canonical_publication(receipt, importer, 20) == receipt
 
 
 @pytest.mark.asyncio
@@ -167,19 +137,3 @@ async def test_source_catalog_accepts_only_fixed_native_extensions_without_role_
         allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist", "pg_trgm"),
     )
     session.scalar.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    "mutation", ["contract", "source_bit", "display_priority", "archive_oid", "contribution_oid", "extra"]
-)
-def test_local_publication_receipt_cannot_impersonate_foreign_provenance(mutation):
-    receipt_by_field = {
-        "contract": canonical.MERGE_CONTRACT,
-        "source_bit": 1,
-        "display_priority": 0,
-        "archive_oid": 10,
-        "contribution_oid": 20,
-    }
-    receipt_by_field[mutation] = True
-    with pytest.raises(RuntimeError, match="local publication receipt"):
-        canonical.validate_canonical_publication(receipt_by_field, "npi", 20)

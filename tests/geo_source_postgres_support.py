@@ -7,7 +7,6 @@ from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import GeoZipLookup
-from process import geo_source_provision as provision
 from tests import provider_directory_source_postgres_support as source
 
 
@@ -37,51 +36,47 @@ async def create_geo_indexes(connection, *, index_profile="current"):
         )
 
 
-async def geo_preimage(driver, schema):
-    """Capture complete native incumbent custody before the real administrator cut."""
-    return await driver.fetchval(
-        "SELECT jsonb_build_object('relation',to_jsonb(c),'triggers',(SELECT jsonb_agg(to_jsonb(t) ORDER BY t.oid) "
-        "FROM pg_trigger t WHERE t.tgrelid=c.oid),'constraints',(SELECT jsonb_agg(to_jsonb(k) ORDER BY k.oid) "
-        "FROM pg_constraint k WHERE k.conrelid=c.oid),'indexes',(SELECT jsonb_agg(pg_get_indexdef(i.indexrelid) "
-        "ORDER BY i.indexrelid) FROM pg_index i WHERE i.indrelid=c.oid),'functions',(SELECT jsonb_agg("
-        "jsonb_build_array(p.oid,p.proowner,p.proacl,pg_get_functiondef(p.oid)) ORDER BY p.oid) FROM pg_proc p "
-        "WHERE p.oid IN(SELECT tgfoid FROM pg_trigger WHERE tgrelid=c.oid))) "
-        "FROM pg_class c WHERE c.oid=to_regclass($1)",
-        schema + ".geo_zip_lookup",
-    )
-
-
 async def provision_geo(engine, policy, verify_role_profile):
-    """Use actual product custody and writer checks with the caller's genuine verifier."""
+    """Hand the bootstrap Geo heap and ledger rights to the Source Owner with plain grants."""
+    from db.plan_release_storage import storage_identifier, storage_relation
+    from process.code_catalog_snapshot import _relation_access
+    from process.geo_source_storage import ROOT
+    from process.plan_release_storage_provision import _GRANTEES_SQL
+    from process.provider_directory_cms_doctors_provision import GENERATION_SELECT, GENERATION_UPDATE
     from process.provider_directory_projection_stage import _copy_driver
 
     async with engine.connect() as connection, connection.begin():
         async with AsyncSession(bind=connection) as session, session.begin():
-            await session.execute(text("SELECT session_user"))
-            expected = await geo_preimage(await _copy_driver(session), policy.schema)
-
-            async def legacy(driver, actual, oid):
-                assert actual == policy and oid > 0
-                assert await geo_preimage(driver, policy.schema) == expected
-
-            async def writers(driver, actual):
-                assert actual == policy and GeoZipLookup.__runtime_schema_sync__ is False
-                assert GeoZipLookup.__table__.info["managed_immutable_storage"]
-                assert not await driver.fetchval(
-                    "SELECT EXISTS(SELECT FROM pg_roles r WHERE r.rolname=ANY($2::text[]) AND "
-                    "(has_table_privilege(r.oid,to_regclass($1),'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
-                    "OR has_any_column_privilege(r.oid,to_regclass($1),'INSERT,UPDATE,REFERENCES')))",
-                    policy.schema + ".geo_zip_lookup",
-                    list((*policy.runtime_roles, *policy.control_runtime_roles)),
-                )
-
-            return await provision.provision_geo_source_storage(
-                session,
-                policy,
-                verify_role_profile=verify_role_profile,
-                verify_writer_closure=writers,
-                verify_legacy_guards=legacy,
-            )
+            await session.execute(text("SELECT 1"))
+            native = await _copy_driver(session)
+            relation = storage_relation(policy.schema, ROOT)
+            ledger = storage_relation(policy.schema, "reference_family_result_generation")
+            owner = storage_identifier(policy.owner_role)
+            await native.execute(f"LOCK TABLE ONLY {relation},{ledger} IN ACCESS EXCLUSIVE MODE")
+            oid = await native.fetchval("SELECT to_regclass($1)::oid::bigint", relation)
+            prior = await _relation_access(session, oid)
+            await native.execute(f"ALTER TABLE {relation} OWNER TO {owner}")
+            for grant in await native.fetch(_GRANTEES_SQL, oid):
+                principal = "PUBLIC" if grant["grantee"] == 0 else storage_identifier(grant["rolname"])
+                column = grant["column_name"]
+                privileges = f"ALL PRIVILEGES ({storage_identifier(column)})" if column else "ALL PRIVILEGES"
+                await native.execute(f"REVOKE {privileges} ON TABLE {relation} FROM {principal} CASCADE")
+            for grant in prior.grants:
+                if grant.privilege_type == "SELECT" and grant.grantee_name != policy.owner_role:
+                    principal = "PUBLIC" if grant.grantee_name is None else storage_identifier(grant.grantee_name)
+                    column = "" if grant.column_name is None else f" ({storage_identifier(grant.column_name)})"
+                    option = " WITH GRANT OPTION" if grant.is_grantable else ""
+                    await session.execute(text(f"GRANT SELECT{column} ON TABLE {relation} TO {principal}{option}"))
+            select = ",".join(storage_identifier(name) for name in GENERATION_SELECT)
+            update = ",".join(storage_identifier(name) for name in GENERATION_UPDATE)
+            await native.execute(f"GRANT SELECT({select}),UPDATE({update}) ON {ledger} TO {owner}")
+            for hook_row in await native.fetch(
+                "SELECT tgname FROM pg_trigger WHERE tgrelid=$1 AND NOT tgisinternal", oid
+            ):
+                await native.execute(f"DROP TRIGGER {storage_identifier(hook_row['tgname'])} ON {relation}")
+            await native.execute(f"UPDATE {ledger} SET source_revision_tracked=FALSE WHERE importer_id='geo'")
+            await verify_role_profile(native, policy.schema, **policy.role_arguments())
+            return oid
 
 
 @asynccontextmanager

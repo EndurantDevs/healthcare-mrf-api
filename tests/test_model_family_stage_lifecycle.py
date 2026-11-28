@@ -97,6 +97,13 @@ async def test_unregistered_family_precreates_ordinary_heaps_with_exact_identity
 
 
 @pytest.mark.asyncio
+async def test_verification_refuses_a_non_ownership_descriptor(scoped_family_fixture):
+    spec, _ownership, _catalog, session = scoped_family_fixture
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage ownership is invalid"):
+        await archive.verify_model_family_stage_ownership(session, spec, object())
+
+
+@pytest.mark.asyncio
 async def test_identity_is_opt_in_and_verification_returns_the_current_sequence(scoped_family_fixture):
     spec, ownership, catalog, session = scoped_family_fixture
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="sequence set"):
@@ -134,28 +141,6 @@ async def test_bad_relationship_set_is_not_reported_as_complete(scoped_family_fi
     session.scalar.return_value = True
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="relationship differs"):
         await archive.complete_model_family_stage(session, spec, ownership, include_identity=True)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ("invalid", "changed", "relationship"))
-async def test_ptg_completion_preserves_custody_errors_and_native_relationship_failure(
-    scoped_family_fixture, monkeypatch, failure
-):
-    from process.ptg_parts import ptg2_physical_binding as binding
-
-    spec, ownership, _catalog, session = scoped_family_fixture
-    monkeypatch.setattr(binding, "local_data_family_spec", lambda: spec)
-    if failure == "relationship":
-        session.scalar.return_value = True
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="relationship differs"):
-            await binding.complete_local_data_family(session, ownership)
-        assert session.execute.await_count
-    else:
-        token = object() if failure == "invalid" else replace(ownership, importer_id="synthetic-other")
-        message = "ownership is invalid" if failure == "invalid" else "ownership changed"
-        with pytest.raises(binding.PTG2PhysicalBindingError, match=message):
-            await binding.complete_local_data_family(session, token)
-        session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -250,3 +235,17 @@ async def test_every_public_lifecycle_operation_requires_caller_transaction(scop
     session.execute.assert_not_awaited()
     session.scalar.assert_not_awaited()
     catalog.schema.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_descriptors_resolve_names_from_stored_identity_tuples(monkeypatch):
+    legacy = SimpleNamespace(importer_id="geo", relation_oids=(("geo_zip_lookup", 1),))
+    assert archive._model_family_names(legacy) == ("geo_zip_lookup",)
+    monkeypatch.setattr(archive, "_schema_oid", AsyncMock(return_value=3))
+    monkeypatch.setattr(archive, "_owned_sequences", AsyncMock(return_value=[("geo_seq", 5, "geo_zip_lookup", "id")]))
+    monkeypatch.setattr(archive, "_namespace_relations", AsyncMock(return_value=[]))
+    ownership = SimpleNamespace(sequence_oids=(("geo_seq", 99, "geo_zip_lookup", "id"),))
+    await archive._require_model_family_namespace(object(), ownership, "stage", (("geo_zip_lookup", 4),))
+    ownership.sequence_oids = (("other_seq", 99, "geo_zip_lookup", "id"),)
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="sequence declaration differs"):
+        await archive._require_model_family_namespace(object(), ownership, "stage", (("geo_zip_lookup", 4),))

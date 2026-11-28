@@ -56,7 +56,6 @@ from api.control_workers import (
 from api.scoped_catalog_publisher_worker import request_cancel as request_catalog_stop
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process import mrf_discovery_acquisition_guard as mrf_acquisition
-from process import npi_isolated_execution as npi_execution
 from process.cms_npd_typed_schema import CONTROL_ADAPTER as CMS_NPD_CONTROL_ADAPTER
 from process.control_cancel import (
     _cancel_attempt_pair,
@@ -1255,9 +1254,6 @@ def _redis_client() -> redis.Redis:
 async def ensure_import_run_table() -> None:
     """Create the public import-run control table once per process."""
 
-    if (scope := npi_execution.current_npi_isolated_execution()) is not None:
-        await scope.verify(None, phase="control")
-        return
     if _IMPORT_RUN_ENSURE_STATE.ensured:
         return
     async with _IMPORT_RUN_ENSURE_LOCK:
@@ -1708,10 +1704,16 @@ def _decode_import_run_cursor(cursor: str) -> tuple[dt.datetime, str]:
     return created_at, run_id
 
 
+async def _read_control_run(run_id):
+    """Read one durable import-run row."""
+    result = await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))
+    return result.scalar_one_or_none()
+
+
 async def get_import_run(run_id: str) -> dict[str, Any] | None:
     """Return one import run; plan-pricing terminalization stays explicit."""
 
-    if not (durable_run := await npi_execution.read_control_run(db, run_id)):
+    if not (durable_run := await _read_control_run(run_id)):
         return None
     public_run = normalize_run(durable_run)
     if public_run.get("importer") not in STALE_WORKER_RECONCILIATION_IMPORTERS and public_run.get("importer") != "nucc":
@@ -1827,7 +1829,7 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
         )
     )
     if updated.rowcount != 1:
-        latest = await npi_execution.read_control_run(db, run["run_id"])
+        latest = await _read_control_run(run["run_id"])
         return normalize_run(latest) if latest is not None else run
     return {
         **run,
@@ -1866,7 +1868,7 @@ def _worker_failure_update_statement(run: dict[str, Any]):
             statement = statement.where(
                 field == expected_attempt_value if expected_attempt_value is not None else field.is_(None)
             )
-    return npi_execution.npi_control_run_statement(statement, run_id=run["run_id"])
+    return statement
 
 
 async def _active_worker_state(run: dict[str, Any]) -> dict[str, Any]:
@@ -4964,7 +4966,7 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
     current = await get_import_run(run_id)
     if not current:
         return None
-    current = await restore_collection_retry_proof(current, lambda: npi_execution.read_control_run(db, run_id))
+    current = await restore_collection_retry_proof(current, lambda: _read_control_run(run_id))
     if str(current.get("importer") or "") == "ptg":
         await require_not_wave_owned_run(db, run_id)
     retry_params = payload.get("retry_params") if isinstance(payload.get("retry_params"), dict) else {}

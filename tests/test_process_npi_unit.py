@@ -370,6 +370,70 @@ async def test_rebuild_phone_staffing_rejects_missing_address_or_pharmacist_rows
 
 
 @pytest.mark.asyncio
+async def test_rebuild_phone_staffing_rebuilds_from_ready_inputs(monkeypatch, npi_module):
+    status = AsyncMock()
+    monkeypatch.setattr(npi_module.db, "scalar", AsyncMock(side_effect=["target", "address", "nucc", 3]))
+    monkeypatch.setattr(npi_module.db, "status", status)
+
+    await npi_module.rebuild_phone_staffing_table(
+        target_table="npi_phone_staffing_stage",
+        address_table="npi_address_stage",
+        schema="mrf",
+    )
+
+    statements = [call.args[0] for call in status.await_args_list]
+    assert statements[0] == "TRUNCATE TABLE mrf.npi_phone_staffing_stage;"
+    assert "INSERT INTO mrf.npi_phone_staffing_stage" in statements[1]
+    assert "FROM mrf.nucc_taxonomy" in statements[1]
+
+
+def test_npi_address_canon_row_orders_the_six_address_parts(npi_module):
+    address_by_field = {
+        "first_line": "1 Main St",
+        "second_line": "Suite 2",
+        "city_name": "Austin",
+        "state_name": "TX",
+        "postal_code": "78701",
+        "country_code": "US",
+    }
+    assert npi_module._npi_address_canon_row(address_by_field) == (
+        "1 Main St",
+        "Suite 2",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_lease_and_save_task_state_are_no_ops(npi_module):
+    context_by_name = {}
+    assert await npi_module._release_npi_import_lease(context_by_name, suppress_errors=False) is None
+    assert context_by_name == {}
+    assert await npi_module._drain_npi_save_tasks([]) is None
+
+
+@pytest.mark.asyncio
+async def test_save_npi_data_routes_each_family_to_its_staging_model(monkeypatch, npi_module):
+    pushed_rows = []
+
+    async def push(rows, model, rewrite=False):
+        pushed_rows.append((model.__tablename__, len(rows), rewrite))
+
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory())
+    monkeypatch.setattr(npi_module, "push_objects", push)
+
+    await npi_module.save_npi_data(
+        {"import_date": "20260603", "context": {}},
+        {"npi_obj_list": [{"npi": 1}], "npi_other_id_list": [{"checksum": 7}, {"checksum": 7}]},
+    )
+
+    assert pushed_rows == [("npi_20260603", 1, True), ("npi_other_identifier_20260603", 1, False)]
+
+
+@pytest.mark.asyncio
 async def test_process_data_rejects_missing_nucc_before_download(monkeypatch, npi_module):
     monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", "https://example.com/")
     monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", "feed.html")

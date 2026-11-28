@@ -3964,6 +3964,31 @@ def _install_queued_cancel_stubs(
 
 
 @pytest.mark.asyncio
+async def test_sync_terminal_worker_failure_reads_back_a_lost_race(monkeypatch):
+    run_by_field = {"run_id": "run_npi_race", "importer": "npi", "status": "running", "progress": {}, "metrics": {}}
+    latest_by_field = {**run_by_field, "status": "finalizing"}
+    database = types.SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                types.SimpleNamespace(rowcount=0),
+                types.SimpleNamespace(scalar_one_or_none=lambda: latest_by_field),
+            ]
+        )
+    )
+    monkeypatch.setattr(control_imports, "db", database)
+    failed_state_by_field = {
+        "status": "failed",
+        "items": [{"job_status": "failed", "failure": {"reason": "Error", "exitCode": 1}}],
+    }
+    monkeypatch.setattr(control_imports, "_active_worker_state", AsyncMock(return_value=failed_state_by_field))
+
+    result = await control_imports._sync_terminal_worker_failure(run_by_field)
+
+    assert result["status"] == "finalizing"
+    assert database.execute.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_sync_terminal_worker_failure_persists_oom_evidence(monkeypatch):
     source_run = _running_ptg_cancel_run(
         "run_ptg_oom",

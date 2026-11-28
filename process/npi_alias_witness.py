@@ -13,10 +13,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import text
 
-from process.npi_isolated_execution import NPI_TABLES, NpiInputRelation
-
 WITNESS_CONTRACT = "npi-address-alias-witness.v1"
-MODEL_CONTRACT = "npi-result-family.postgres.alias.v1"
 METADATA_KEY = "npi_address_witness"
 _ISSUER = object()
 _SHA = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -27,6 +24,31 @@ SETS = ("raw", "strict", "effective", "aliases", "absent_strict", "canonical")
 def _require(condition):
     if not condition:
         raise RuntimeError("NPI witnessed alias evidence differs")
+
+
+NPI_TABLES = ("npi", "npi_taxonomy_group", "npi_other_identifier", "npi_taxonomy", "npi_address", "npi_phone_staffing")
+_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z", re.ASCII)
+
+
+@dataclass(frozen=True)
+class NpiInputRelation:
+    """One native relation identity recorded in a retained alias witness."""
+
+    schema_name: str
+    table_name: str
+    relation_oid: int
+    relfilenode: int
+
+    def __post_init__(self):
+        for name in (self.schema_name, self.table_name):
+            _require(type(name) is str and _IDENTIFIER.fullmatch(name) is not None)
+        _require(type(self.relation_oid) is int and 0 < self.relation_oid < 2**32)
+        _require(type(self.relfilenode) is int and 0 <= self.relfilenode < 2**32)
+
+    @property
+    def qualified(self):
+        """Render only the validated selected relation's SQL identifier pair."""
+        return f'"{self.schema_name}"."{self.table_name}"'
 
 
 def canonical_bytes(witness_data):
@@ -140,30 +162,6 @@ class NpiAliasWitnessAuthority:
 
     def __post_init__(self):
         _require(self._issuer is _ISSUER and type(self.witness) is NpiAddressWitness and callable(self.verify_witness))
-
-
-async def authenticate_npi_alias_witness(session, witness, *, schema_name, verify_witness):
-    """Bind only after the trusted Publisher revalidates its protected native receipt."""
-    _require(session.in_transaction() and callable(verify_witness))
-    witness = validate_npi_address_witness(witness)
-    _require(await verify_witness(session, witness.as_dict()) is True)
-    backend_ids = tuple(
-        (
-            await session.execute(
-                text(
-                    "SELECT pg_catalog.pg_backend_pid(),(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()),"
-                    "session_user::regrole::oid,current_user::regrole::oid"
-                )
-            )
-        ).one()
-    )
-    _require(backend_ids[2] == backend_ids[3])
-    pairs = await _output_relations(session, schema_name)
-    authority = NpiAliasWitnessAuthority(
-        session, session.get_transaction(), backend_ids, asyncio.current_task(), pairs, witness, verify_witness, _ISSUER
-    )
-    await require_npi_alias_authority(session, authority)
-    return authority
 
 
 async def _output_relations(session, schema):

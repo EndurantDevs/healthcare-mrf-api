@@ -673,10 +673,6 @@ def _has_candidate_triggers(records, schema):
 async def assert_nppes_candidate_catalog(connection, schema, policy):
     """Validate the candidate's native data schema and retained statement guards."""
     try:
-        from process.nppes_isolated_catalog import verified_isolated_nppes_catalog
-
-        if await verified_isolated_nppes_catalog(connection, schema, policy) is not None:
-            return
         if policy.schema != schema or connection.is_in_transaction() is not True:
             raise writer_error()
         if (

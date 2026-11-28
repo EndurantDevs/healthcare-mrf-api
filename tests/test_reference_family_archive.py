@@ -26,7 +26,6 @@ from sqlalchemy import (
     func,
 )
 
-from process import florida_projection_archive as florida_archive
 from process import reference_family_archive as archive
 from process import source_profile_result_archive as profile_archive
 from process.provider_quality_parts.table_helpers import _index_name_for_table
@@ -1412,9 +1411,9 @@ async def test_restore_defers_all_index_backing_constraints_with_family_ddl_pari
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("importer_id", (*profile_archive.SOURCES, florida_archive.IMPORTER_ID))
+@pytest.mark.parametrize("importer_id", sorted(set(profile_archive.SOURCES) - {profile_archive.PROJECTION_IMPORTER}))
 async def test_profile_restore_completes_every_deferred_model_index(monkeypatch, importer_id):
-    subject = florida_archive if importer_id == florida_archive.IMPORTER_ID else profile_archive
+    subject = profile_archive
     spec = archive.ReferenceFamilySpec(importer_id, subject.MODELS)
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
     ownership = SimpleNamespace(importer_id=importer_id, schema_name="synthetic_stage")
@@ -1424,10 +1423,7 @@ async def test_profile_restore_completes_every_deferred_model_index(monkeypatch,
     monkeypatch.setattr(subject, "capture_ownership", AsyncMock(return_value=ownership))
     monkeypatch.setattr(subject, "stage_schema", lambda _identity: ownership.schema_name)
     monkeypatch.setattr(subject, "verify_ownership", AsyncMock())
-    if subject is florida_archive:
-        await subject.precreate_restore(session, UUID(int=1))
-    else:
-        await subject.precreate_restore(session, importer_id, UUID(int=1))
+    await subject.precreate_restore(session, importer_id, UUID(int=1))
     heaps = _model_ddl(session)
     session.execute.reset_mock()
     await subject.complete_restore(session, ownership)

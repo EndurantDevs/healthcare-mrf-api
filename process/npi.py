@@ -33,8 +33,6 @@ from db.models import (
     NPIPhoneStaffing,
     db,
 )
-from process import npi_isolated_batches as isolated_batches
-from process import npi_isolated_execution as isolated_npi
 from process import nppes_public_evidence_catalog as nppes_catalog
 from process import provider_directory_generic_source_policy as source_policy
 from process import provider_geo_search
@@ -288,9 +286,6 @@ def _postgres_identifier(value: object) -> str:
 def _runtime_db_schema() -> str:
     """Resolve the one schema shared by migrations and the NPI runtime."""
 
-    scope = isolated_npi.current_npi_isolated_execution()
-    if scope is not None:
-        return scope.output_schema
     runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
     legacy_schema = os.getenv("DB_SCHEMA")
     if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
@@ -298,44 +293,18 @@ def _runtime_db_schema() -> str:
     return _postgres_identifier(runtime_schema or legacy_schema or "mrf")
 
 
-def _nppes_source_schema(output_schema: str) -> str:
-    scope = isolated_npi.current_npi_isolated_execution()
-    return scope.source_schema if scope is not None and scope.source_schema is not None else output_schema
-
-
 def _npi_staging_model(model, import_date):
-    """Keep isolated data models separate from canonical control models."""
-    scope = isolated_npi.current_npi_isolated_execution()
-    if scope is not None:
-        stage = scope.stage_model(model, import_date)
-        if (
-            stage.__table__.schema != scope.output_schema
-            or stage.__tablename__ != model.__main_table__
-            or stage.__main_table__ != model.__main_table__
-        ):
-            raise NPIPrerequisiteError("Isolated NPI stage model is invalid")
-        return stage
+    """Build the dated staging model for one canonical NPI model."""
     return make_class(model, import_date)
 
 
 def _npi_input_relation(table, schema):
-    """Resolve selected input heaps without falling back to mutable canonical names."""
-    scope = isolated_npi.current_npi_isolated_execution()
-    if scope is None:
-        return f"{schema}.{table}"
-    name = "address_archive_v2" if table == archive_table_name() else table
-    relation = scope.input_relation(name)
-    if relation is None:
-        raise NPIPrerequisiteError("Selected NPI input is absent")
-    return relation.qualified
+    """Name one shared NPI input relation in the runtime schema."""
+    return f"{schema}.{table}"
 
 
 async def _npi_has_input_table(table, schema):
-    """Respect explicitly captured optional absences rather than skipping an unbound input."""
-    scope = isolated_npi.current_npi_isolated_execution()
-    if scope is not None:
-        name = "address_archive_v2" if table == archive_table_name() else table
-        return scope.input_relation(name) is not None
+    """Check whether one shared NPI input relation exists."""
     return bool(await db.scalar(f"SELECT to_regclass('{schema}.{table}');"))
 
 
@@ -499,7 +468,7 @@ async def _assert_nppes_canonical_stage_parity(
     """Prove the canonical NPI stage matches each latest admitted source row."""
 
     fixed_receipt = validate_nppes_public_evidence_chain_receipt(receipt)
-    schema = _postgres_identifier(_nppes_source_schema(db_schema))
+    schema = _postgres_identifier(db_schema)
     stage_table = _postgres_identifier(_npi_staging_model(NPIData, import_date).__tablename__)
     async with source_policy.source_transaction(db, isolation="repeatable read"):
         publisher = source_policy.bound_publisher()
@@ -872,8 +841,6 @@ async def _assert_nucc_ready(schema: str) -> None:
 async def _assert_nppes_canonical_ready(schema: str) -> None:
     if not source_enabled("nppes"):
         return
-    if isolated_npi.current_npi_isolated_execution() is not None:
-        return
     function_exists = await db.scalar(f"SELECT to_regprocedure('{schema}.addr_key_v1(text,text,text,text,text,text)');")
     if not function_exists:
         raise NPIPrerequisiteError(
@@ -1026,65 +993,6 @@ def _npi_record_from_source_row(
     return npi_record_by_field
 
 
-@asynccontextmanager
-async def _isolated_write_window(ctx):
-    if isolated_npi.current_npi_isolated_execution() is None:
-        yield None
-        return
-
-    def models(kind):
-        """Resolve only this attempt's precreated output family."""
-        model, rewrite = {
-            "npi_obj_list": (NPIData, True),
-            "npi_taxonomy_list": (NPIDataTaxonomy, True),
-            "npi_other_id_list": (NPIDataOtherIdentifier, False),
-            "npi_taxonomy_group_list": (NPIDataTaxonomyGroup, True),
-            "npi_address_list": (NPIAddress, True),
-        }[kind]
-        return _npi_staging_model(model, ctx["import_date"]), rewrite
-
-    async def cancel_check():
-        """Recheck the control run before native COPY or merge."""
-        context = ctx.get("context") or {}
-        run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
-        await raise_if_cancelled(ctx, {"run_id": run_id})
-
-    async with isolated_batches.bind(db, models, cancel_check) as writer:
-        yield writer
-
-
-def _bound_isolated_writes(function):
-    @wraps(function)
-    async def wrapped(ctx, *args, **kwargs):
-        """Keep one isolated native writer in the parser's owning task."""
-        async with _isolated_write_window(ctx):
-            return await function(ctx, *args, **kwargs)
-
-    return wrapped
-
-
-def _bound_isolated_parser(function):
-    @wraps(function)
-    async def wrapped(ctx, task):
-        """Bound isolated expansion and close its original logical dedup window."""
-        if isolated_npi.current_npi_isolated_execution() is None:
-            return await function(ctx, task)
-        if not task.get("direct"):
-            raise isolated_batches.NpiBatchError("NPI isolated parsing requires direct bounded persistence")
-        context = ctx.get("context") or {}
-        run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or task.get("run_id") or "").strip()
-        task = task.copy()
-        task["run_id"] = run_id
-        async with _isolated_write_window(ctx) as writer:
-            for rows in isolated_batches.raw_batches(task["row_list"]):
-                await raise_if_cancelled(ctx, task)
-                await function(ctx, {**task, "row_list": rows})
-            await writer.finish_window()
-
-    return wrapped
-
-
-@_bound_isolated_parser
 async def process_npi_chunk(ctx, task):
     """Parse one NPPES CSV chunk and enqueue or persist normalized rows."""
     redis = ctx["redis"]
@@ -1224,25 +1132,15 @@ async def process_npi_chunk(ctx, task):
         ),
     }
     if task.get("direct"):
-        writer = isolated_batches.current()
-        if writer is None:
-            await save_npi_data(ctx, normalized_rows_by_kind)
-            print(f"Processing.. {len(npi_obj_list)} rows directly")
-        else:
-            await writer.add(normalized_rows_by_kind)
+        await save_npi_data(ctx, normalized_rows_by_kind)
+        print(f"Processing.. {len(npi_obj_list)} rows directly")
     else:
         await redis.enqueue_job("save_npi_data", normalized_rows_by_kind, _queue_name=NPI_QUEUE_NAME)
-
-
-# Raw buffer flushes retain the surrounding original logical dedup window.
-_process_npi_chunk = process_npi_chunk.__wrapped__
 
 
 async def _prepare_npi_staging(import_date: str, db_schema: str) -> None:
     """Recreate every canonical NPI staging table for one import attempt."""
 
-    if isolated_npi.current_npi_isolated_execution() is not None:
-        return
     for model_class in _NPI_STAGING_CLASSES:
         staged_model = _npi_staging_model(model_class, import_date)
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{staged_model.__main_table__}_{import_date};")
@@ -1267,14 +1165,12 @@ async def _prepare_npi_staging(import_date: str, db_schema: str) -> None:
 
 
 @_release_lease_after_process_failure
-@_bound_isolated_writes
 async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
     """Download and process the configured NPPES dissemination files."""
     # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
     task = task or {}
     ctx.setdefault("context", {})
     context = ctx["context"]
-    scope = await isolated_npi.verify_npi_isolated_execution(ctx, phase="process")
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     if run_id:
         task = task.copy()
@@ -1295,20 +1191,17 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
     has_scratch_root = evidence_config.required or bool(os.getenv("HLTHPRT_NPPES_PUBLIC_EVIDENCE_SCRATCH_ROOT"))
     scratch_root = resolve_nppes_scratch_root() if has_scratch_root else None
     canonical_addresses_enabled = source_enabled("nppes")
-    if scope is not None and not canonical_addresses_enabled:
-        raise NPIPrerequisiteError("Isolated NPI preparation requires canonical address output")
     await ensure_database(test_mode)
     await _acquire_npi_import_lease(context)
     await _assert_npi_import_lease(context)
     if evidence_config.required:
         await _assert_nppes_postgres_runtime(context)
-    if scope is None:
-        await _ensure_required_extensions()
+    await _ensure_required_extensions()
 
     import_date = ctx["import_date"]
     db_schema = _runtime_db_schema()
     if evidence_config.required:
-        await _assert_nppes_storage_catalog(context, _nppes_source_schema(db_schema))
+        await _assert_nppes_storage_catalog(context, db_schema)
     if _npi_requires_nucc(context):
         await _assert_nucc_ready(db_schema)
     if canonical_addresses_enabled:
@@ -1318,13 +1211,9 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
         print(f"Loaded {len(taxonomy_int_code_map)} NUCC taxonomy integer codes for NPI address load.")
     count_files = 0
     sql_chunk_size = 299999
-    max_pending_save_tasks = (
-        1
-        if scope is not None
-        else _env_positive_int(
-            "HLTHPRT_NPI_MAX_PENDING_SAVE_TASKS",
-            DEFAULT_NPI_MAX_PENDING_SAVE_TASKS,
-        )
+    max_pending_save_tasks = _env_positive_int(
+        "HLTHPRT_NPI_MAX_PENDING_SAVE_TASKS",
+        DEFAULT_NPI_MAX_PENDING_SAVE_TASKS,
     )
     pending_save_tasks: list[asyncio.Task] = []
     context[_NPI_PENDING_SAVE_TASKS_KEY] = pending_save_tasks
@@ -1337,9 +1226,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
 
     async def enqueue_or_flush(coros: list, coro) -> None:
         """Bound pending save tasks by flushing the active task batch."""
-        if scope is not None:
-            await coro
-            return
         coros.append(asyncio.create_task(coro))
         if len(coros) >= max_pending_save_tasks:
             await _drain_npi_save_tasks(coros)
@@ -1363,8 +1249,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
         raise NPIPrerequisiteError("No NPPES source archives were discovered")
     await raise_if_cancelled(ctx, task)
     await _assert_npi_import_lease(context)
-    if scope is not None:
-        await scope.verify(ctx, phase="staging")
     await _prepare_npi_staging(import_date, db_schema)
     if run_id:
         enqueue_live_progress(
@@ -1452,30 +1336,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                     for filename in glob.glob(f"{tmpdirname}/endpoint*.csv")
                     if not os.path.basename(filename).endswith("_fileheader.csv")
                 ][0]
-            if count_files > 1 and scope is not None:
-                current_sql_chunk_size = sql_chunk_size // 26
-                cleanup_sources = (
-                    (
-                        "primary",
-                        npi_file,
-                        (
-                            (NPIData, ()),
-                            (NPIDataTaxonomyGroup, ()),
-                            (NPIDataTaxonomy, ()),
-                            (NPIAddress, ("primary", "mail")),
-                        ),
-                    ),
-                    ("practice_location", pl_file, ((NPIAddress, ("secondary",)),)),
-                    ("other_name", other_file, ((NPIDataOtherIdentifier, ()),)),
-                )
-                for member, path, cleanup_targets in cleanup_sources:
-                    async with _open_nppes_source(legacy_layout, member, path) as afp:
-                        count_removed = await isolated_batches.current().delete_selected(
-                            AsyncDictReader(afp, delimiter=","),
-                            tuple((_npi_staging_model(model, import_date), types) for model, types in cleanup_targets),
-                        )
-                    print(f"Cleaned up models for {count_removed} NPIs due to multiple files.")
-            if count_files > 1 and scope is None:
+            if count_files > 1:
                 # Collect all NPIs from npi_file and pl_file
                 current_sql_chunk_size = sql_chunk_size // 26
                 npi_set: set[int] = set()
@@ -1555,15 +1416,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
             count = 0
 
             row_list = []
-            raw_batch_bytes = 0
-            primary_fields_by_name = {
-                "npi_csv_map": npi_csv_map,
-                "npi_csv_map_reverse": npi_csv_map_reverse,
-                "taxonomy_int_code_map": taxonomy_int_code_map,
-                "direct": True,
-            }
-            if scope is not None and isolated_batches.memory_bytes(primary_fields_by_name) > isolated_batches.RAW_BYTES:
-                raise isolated_batches.NpiBatchError("NPI isolated CSV header exceeds the parser byte budget")
             coros = pending_save_tasks
             processed_rows = 0
             async with _open_nppes_source(legacy_layout, "primary", npi_file) as afp:
@@ -1572,19 +1424,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                         continue
                     if not count % current_sql_chunk_size:
                         print(f"Processed: {count}")
-                    if scope is not None:
-                        amount = isolated_batches.memory_bytes(source_csv_row) + 16
-                        if amount > isolated_batches.RAW_BYTES:
-                            raise isolated_batches.NpiBatchError("NPI isolated CSV row exceeds the parser byte budget")
-                        if row_list and (
-                            len(row_list) == isolated_batches.RAW_ROWS
-                            or raw_batch_bytes + amount > isolated_batches.RAW_BYTES
-                        ):
-                            await raise_if_cancelled(ctx, task)
-                            await _process_npi_chunk(ctx, {**primary_fields_by_name, "row_list": row_list})
-                            row_list.clear()
-                            raw_batch_bytes = 0
-                        raw_batch_bytes += amount
                     row_list.append(source_csv_row)
                     processed_rows += 1
                     if run_id and processed_rows and processed_rows % (100 if test_mode else 100_000) == 0:
@@ -1611,7 +1450,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                         }
                         await enqueue_or_flush(coros, process_npi_chunk(ctx, npi_chunk_by_field))
                         row_list.clear()
-                        raw_batch_bytes = 0
                         count = 0
                     else:
                         count += 1
@@ -1630,7 +1468,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
             row_list.clear()
 
             npi_other_org_list_dict = {}
-            other_batch_bytes = 0
 
             async with _open_nppes_source(legacy_layout, "other_name", other_file) as afp:
                 processed_other = 0
@@ -1650,22 +1487,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                     }
                     checksum = return_checksum(list(other_identifier_by_field.values()))
                     other_identifier_by_field["checksum"] = checksum
-                    if scope is not None:
-                        amount = isolated_batches.memory_bytes(other_identifier_by_field) + 16
-                        if amount > isolated_batches.RAW_BYTES:
-                            raise isolated_batches.NpiBatchError(
-                                "NPI isolated other-name row exceeds the parser byte budget"
-                            )
-                        if npi_other_org_list_dict and (
-                            len(npi_other_org_list_dict) == isolated_batches.RAW_ROWS
-                            or other_batch_bytes + amount > isolated_batches.RAW_BYTES
-                        ):
-                            await isolated_batches.current().add(
-                                {"npi_other_id_list": list(npi_other_org_list_dict.values())}
-                            )
-                            npi_other_org_list_dict.clear()
-                            other_batch_bytes = 0
-                        other_batch_bytes += amount
                     npi_other_org_list_dict[checksum] = other_identifier_by_field
 
                     if count > current_sql_chunk_size:
@@ -1676,7 +1497,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                         }
                         await enqueue_or_flush(coros, save_npi_data(ctx, other_identifier_rows_by_key))
                         npi_other_org_list_dict.clear()
-                        other_batch_bytes = 0
                         count = 0
                     else:
                         count += 1
@@ -1701,7 +1521,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
             npi_other_org_list_dict.clear()
 
             npi_address_list_dict = {}
-            secondary_batch_bytes = 0
             async with _open_nppes_source(legacy_layout, "practice_location", pl_file) as afp:
                 processed_secondary = 0
                 async for source_csv_row in AsyncDictReader(afp, delimiter=","):
@@ -1750,26 +1569,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                             secondary_address_by_field["type"],
                         ]
                     )
-                    if scope is not None:
-                        amount = isolated_batches.memory_bytes(secondary_address_by_field) + 16
-                        if amount > isolated_batches.RAW_BYTES:
-                            raise isolated_batches.NpiBatchError(
-                                "NPI isolated practice-location row exceeds the parser byte budget"
-                            )
-                        if npi_address_list_dict and (
-                            len(npi_address_list_dict) == isolated_batches.RAW_ROWS
-                            or secondary_batch_bytes + amount > isolated_batches.RAW_BYTES
-                        ):
-                            await isolated_batches.current().add(
-                                {
-                                    "npi_address_list": _prepare_npi_address_rows(
-                                        npi_address_list_dict.values(), canonical_enabled=canonical_addresses_enabled
-                                    )
-                                }
-                            )
-                            npi_address_list_dict.clear()
-                            secondary_batch_bytes = 0
-                        secondary_batch_bytes += amount
                     npi_address_list_dict[address_key] = secondary_address_by_field
 
                     if count > current_sql_chunk_size:
@@ -1791,7 +1590,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
                         #     'npi_address_list': list(npi_address_list_dict.values()),
                         # })
                         npi_address_list_dict.clear()
-                        secondary_batch_bytes = 0
                         count = 0
                     else:
                         count += 1
@@ -1854,7 +1652,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
             prepared_chain,
             evidence_config,
             expected_source_record_counts=tuple(staged_source_record_counts),
-            schema=_nppes_source_schema(db_schema),
+            schema=db_schema,
             cancel_check=evidence_cancel_check,
         )
         validated_receipt = validate_nppes_public_evidence_chain_receipt(chain_receipt)
@@ -1895,11 +1693,6 @@ async def startup(ctx):  # pragma: no cover
         ctx["import_date"] = datetime.datetime.now().strftime("%Y%m%d")
     import_date = ctx["import_date"]
     db_schema = _runtime_db_schema()
-
-    scope = await isolated_npi.verify_npi_isolated_execution(ctx, phase="startup")
-    if scope is not None:
-        await scope.startup(ctx)
-        return
 
     await _ensure_required_extensions()
     try:
@@ -2502,7 +2295,6 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
     if not context.get("run"):
         print("No NPI jobs ran in this worker session; skipping shutdown validation.")
         return
-    scope = await isolated_npi.verify_npi_isolated_execution(ctx, phase="finalize")
     attempt_id, attempt_started_at = _required_npi_control_attempt(context, run_id)
     await _assert_npi_import_lease(context)
     if context.get("test_mode"):
@@ -2518,7 +2310,6 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
     if source_enabled("nppes"):
         await _assert_nppes_canonical_ready(db_schema)
     staged_models_by_table = {}
-    isolated_addresses = None
     has_missing_stage = False
     for model_class in _NPI_STAGING_CLASSES:
         staged_model = _npi_staging_model(model_class, import_date)
@@ -2539,33 +2330,18 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
 
     async def has_table(table_name: str) -> bool:
         """Check whether a table exists in the active import schema."""
-        if scope is not None:
-            if table_name == archive_table_name() and isolated_addresses is not None:
-                return True
-            if table_name in scope.inputs or table_name == archive_table_name():
-                return await _npi_has_input_table(table_name, db_schema)
         exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}');")
         return bool(exists)
 
     async def has_table_column(table_name: str, column_name: str) -> bool:
         """Check whether an import table exposes a named column."""
-        column_schema = db_schema
-        if scope is not None:
-            relation = (
-                isolated_addresses.relation
-                if table_name == archive_table_name() and isolated_addresses is not None
-                else scope.input_relation(table_name)
-            )
-            if relation is None:
-                return False
-            column_schema, table_name = relation.schema_name, relation.table_name
         return bool(
             await db.scalar(
                 f"""
             SELECT EXISTS (
                 SELECT 1
                   FROM information_schema.columns
-                 WHERE table_schema = '{column_schema}'
+                 WHERE table_schema = '{db_schema}'
                    AND table_name = '{table_name}'
                    AND column_name = '{column_name}'
             );
@@ -2603,16 +2379,6 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
         }
 
         async def _canonical_address_resolve():
-            if scope is not None:
-                return await scope.resolve_addresses(
-                    ctx,
-                    staging_table=test.__tablename__,
-                    field_map=npi_address_field_map,
-                    output_schema=db_schema,
-                    pinned_inputs=scope.inputs,
-                    openaddresses_backfill=_is_environment_enabled("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False),
-                    cancel_check=_cancel_check,
-                )
             return await resolve_npi_address_archive(
                 staging_table=test.__tablename__,
                 field_map=npi_address_field_map,
@@ -2624,17 +2390,7 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
             "canonical_address_resolve",
             _canonical_address_resolve(),
         )
-        if scope is not None:
-            if (
-                type(address_stats) is not isolated_npi.NpiAddressPreparation
-                or address_stats.relation.schema_name != db_schema
-                or address_stats.relation.table_name != "npi_canonical_address"
-            ):
-                raise NPIPrerequisiteError("Isolated NPI canonical contribution is invalid")
-            isolated_addresses = address_stats
-            address_stats = isolated_addresses.stats
-            await scope.verify(ctx, phase="addresses_result")
-        elif _is_environment_enabled("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False):
+        if _is_environment_enabled("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False):
             oa_stats = await timed_shutdown_phase(
                 "openaddresses_archive_backfill",
                 refresh_archive_geocodes_from_openaddresses_sharded(schema=db_schema, run_id=run_id or None),
@@ -2656,25 +2412,12 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
         use_canonical_archive: bool,
     ):
         async def _run_geo_update():
-            archive_relation = (
-                isolated_addresses.relation.qualified
-                if isolated_addresses is not None and use_canonical_archive
-                else _npi_input_relation(archive_source, db_schema)
+            archive_relation = _npi_input_relation(archive_source, db_schema)
+            formatted_address_sql = (
+                f"{db_schema}.{ADDRESS_FORMAT_FUNCTION}("
+                "a.first_line, a.second_line, a.city_name, a.state_name, "
+                "a.postal_code, a.country_code)"
             )
-            if isolated_addresses is not None:
-                formatted_address_sql = (
-                    "b.formatted_address"
-                    if use_canonical_archive
-                    else "COALESCE((SELECT rendered.formatted_address FROM "
-                    + isolated_addresses.relation.qualified
-                    + " AS rendered WHERE rendered.address_key=a.address_key),a.formatted_address)"
-                )
-            else:
-                formatted_address_sql = (
-                    f"{db_schema}.{ADDRESS_FORMAT_FUNCTION}("
-                    "a.first_line, a.second_line, a.city_name, a.state_name, "
-                    "a.postal_code, a.country_code)"
-                )
             if use_canonical_archive and await has_table_column(
                 archive_source,
                 "address_key",
@@ -2707,8 +2450,6 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
 
     async def create_additional_indexes(cls, staged_model) -> None:
         """Create model-declared secondary indexes on a staged table."""
-        if scope is not None:
-            return
         if not hasattr(cls, "__my_additional_indexes__") or not cls.__my_additional_indexes__:
             return
         for index in cls.__my_additional_indexes__:
@@ -2914,14 +2655,10 @@ WHERE
             db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};"),
         )
 
-    vacuum_tasks = (
-        [
-            asyncio.create_task(vacuum_table(staged_models_by_table[cls.__main_table__]))
-            for cls in processing_classes_array
-        ]
-        if scope is None
-        else []
-    )
+    vacuum_tasks = [
+        asyncio.create_task(vacuum_table(staged_models_by_table[cls.__main_table__]))
+        for cls in processing_classes_array
+    ]
     await _drain_npi_save_tasks(vacuum_tasks)
 
     terminal_metrics_by_name = {
@@ -2936,39 +2673,6 @@ WHERE
     if type(lease) is not _NpiImportLease:
         raise NPIPrerequisiteError("NPI import lease is missing")
     schema = _postgres_identifier(db_schema)
-    if scope is not None:
-        if isolated_addresses is None:
-            raise NPIPrerequisiteError("Isolated NPI canonical contribution is missing")
-        stage_tables = tuple(
-            (cls.__main_table__, staged_models_by_table[cls.__main_table__].__tablename__)
-            for cls in processing_classes_array
-        )
-        await validate_npi_search_taxonomy_projection(
-            npi_table=dict(stage_tables)["npi"],
-            taxonomy_table=dict(stage_tables)["npi_taxonomy"],
-            schema=schema,
-            connection=lease.connection,
-        )
-        counts = []
-        for name, table in stage_tables:
-            counts.append((name, await lease.connection.fetchval(f"SELECT count(*)::bigint FROM {schema}.{table}")))
-        return await isolated_npi.handoff_npi_prepared_output(
-            ctx,
-            isolated_npi.NpiPreparedOutput(
-                run_id,
-                attempt_id,
-                attempt_started_at,
-                schema,
-                scope.control_schema,
-                import_date,
-                stage_tables,
-                tuple(counts),
-                isolated_addresses.relation,
-                evidence_receipt,
-                terminal_metrics_by_name,
-                isolated_addresses.address_witness,
-            ),
-        )
     publication_import_date = _canonical_publication_import_date(import_date)
     for publication_attempt in range(1, 5):
         publication_state_by_name: dict[str, object] = {}
@@ -3134,11 +2838,6 @@ async def save_npi_data(ctx, task):
     import_date = ctx["import_date"]
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
-    if isolated_npi.current_npi_isolated_execution() is not None:
-        async with _isolated_write_window(ctx) as writer:
-            await writer.add(task)
-            await writer.finish_window()
-        return
     write_tasks = []
     for key in task:
         match key:

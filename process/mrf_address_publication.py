@@ -3,7 +3,7 @@
 
 import asyncio
 import math
-from dataclasses import dataclass, field
+from dataclasses import field
 from uuid import UUID
 
 from sqlalchemy import MetaData, Table, text
@@ -25,7 +25,6 @@ MODEL_CLOSURE_CONTRACTS = (MODEL_CLOSURE_CONTRACT, ACCOUNTED_MODEL_CLOSURE_CONTR
 ADDRESS_COVERAGE_CONTRACT = "mrf-address-coverage.indexed-set.v3"
 MERGE_CONTRACT = "canonical-address-model-publication.v1"
 CANONICAL_POLICIES = {"npi": ("npi_canonical_address", 1, 0), "mrf": (STAGE_TABLE, 16, 5)}
-_OUTPUT_PREPARATION_ISSUER = object()
 MAX_REDIRECT_DEPTH = 64
 IDENTITY_COLUMNS = (
     "identity_key",
@@ -50,74 +49,6 @@ DISPLAY_COLUMNS = (
     "formatted_address_version",
     "formatted_address_source",
 )
-
-
-@dataclass(frozen=True)
-class CanonicalSourceFence:
-    """An ephemeral live session, never portable snapshot or request authority."""
-
-    session: object
-    transaction: object
-    backend_pid: int
-    database_oid: int
-    relation_oid: int
-    virtualtransaction: str
-
-
-async def capture_canonical_source_fence(session):
-    """Fence the fixed canonical heap on the separately admitted Publisher session."""
-    if not session.in_transaction():
-        raise RuntimeError("canonical source fence transaction is unavailable")
-    await session.execute(text('LOCK TABLE "mrf"."address_archive_v2" IN SHARE ROW EXCLUSIVE MODE NOWAIT'))
-    row = (
-        (
-            await session.execute(
-                text(
-                    "SELECT l.pid,l.database,l.relation,l.virtualtransaction FROM pg_catalog.pg_locks l "
-                    "WHERE l.locktype='relation' AND l.pid=pg_catalog.pg_backend_pid() "
-                    "AND l.database=(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()) "
-                    "AND l.relation=pg_catalog.to_regclass('mrf.address_archive_v2') "
-                    "AND l.mode='ShareRowExclusiveLock' AND l.granted"
-                )
-            )
-        )
-        .mappings()
-        .one()
-    )
-    return CanonicalSourceFence(
-        session, session.get_transaction(), row["pid"], row["database"], row["relation"], row["virtualtransaction"]
-    )
-
-
-async def require_canonical_source_fence(session, fence, schema_name):
-    """Corroborate the exact live holder after pinning the local canonical name."""
-    if (
-        not isinstance(fence, CanonicalSourceFence)
-        or schema_name != "mrf"
-        or not session.in_transaction()
-        or fence.session.get_transaction() is not fence.transaction
-        or not fence.transaction.is_active
-    ):
-        raise RuntimeError("canonical source fence transaction differs")
-    await session.execute(text('LOCK TABLE "mrf"."address_archive_v2" IN ACCESS SHARE MODE NOWAIT'))
-    held = await session.scalar(
-        text(
-            "SELECT CAST(:database AS oid)=(SELECT oid FROM pg_catalog.pg_database "
-            "WHERE datname=current_database()) AND CAST(:relation AS oid)=pg_catalog.to_regclass('mrf.address_archive_v2') "
-            "AND CAST(:pid AS integer)<>pg_catalog.pg_backend_pid() AND EXISTS(SELECT 1 FROM pg_catalog.pg_locks l "
-            "WHERE l.locktype='relation' AND l.pid=:pid AND l.database=CAST(:database AS oid) "
-            "AND l.relation=CAST(:relation AS oid) AND l.virtualtransaction=:transaction "
-            "AND l.mode='ShareRowExclusiveLock' AND l.granted)"
-        ),
-        {
-            "pid": fence.backend_pid,
-            "database": fence.database_oid,
-            "relation": fence.relation_oid,
-            "transaction": fence.virtualtransaction,
-        },
-    )
-    if held is not True:
-        raise RuntimeError("canonical source fence identity differs")
 
 
 def _clone_model_table(source: Table, metadata: MetaData, *, schema: str | None, name: str | None = None) -> Table:
@@ -351,56 +282,6 @@ async def _require_native_read_structure(session, oids, allowed_type_oids):
         allowed_type_oids=allowed_type_oids,
         allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist", "pg_trgm"),
     )
-
-
-async def require_native_read_catalog_subjects(session, oids, subjects):
-    """Check the address artifact's two heaps against all bounded execution subjects."""
-    from db.plan_release_storage import storage_identifier
-
-    if (
-        type(subjects) is not tuple
-        or not 1 <= len(subjects) <= 33
-        or any(type(role) is not str for role in subjects)
-        or len(set(subjects)) != len(subjects)
-        or len(oids) != 2
-    ):
-        raise RuntimeError("native SOURCE executable roles are invalid")
-    for role in subjects:
-        storage_identifier(role)
-    await _require_native_read_structure(session, oids, ())
-    safe = await session.scalar(
-        text(
-            "WITH objects(classid,objid) AS (SELECT 'pg_class'::regclass,indexrelid "
-            "FROM pg_catalog.pg_index WHERE indrelid=ANY(CAST(:oids AS oid[])) UNION ALL "
-            "SELECT 'pg_attrdef'::regclass,oid FROM pg_catalog.pg_attrdef WHERE adrelid=ANY(CAST(:oids AS oid[])) UNION ALL "
-            "SELECT 'pg_constraint'::regclass,oid FROM pg_catalog.pg_constraint WHERE conrelid=ANY(CAST(:oids AS oid[]))), "
-            "referenced AS (SELECT d.refclassid,d.refobjid FROM objects x JOIN pg_catalog.pg_depend d "
-            "ON (d.classid,d.objid)=(x.classid,x.objid)), "
-            "families AS (SELECT c.opcowner,f.opfowner,f.oid FROM pg_catalog.pg_index i,LATERAL unnest(i.indclass) cls(oid) "
-            "JOIN pg_catalog.pg_opclass c ON c.oid=cls.oid JOIN pg_catalog.pg_opfamily f ON f.oid=c.opcfamily "
-            "WHERE i.indrelid=ANY(CAST(:oids AS oid[]))), "
-            "owners(oid) AS (SELECT p.proowner FROM referenced d JOIN pg_catalog.pg_proc p "
-            "ON d.refclassid='pg_proc'::regclass AND p.oid=d.refobjid UNION "
-            "SELECT o.oprowner FROM referenced d JOIN pg_catalog.pg_operator o "
-            "ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid UNION "
-            "SELECT p.proowner FROM referenced d JOIN pg_catalog.pg_operator o "
-            "ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid JOIN pg_catalog.pg_proc p ON p.oid=o.oprcode UNION "
-            "SELECT opcowner FROM families UNION SELECT opfowner FROM families UNION "
-            "SELECT p.proowner FROM families f JOIN pg_catalog.pg_amproc a ON a.amprocfamily=f.oid "
-            "JOIN pg_catalog.pg_proc p ON p.oid=a.amproc UNION "
-            "SELECT o.oprowner FROM families f JOIN pg_catalog.pg_amop a ON a.amopfamily=f.oid "
-            "JOIN pg_catalog.pg_operator o ON o.oid=a.amopopr UNION "
-            "SELECT p.proowner FROM families f JOIN pg_catalog.pg_amop a ON a.amopfamily=f.oid "
-            "JOIN pg_catalog.pg_operator o ON o.oid=a.amopopr JOIN pg_catalog.pg_proc p ON p.oid=o.oprcode), "
-            "subjects AS (SELECT r.oid FROM unnest(CAST(:subjects AS text[])) requested(name) "
-            "LEFT JOIN pg_catalog.pg_roles r ON r.rolname=requested.name) "
-            "SELECT (SELECT count(*)=cardinality(CAST(:subjects AS text[])) AND bool_and(oid IS NOT NULL) FROM subjects) "
-            "AND NOT EXISTS(SELECT 1 FROM subjects s CROSS JOIN owners o WHERE pg_catalog.pg_has_role(s.oid,o.oid,'MEMBER'))"
-        ),
-        {"oids": list(oids), "subjects": list(subjects)},
-    )
-    if safe is not True:
-        raise RuntimeError("canonical source executable ownership is unsupported")
 
 
 def _native_execution_subjects(executable_roles):
@@ -764,12 +645,6 @@ async def _require_canonical_output_layout(session, ownership):
     return relation_oid
 
 
-async def _canonical_output_inventory(session, ownership):
-    """Observe the exact named output after native read and complete-family checks."""
-    await _require_canonical_output_layout(session, ownership)
-    return {"relations": [{"schema_name": ownership.schema_name, "relation_name": AddressArchiveV2.__tablename__}]}
-
-
 async def require_canonical_output_base(session, archive, evidence):
     """Validate the selected retained base by name and complete native model shape.
 
@@ -905,28 +780,6 @@ async def require_canonical_publication_catalog(session, archive):
     if not schema or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in schema):
         raise RuntimeError("canonical publication schema differs")
     await require_canonical_source_model(session, schema, lambda s, n: f'"{s}"."{n}"')
-
-
-def validate_canonical_publication(receipt, importer_id, contribution_oid):
-    """Keep local merge evidence distinct from a foreign canonical publication seal."""
-    _table, source_bit, priority = CANONICAL_POLICIES[importer_id]
-    if (
-        not isinstance(receipt, dict)
-        or set(receipt) != {"contract", "source_bit", "display_priority", "archive_oid", "contribution_oid"}
-        or receipt["contract"] != MERGE_CONTRACT
-        or type(receipt["source_bit"]) is not int
-        or receipt["source_bit"] != source_bit
-        or type(receipt["display_priority"]) is not int
-        or receipt["display_priority"] != priority
-        or any(
-            type(receipt[name]) is not int or not 0 < receipt[name] < 2**32
-            for name in ("archive_oid", "contribution_oid")
-        )
-        or receipt["contribution_oid"] != contribution_oid
-        or receipt["archive_oid"] == contribution_oid
-    ):
-        raise RuntimeError("canonical local publication receipt differs")
-    return receipt
 
 
 def referenced_address_filter(schema, qualified, *, key="row_value.address_key"):
