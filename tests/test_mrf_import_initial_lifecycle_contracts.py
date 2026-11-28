@@ -185,6 +185,7 @@ def _install_initial_import_mocks(
         "_prepare_import_tables",
         "download_it_and_save",
         "unzip",
+        "_purge_other_mrf_runs",
         "_init_mrf_run_state",
     ):
         monkeypatch.setattr(initial, name, AsyncMock())
@@ -345,6 +346,7 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         context_by_field, pushed_batches, sadp_only=None if current_headers == "legacy" else False
     )
     _assert_initial_import_queue_result(progress_events, redis)
+    initial._purge_other_mrf_runs.assert_awaited_once_with(redis, "run-contract")
 
 
 @pytest.mark.parametrize("invalid_row", ["missing_header", "blank_issuer", "invalid_issuer"])

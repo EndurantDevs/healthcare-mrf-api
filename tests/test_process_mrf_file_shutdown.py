@@ -548,3 +548,18 @@ async def test_current_run_job_runs_without_worker_run_id(monkeypatch):
 
     assert await guarded_job({}, task_by_field) == 1
     job.assert_awaited_once_with({}, task_by_field)
+
+
+@pytest.mark.asyncio
+async def test_new_run_purges_other_runs_including_locked_jobs():
+    """A new run drops other runs' queued jobs even when a dead worker's lock keeps them from running."""
+    redis = _StaleRunRedis()
+
+    await process_initial._purge_other_mrf_runs(redis, "run_new")
+
+    assert redis.queue_job_ids_by_name == {
+        process_initial.MRF_QUEUE_NAME: ["mrf:provider:run_new:cc"],
+        process_initial.MRF_FINISH_QUEUE_NAME: ["shutdown_mrf_run_new"],
+    }
+    assert "mrf:run:run_old:pending_work" in redis.deleted_keys
+    assert not any("run_new" in key for key in redis.deleted_keys)

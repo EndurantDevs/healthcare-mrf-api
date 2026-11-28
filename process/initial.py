@@ -419,6 +419,20 @@ async def _purge_stale_mrf_run(redis, run_id: str) -> None:
             await redis.delete(*(f"arq:job:{job_id}" for job_id in stale_job_ids))
 
 
+async def _purge_other_mrf_runs(redis, run_id: str) -> None:
+    """Drop queued parser work of every other run; a job a dead worker still locks never reaches the guard."""
+    queued_job_ids = [_decode_redis_text(raw_job_id) for raw_job_id in await redis.zrange(MRF_QUEUE_NAME, 0, -1)]
+    other_run_ids = {
+        job_id.split(":")[2]
+        for job_id in queued_job_ids
+        if job_id.startswith("mrf:") and job_id.count(":") >= 3 and job_id.split(":")[2] != run_id
+    }
+    for other_run_id in sorted(other_run_ids):
+        await _purge_stale_mrf_run(redis, other_run_id)
+    if other_run_ids:
+        logger.warning("Dropped queued work of %s other MRF run(s) before run %s", len(other_run_ids), run_id)
+
+
 def _current_mrf_run_job(job):
     """Skip MRF jobs left behind by another control run instead of re-running its work."""
 
@@ -3278,6 +3292,7 @@ async def init_file(ctx, task=None):
         max_urls = TEST_PLAN_URLS if is_test_mode_enabled else None
         selected_urls = sorted(url_list)[:max_urls] if max_urls else sorted(url_list)
         state_run_id = _mrf_run_state_id(ctx)
+        await _purge_other_mrf_runs(redis, state_run_id)
         await _init_mrf_run_state(redis, state_run_id)
         await mark_control_run(
             run_id,
