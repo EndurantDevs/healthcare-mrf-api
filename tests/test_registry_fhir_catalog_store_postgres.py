@@ -289,10 +289,10 @@ async def test_copy_batches_are_bounded(storage_database):
             )
             == 11
         )
-    # Six heap indexes, eleven secondary indexes and four on the derived network company summary.
+    # Six heap indexes, eleven secondary indexes and five on the derived network company summary.
     assert (
         await fixture.connection.fetchval("SELECT count(*) FROM pg_indexes WHERE schemaname=$1", candidate.schema_name)
-        == 21
+        == 22
     )
     await _assert_catalog_source_indexes(fixture.connection, candidate.schema_name)
     assert (

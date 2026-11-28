@@ -562,7 +562,7 @@ WITH source_companies AS MATERIALIZED (
    AND ($12::text[] IS NULL OR ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
      binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
      binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12)
-   AND ($8::text IS NULL OR EXISTS(SELECT 1 FROM matching_edges edge
+   AND ($8::text IS NULL OR EXISTS(SELECT 1 FROM {label_edges} edge
      WHERE edge.network_id=binding.network_id AND edge.binding_id=binding.binding_id
        AND edge.source_generation=company.source_generation))
 ), filtered AS MATERIALIZED (
@@ -570,8 +570,7 @@ WITH source_companies AS MATERIALIZED (
  WHERE network.metadata_generation=$1 AND NOT network.network_id=ANY($2::integer[])
    AND ($9::boolean IS NULL OR network.archived=$9)
    AND ($10::text IS NULL OR network.search_name LIKE $10 ESCAPE '\'
-     OR network.network_id IN (SELECT edge.network_id FROM matching_edges edge
-       JOIN searched_edges searched USING(network_id,relationship_id))
+     OR network.network_id IN ({searched_networks})
      OR network.network_id IN (SELECT network_id FROM source_label_networks WHERE broad_match))
    AND ($11::text IS NULL OR $11=ANY(network.benefit_codes))
    AND ($12::text[] IS NULL OR EXISTS(SELECT 1 FROM {control}.registry_fhir_catalog_binding binding
@@ -642,7 +641,22 @@ _GROUPED_RELATIONSHIPS_SQL = r"""SELECT count(*) AS total,coalesce(jsonb_agg(num
 
 _RELATIONSHIPS_SQL = " CROSS JOIN LATERAL (\n   {grouped}\n ) relationships\n"
 
-# The summary holds matching_edges' filter columns per edge key, so it answers plan-free filters exactly.
+_SEARCHED_NETWORKS_SQL = r"""SELECT edge.network_id FROM matching_edges edge
+       JOIN searched_edges searched USING(network_id,relationship_id)"""
+
+# Each key holds one company and one plan text, so a key that passes the filters and matches the text is an edge
+# that does; without plan_search in the key, search keeps the per-edge read above.
+_SUMMARY_SEARCHED_NETWORKS_SQL = r"""SELECT summary.network_id FROM company_keys summary
+       WHERE summary.company_search LIKE $10 ESCAPE '\' OR summary.plan_search LIKE $10 ESCAPE '\'"""
+
+# The summary holds matching_edges' filter columns per edge key, so it answers those filters exactly.
+# Snapshots summarized before plan_search joined the key answer only plan-free reads, without {plan_filter}.
+# ||'' keeps per-network probes on the network index; edge_networks repeats the filter in indexable form.
+_SUMMARY_PLAN_FILTER = r"""
+   AND ($8::text IS NULL OR summary.plan_search||'' LIKE $8 ESCAPE '\')"""
+_SUMMARY_PLAN_NETWORKS = r"""
+   AND ($8::text IS NULL OR summary.plan_search LIKE $8 ESCAPE '\')"""
+
 _SUMMARY_EDGE_NETWORKS_SQL = r"""label_generations AS MATERIALIZED (
  SELECT DISTINCT source_generation FROM source_companies company
  WHERE $7::text IS NOT NULL AND $5::uuid IS NULL AND $6::uuid IS NULL
@@ -652,7 +666,7 @@ _SUMMARY_EDGE_NETWORKS_SQL = r"""label_generations AS MATERIALIZED (
  WHERE summary.metadata_generation=$1
    AND (summary.company_id IS NULL OR NOT summary.company_id=ANY($3::uuid[]))
    AND ($5::uuid IS NULL OR summary.company_id=$5)
-   AND ($6::uuid IS NULL OR (summary.group_id=$6 AND NOT summary.group_id=ANY($4::uuid[])))
+   AND ($6::uuid IS NULL OR (summary.group_id=$6 AND NOT summary.group_id=ANY($4::uuid[]))){plan_filter}
    AND ($12::text[] IS NULL OR EXISTS(SELECT FROM {control}.registry_fhir_catalog_binding binding
      WHERE (binding.metadata_generation,binding.network_id,binding.binding_id,binding.source_id)=
        (summary.metadata_generation,summary.network_id,summary.binding_id,summary.source_id)
@@ -664,8 +678,8 @@ _SUMMARY_EDGE_NETWORKS_SQL = r"""label_generations AS MATERIALIZED (
        AND summary.source_generation IN (SELECT source_generation FROM label_generations)))
 ), edge_networks AS MATERIALIZED (
  SELECT DISTINCT network_id FROM company_keys summary
- WHERE ($5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL)
-   AND ($7::text IS NULL OR summary.company_search LIKE $7 ESCAPE '\')"""
+ WHERE ($5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL OR $8::text IS NOT NULL)
+   AND ($7::text IS NULL OR summary.company_search LIKE $7 ESCAPE '\'){plan_networks}"""
 
 # Keys never share a document unless flagged, so totals add up and each key's first ids hold its first documents.
 # Redaction can merge documents across keys and nested offsets need every document, so both keep the grouped read.
@@ -693,7 +707,8 @@ _SUMMARY_RELATIONSHIPS_SQL = r""" CROSS JOIN LATERAL (
 """
 
 
-def _catalog_page_statement(snapshot, manifest, *, summarized=False):
+def _catalog_page_statement(snapshot, manifest, *, summary=""):
+    """summary is "" for the grouped read, "company" for a summary without plan_search, "plan" with it."""
     parameters = ()
     directory_available = "false"
     if manifest is not None:
@@ -713,17 +728,20 @@ def _catalog_page_statement(snapshot, manifest, *, summarized=False):
                 candidate=storage_identifier(manifest.schema_name), addresses=addresses
             )
     control = storage_identifier(snapshot["schema_name"])
-    edge_networks, relationships = (
-        (_SUMMARY_EDGE_NETWORKS_SQL, _SUMMARY_RELATIONSHIPS_SQL)
-        if summarized
-        else (_EDGE_NETWORKS_SQL, _RELATIONSHIPS_SQL)
+    edge_networks, relationships, label_edges = (
+        (_SUMMARY_EDGE_NETWORKS_SQL, _SUMMARY_RELATIONSHIPS_SQL, "company_keys")
+        if summary
+        else (_EDGE_NETWORKS_SQL, _RELATIONSHIPS_SQL, "matching_edges")
     )
+    plan_filter, plan_networks = (_SUMMARY_PLAN_FILTER, _SUMMARY_PLAN_NETWORKS) if summary == "plan" else ("", "")
     return (
         _PAGE_SQL.format(
             control=control,
             directory_available=directory_available,
-            edge_networks=edge_networks.format(control=control),
+            edge_networks=edge_networks.format(control=control, plan_filter=plan_filter, plan_networks=plan_networks),
             relationships=relationships.format(control=control, grouped=_GROUPED_RELATIONSHIPS_SQL),
+            label_edges=label_edges,
+            searched_networks=_SUMMARY_SEARCHED_NETWORKS_SQL if summary == "plan" else _SEARCHED_NETWORKS_SQL,
         ),
         parameters,
     )
@@ -732,13 +750,17 @@ def _catalog_page_statement(snapshot, manifest, *, summarized=False):
 _NETWORK_COMPANY_SCHEMAS = {}
 
 
-async def _has_network_companies(connection, schema_name):
+async def _network_summary(connection, schema_name):
     """Published schemas never change, so one lookup per schema decides the summarized statement."""
     if schema_name not in _NETWORK_COMPANY_SCHEMAS:
         relation = storage_identifier(schema_name) + "." + NETWORK_COMPANY_TABLE
-        _NETWORK_COMPANY_SCHEMAS[schema_name] = (
-            await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", relation) is True
+        summary = await connection.fetchval(
+            "SELECT CASE WHEN to_regclass($1) IS NULL THEN '' WHEN EXISTS(SELECT FROM pg_attribute "
+            "WHERE attrelid=to_regclass($1) AND attname='plan_search' AND NOT attisdropped) "
+            "THEN 'plan' ELSE 'company' END",
+            relation,
         )
+        _NETWORK_COMPANY_SCHEMAS[schema_name] = summary if summary in ("company", "plan") else ""
     return _NETWORK_COMPANY_SCHEMAS[schema_name]
 
 
@@ -847,8 +869,10 @@ async def read_fhir_catalog(
         continuation_scope_sha256 = _continuation_scope(
             query, manifest, snapshot, exclusions, policy, access_scope_sha256
         )
-        summarized = query.plan_search is None and await _has_network_companies(connection, snapshot["schema_name"])
-        sql, address_parameters = _catalog_page_statement(snapshot, manifest, summarized=summarized)
+        summary = await _network_summary(connection, snapshot["schema_name"])
+        if query.plan_search is not None and summary != "plan":
+            summary = ""
+        sql, address_parameters = _catalog_page_statement(snapshot, manifest, summary=summary)
         entry = await connection.fetchrow(
             sql,
             *(

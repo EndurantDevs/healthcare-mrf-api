@@ -115,7 +115,7 @@ NETWORK_COMPANY_TABLE = "registry_fhir_catalog_network_company"
 
 
 def network_company_sql(namespace, *, trigram_schema="public"):
-    """Summarize the closed relationship heap so company reads skip per-edge scans and grouping."""
+    """Summarize the closed relationship heap so company and plan reads skip per-edge scans and grouping."""
     table = f"{namespace}.{NETWORK_COMPANY_TABLE}"
     return (
         f"""CREATE TABLE {table} (
@@ -128,6 +128,7 @@ def network_company_sql(namespace, *, trigram_schema="public"):
       company_id uuid,
       group_id uuid,
       company_search text NOT NULL,
+      plan_search text NOT NULL,
       relationship_count bigint NOT NULL CHECK(relationship_count>0),
       shared_documents boolean NOT NULL,
       first_relationship_ids text[] COLLATE "C" NOT NULL
@@ -136,12 +137,13 @@ def network_company_sql(namespace, *, trigram_schema="public"):
         # One row per distinct visible document inside each key; shared marks a document seen under two keys.
         f"""INSERT INTO {table}
     SELECT metadata_generation,network_id,source_id,binding_id,source_generation,evidence_generation,
-      company_id,group_id,company_search,count(*),bool_or(keys>1),
+      company_id,group_id,company_search,plan_search,count(*),bool_or(keys>1),
       (array_agg(relationship_id ORDER BY relationship_id))[1:{NESTED_LIMIT}]
     FROM (
       SELECT edge.metadata_generation,edge.network_id,edge.source_id,edge.binding_id,edge.source_generation,
         split_part(binding.document_json->>'evidence_id',':',1) AS evidence_generation,
-        edge.company_id,edge.group_id,edge.company_search,min(edge.relationship_id) AS relationship_id,
+        edge.company_id,edge.group_id,edge.company_search,edge.plan_search,
+        min(edge.relationship_id) AS relationship_id,
         count(*) OVER (PARTITION BY edge.metadata_generation,edge.network_id,
           edge.document_json-'relationship_id') AS keys
       FROM {namespace}.registry_fhir_catalog_relationship edge
@@ -150,16 +152,18 @@ def network_company_sql(namespace, *, trigram_schema="public"):
            (edge.metadata_generation,edge.network_id,edge.binding_id,edge.source_id)
       WHERE edge.source_id='registry-manual' OR binding.binding_id IS NOT NULL
       GROUP BY edge.metadata_generation,edge.network_id,edge.source_id,edge.binding_id,edge.source_generation,
-        binding.document_json->>'evidence_id',edge.company_id,edge.group_id,edge.company_search,
+        binding.document_json->>'evidence_id',edge.company_id,edge.group_id,edge.company_search,edge.plan_search,
         edge.document_json-'relationship_id'
     ) documents
     GROUP BY metadata_generation,network_id,source_id,binding_id,source_generation,evidence_generation,
-      company_id,group_id,company_search""",
+      company_id,group_id,company_search,plan_search""",
         f"CREATE INDEX registry_fhir_catalog_network_company_idx ON {table} (metadata_generation,network_id)",
         f"CREATE INDEX registry_fhir_catalog_network_company_id_idx ON {table} (metadata_generation,company_id)",
         f"CREATE INDEX registry_fhir_catalog_network_company_group_idx ON {table} (metadata_generation,group_id)",
         f"CREATE INDEX registry_fhir_catalog_network_company_trgm ON {table} "
         f"USING gin (company_search {trigram_schema}.gin_trgm_ops)",
+        f"CREATE INDEX registry_fhir_catalog_network_company_plan_trgm ON {table} "
+        f"USING gin (plan_search {trigram_schema}.gin_trgm_ops)",
         f"ANALYZE {table}",
     )
 
