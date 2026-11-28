@@ -16,6 +16,7 @@ class GuardianCapture:
     def __init__(self, connection, scope, budget, *, fresh):
         self.db = connection
         self.budget = budget
+        self.coverage_invalidated = False
         if fresh:
             self.db.executescript("""
                 BEGIN IMMEDIATE;
@@ -52,6 +53,11 @@ class GuardianCapture:
                 self.db.execute("INSERT INTO edition VALUES (?, 0)", (scope,))
         if self.db.execute("SELECT scope FROM edition").fetchall() != [(scope,)]:
             raise ValueError("guardian_retained_scope_changed")
+        if not self.db.execute("PRAGMA user_version").fetchone()[0]:
+            # Rebuild legacy geographic shortcuts from retained responses under the current rules.
+            with self.db:
+                self.db.execute("DELETE FROM circle")
+                self.db.execute("PRAGMA user_version=1")
 
     def reserve(self, kind, key):
         """Charge before sending. A lost response must never be silently replayed."""
@@ -144,22 +150,29 @@ class GuardianCapture:
     def observe(self, scope, observations):
         """Exclude coordinate conflicts from cross-window coverage proofs."""
         with self.db:
+            conflicts = self.db.executemany(
+                "UPDATE observation SET lat=NULL,lon=NULL WHERE scope=? AND payload=? AND lat IS NOT NULL "
+                "AND (lat IS NOT ? OR lon IS NOT ?)",
+                ((scope, key, lat, lon) for key, lat, lon, *_ in observations),
+            ).rowcount
             self.db.executemany(
-                "INSERT INTO observation VALUES (?,?,?,?,?,?) ON CONFLICT(scope,payload) DO UPDATE SET lat=NULL,lon=NULL "
-                "WHERE observation.lat IS NOT excluded.lat OR observation.lon IS NOT excluded.lon",
-                ((scope, *row) for row in observations),
+                "INSERT OR IGNORE INTO observation VALUES (?,?,?,?,?,?)", ((scope, *row) for row in observations)
             )
+            if conflicts:
+                # A previously credited position may have closed a window earlier in this sweep.
+                self.db.execute("DELETE FROM circle WHERE scope=?", (scope,))
+                self.coverage_invalidated = True
 
-    def has_located_key(self, scope, keys):
-        """Check whether earlier coverage could rely on one of these positions."""
-        return (
-            self.db.execute(
-                "SELECT 1 FROM observation WHERE scope=? AND payload IN (SELECT value FROM json_each(?)) "
-                "AND lat IS NOT NULL LIMIT 1",
-                (scope, canonical_json(keys)),
-            ).fetchone()
-            is not None
-        )
+    def has_locations_for_all_keys(self, scope, keys):
+        """A reusable geographic proof needs unambiguous retained positions for its direct cards."""
+        if not keys:
+            return False
+        missing = self.db.execute(
+            "SELECT 1 FROM json_each(?) AS keys WHERE NOT EXISTS ("
+            "SELECT 1 FROM observation WHERE scope=? AND payload=keys.value AND lat IS NOT NULL) LIMIT 1",
+            (canonical_json(sorted(keys)), scope),
+        ).fetchone()
+        return missing is None
 
     def is_count_reconciled(self, scope, center, radius, keys, total):
         """Count only unambiguous same-selector identities safely inside this actual search circle."""
@@ -237,10 +250,18 @@ class GuardianCapture:
 
     def record_gap(self, window, reason, count, keys, observed_span):
         """Store an unresolved cell and its direct publisher evidence."""
+        window_key = canonical_json(window)
         with self.db:
+            prior = self.db.execute("SELECT keys,reason,reported FROM gap WHERE window=?", (window_key,)).fetchone()
+            if prior:
+                if prior[2] != count:
+                    raise ValueError("guardian_search_count_mismatch")
+                keys = keys.union(strict_json(prior[0]))
+                if prior[1] == "direct_only_result_cap":
+                    reason = prior[1]
             self.db.execute(
                 "INSERT OR REPLACE INTO gap VALUES (?,?,?,?,?,?)",
-                (canonical_json(window), window[0], reason, count, canonical_json(sorted(keys)), observed_span),
+                (window_key, window[0], reason, count, canonical_json(sorted(keys)), observed_span),
             )
 
     def gap_scopes(self):
@@ -256,12 +277,12 @@ class GuardianCapture:
         """Read one selector's capped cells without revisiting cleared rows."""
         after = ""
         while rows := self.db.execute(
-            "SELECT window,reported,keys,observed_span FROM gap WHERE scope=? AND window>? "
-            "AND reason='unresolved_result_cap' ORDER BY window LIMIT 32",
+            "SELECT window,reported,keys,observed_span,reason FROM gap WHERE scope=? AND window>? "
+            "AND reason IN ('unresolved_result_cap','direct_only_result_cap') ORDER BY window LIMIT 32",
             (scope, after),
         ).fetchall():
-            for window, count, keys, observed_span in rows:
-                yield strict_json(window), count, set(strict_json(keys)), observed_span
+            for window, count, keys, observed_span, reason in rows:
+                yield strict_json(window), count, set(strict_json(keys)), observed_span, reason
             after = rows[-1][0]
 
     def progress(self):
