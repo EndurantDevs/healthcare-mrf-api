@@ -55,17 +55,27 @@ def _replace_revision_body(schema):
 
 
 def upgrade():
-    """Preserve lineage, provenance and revision guards while mapping declared names."""
+    """Preserve lineage, provenance and revision guards while mapping declared names.
+
+    A table that already has the named columns, for example in a copied database, keeps them; the counter
+    body and the shape check, which validates the stored row, are installed either way.
+    """
     schema = _schema()
     table = storage_identifier(schema) + '."npi_result_generation"'
-    op.execute(f"ALTER TABLE {table} ADD COLUMN serving_schema varchar(63), ADD COLUMN serving_relation_names text[]")
+    op.execute(
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS serving_schema varchar(63), "
+        "ADD COLUMN IF NOT EXISTS serving_relation_names text[]"
+    )
     op.execute(
         text(
             f"UPDATE {table} SET serving_schema=:schema, serving_relation_names=:names WHERE origin_lineage_id IS NOT NULL"
         ).bindparams(schema=schema, names=list(_NAMES))
     )
     _replace_revision_body(schema)
-    op.execute(f"ALTER TABLE {table} DROP CONSTRAINT npi_result_generation_shape_check, DROP COLUMN relation_oids")
+    op.execute(
+        f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS npi_result_generation_shape_check, "
+        "DROP COLUMN IF EXISTS relation_oids"
+    )
     names = "ARRAY[" + ",".join("'" + name + "'" for name in _NAMES) + "]::text[]"
     op.execute(f"""ALTER TABLE {table} ADD CONSTRAINT npi_result_generation_shape_check CHECK (
       singleton IS TRUE AND local_generation BETWEEN 0 AND 9223372036854775807 AND (
