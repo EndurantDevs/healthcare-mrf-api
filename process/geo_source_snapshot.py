@@ -204,7 +204,7 @@ async def _publish(session, candidate):
     root = storage_relation(candidate.schema, ROOT)
     stage = storage_relation(candidate.schema, candidate.stage)
     await session.execute(text(f"LOCK TABLE ONLY {root},{stage} IN ACCESS EXCLUSIVE MODE NOWAIT"))
-    await require_geo_storage(session, schema_name=candidate.schema, expected_oid=candidate.old_oid, is_incumbent=True)
+    await require_geo_storage(session, schema_name=candidate.schema, is_incumbent=True)
     await require_geo_storage(session, schema_name=candidate.schema, relation_name=candidate.stage)
     authority = await generation.read_reference_family_result_generation_authority(
         session,

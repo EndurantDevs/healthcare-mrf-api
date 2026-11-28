@@ -196,7 +196,7 @@ async def _assert_tiger_reader_security(reader_sessions, first, owner):
                     await session.execute(text(statement))
 
 
-async def _prepare_replacement_tiger_leaf(sessions, first, receipt, owner, owner_oid):
+async def _prepare_replacement_tiger_leaf(sessions, first, receipt, owner):
     """Build a second real source epoch without reading protected target data as legacy authority."""
     admin_sessions, publisher_sessions, _reader_sessions = sessions
     # Capture a second genuine source epoch in a separate temporary source
@@ -214,15 +214,12 @@ async def _prepare_replacement_tiger_leaf(sessions, first, receipt, owner, owner
                 (first.ownership.schema_name, name) for name, _old_token in first.ownership.relation_oids
             ),
             expected_children=(),
-            owner_oid=owner_oid,
             expected_parent_inventory=receipt["parent_inventory"],
         )
     return second, second_validation
 
 
-async def _exchange_tiger_leaves_and_rollback(
-    publisher_sessions, first, second, second_validation, cutover, receipt, owner_oid
-):
+async def _exchange_tiger_leaves_and_rollback(publisher_sessions, first, second, second_validation, cutover, receipt):
     """Late failure and committed inverse both preserve the original child OIDs."""
     with pytest.raises(RuntimeError, match="late failure"):
         async with publisher_sessions.begin() as session:
@@ -262,7 +259,6 @@ async def _exchange_tiger_leaves_and_rollback(
             expected_children=tuple(
                 (second.ownership.schema_name, name) for name, _old_token in second.ownership.relation_oids
             ),
-            owner_oid=owner_oid,
             expected_parent_inventory=receipt["parent_inventory"],
         )
 
@@ -292,6 +288,6 @@ async def test_genuine_tiger_snapshot_children_activation_rollback_security_and_
         await _provision_tiger_roots(url, sessions, roles)
         first, cutover, receipt, owner_oid = await _initial_tiger_child_activation(sessions, roles)
         await _assert_tiger_reader_security(sessions[2], first, roles[0])
-        second, validation = await _prepare_replacement_tiger_leaf(sessions, first, receipt, roles[0], owner_oid)
-        await _exchange_tiger_leaves_and_rollback(sessions[1], first, second, validation, cutover, receipt, owner_oid)
+        second, validation = await _prepare_replacement_tiger_leaf(sessions, first, receipt, roles[0])
+        await _exchange_tiger_leaves_and_rollback(sessions[1], first, second, validation, cutover, receipt)
         await _assert_tiger_database_backup(url, sessions, receipt, owner_oid, tmp_path)

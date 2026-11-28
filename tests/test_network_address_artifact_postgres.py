@@ -16,7 +16,6 @@ from sqlalchemy.engine import make_url
 
 from process import entity_address_alias_guard as alias_guard
 from process import entity_address_snapshot_adoption as adoption
-from process import entity_address_snapshot_preparation as preparation
 from process import network_address_artifact as artifact
 from process.network_address_projection import PinnedAddressSource
 from tests.test_address_numeric_grid_alias_runtime_db import _create_alias_probe_schema
@@ -210,7 +209,6 @@ async def _native_swap(resources, monkeypatch):
                 schema,
                 SimpleNamespace(__main_table__="entity_address_unified"),
                 SimpleNamespace(__tablename__="entity_address_unified_next", __my_additional_indexes__=[]),
-                await preparation._publisher_authority(native_db.session),
             )
             oid = await resources.publisher.fetchval(
                 "SELECT to_regclass($1)::oid::bigint", f'"{schema}".entity_address_unified'

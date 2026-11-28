@@ -53,13 +53,11 @@ async def test_native_settings_declaration_preserves_quoted_schema_and_timezone(
             )
             before = await connection.fetchrow(query, signature)
             assert json.loads(before["definition"])["proconfig"] == old_settings
-            expected = settings._declaration_after(before["body"], old_settings, target_settings)
             await connection.execute("ALTER FUNCTION " + signature + " SET " + target_settings[0])
             after = await connection.fetchrow(query, signature)
             original_definition = json.loads(before["definition"])
             original_definition["proconfig"] = target_settings
             assert json.loads(after["definition"]) == original_definition
-            assert after["body"] == expected
     finally:
         if connection.is_in_transaction():
             await transaction.rollback()

@@ -25,7 +25,6 @@ from process.reference_family_archive import (
     _source_metadata,
     mrf_publication_digest,
     prepare_reference_family_activation,
-    protected_publisher_owner,
     reference_family_profile_contract,
     reference_family_spec,
     validate_reference_family_manifest,
@@ -289,14 +288,12 @@ async def admit_registry_aca_global_epoch(session, prepared, *, runtime_roles):
     if not session.in_transaction():
         _invalid()
     _metadata(prepared, runtime_roles)
-    owner_oid = await protected_publisher_owner(session)
     validation = await prepare_reference_family_activation(
         session,
         ownership=prepared.ownership,
         manifest=prepared.manifest,
         package_id=hashlib.sha256(_canonical_json(prepared.manifest.as_dict())).hexdigest(),
         profile_contract=reference_family_profile_contract(prepared.manifest),
-        sealed_owner_oid=owner_oid,
     )
     epoch = PinnedACAGlobalEpoch(prepared, validation, runtime_roles)
     await _native_epoch(session, epoch)

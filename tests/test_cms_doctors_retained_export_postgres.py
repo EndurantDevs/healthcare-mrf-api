@@ -192,8 +192,6 @@ async def test_retained_export_refuses_foreign_owner_and_assumed_actor_before_cr
                 )
             assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": schema}) is None
             await session.execute(text(f'SET LOCAL ROLE "{component.retention_owner}"'))
-            with pytest.raises(archive.ReferenceFamilyArchiveError, match="protected publisher is unavailable"):
-                await archive.protected_publisher_owner(session)
             await session.execute(text("RESET ROLE"))
             await _assert_retained_actor(session, component)
 

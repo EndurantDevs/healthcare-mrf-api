@@ -989,28 +989,6 @@ async def validate_frozen_source_handoff(connection, directory, handoff, *, prot
     )
 
 
-async def validate_frozen_cms_source_handoff(connection, directory, handoff, *, protected_owner_role):
-    """Check complete frozen CMS intake without claiming identity or serving readiness."""
-    from process.provider_directory_cms_source_handoff import validate_cms_handoff_rows
-
-    storage._require(type(handoff) is FHIRSourceCandidateHandoff, "handoff_required")
-    document = handoff.document
-    storage._require(document.get("contract") == storage.CMS_ISOLATED_CONTRACT, "cms_handoff_required")
-    storage._require(connection.is_in_transaction() is True, "transaction_required")
-    transaction_id = await connection.fetchval("SELECT pg_current_xact_id()::text")
-    result = await _validate_frozen_source_handoff(
-        connection, directory, handoff, protected_owner_role=protected_owner_role
-    )
-    policy = SimpleNamespace(schema=document["storage"]["storage_schema"], owner_role=protected_owner_role)
-    await validate_cms_handoff_rows(connection, policy, document)
-    storage._require(
-        connection.is_in_transaction() is True
-        and await connection.fetchval("SELECT pg_current_xact_id()::text") == transaction_id,
-        "transaction_changed",
-    )
-    return {**result, "source_release": document["identity"]["metadata"]["source_release"]}
-
-
 async def _validate_frozen_source_handoff(connection, directory, handoff, *, protected_owner_role):
     storage._require(connection.is_in_transaction(), "transaction_required")
     document = handoff.document

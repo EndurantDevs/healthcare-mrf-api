@@ -9,8 +9,7 @@ import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-from process import provider_directory_cms_callable_custody as custody
-from tests.test_provider_directory_cms_callable_custody import _migration_functions
+from tests.test_cms_archive_transaction_migration import _migration_functions, body_digest
 
 
 def _migration():
@@ -38,9 +37,8 @@ def test_authentic_successor_body_requires_text_and_jsonb_without_an_untyped_fal
     body = _migration_functions()[name][-1]
     old_call, new_call = migration._calls("snapshot_schema")
     assert old_call not in body and body.count(new_call) == 1
-    assert custody._body_digest(body, "snapshot_schema") == next_hash
-    assert custody._body_digest(body.replace(new_call, old_call), "snapshot_schema") == previous_hash
-    assert custody._CONTRACTS[name][-1] == next_hash
+    assert body_digest(body, "snapshot_schema") == next_hash
+    assert body_digest(body.replace(new_call, old_call), "snapshot_schema") == previous_hash
 
 
 def test_offline_repair_keeps_native_identity_acl_and_all_nonbody_attributes(monkeypatch):

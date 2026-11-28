@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from db.connection import Database
 from db.migration_named_preparation import TABLES as NAMED_CLAIM_TABLES
 from db.migration_named_preparation import upgrade_named_preparation_catalog
+from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_source_policy as source
 from process.entity_address_cutover_contract import postgres_sqlstate
 from process.plan_release_storage_custody import storage_roles
@@ -761,56 +762,126 @@ async def bootstrap_source_component(engine, policy, *, migration_prefixes=None)
 _ORIGINAL_SOURCE_BOOTSTRAP = bootstrap_source_component
 
 
-async def _source_guard_preimage(driver, provision, schema):
-    roots = [schema + "." + root for root in (*provision.PAYLOAD_ROOTS, *provision.CONTROL_ROOTS)]
-    return await driver.fetchval(
-        "WITH RECURSIVE roots(oid) AS (SELECT to_regclass(name)::oid FROM unnest($1::text[]) n(name) UNION "
-        "SELECT (value->>'original_oid')::oid FROM "
-        + schema
-        + ".pd_dataset_migration_plan,jsonb_each(plan->'tables')),"
-        "family(oid) AS (SELECT oid FROM roots UNION SELECT i.inhrelid FROM pg_inherits i JOIN family f ON i.inhparent=f.oid) "
-        "SELECT jsonb_build_object('relations',(SELECT jsonb_agg(to_jsonb(c) ORDER BY oid) FROM pg_class c "
-        "WHERE oid IN(SELECT oid FROM family)),'triggers',(SELECT jsonb_agg(to_jsonb(t) ORDER BY oid) "
-        "FROM pg_trigger t WHERE tgrelid IN(SELECT oid FROM family)),'constraints',(SELECT jsonb_agg(to_jsonb(k) ORDER BY oid) "
-        "FROM pg_constraint k WHERE conrelid IN(SELECT oid FROM family)),'functions',(SELECT jsonb_agg("
-        "jsonb_build_array(p.oid,p.proowner,p.proacl,pg_get_functiondef(p.oid)) ORDER BY p.oid) FROM pg_proc p "
-        "WHERE p.oid IN(SELECT tgfoid FROM pg_trigger WHERE tgrelid IN(SELECT oid FROM family))))",
-        roots,
-    )
+_MINT_ROOTS = (
+    "provider_directory_organization_identity",
+    "provider_directory_site_identity",
+    "provider_directory_insurance_network_identity",
+)
+_RETIRED_FUNCTIONS = (
+    "prepare_pd_rooted_dataset_candidate(text)",
+    "finish_pd_rooted_dataset_candidate(text)",
+    "prepare_pd_practitioner_dataset_candidate(text)",
+    "finish_pd_practitioner_dataset_candidate(text)",
+    "prepare_pd_dataset_candidate(text,text)",
+    "finish_pd_dataset_candidate(text,text)",
+    "validate_pd_dataset_candidate(text,text)",
+    "prepare_pd_generic_dataset_storage()",
+    "guard_pd_generic_dataset_finalization()",
+    "validate_pd_dataset_bulk_relationships(text,text)",
+    "pd_dataset_candidate_tables(text)",
+    "guard_pd_dataset_candidate_parent()",
+    "deny_pd_dataset_candidate_write()",
+)
+_RETAINED_EMPTY_SQL = """SELECT c.oid::bigint,n.nspname,c.relname FROM pg_class c
+ JOIN pg_namespace n ON n.oid=c.relnamespace WHERE NOT c.relispartition
+ AND c.oid IN (SELECT (value->>'original_oid')::oid FROM {plan},jsonb_each(plan->'tables'))"""
+_PAYLOAD_HOOKS_SQL = """SELECT format('DROP TRIGGER %I ON %I.%I',t.tgname,n.nspname,c.relname)
+ FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE t.tgrelid=ANY($1::oid[]) AND NOT t.tgisinternal
+ UNION ALL SELECT format('ALTER TABLE %I.%I DROP CONSTRAINT %I',n.nspname,c.relname,k.conname)
+ FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE k.conrelid=ANY($1::oid[]) AND k.contype='f' AND k.conparentid=0"""
 
 
 async def provision_source_component(engine, policy):
-    """Real native writer/legacy custody callbacks, without an enrolled-manifest claim."""
+    """Apply the legacy generic-source cut: close grants, drop old guards and partition the payload."""
+    from db.migration_provider_directory_dataset_candidates import TABLES
     from process import provider_directory_generic_source_provision as provision
+    from process.plan_release_storage_provision import _FAMILY_SQL, _close_relation_grants
+    from process.provider_directory_generic_source_completion import _KEYS
+    from process.provider_directory_generic_source_storage import HEADER, RELATIONSHIP, WITNESS
+    from process.provider_directory_source_checkpoint_catalog import (
+        CHECKPOINT_LAYOUTS,
+        capture_checkpoint_controls,
+        retire_bulk_abandonment_hooks,
+    )
+    from process.provider_directory_source_coverage_control import COVERAGE_ROOT
+    from process.provider_directory_source_proof_control import PROOF_ROOT, retire_proof_control_hooks
+    from tests.cms_control_privileges_support import grant_source_admission_controls
 
+    controls = (HEADER, PROOF_ROOT, COVERAGE_ROOT, *CHECKPOINT_LAYOUTS, "pd_dataset_migration_plan", *_MINT_ROOTS)
+    controls += tuple(name.removesuffix("_resource") for name in TABLES[4:])
+    roots = [storage_relation(policy.schema, name) for name in (*provision.PAYLOAD_ROOTS, *controls)]
+    payload_roots = [storage_relation(policy.schema, name) for name in provision.PAYLOAD_ROOTS]
+    plan = storage_relation(policy.schema, "pd_dataset_migration_plan")
     async with async_sessionmaker(engine)() as session, session.begin():
+        # The first ORM statement opens the transaction the raw driver then shares.
         await session.execute(text("SELECT current_user=session_user"))
         driver = await _copy_driver(session)
-        expected = await _source_guard_preimage(driver, provision, policy.schema)
-
-        async def legacy(connection, actual_policy, family):
-            assert actual_policy == policy and family
-            assert await _source_guard_preimage(connection, provision, policy.schema) == expected
-
-        async def writers(connection, actual_policy):
-            assert actual_policy == policy
-            assert not await connection.fetchval(
-                "SELECT EXISTS(SELECT FROM pg_class c,pg_roles r WHERE c.relnamespace=$1::regnamespace "
-                "AND c.relname=ANY($2::text[]) AND r.rolname=ANY($3::text[]) AND "
-                "(has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR "
-                "has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')))",
-                policy.schema,
-                list((*provision.PAYLOAD_ROOTS, *provision.MINT_ROOTS)),
-                list(policy.runtime_roles),
-            )
-
-        return await provision.provision_generic_source_storage(
-            driver,
-            policy,
-            verify_role_profile=verify_native_source_profile,
-            verify_writer_closure=writers,
-            verify_legacy_guards=legacy,
+        # Catalog definitions below must render schema-qualified, as the checkpoint layout expects.
+        await driver.execute("SET LOCAL search_path=pg_catalog,pg_temp")
+        retained = await driver.fetch(_RETAINED_EMPTY_SQL.format(plan=plan))
+        for relation in (*await driver.fetch(_FAMILY_SQL, roots), *retained):
+            await _close_relation_grants(driver, relation, policy.owner_role, policy.runtime_roles)
+        await grant_source_admission_controls(driver, policy)
+        await retire_bulk_abandonment_hooks(
+            driver, policy, await capture_checkpoint_controls(driver, policy, legacy=True)
         )
+        await retire_proof_control_hooks(driver, policy)
+        payload_oids = [relation["oid"] for relation in (*await driver.fetch(_FAMILY_SQL, payload_roots), *retained)]
+        for (statement,) in await driver.fetch(_PAYLOAD_HOOKS_SQL, payload_oids):
+            await driver.execute(statement)
+        for root in (WITNESS, RELATIONSHIP):
+            await _partition_dataset_payload(driver, policy, root, _KEYS[root])
+        for relation in await driver.fetch(_FAMILY_SQL, roots):
+            await _close_relation_grants(driver, relation, policy.owner_role, policy.runtime_roles)
+        header = storage_relation(policy.schema, HEADER)
+        for trigger in ("pd_dataset_storage", "pd_dataset_generic_finalization"):
+            await driver.execute(f"DROP TRIGGER IF EXISTS {storage_identifier(trigger)} ON {header}")
+        for signature in _RETIRED_FUNCTIONS:
+            name, arguments = signature.split("(", 1)
+            await driver.execute(f"DROP FUNCTION IF EXISTS {storage_relation(policy.schema, name)}({arguments}")
+
+
+async def _partition_dataset_payload(driver, policy, root_name, keys_by_column):
+    """Reuse the old native heap as history; never copy its payload rows."""
+    from process.provider_directory_generic_source_storage import RELATIONSHIP
+
+    root = storage_relation(policy.schema, root_name)
+    relation_by_field = await driver.fetchrow(
+        "SELECT oid::bigint,relkind::text FROM pg_class WHERE oid=to_regclass($1)", root
+    )
+    if relation_by_field["relkind"] == "p":
+        return
+    history_name = "pd_generic_source_history_" + str(relation_by_field["oid"])
+    history = storage_relation(policy.schema, history_name)
+    keys = await driver.fetchval(f"SELECT array_agg(DISTINCT dataset_id ORDER BY dataset_id) FROM {root}") or []
+    await driver.execute(f"ALTER TABLE {root} RENAME TO {storage_identifier(history_name)}")
+    indexes = await driver.fetch(
+        "SELECT indexrelid::bigint,relname FROM pg_index JOIN pg_class ON oid=indexrelid WHERE indrelid=$1",
+        relation_by_field["oid"],
+    )
+    for index in indexes:
+        await driver.execute(
+            f"ALTER INDEX {storage_relation(policy.schema, index['relname'])} RENAME TO "
+            f"{storage_identifier('pd_generic_source_idx_' + str(index['indexrelid']))}"
+        )
+    await driver.execute(
+        f"CREATE TABLE {root} (LIKE {history} INCLUDING DEFAULTS INCLUDING CONSTRAINTS "
+        "INCLUDING STORAGE) PARTITION BY LIST (dataset_id)"
+    )
+    await driver.execute(f"ALTER TABLE {root} OWNER TO {storage_identifier(policy.owner_role)}")
+    await driver.execute(f"ALTER TABLE {root} ADD PRIMARY KEY ({','.join(map(storage_identifier, keys_by_column))})")
+    if root_name == RELATIONSHIP:
+        await driver.execute(
+            f"CREATE INDEX {storage_identifier(root_name + '_target_idx')} ON {root} (dataset_id,target_type,target_resource_id)"
+        )
+    if keys:
+        literals = ",".join("'" + dataset_id.replace("'", "''") + "'" for dataset_id in keys)
+        await driver.execute(f"ALTER TABLE {root} ATTACH PARTITION {history} FOR VALUES IN ({literals})")
+    else:
+        # An empty old heap keeps its OID without a default partition.
+        await driver.execute(f"ALTER TABLE {history} ADD CHECK (false)")
 
 
 @asynccontextmanager

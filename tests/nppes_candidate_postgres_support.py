@@ -18,7 +18,6 @@ from db.plan_release_storage import storage_identifier, storage_relation
 from process import nppes_public_evidence_storage as storage
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_source_acquisition_custody as acquisition
-from process import provider_directory_source_callable_custody as source_callables
 from process import provider_directory_source_cohort_custody as cohort
 from process.nppes_public_evidence_control_custody import adopt_nppes_control_custody
 from process.provider_directory_cms_control_custody import _RIGHTS as control_rights
@@ -234,6 +233,64 @@ async def loading_family(connection, schema, admission_ref):
     return {root: proof["name"] for root, proof in binding["tables"].items()}
 
 
+# The Source callables the removed acquisition adoption re-owned; "@work" is the rooted work row type.
+_SOURCE_CALLABLES = """
+account_provider_directory_rooted_graph_edge_budget() account_provider_directory_rooted_graph_resource_budget()
+account_provider_directory_rooted_graph_work_budget() advance_reference_source_generation()
+guard_pd_dataset_bulk_parent_delete() guard_pd_dataset_parent_key_update() guard_pd_uhc_flex_candidate_insert()
+guard_pd_uhc_flex_practitioner_acquisition() guard_pd_uhc_flex_practitioner_admission_immutable()
+guard_pd_uhc_flex_practitioner_admission_insert() guard_pd_uhc_flex_practitioner_dataset()
+guard_pd_uhc_flex_practitioner_dataset_endpoint() guard_pd_uhc_flex_practitioner_dataset_parent()
+guard_pd_uhc_flex_practitioner_dataset_resource() guard_pd_uhc_flex_practitioner_dataset_source()
+guard_pd_uhc_flex_practitioner_resource() guard_pd_uhc_flex_practitioner_single_root_admission_insert()
+guard_pd_uhc_flex_practitioner_twin_attempt_immutable() guard_pd_uhc_flex_practitioner_twin_attempt_insert()
+guard_pd_uhc_flex_practitioner_work() guard_provider_directory_endpoint_dataset_admission_seal()
+guard_provider_directory_exact_logical_current() guard_provider_directory_reviewed_subset_activation_source()
+guard_provider_directory_rooted_graph_acquisition() guard_provider_directory_rooted_graph_copy_owner()
+guard_provider_directory_rooted_graph_dataset() guard_provider_directory_rooted_graph_dataset_resource()
+guard_provider_directory_rooted_graph_dependency() guard_provider_directory_rooted_graph_single_root_admission()
+guard_provider_directory_rooted_graph_storage_seal() guard_provider_directory_rooted_graph_twin_admission()
+guard_provider_directory_rooted_graph_twin_attempt() guard_provider_directory_rooted_graph_work()
+guard_provider_directory_subset_published_source() guard_provider_directory_terminal_root_retirement_child()
+guard_provider_directory_uhc_flex_npi_cohort() guard_provider_directory_uhc_flex_npi_member()
+guard_tin_npi_connector_endpoint_dataset() pd_practitioner_migration_fence()
+provider_directory_profile_delta_receipt_immutable_v1()
+reject_provider_directory_rooted_graph_witness_mutation() validate_provider_directory_uhc_flex_npi_members()
+admit_pd_uhc_flex_practitioner_stage(text,text,bigint,integer,text)
+admit_provider_directory_rooted_graph_witnesses(text,text,integer,text,regclass,regclass)
+admit_provider_directory_rooted_graph_work(text,text) assert_provider_directory_rooted_graph_storage(text)
+attach_provider_directory_rooted_graph_storage(text)
+finish_provider_directory_rooted_graph_initial_storage(text)
+finish_provider_directory_rooted_graph_storage(text) initialize_pd_uhc_flex_practitioner_work(text,text)
+initialize_provider_directory_rooted_graph_work(text) pd_uhc_flex_practitioner_terminal_set_sha256(text)
+prepare_pd_uhc_flex_practitioner_stage() prepare_pd_uhc_flex_practitioner_work(text,text)
+prepare_provider_directory_rooted_graph_storage(text) prepare_provider_directory_rooted_graph_witness_stage()
+prepare_provider_directory_rooted_graph_work_stage()
+provider_directory_endpoint_dataset_admission_metadata_sha256(jsonb,smallint,text,text,varchar[])
+provider_directory_fhir_request_failure_coverage_valid(jsonb)
+provider_directory_reviewed_subset_activation_valid(text)
+provider_directory_rooted_graph_dataset_intrinsic_valid(text)
+provider_directory_rooted_graph_dataset_ready(text) provider_directory_rooted_graph_dataset_valid(text)
+provider_directory_rooted_graph_edge_set_sha256(text)
+provider_directory_rooted_graph_official_lineage_current(text)
+provider_directory_rooted_graph_request_failure_coverage(text)
+provider_directory_rooted_graph_resource_set_sha256(text) provider_directory_rooted_graph_sha256(text)
+provider_directory_rooted_graph_terminal_set_sha256(text) provider_directory_subset_canonical_sha256(jsonb)
+provider_directory_subset_completion_canonical_json(jsonb)
+provider_directory_subset_completion_proof_pair_valid(jsonb,text)
+provider_directory_subset_completion_proof_shape_valid(jsonb,text,bigint)
+provider_directory_subset_content_proof_valid(jsonb,text,text,text,jsonb,jsonb,text,bigint,jsonb,jsonb)
+provider_directory_subset_payload_canonical_json(jsonb) provider_directory_subset_payload_sha256(jsonb)
+provider_directory_uhc_flex_practitioner_dataset_ready(text)
+provider_directory_uhc_flex_practitioner_dataset_valid(text) ptg_wave_canonical_json_ascii_v1(json)
+ptg_wave_canonical_json_ascii_v1(jsonb) ptg_wave_json_ascii_text_v1(text) public_evidence_npi_valid(text)
+read_provider_directory_rooted_graph_initial_work(text,text,integer)
+validate_provider_directory_rooted_graph_stage_checks(regclass,regclass)
+validate_provider_directory_rooted_graph_witnesses(regclass,regclass,@work)
+validate_provider_directory_rooted_graph_work_stage(text,text)
+""".split()
+
+
 async def _adopt_acquisition_family(driver, policy):
     """Stand in for the operator's one-time adoption: the Source owner owns the acquisition family
     with full rights, and the builder keeps only its fixed writer rights."""
@@ -260,7 +317,10 @@ async def _adopt_acquisition_family(driver, policy):
         for right, names in column_rights.items():
             selected = ",".join(storage_identifier(column) for column in names)
             await driver.execute(f"GRANT {right}({selected}) ON TABLE {table} TO {builder}")
-    for signature in source_callables.source_callable_signatures(policy.schema):
+    work = storage_relation(policy.schema, "provider_directory_rooted_graph_work")
+    for callable_signature in _SOURCE_CALLABLES:
+        name, arguments = callable_signature.split("(", 1)
+        signature = storage_relation(policy.schema, name) + "(" + arguments.replace("@work", work)
         # Source callables, including the definer guards, run as the Source owner; the builder may execute them.
         if await driver.fetchval("SELECT to_regprocedure($1)", signature) is not None:
             # The shared Reference counter keeps its migration actor and mutable-ledger rights.

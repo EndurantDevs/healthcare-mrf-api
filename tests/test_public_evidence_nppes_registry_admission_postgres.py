@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +16,6 @@ from sqlalchemy.exc import DBAPIError
 
 from process import nppes_public_evidence_writer as writer
 from process import provider_directory_generic_source_policy as source
-from process import provider_directory_source_callable_custody as source_callables
 from process.control_cancel import ImportCancelledError
 from process.nppes_public_evidence_replay import prepare_nppes_registry_replay
 from process.nppes_public_evidence_rows import SOURCE_RECORD_COLUMNS
@@ -129,7 +127,7 @@ FROZEN_MEMBERS = (
 )
 
 
-def test_native_fixture_migrations_cover_full_callable_contract_without_changing_legacy_slice():
+def test_native_fixture_migrations_extend_without_changing_legacy_slice():
     original = source_component_migrations()
     prefixes = nppes_source_component_migrations()
     assert set(original) < set(prefixes)
@@ -141,16 +139,6 @@ def test_native_fixture_migrations_cover_full_callable_contract_without_changing
     assert prefixes.index("20260909120000") < prefixes.index("20261016040000")
     assert prefixes.index("20261016040000") < prefixes.index("20261016050000")
     assert source_component_migrations() == original
-    for prefix in ("20261016040000", "20261016050000"):
-        path = next((Path(__file__).parents[1] / "alembic" / "versions").glob(prefix + "*.py"))
-        spec = importlib.util.spec_from_file_location("native_fixture_repair_" + prefix, path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        for contract in module._CONTRACTS:
-            matching_entries = [
-                value[-1] for key, value in source_callables._CONTRACTS.items() if key.split("(")[0] == contract[0]
-            ]
-            assert contract[-1] in matching_entries, contract[0]
 
 
 def test_native_fixture_retry_and_json_canonical_predecessors_are_authentic():
@@ -380,11 +368,6 @@ async def test_native_npi_pure_helper_uses_original_sql_and_builder_before_custo
     original.op = SimpleNamespace(execute=expected_entries.append)
     original._create_digest_helpers("snapshot_schema")
     assert creates == expected_entries
-    body = creates[-1].split("$function$")[1]
-    assert (
-        source_callables._body_digest(body, "snapshot_schema")
-        == source_callables._CONTRACTS["public_evidence_npi_valid(text)"][-1]
-    )
     index = statements.index(creates[-1])
     assert statements[index - 1] == 'SET LOCAL ROLE "builder"'
     assert statements[index + 1] == 'SET LOCAL ROLE "owner"'
@@ -445,11 +428,6 @@ async def test_native_canonical_fragment_plan_preserves_authentic_bodies_and_fai
         "ptg_wave_canonical_json_ascii_v1(jsonb)",
         "ptg_wave_json_ascii_text_v1(text)",
     }
-    for (name, kinds), attributes in parsed_by_key.items():
-        assert (
-            source_callables._body_digest(attributes[-1], "snapshot_schema")
-            == source_callables._CONTRACTS[f"{name}({kinds})"][-1]
-        )
     parameters = connection.scalar.await_args.args[1]
     assert len(parameters["signatures"]) == 7
     assert '"snapshot_schema".ptg_wave_ordinary_terminal_receipt_guard()' in parameters["signatures"]

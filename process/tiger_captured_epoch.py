@@ -66,7 +66,7 @@ async def read_locked_tiger_graph(session):
     return {"contract": GRAPH_CONTRACT, "relations": [dict(row) for row in rows]}
 
 
-async def has_attested_inherited_tiger_source_capture(session, *, owner_oid=None):
+async def has_attested_inherited_tiger_source_capture(session):
     """Use actual native locks and reads; no role or catalog identity is attested."""
     archive._require_transaction(session)
     async with archive._bounded_capture(session):

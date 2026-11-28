@@ -132,7 +132,7 @@ async def _publisher_authority(session):
     destination._require_caller_transaction(session)
 
 
-async def _require_alias_authority(session, db_schema, owner_oid=None):
+async def _require_alias_authority(session, db_schema):
     """Read the declared alias state without interpreting old role or catalog tokens."""
     return await alias._alias_state(session, serving._schema_name(db_schema))
 
@@ -307,7 +307,7 @@ def _prepared_adoption(stored):
 _CMS_RECEIPT_TABLE = "provider_directory_cms_serving_receipt"
 
 
-async def _lock_publication_state(session, schema, owner_oid=None):
+async def _lock_publication_state(session, schema):
     """Lock the fixed native state names and preserve the composite CMS publication boundary."""
     schema = serving._schema_name(schema)
     names = (destination.geo_projection.GEO_ASSURANCE_STATE_TABLE, serving.result_generation.TABLE_NAME)
@@ -565,7 +565,7 @@ def _validated_loaded_input(owner, semantic_receipt, source_alias_receipt, desti
     return owner, semantic, source_alias
 
 
-def _require_loaded_inventory(proof, owner, owner_oid=None):
+def _require_loaded_inventory(proof, owner):
     """Require the authenticated mutable handoff before local transforms and native freeze."""
     _require(isinstance(proof, Mapping) and proof.get("state") == "handed_off", "handed-off operation differs")
     _require_proof_inventory(proof, owner)
@@ -666,7 +666,6 @@ async def _audit_loaded_adoption(session, destination_options, selected, authent
         archive_scope = native.restore.family_archive.selected_canonical_archive(
             session,
             schema_name=schema,
-            owner_oid=None,
             selected_relations={
                 "npi": selected["dependency_bindings"][f"{schema}.npi_address"],
                 "mrf": selected["dependency_bindings"][f"{schema}.mrf_address"],

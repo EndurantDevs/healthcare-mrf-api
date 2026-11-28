@@ -14,7 +14,6 @@ from sqlalchemy.engine import make_url
 
 from db import migration_cms_retirement_resolution as migration
 from db.plan_release_storage import storage_identifier, storage_relation
-from process import provider_directory_cms_callable_custody as callables
 from tests.provider_directory_terminal_root_retirement_pg_support import TARGET_DATASET_ID, retirement_postgres
 from tests.provider_directory_terminal_root_retirement_v2_pg_support import load_v2_migration, run_v2_migration
 from tests.tin_npi_connector_postgres_support import POSTGRES_DSN_ENV
@@ -112,26 +111,6 @@ async def _harden(driver, schema, before):
         assert after[name]["prosrc"] == pairs_by_name[name][1]
         assert all(
             after[name][field] == original[field] for field in ("identity", "hooks", "dependencies", "description")
-        )
-    await _check_consumers(driver, schema)
-
-
-async def _check_consumers(driver, schema):
-    names = [migration.evidence.EVIDENCE_FUNCTION, migration.v2.EVIDENCE_FUNCTION, migration.guards.PARENT_GUARD]
-    signatures = [
-        storage_relation(schema, name) + ("()" if name == migration.guards.PARENT_GUARD else "(text)") for name in names
-    ]
-    rows = await driver.fetch(callables._FUNCTION_SQL, signatures, schema, names, [])
-    namespace = await driver.fetchval("SELECT oid::bigint FROM pg_catalog.pg_namespace WHERE nspname=$1", schema)
-    specs = callables._original_callee_contracts(schema, "preparation_schema")
-    assert len(rows) == len(names)
-    for row in rows:
-        definition = json.loads(row["definition"]) if isinstance(row["definition"], str) else row["definition"]
-        callables._require_cms_callee_body(
-            dict(definition=definition, language=row["language"]),
-            specs[definition["proname"]],
-            schema,
-            namespace,
         )
 
 

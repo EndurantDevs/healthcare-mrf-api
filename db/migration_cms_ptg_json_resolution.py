@@ -88,20 +88,6 @@ def _snapshot(connection, schema):
     )
 
 
-def _require_definition(observed, schema):
-    from process import provider_directory_source_callable_custody as source
-
-    definition_by_field = {**observed["identity"], "prosrc": observed["body"]}
-    source._require_definition(
-        {"definition": definition_by_field, "language": observed["language"]},
-        source._CONTRACTS[FUNCTION + "(jsonb)"],
-        schema,
-        int(definition_by_field["pronamespace"]),
-        source._TYPE_OIDS,
-        observed["namespace_identifier"],
-    )
-
-
 def upgrade_cms_ptg_json_resolution(connection, schema, *, expected):
     """Change one existing body in a savepoint; preserve identity and caller commit."""
     _require(connection.in_transaction(), "transaction_required")
@@ -114,7 +100,6 @@ def upgrade_cms_ptg_json_resolution(connection, schema, *, expected):
     original, hardened = ptg_json_bodies(schema)
     before = _snapshot(connection, schema)
     _identity(before, pins, (original, hardened))
-    _require_definition(before, schema)
     if before["body"] == hardened:
         return
     _require(before["definition"].count(original) == 1, "definition_changed")
@@ -122,7 +107,6 @@ def upgrade_cms_ptg_json_resolution(connection, schema, *, expected):
         connection.exec_driver_sql(before["definition"].replace(original, hardened, 1))
         after = _snapshot(connection, schema)
         _identity(after, pins, (hardened,))
-        _require_definition(after, schema)
         _require(
             all(after[field] == before[field] for field in ("identity", "description", "hooks")),
             "identity_changed",

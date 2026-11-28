@@ -10,8 +10,6 @@ import pytest
 
 from db.migration_provider_directory_dataset_candidates import TABLES
 from process import provider_directory_history_compaction_cutover as cutover_module
-from process.provider_directory_generic_source_policy import GenericSourcePolicy
-from process.provider_directory_generic_source_provision import _retained_empty_dataset_histories
 from process.provider_directory_history_compaction import (
     _STAGE_COMPONENT,
     GENERIC_HISTORY_TABLES,
@@ -156,7 +154,7 @@ async def _seed_history_fixture(context):
     return cat_schema, [spec[0] for spec in retained_specs], [spec[0] for spec in omitted_specs]
 
 
-async def _assert_downstream_checks(context, schema_name, roles_by_kind):
+async def _assert_downstream_checks(context, schema_name):
     """Verify downstream consumers, native controls, and post-compaction writes stay healthy."""
     connection, schema = context.connection, context.schema
     plan = await connection.fetchval(f"SELECT plan FROM {schema}.pd_dataset_migration_plan WHERE singleton")
@@ -169,15 +167,6 @@ async def _assert_downstream_checks(context, schema_name, roles_by_kind):
         histories,
     ) == len(TABLES)
     assert await require_native_retirement_controls(_DatabaseAdapter(connection)) == set(TABLES[:5])
-    policy = GenericSourcePolicy(
-        schema=schema_name,
-        owner_role=roles_by_kind["owner"],
-        publisher_role=roles_by_kind["generic"],
-        runtime_roles=(roles_by_kind["member"],),
-    )
-    async with connection.transaction():
-        retained_empty = await _retained_empty_dataset_histories(connection, policy)
-    assert len(retained_empty) >= 1
 
     await connection.execute(
         f"""INSERT INTO {schema}.provider_directory_endpoint_dataset(
@@ -214,7 +203,7 @@ async def _exercise_prepare_and_nowait_guard(connection, context, schema_name):
 @pytest.mark.asyncio
 async def test_online_history_compaction_cutover_rollback_and_drop(monkeypatch):
     """Exercise plan, online prepare, NOWAIT cutover, rollback, re-cutover, and drop."""
-    async with _candidate_test_scope(monkeypatch) as (context, roles_by_kind):
+    async with _candidate_test_scope(monkeypatch) as (context, _roles_by_kind):
         await _install_retirement_child_guards(context)
         cat_schema, _retained_ids, omitted_ids = await _seed_history_fixture(context)
         try:
@@ -246,7 +235,7 @@ async def test_online_history_compaction_cutover_rollback_and_drop(monkeypatch):
             await cutover_history_compaction(connection, schema=schema_name)
             dropped = await drop_retired_history(connection, schema=schema_name)
             assert len(dropped["dropped_relations"]) == len(GENERIC_HISTORY_TABLES)
-            await _assert_downstream_checks(context, schema_name, roles_by_kind)
+            await _assert_downstream_checks(context, schema_name)
             await run_migration(context.engine, _candidate_migration(), "upgrade")
         finally:
             await context.connection.execute(f'DROP SCHEMA IF EXISTS "{cat_schema}" CASCADE')

@@ -229,9 +229,8 @@ def _cut_case(monkeypatch):
     monkeypatch.setattr(snapshot, "bound_publisher", lambda: publisher)
 
     async def shape(_session, **options):
-        assert options.get("is_incumbent", False) == ("expected_oid" in options)
         events.append("shape")
-        return 11 if "expected_oid" in options else 22
+        return 11 if options.get("is_incumbent") else 22
 
     async def ledger(*args, **kwargs):
         assert kwargs["lock"] is True

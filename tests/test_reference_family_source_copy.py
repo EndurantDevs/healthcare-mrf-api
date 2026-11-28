@@ -414,7 +414,6 @@ def _clone_case(monkeypatch, importer="mrf"):
     monkeypatch.setattr(archive, "_rebase_owned_sequences", AsyncMock())
     monkeypatch.setattr(archive, "_is_model_table_equal", AsyncMock(return_value=True))
     if importer in {"cms-doctors", "geo"}:
-        monkeypatch.setattr(archive, "protected_publisher_owner", AsyncMock(return_value=41))
         monkeypatch.setattr(archive, "seal_model_family_storage", AsyncMock())
     capture = archive.ReferenceFamilySourceCapture(
         SimpleNamespace(

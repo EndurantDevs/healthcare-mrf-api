@@ -6,7 +6,6 @@ from copy import deepcopy
 import pytest
 
 from db import migration_cms_retirement_resolution as migration
-from process.provider_directory_cms_callable_custody import _cms_callee_contracts
 
 
 @pytest.mark.parametrize("schema", ["sample", "alternate_catalog", "Mixed_Catalog23"])
@@ -26,11 +25,6 @@ def test_exact_current_bodies_change_only_explicit_argument_casts(schema):
         assert migration._digest(original, schema) == migration.ORIGINAL_SHA256[name]
         assert "::pg_catalog.text" not in original
         assert hardened.replace("::pg_catalog.text", "") == original
-    assert len(_cms_callee_contracts()) == 32
-    assert set(pairs_by_name) & _cms_callee_contracts().keys() == {
-        migration.evidence.EVIDENCE_FUNCTION,
-        migration.v2.EVIDENCE_FUNCTION,
-    }
 
 
 @pytest.mark.parametrize("position", range(6))

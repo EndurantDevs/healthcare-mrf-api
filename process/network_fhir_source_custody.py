@@ -437,7 +437,7 @@ class FHIRSourceCustodyError(ValueError):
     """Retained source custody is unavailable or has changed."""
 
 
-def _require_function(function_record, schema, owner_oid):
+def _require_function(function_record, schema):
     """Recognize a reachable routine by name, language, volatility, definer and settings.
 
     Bodies and owners are not compared: PostgreSQL grants decide who may replace a routine.
@@ -452,13 +452,13 @@ def _require_function(function_record, schema, owner_oid):
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
 
 
-def _require_guard(guard_record, schema, owner_oid, name, event_mask):
+def _require_guard(guard_record, schema, name, event_mask):
     """Bind a native trigger's complete invocation to its reviewed guard function shape."""
     if guard_record is None:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
     function_name = _GUARD_FUNCTIONS[name]
     if function_name == "guard_tin_npi_connector_endpoint_dataset":
-        _require_function(guard_record, schema, owner_oid)
+        _require_function(guard_record, schema)
     expected_arguments = b"raw\x00" if name == "provider_directory_endpoint_dataset_admission_raw_guard" else b""
     is_security_definer = function_name in {
         "guard_provider_directory_endpoint_dataset_admission_seal",

@@ -248,9 +248,7 @@ async def _require_exchange_leaf_layout(session, incoming, predecessors):
         )
 
 
-async def exchange_tiger_snapshot_children(
-    session, *, incoming_pairs, expected_children, expected_parent_inventory, owner_oid=None
-):
+async def exchange_tiger_snapshot_children(session, *, incoming_pairs, expected_children, expected_parent_inventory):
     """Exchange named leaves in the caller transaction, retaining detached rollback data."""
     archive._require_transaction(session)
     incoming = _child_names(incoming_pairs)

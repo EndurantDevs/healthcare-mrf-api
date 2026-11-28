@@ -452,12 +452,9 @@ async def test_administrative_policy_uses_declared_names_without_database_role_q
 
 
 @pytest.mark.asyncio
-async def test_retained_scope_does_not_supply_an_ordinary_source_writer(monkeypatch):
-    retained = AsyncMock()
-    monkeypatch.setattr(archive, "protected_publisher_owner", retained)
+async def test_retained_scope_does_not_supply_an_ordinary_source_writer():
     with pytest.raises(ValueError, match="publisher_connection_required"):
         await immutable._writer(SimpleNamespace(in_transaction=lambda: True))
-    retained.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -519,15 +516,14 @@ def protected_publication(monkeypatch):
     session = SimpleNamespace(
         in_transaction=lambda: True, begin_nested=savepoint, execute=AsyncMock(), scalar=AsyncMock()
     )
-    connection, owner = AsyncMock(), AsyncMock()
+    connection = AsyncMock()
     monkeypatch.setattr(stage, "_copy_driver", connection)
-    monkeypatch.setattr(archive, "protected_publisher_owner", owner)
     roles = SimpleNamespace(owner_role="retained_owner", publisher_role="publisher", runtime_roles=("reader",))
     original = archive.model_family_roles
     monkeypatch.setattr(
         archive, "model_family_roles", lambda config=None: original(roles if config is None else config)
     )
-    return SimpleNamespace(session=session, connection=connection, owner=owner, events=events, roles=roles)
+    return SimpleNamespace(session=session, connection=connection, events=events, roles=roles)
 
 
 @pytest.mark.asyncio
@@ -542,7 +538,6 @@ async def test_protected_publication_uses_named_dcl_and_keeps_source_routing_sep
             await immutable._writer(observed.session)
     assert observed.events == ["savepoint", "release"]
     assert immutable._PROTECTED_PUBLICATION.get() is None
-    observed.owner.assert_not_awaited()
     observed.connection.assert_not_awaited()
 
 
@@ -563,18 +558,6 @@ async def test_protected_publication_rejects_wrong_scope_or_missing_transaction(
             )
     assert observed.events == ["savepoint", "rollback"]
     assert immutable._PROTECTED_PUBLICATION.get() is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("old_owner", [None, True, 0, 2**32, "opaque old edition"])
-async def test_old_owner_argument_cannot_become_publication_authority(protected_publication, old_owner):
-    observed = protected_publication
-    async with archive.protected_reference_family_publication(
-        observed.session, importer_id="geo", schema_name="mrf", expected_owner_oid=old_owner
-    ):
-        assert await immutable._archive_writer(observed.session, "geo", "mrf") == "retained_owner"
-    observed.owner.assert_not_awaited()
-    observed.connection.assert_not_awaited()
 
 
 @pytest.mark.asyncio

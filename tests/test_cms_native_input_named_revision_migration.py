@@ -91,8 +91,7 @@ def test_native_fence_requires_the_actual_named_npi_statement_body():
 
 @pytest.mark.parametrize("name", tuple(_migration()._FUNCTION_BODY_DIGESTS))
 def test_existing_serving_and_counter_body_contracts_are_exact_and_replayable(name):
-    from process.provider_directory_cms_callable_custody import _body_digest
-    from tests.test_provider_directory_cms_callable_custody import _migration_functions
+    from tests.test_cms_archive_transaction_migration import _migration_functions, body_digest
 
     migration = _migration()
     previous = (
@@ -106,7 +105,7 @@ def test_existing_serving_and_counter_body_contracts_are_exact_and_replayable(na
         assert updated.count(old) == (pair[2] if len(pair) == 3 else 1)
         updated = updated.replace(old, new)
     assert (
-        tuple(_body_digest(body, "snapshot_schema") for body in (previous, updated))
+        tuple(body_digest(body, "snapshot_schema") for body in (previous, updated))
         == migration._FUNCTION_BODY_DIGESTS[name]
     )
     statement = migration._function_sql("snapshot_schema", names=(name,))

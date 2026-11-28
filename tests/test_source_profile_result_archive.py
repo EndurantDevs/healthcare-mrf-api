@@ -373,7 +373,7 @@ async def test_first_use_capture_requires_exact_single_transaction_continuation(
     prepared = SimpleNamespace(manifest={"run_ids": [capture["source_run_id"]]}, ownership=object())
     for name in ("_source_lock", "require_pin_guards"):
         monkeypatch.setattr(archive, name, AsyncMock())
-    for name, field_value in (("protected_publisher_owner", 22), ("_lock_family", None), ("_relation_oid", 30)):
+    for name, field_value in (("_lock_family", None), ("_relation_oid", 30)):
         monkeypatch.setattr(archive.native, name, AsyncMock(return_value=field_value))
     for name, field_value in (
         ("_pointer", capture["expected"]),
@@ -624,8 +624,7 @@ async def test_witness_native_publication_never_falls_back_to_ordinary_payload_c
     for name in ("_source_lock", "require_pin_guards", "_record_native_custody", "_publish_result_pointer"):
         monkeypatch.setattr(archive, name, AsyncMock())
     monkeypatch.setattr(archive, "_finish_native_attempt", AsyncMock(wraps=archive._finish_native_attempt))
-    for name, field_value in (("protected_publisher_owner", 22), ("_lock_family", None)):
-        monkeypatch.setattr(archive.native, name, AsyncMock(return_value=field_value))
+    monkeypatch.setattr(archive.native, "_lock_family", AsyncMock(return_value=None))
     monkeypatch.setattr(archive, "require_native_handoff", AsyncMock(return_value=handoff))
     monkeypatch.setattr(archive, "_pointer", AsyncMock(return_value=handoff["expected"]))
     monkeypatch.setattr(archive, "_native_receipt_witnesses", AsyncMock(return_value={}))

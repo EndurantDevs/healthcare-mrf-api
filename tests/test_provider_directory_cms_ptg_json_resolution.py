@@ -12,13 +12,8 @@ import pytest
 from db import migration_cms_ptg_json_resolution as migration
 from db.migration_cms_noncurrent_seal import _migration
 from db.migration_cms_snapshot_allocator import _INSTALLER_ADMIN_SQL
-from process import provider_directory_cms_transition_routines as transition
-from process import provider_directory_source_callable_custody as source
 from tests.test_acquisition_validator_argument_types_migration import _parse_functions
-from tests.test_provider_directory_cms_transition_routines import _raw
-from tests.test_provider_directory_source_callable_custody import _entry
-
-_KEY = migration.FUNCTION + "(jsonb)"
+from tests.test_cms_archive_transaction_migration import body_digest
 
 
 def _constructor_bodies(monkeypatch, schema):
@@ -38,7 +33,7 @@ def test_exact_constructor_changes_only_native_call_qualification(monkeypatch, s
     assert old == _constructor_bodies(monkeypatch, schema)
     assert new.count("pg_catalog.to_jsonb(entry.key)") == 1
     assert new.replace("pg_catalog.to_jsonb(entry.key)", "to_jsonb(entry.key)") == old
-    assert source._body_digest(old, schema) == migration.ORIGINAL_SHA256
+    assert body_digest(old, schema) == migration.ORIGINAL_SHA256
     repairs = _migration("20261016050000_acquisition_validator_argument_types.py")
     selected_rows = [row for row in repairs._CONTRACTS if row[0] == migration.FUNCTION and row[2] == "jsonb"]
     assert len(selected_rows) == 1 and selected_rows[0][-2:] == (migration.ORIGINAL_SHA256, migration.ORIGINAL_SHA256)
@@ -55,73 +50,17 @@ def test_unknown_predecessor_refuses_without_renewing_expected_digest(monkeypatc
         migration.ptg_json_bodies.cache_clear()
 
 
-def _source_entry(version, *, target_settings=False):
-    entry = _entry(_KEY)
-    entry["definition"]["prosrc"] = migration.ptg_json_bodies("sample")[version]
-    if target_settings:
-        entry["definition"]["proconfig"] = ["search_path=pg_catalog, sample, pg_temp"]
-    return entry
-
-
-@pytest.mark.parametrize("version", [0, 1])
-@pytest.mark.parametrize("target_settings", [False, True])
-def test_shared_source_and_complete_inventory_recognizers_accept_only_fixed_pair(version, target_settings):
-    entry = _source_entry(version, target_settings=target_settings)
-    before = deepcopy(entry)
-    source._require_definition(entry, source._CONTRACTS[_KEY], "sample", 201, source._TYPE_OIDS, "sample")
-    native = _raw(entry, schema="sample", namespace=201)
-    native["native"]["namespace_identifier"] = "sample"
-    transition.require_cms_transition_routine_definitions(
-        [native], catalog_schema="sample", catalog_schema_oid=201, preparation_schema="preparation_schema"
-    )
-    assert entry == before
-    assert not source._is_approved_body(entry["definition"], "sample", "f" * 64)
-    assert not source._is_approved_body(
-        entry["definition"], "sample", source._CONTRACTS[migration.FUNCTION + "(json)"][-1]
-    )
-    entry["definition"]["prosrc"] += "\n"
-    with pytest.raises(ValueError, match="definition_changed"):
-        source._require_definition(entry, source._CONTRACTS[_KEY], "sample", 201, source._TYPE_OIDS, "sample")
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("pronamespace", "999"),
-        ("proname", "other_helper"),
-        ("proargtypes", ["114"]),
-        ("proargnames", ["other_input"]),
-        ("proargdefaults", "unapproved"),
-        ("provariadic", "3802"),
-        ("prorettype", "3802"),
-        ("prosecdef", True),
-        ("proisstrict", False),
-        ("provolatile", "v"),
-        ("proparallel", "u"),
-        ("proconfig", ["search_path=sample, pg_catalog"]),
-    ],
-)
-def test_exact_successor_preserves_source_abi_and_settings(field, value):
-    entry = _source_entry(1)
-    entry["definition"][field] = value
-    with pytest.raises(ValueError, match="definition_changed"):
-        source._require_definition(entry, source._CONTRACTS[_KEY], "sample", 201, source._TYPE_OIDS, "sample")
-
-
 @pytest.fixture
 def upgrade_case(monkeypatch):
     """Labelled IO stub: real updater/property coverage belongs to the native suite."""
     old, new = migration.ptg_json_bodies("sample")
-    entry = _source_entry(0)
-    identity_by_field = dict(entry["definition"])
-    identity_by_field.pop("prosrc")
     state = SimpleNamespace(
         body=old,
         definition="CREATE OR REPLACE FUNCTION trusted() AS $function$" + old + "$function$;",
-        identity=identity_by_field,
+        identity=dict(oid="501", proowner="103", proname=migration.FUNCTION, prosecdef=False),
         description="retained comment",
         hooks=[],
-        language=entry["language"],
+        language="sql",
         namespace_identifier="sample",
         path="pg_catalog, pg_temp",
         admin=True,
@@ -178,7 +117,7 @@ def test_installer_preserves_properties_and_repeats_without_write(upgrade_case):
     assert state.writes == 1 and not hasattr(state.connection, "commit")
 
 
-@pytest.mark.parametrize("fault", ["transaction", "path", "admin", "oid", "owner", "body", "definition", "abi"])
+@pytest.mark.parametrize("fault", ["transaction", "path", "admin", "oid", "owner", "body", "definition"])
 def test_installer_refuses_before_body_write(upgrade_case, fault):
     state, pins = upgrade_case, dict(oid=501, owner_oid=103)
     match fault:
@@ -194,8 +133,6 @@ def test_installer_refuses_before_body_write(upgrade_case, fault):
             state.body += "unapproved"
         case "definition":
             state.definition += state.body
-        case "abi":
-            state.identity["prosecdef"] = True
     with pytest.raises((RuntimeError, ValueError)):
         _upgrade(state, pins)
     assert state.writes == 0

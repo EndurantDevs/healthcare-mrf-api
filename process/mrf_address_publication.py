@@ -757,7 +757,7 @@ async def _require_canonical_output_layout(session, ownership):
         raise RuntimeError("canonical output inventory changed")
     await native._stage_inventory(session, ownership.schema_name, {relation_name: relation_name})
     relation_by_field = {"relation_name": relation_name, "schema_name": ownership.schema_name}
-    await family._require_selected_mrf_catalog(session, [relation_by_field], None)
+    await family._require_selected_mrf_catalog(session, [relation_by_field])
     enum_oid = await _canonical_enum_oid(session)
     relation_oid = dict(observed.relation_oids)[relation_name]
     await require_native_read_catalog(session, (relation_oid,), allowed_type_oids=(enum_oid,))

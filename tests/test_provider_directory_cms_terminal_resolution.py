@@ -10,21 +10,15 @@ import pytest
 
 from db import migration_cms_terminal_resolution as migration
 from process import network_fhir_source_custody as reader
-from process import provider_directory_cms_callable_custody as callables
-from process import provider_directory_cms_transition_routines as transition
-from process import provider_directory_source_callable_custody as source
-from tests.test_provider_directory_cms_allocation_guard_contracts import original_guards as original_guards
-from tests.test_provider_directory_cms_callee_custody import _original_allocation_pins
-from tests.test_provider_directory_cms_transition_routines import _raw
+from tests.test_cms_archive_transaction_migration import body_digest
 
 
 @pytest.mark.parametrize("schema", ["snapshot_schema", "alternate_catalog", "Mixed_Catalog23"])
 def test_only_the_two_frozen_varchar_arguments_change(schema):
     original, hardened = migration.terminal_guard_bodies(schema)
-    assert callables._body_digest(original, schema) == migration.ORIGINAL_SHA256
+    assert body_digest(original, schema) == migration.ORIGINAL_SHA256
     assert hardened.count("NEW.dataset_id::pg_catalog.text") == 2
     assert hardened.replace("NEW.dataset_id::pg_catalog.text", "NEW.dataset_id") == original
-    assert len(callables._cms_callee_contracts()) == 32
 
 
 def test_unknown_constructor_body_refuses_without_recapturing_authority(monkeypatch):
@@ -38,29 +32,6 @@ def test_unknown_constructor_body_refuses_without_recapturing_authority(monkeypa
             migration.terminal_guard_bodies("unknown_predecessor")
     finally:
         migration.terminal_guard_bodies.cache_clear()
-
-
-@pytest.mark.parametrize("version", [0, 1])
-def test_allocation_and_complete_supplied_inventory_share_exact_body_pair(original_guards, version):
-    guard = next(row for row in original_guards if row["definition"]["proname"] == migration.GUARD)
-    guard["definition"]["prosrc"] = migration.terminal_guard_bodies("snapshot_schema")[version]
-    pins = _original_allocation_pins(original_guards)
-    assert callables.require_original_cms_allocation_callees(original_guards, **pins)[migration.GUARD] == guard
-    assert (
-        transition.require_cms_transition_routine_definitions(
-            [_raw(guard)],
-            catalog_schema="snapshot_schema",
-            catalog_schema_oid=42,
-            preparation_schema="preparation_schema",
-        )
-        is None
-    )
-    assert not source._is_approved_body(guard["definition"], "snapshot_schema", "f" * 64)
-    guard["definition"]["prosrc"] += "\n-- unapproved"
-    with pytest.raises(ValueError, match="original_allocation_pin_changed"):
-        callables.require_original_cms_allocation_callees(original_guards, **pins)
-    with pytest.raises(ValueError, match="definition_changed"):
-        callables.require_original_cms_allocation_callees(original_guards, **_original_allocation_pins(original_guards))
 
 
 def _reader_function(version):
@@ -80,7 +51,7 @@ def _reader_function(version):
 def test_retained_reader_recognizes_exact_successor_without_input_changes(version):
     function = _reader_function(version)
     before = deepcopy(function)
-    reader._require_function(function, "snapshot_schema", 100)
+    reader._require_function(function, "snapshot_schema")
     assert function == before
 
 
@@ -95,7 +66,7 @@ def test_reader_keeps_native_attribute_checks(fault):
     }[fault]
     function[key] = value
     with pytest.raises(reader.FHIRSourceCustodyError):
-        reader._require_function(function, "snapshot_schema", 100)
+        reader._require_function(function, "snapshot_schema")
 
 
 @pytest.fixture

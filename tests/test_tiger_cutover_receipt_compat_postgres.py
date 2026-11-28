@@ -64,7 +64,7 @@ async def test_first_cutover_and_retained_replacement_through_the_named_receipt(
         await _provision_tiger_roots(url, sessions, roles)
         first, cutover, receipt, owner_oid = await _first_cutover(sessions, roles)
         assert tuple(map(tuple, receipt["relations"])) == _named_children(first)
-        second, second_validation = await _prepare_replacement_tiger_leaf(sessions, first, receipt, roles[0], owner_oid)
+        second, second_validation = await _prepare_replacement_tiger_leaf(sessions, first, receipt, roles[0])
         async with sessions[1].begin() as session:
             replacement = await inherited.activate_tiger_snapshot_children(
                 session,
@@ -83,7 +83,7 @@ async def test_retained_replacement_starts_from_saved_table_oid_pairs():
     async with _owned_database() as (url, sessions, roles):
         await _provision_tiger_roots(url, sessions, roles)
         first, cutover, receipt, owner_oid = await _first_cutover(sessions, roles)
-        second, second_validation = await _prepare_replacement_tiger_leaf(sessions, first, receipt, roles[0], owner_oid)
+        second, second_validation = await _prepare_replacement_tiger_leaf(sessions, first, receipt, roles[0])
         # A receipt saved before the named form carries (table, oid) pairs; the OIDs stay opaque tokens.
         saved_child_pairs = [["zcta5", 424242], ["zip_state", 434343]]
         saved_parent_by_field = {"contract": inherited.CONTRACT, "parent_oids": [["zcta5", 101], ["zip_state", 102]]}

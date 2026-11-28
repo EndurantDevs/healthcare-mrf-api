@@ -144,18 +144,14 @@ async def test_current_resolution_and_publisher_guard_precede_staging(monkeypatc
     monkeypatch.setattr(calibration, "resolve_plan_release_serving_resolution", AsyncMock(return_value=resolved))
     monkeypatch.setattr(calibration, "lock_identity", AsyncMock())
     monkeypatch.setattr(build, "resolve_inputs", AsyncMock(return_value=(identity_by_field, ())))
-    publisher = AsyncMock()
-    monkeypatch.setattr(calibration.native, "protected_publisher_owner", publisher)
     monkeypatch.setattr(calibration, "_publication_state", AsyncMock(return_value=()))
     session = SimpleNamespace(execute=AsyncMock())
     if drift:
         with pytest.raises(ValueError, match="identity changed"):
             await calibration._resolved_inputs(session, params, {})
-        publisher.assert_not_awaited()
     else:
         _, authenticated, _, _ = await calibration._resolved_inputs(session, params, {})
         assert authenticated == identity_by_field
-        publisher.assert_awaited_once_with(session)
     # Exercise the real isolation and physical-lock setup: no SELECT may take
     # a transaction snapshot before REPEATABLE READ has been established.
     setup_statements = [str(call.args[0]) for call in session.execute.await_args_list]

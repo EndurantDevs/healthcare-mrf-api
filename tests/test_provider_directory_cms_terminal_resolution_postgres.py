@@ -9,16 +9,15 @@ import pytest
 
 from db import migration_cms_terminal_resolution as migration
 from db.plan_release_storage import storage_relation
-from process import provider_directory_source_callable_custody as source
 from tests.cms_native_layout_postgres_support import _reader
 from tests.cms_native_layout_postgres_support import native_layout as native_layout
-from tests.test_provider_directory_cms_creator_dispatch_postgres import _creator
-from tests.test_provider_directory_cms_replay_resolution_postgres import _attacker_locks
-from tests.test_provider_directory_cms_terminal_guard_resolution_postgres import (
+from tests.cms_terminal_guard_postgres_support import (
     _assert_properties,
     _hooks,
     _routines,
 )
+from tests.test_provider_directory_cms_creator_dispatch_postgres import _creator
+from tests.test_provider_directory_cms_replay_resolution_postgres import _attacker_locks
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 
@@ -101,8 +100,8 @@ async def test_real_deferred_guard_never_executes_hostile_sibling_after_typing(n
                         )
                     )
                 checked = await _routines(driver)
-                guard = next(row for row in checked if row["native"]["definition"]["proname"] == migration.GUARD)
-                assert source._is_approved_body(guard["native"]["definition"], "mrf", migration.ORIGINAL_SHA256)
+                installed = next(row for row in checked if row["native"]["definition"]["proname"] == migration.GUARD)
+                assert installed["native"]["definition"]["prosrc"] == migration.terminal_guard_bodies("mrf")[int(typed)]
                 await _sibling(creator, callee, kind, key)
                 assert await _routines(driver) == checked
                 await _invoke(driver, callee, typed=typed, kind=kind, key=key)

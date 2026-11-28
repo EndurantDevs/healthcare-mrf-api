@@ -8,7 +8,7 @@ from uuid import uuid4
 from sqlalchemy import text
 
 
-async def _selection_projection(session, schema_name, owner_oid, selected_relations, authenticators, alias_authority):
+async def _selection_projection(session, schema_name, selected_relations, authenticators, alias_authority):
     """Authenticate and fence the exact base and selected native inventories."""
     from process import reference_family_archive as archive
     from process.mrf_address_publication import (
@@ -25,7 +25,7 @@ async def _selection_projection(session, schema_name, owner_oid, selected_relati
     inventories = await authenticate_inventory(session)
     if not isinstance(inventories, Mapping) or not inventories or not set(inventories) <= {"npi", "mrf"}:
         raise archive.ReferenceFamilyArchiveError("selected canonical contribution scope differs")
-    relations, contributions = archive._selected_canonical_sources(inventories, selected_relations, owner_oid)
+    relations, contributions = archive._selected_canonical_sources(inventories, selected_relations)
     base = f"{archive._quoted(schema_name)}.{archive._quoted(archive.archive_table_name())}"
     await session.execute(text(f"LOCK TABLE {base} IN SHARE ROW EXCLUSIVE MODE NOWAIT"))
     if authenticate_base is None:
@@ -45,7 +45,7 @@ async def _selection_projection(session, schema_name, owner_oid, selected_relati
         )
     )
     await archive._require_selected_mrf_catalog(
-        session, sorted(relations, key=lambda relation: (relation["schema_name"], relation["relation_name"])), owner_oid
+        session, sorted(relations, key=lambda relation: (relation["schema_name"], relation["relation_name"]))
     )
     alias_arguments = {} if alias_authority is None else {"npi_alias_authority": alias_authority}
     await validate_canonical_contributions(session, contributions, base, **alias_arguments)
@@ -57,7 +57,6 @@ async def selected_canonical_archive(
     session,
     *,
     schema_name,
-    owner_oid,
     selected_relations,
     authenticate_inventory,
     authenticate_base=None,
@@ -69,7 +68,6 @@ async def selected_canonical_archive(
     projection = await _selection_projection(
         session,
         schema_name,
-        owner_oid,
         selected_relations,
         (authenticate_inventory, authenticate_base),
         npi_alias_authority,

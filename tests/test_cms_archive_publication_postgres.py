@@ -146,7 +146,7 @@ async def _restore_epoch_rows(session, schema, rows_by_root):
 
 
 async def _install_epoch_guards(session, schema, statements, roots):
-    from process.provider_directory_source_cms_epoch_control import EPOCH_GUARD_FUNCTIONS
+    from tests.cms_npd_admission_postgres_support import EPOCH_GUARD_FUNCTIONS
 
     for statement in statements:
         if any(

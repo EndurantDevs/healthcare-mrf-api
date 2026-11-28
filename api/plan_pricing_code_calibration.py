@@ -83,7 +83,6 @@ async def _resolved_inputs(session, params, calibration_by_field):
     if identity_digest(identity) != params["expected_identity_digest"]:
         raise ValueError("code calibration input identity changed before preparation")
     await lock_identity(session, identity)
-    await native.protected_publisher_owner(session)
     calibration_by_field.update(identity=identity, publication_before=await _publication_state(session, identity))
     return resolution.selection, identity, inputs, scope
 
