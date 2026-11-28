@@ -280,7 +280,7 @@ def test_redirect_and_truncated_counts_fail_closed():
         with pytest.raises(ValueError, match="redirect_invalid"):
             sweep._search_result({**handoff_map, **overrides})
     for record in [
-        {"redirect": False, "providers": [], "totalResults": 1},
+        {"redirect": False, "providers": None, "totalResults": 1},
         {"redirect": 0, "providers": [], "totalResults": 0},
         {"redirect": False, "providers": [], "totalResults": True},
     ]:
@@ -312,13 +312,13 @@ async def test_capped_search_retains_unlocated_card_without_using_it_in_other_wi
     assert len(capture.detail_batch("", 10)) == 4
     updated_card_map = {**suspect_card_map, "distance": 1.5}
     assert not sweep._observe(capture, scope, [updated_card_map], center, 10)[1]
-    assert sweep._observe(capture, scope, cards, center, 10) == (keys, False)
+    assert sweep._observe(capture, scope, cards, center, 10) == (Counter(keys), False)
     assert len(capture.detail_batch("", 10)) == 4
     assert capture.is_count_reconciled(scope, center, 10, set(), 3)
 
     capture.add_circle("another", center, 2)
     sweep._observe(capture, "another", [updated_card_map], center, 10)
-    assert sweep._observe(capture, "another", cards, center, 10) == (keys, False)
+    assert sweep._observe(capture, "another", cards, center, 10) == (Counter(keys), False)
     assert capture.coverage_invalidated and not capture.covers_tile("another", center, 0.1)
 
 
@@ -353,14 +353,14 @@ async def test_capped_unlocated_site_requires_direct_union(capture, monkeypatch)
     assert reason == "direct_only_result_cap" and not target.is_closed(capture)
     capture.add_circle(scope, tile.center, 2)
     assert not target.is_closed(capture)
-    assert not sweep._is_gap_closed(capture, window, count, keys | {"extra", "another"}, reason)
+    assert not sweep._is_gap_closed(capture, window, count, keys | Counter(["extra", "another"]), reason)
     capture.db.execute("DELETE FROM circle")
     direct_page_map = {"providers": cards[2:], "totalResults": 1, "redirect": False}
     await target.probe(capture, AsyncMock(return_value=direct_page_map), tile.center, {"specialties": ["Specialty"]})
     assert target.is_closed(capture) and not capture.has_gaps()
     assert len(capture.detail_batch("", 10)) == 3
     assert not capture.covers_tile(scope, tile.center, 0.1)
-    capture.record_gap(window, reason, count, keys | {"extra", "another"}, span)
+    capture.record_gap(window, reason, count, keys | Counter(["extra", "another"]), span)
     capture.record_gap(window, "unresolved_result_cap", count, keys, span)
     window, count, retained_keys, _, reason = next(capture.gap_batches(scope))
     assert reason == "direct_only_result_cap" and len(retained_keys) > count
@@ -399,12 +399,16 @@ async def test_revoked_positions_revisit_previously_skipped_tiles(capture, monke
     sweep._observe(capture, scope, [_card()], first.tile.center, 2)
     capture.add_circle(scope, first.tile.center, 2)
     origin_centers = []
-    monkeypatch.setattr(sweep, "_capture_details", AsyncMock())
+    monkeypatch.setattr(sweep, "normalize_guardian_detail", lambda detail: ())
 
     async def request(kind, query):
         key = canonical_json(query)
         if retained := capture.lookup(kind, key):
             return json.loads(retained)
+        if kind == "detail":
+            capture.reserve(kind, key)
+            capture.retain(kind, key, canonical_json(query).encode())
+            return query
         lat = query["searchParams"]["latitude"]
         origin_centers.append(lat)
         card = _card() if lat == 40 else {**_card(), "distance": None}
@@ -423,15 +427,22 @@ async def test_revoked_positions_revisit_previously_skipped_tiles(capture, monke
         capture = GuardianCapture(capture.db, "edition", 100, fresh=False)
         assert not capture.covers_tile(scope, first.tile.center, 0.1)
     await sweep.capture_directory(capture, plan, request, AsyncMock(), AsyncMock())
-    assert origin_centers == [41, 40] and capture.attempt_count() == 2
+    assert origin_centers == [41, 40] and capture.attempt_count() == 3
     assert not capture.is_count_reconciled(scope, first.tile.center, 2, set(), 1)
 
 
-async def test_unresolved_cap_records_gap(capture):
+async def test_unresolved_cap_records_gap(capture, monkeypatch):
+    monkeypatch.setattr(sweep, "normalize_guardian_detail", lambda detail: ())
+    capture.budget = 1000
     tile = GeoTile(39.9999, 40.0001, -80.0001, -79.9999)
     cards = [_card(str(n)) for n in range(150)]
 
     async def fetch(kind, payload):
+        if kind == "detail":
+            key = canonical_json(payload)
+            capture.reserve(kind, key)
+            capture.retain(kind, key, canonical_json(payload).encode())
+            return payload
         if kind == "specialty":
             return [{"specialtyId": "1", "specialtyName": "Specialty"}]
         params = payload["searchParams"]
@@ -446,11 +457,11 @@ async def test_unresolved_cap_records_gap(capture):
     plan = sweep.SearchPlan(None, (sweep.SearchRegion("PA", "00001", tile),), 1.0, 100, "edition", SELECTORS)
     with pytest.raises(ValueError, match="coverage_incomplete"):
         await sweep.capture_directory(capture, plan, request, AsyncMock(), AsyncMock())
-    assert request.await_count == len(plan.selectors) * (1 + 4 + 18 + 1 + 1)
+    assert request.await_count == len(plan.selectors) * (1 + 4 + 18 + 1 + 1) + len(cards)
     assert capture.db.execute("SELECT reason,count(*) FROM gap GROUP BY reason").fetchall() == [
         ("unresolved_result_cap", len(plan.selectors))
     ]
-    assert capture.projected_count() == 0
+    assert capture.projected_count() == len(cards)
 
 
 async def test_destination_denials_and_retry_after(capture):
@@ -601,13 +612,178 @@ async def test_normal_entrypoint_replays_edition(replay_transport):
             pytest.fail("missing retained edition should stop before transport")
 
 
-async def test_uncapped_duplicate_card_refuses_coverage(capture):
+@pytest.mark.parametrize("conflicting", [False, True])
+async def test_full_response_counts_occurrences_and_queues_distinct_details(capture, conflicting):
     region = sweep.SearchRegion("PA", "00001", GeoTile(39.999, 40.001, -80.001, -79.999))
-    request = AsyncMock(return_value={"redirect": False, "totalResults": 2, "providers": [_card(), _card()]})
-    with pytest.raises(ValueError, match="duplicate_card"):
-        await sweep._sweep(capture, region, ("PLAN-A", ""), region.tile, request, {"covered_by_prior_circle": 0})
-    assert not capture.db.execute("SELECT 1 FROM circle").fetchone()
-    assert not capture.db.execute("SELECT 1 FROM request").fetchone()
+    card = _card()
+    other_card_map = {**card, "ddsPracticeName": "Example Office", "phone": "555-0100"}
+    if conflicting:
+        other_card_map["latitude"], other_card_map["longitude"] = sweep._offset(region.tile.center, 0.5, 0)
+        other_card_map["distance"] = 0.5
+    request = AsyncMock(
+        return_value={"redirect": False, "totalResults": 3, "providers": [card, other_card_map, _card("002")]}
+    )
+    await sweep._sweep(capture, region, ("PLAN-A", ""), region.tile, request, {})
+    assert not capture.has_gaps() and not capture.db.execute("SELECT 1 FROM circle").fetchone()
+    assert len(capture.detail_batch("", 5)) == 2
+    assert capture.db.execute("SELECT count(*) FROM observation WHERE lat IS NULL").fetchone()[0] == int(conflicting)
+
+
+async def test_duplicate_leaf_reconciles_only_simultaneous_same_query_occurrences(capture, monkeypatch):
+    region = sweep.SearchRegion("PA", "00001", GeoTile(39.999, 40.001, -80.001, -79.999))
+    selector = ("PLAN-A", "CLIENT-X")
+    scope = canonical_json([region.state, region.zip_code, *selector])
+    monkeypatch.setattr(sweep, "_CARD_LIMIT", 3)
+    cards = [_card("A"), _card("A"), _card("B")]
+    page_map = {"providers": cards, "redirect": False, "totalResults": 5}
+    await sweep._sweep(capture, region, selector, region.tile, AsyncMock(return_value=page_map), {"capped": 0})
+    window, count, keys, span, reason = next(capture.gap_batches(scope))
+    target = sweep.DenseWindow(window, region, selector, count, keys, span, reason)
+    subset_map = {"providers": [_card("B"), _card("C")], "totalResults": 2, "redirect": False}
+    capture.observe("other selector", [(canonical_json(sweep._detail_key(_card("D"))), *target.center, None, None)])
+    await target.probe(capture, AsyncMock(return_value=subset_map), sweep._offset(target.center, 1, 0), {})
+    assert target.keys.total() == 3 and not target.is_closed(capture)
+    for label in ("First", "Second"):
+        subset_map["providers"][1]["phone"] = label
+        await target.probe(capture, AsyncMock(return_value=subset_map), target.center, {"specialties": [label]})
+    assert target.keys.total() == 4 and len(target.keys) == 3 and not target.is_closed(capture)
+    restored = next(capture.gap_batches(scope))
+    assert restored[2] == target.keys
+    extra_map = {"providers": [_card("C"), _card("C")], "totalResults": 2, "redirect": False}
+    await target.probe(capture, AsyncMock(return_value=extra_map), target.center, {"specialties": ["Third"]})
+    assert target.is_closed(capture) and not capture.has_gaps()
+    assert not capture.covers_tile(scope, target.center, 0.1)
+    assert not sweep._is_gap_closed(capture, window, count - 1, target.keys, reason)
+
+
+async def test_short_page_keeps_gap_and_independent_known_details(capture, monkeypatch):
+    first = sweep.SearchRegion("PA", "00001", GeoTile(39.999, 40.001, -80.001, -79.999))
+    second = sweep.SearchRegion("PA", "00001", GeoTile(40.999, 41.001, -80.001, -79.999))
+    plan = sweep.SearchPlan(None, (first, second), 1, 100, "edition", (("PLAN-A", ""),))
+    capture.enqueue_details([sweep._detail_key(_card("earlier"))])
+    actions = []
+    monkeypatch.setattr(sweep, "normalize_guardian_detail", lambda detail: ())
+
+    async def request(kind, fields):
+        actions.append(kind)
+        if kind == "detail":
+            key = canonical_json(fields)
+            capture.reserve(kind, key)
+            capture.retain(kind, key, canonical_json(fields).encode())
+            return fields
+        latitude = fields["searchParams"]["latitude"]
+        return {
+            "providers": [_card(str(latitude), latitude)],
+            "totalResults": 2 if latitude == 40 else 1,
+            "redirect": False,
+        }
+
+    with pytest.raises(ValueError, match="coverage_incomplete"):
+        await sweep.capture_directory(capture, plan, request, AsyncMock(), AsyncMock())
+    assert actions == ["detail", "search", "detail", "search", "detail"]
+    assert capture.projected_count() == 3
+    assert capture.db.execute("SELECT reason FROM gap").fetchall() == [("search_cardinality_mismatch",)]
+
+
+async def test_interleaves_bounded_detail_batches_and_drains_lower_keys(capture, monkeypatch):
+    regions = tuple(sweep.SearchRegion("PA", f"{i:05d}", GeoTile(39.999, 40.001, -80.001, -79.999)) for i in range(3))
+    plan = sweep.SearchPlan(None, regions, 1, 1000, "edition", (("PLAN-A", ""),), max_concurrency=2)
+    capture.budget = 1000
+    capture.enqueue_details([sweep._detail_key(_card(f"prior-{n:03d}")) for n in range(220)])
+    monkeypatch.setattr(sweep, "normalize_guardian_detail", lambda detail: ())
+    projected_counts = []
+
+    async def request(kind, fields):
+        if kind == "detail":
+            key = canonical_json(fields)
+            capture.reserve(kind, key)
+            capture.retain(kind, key, canonical_json(fields).encode())
+            return fields
+        projected_counts.append(capture.projected_count())
+        return {"providers": [_card("earlier")], "totalResults": 1, "redirect": False}
+
+    await sweep.capture_directory(capture, plan, request, AsyncMock(), AsyncMock())
+    assert projected_counts == [100, 200, 220]
+    assert capture.attempt_count() == capture.projected_count() == 221
+
+
+@pytest.mark.parametrize("invalid_fields", [{"latitude": "unknown", "longitude": -80}, {"specialties": []}])
+async def test_matching_unprojectable_detail_is_retained_while_others_finish(capture, invalid_fields):
+    region = sweep.SearchRegion("PA", "00001", GeoTile(39.999, 40.001, -80.001, -79.999))
+    plan = sweep.SearchPlan(None, (region,), 1, 100, "edition", (("PLAN-A", ""),))
+    keys = [sweep._detail_key(_card(number)) for number in ("A", "B")]
+    capture.enqueue_details(keys)
+    sent_keys = []
+
+    async def request(kind, fields):
+        if kind == "search":
+            return {"providers": [], "totalResults": 0, "redirect": False}
+        key = canonical_json(fields)
+        if prior := capture.lookup(kind, key):
+            return json.loads(prior)
+        sent_keys.append(key)
+        detail_map = {
+            **fields,
+            "address1": "1 Example St",
+            "city": "Example",
+            "state": "PA",
+            "zip": "00001",
+            "networks": "Example Network",
+            "latitude": 40,
+            "longitude": -80,
+        }
+        if fields == keys[0]:
+            detail_map.update(invalid_fields)
+        capture.reserve(kind, key)
+        capture.retain(kind, key, canonical_json(detail_map).encode())
+        return detail_map
+
+    for _ in range(2):
+        with pytest.raises(ValueError, match="detail_coverage_incomplete"):
+            await sweep.capture_directory(capture, plan, request, AsyncMock(), AsyncMock())
+    assert len(sent_keys) == len(set(sent_keys)) == 2 and capture.projected_count() == 1
+    assert capture.db.execute("SELECT status FROM request WHERE payload=?", (canonical_json(keys[0]),)).fetchone() == (
+        "received",
+    )
+    with pytest.raises(ValueError, match="detail_coverage_incomplete"):
+        capture.summary(())
+
+
+@pytest.mark.parametrize("override", [{"practiceId": "different"}, {"networks": []}, {"providers": [{}]}])
+async def test_identity_or_shape_error_stops_detail_work(capture, override):
+    fields = sweep._detail_key(_card())
+    detail_map = {
+        **fields,
+        "address1": "1 Example St",
+        "city": "Example",
+        "state": "PA",
+        "zip": "00001",
+        "networks": "Example Network",
+        **override,
+    }
+    capture.enqueue_details([fields, sweep._detail_key(_card("other"))])
+    request = AsyncMock(return_value=detail_map)
+    with pytest.raises(ValueError, match="identity_changed|detail_text_invalid|nested_provider_shape_invalid"):
+        await sweep._capture_details(capture, request, AsyncMock(), AsyncMock())
+    assert request.await_count == 1 and capture.projected_count() == 0
+
+
+async def test_untrusted_filtered_response_retains_keys_without_parent_credit(capture):
+    region = sweep.SearchRegion("PA", "00001", GeoTile(39.999, 40.001, -80.001, -79.999))
+    selector = ("PLAN-A", "")
+    scope = canonical_json([region.state, region.zip_code, *selector])
+    keys, _ = sweep._observe(capture, scope, [_card("A")], region.tile.center, 2)
+    target = sweep.DenseWindow([scope, region.tile.bounds], region, selector, 2, keys, 0.1)
+    page_map = {
+        "providers": [{**_card("B"), "ddsPracticeName": "Different Office"}],
+        "totalResults": 1,
+        "redirect": False,
+    }
+    await target.probe(
+        capture, AsyncMock(return_value=page_map), target.center, {}, qualifier=("officeName", "Example")
+    )
+    assert target.keys.total() == 1 and len(capture.detail_batch("", 5)) == 2
+    assert not target.is_closed(capture)
 
 
 async def test_boundary_name_requires_original_scope(capture):

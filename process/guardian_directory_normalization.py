@@ -11,6 +11,10 @@ _PLAN_NET = "http://hl7.org/fhir/us/davinci-pdex-plan-net/StructureDefinition/"
 _NPI_SYSTEM = "http://hl7.org/fhir/sid/us-npi"
 
 
+class GuardianDetailDataError(ValueError):
+    """A matching detail cannot be projected from its retained field values."""
+
+
 def _id(kind, *parts):
     digest = hashlib.sha256(canonical_json(parts).encode()).hexdigest()[:40]
     return f"guardian-{kind}-{digest}"
@@ -21,6 +25,19 @@ def _text(record, key):
     if value is None:
         return ""
     if not isinstance(value, str) or len(value) > 2048:
+        if key in {
+            "phone",
+            "specialties",
+            "gender",
+            "ddsFirstName",
+            "ddsMiddleName",
+            "ddsLastName",
+            "ddsSuffixName",
+            "ddsDegree",
+            "address2",
+            "suite",
+        }:
+            raise GuardianDetailDataError("guardian_detail_text_invalid")
         raise ValueError("guardian_detail_text_invalid")
     text = value.strip()
     return "" if text == "No Information Available" else text
@@ -71,10 +88,13 @@ def _location(detail, practice):
     coords = [detail.get(key) for key in ("latitude", "longitude")]
     if all(coordinate not in (None, "") for coordinate in coords):
         if any(type(coordinate) not in (int, float, str) for coordinate in coords):
-            raise ValueError("guardian_detail_position_invalid")
-        latitude, longitude = map(float, coords)
+            raise GuardianDetailDataError("guardian_detail_position_invalid")
+        try:
+            latitude, longitude = map(float, coords)
+        except ValueError, OverflowError:
+            raise GuardianDetailDataError("guardian_detail_position_invalid") from None
         if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-            raise ValueError("guardian_detail_position_invalid")
+            raise GuardianDetailDataError("guardian_detail_position_invalid")
         if latitude or longitude:
             site_map["position"] = {"latitude": latitude, "longitude": longitude}
     return site_map
