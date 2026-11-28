@@ -7,6 +7,7 @@ import re
 import time
 import urllib.parse
 from contextlib import aclosing
+from dataclasses import replace
 from functools import lru_cache, partial
 from itertools import batched, islice
 
@@ -139,6 +140,38 @@ def location_plan_identity(directory, source_record):
     """Bind unrestricted Location checkpoints to the image's exact ZIP plan."""
     start_url = directory._resource_start_url(source_record, "Location", page_count=1)
     return _location_zip_digest() if start_url and not _has_postal_filter(start_url) else None
+
+
+async def resolve_retained_checkpoint_context(directory, source_records, dataset_resources, checkpoint_context):
+    """Fall back to a pre-ZIP-plan UHC checkpoint scope only when it proves a retained retry."""
+    if (
+        checkpoint_context is None
+        or not checkpoint_context.retry_of_run_id
+        or checkpoint_context.canonical_api_base != directory.UHC_PROVIDER_DIRECTORY_BASE
+    ):
+        return checkpoint_context
+    endpoint_id = directory._endpoint_id_for_source_records(source_records)
+    selected_resources = tuple(sorted(set(dataset_resources)))
+    if not endpoint_id or not selected_resources:
+        return checkpoint_context
+    if (
+        await directory._checkpoint_candidate_dataset_id(checkpoint_context, endpoint_id, selected_resources)
+        is not None
+    ):
+        return checkpoint_context
+    source_id_values = sorted(source_record["source_id"] for source_record in source_records)
+    checkpoint_source_record = directory._scoped_partition_source_record(source_records, source_id_values)
+    legacy_identity = directory._pagination_checkpoint_scope_identity(
+        checkpoint_source_record,
+        source_id_values,
+        include_location_zip_plan=False,
+    )
+    if legacy_identity is None or legacy_identity[1] == checkpoint_context.source_scope_hash:
+        return checkpoint_context
+    legacy_context = replace(checkpoint_context, source_scope_hash=legacy_identity[1])
+    if await directory._checkpoint_candidate_dataset_id(legacy_context, endpoint_id, selected_resources) is not None:
+        return legacy_context
+    return checkpoint_context
 
 
 async def location_start_urls(directory, source_record, page_count):

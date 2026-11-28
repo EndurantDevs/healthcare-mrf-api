@@ -1073,6 +1073,64 @@ def _is_unstarted_named_root(header, binding, identity, expected_counts, manifes
     )
 
 
+def _is_pre_takeover_postal_owner(header, stored_identity, *, is_empty_vsp_failure, has_changed_header_owner):
+    """Recognize an untouched postal acquiring header before validating the stopped retry lineage."""
+    source_ids = stored_identity["metadata"].get("source_ids")
+    return (
+        has_changed_header_owner
+        and not is_empty_vsp_failure
+        and header["status"] == "acquiring"
+        and header["import_run_id"] is not None
+        and len(source_ids or ()) == 1
+        and set(stored_identity["metadata"].get("selected_resources", ()))
+        == set(import_module("process.provider_directory_fhir").UHC_SUPPORTED_RESOURCES)
+    )
+
+
+def _require_transition_candidate_binding(
+    header,
+    candidate_by_field,
+    identity_by_field,
+    old_storage,
+    expected_counts,
+    *,
+    is_empty_vsp_failure,
+    is_unstarted_named_root,
+):
+    """Enforce candidate identity, scope, and storage invariants before transition."""
+    stored_identity = candidate_by_field["identity"]
+    metadata = _json(header["publication_metadata_json"])
+    has_identity_metadata = _transition_metadata_matches(
+        metadata, stored_identity["metadata"], "failed" if is_unstarted_named_root else header["status"]
+    )
+    has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
+    allow_header_owner = (
+        not has_changed_header_owner
+        or is_empty_vsp_failure
+        or _is_pre_takeover_postal_owner(
+            header, stored_identity, is_empty_vsp_failure=is_empty_vsp_failure, has_changed_header_owner=True
+        )
+    )
+    _require(
+        candidate_by_field["contract"] in (ISOLATED_CONTRACT, *NAMED_CONTRACTS)
+        and allow_header_owner
+        and candidate_by_field["admission"] is None
+        and candidate_by_field["auxiliary"] is None
+        and all(
+            stored_identity[field] == identity_by_field[field]
+            for field in ("dataset_id", "endpoint_id", "acquisition_root_run_id")
+        )
+        and (is_empty_vsp_failure or has_identity_metadata)
+        and set(stored_identity["metadata"].get("selected_resources", ()))
+        == set(stored_identity["metadata"].get("expected_resources", ()))
+        == {name for name in expected_counts if not name.startswith("LU:")}
+        == {_resource_family(name) for name in expected_counts}
+        and candidate_by_field.get("storage")
+        == {key: old_storage[key] for key in ("catalog_schema", "storage_schema")},
+        "transition_candidate_changed",
+    )
+
+
 async def _locked_transition_candidate(
     connection,
     policy,
@@ -1098,30 +1156,19 @@ async def _locked_transition_candidate(
     is_unstarted_named_root = not is_empty_vsp_failure and _is_unstarted_named_root(
         header, candidate_by_field, identity_by_field, expected_counts, manifest_replay
     )
-    metadata = _json(header["publication_metadata_json"])
-    metadata_status = "failed" if is_unstarted_named_root else header["status"]
-    has_identity_metadata = _transition_metadata_matches(metadata, stored_identity["metadata"], metadata_status)
-    has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
+    header_owner_run_id = header["import_run_id"]
+    has_changed_header_owner = header_owner_run_id != identity_by_field["failed_run_id"]
     source_ids = stored_identity["metadata"].get("source_ids")
     if is_unstarted_named_root or (source_ids != [VSP_SOURCE_ID] and named_source_resources(source_ids) is not None):
         _require_named_source_identity(stored_identity)
-    _require(
-        candidate_by_field["contract"] in (ISOLATED_CONTRACT, *NAMED_CONTRACTS)
-        and (not has_changed_header_owner or is_empty_vsp_failure)
-        and candidate_by_field["admission"] is None
-        and candidate_by_field["auxiliary"] is None
-        and all(
-            stored_identity[field] == identity_by_field[field]
-            for field in ("dataset_id", "endpoint_id", "acquisition_root_run_id")
-        )
-        and (is_empty_vsp_failure or has_identity_metadata)
-        and set(stored_identity["metadata"].get("selected_resources", ()))
-        == set(stored_identity["metadata"].get("expected_resources", ()))
-        == {name for name in expected_counts if not name.startswith("LU:")}
-        == {_resource_family(name) for name in expected_counts}
-        and candidate_by_field.get("storage")
-        == {key: old_storage[key] for key in ("catalog_schema", "storage_schema")},
-        "transition_candidate_changed",
+    _require_transition_candidate_binding(
+        header,
+        candidate_by_field,
+        identity_by_field,
+        old_storage,
+        expected_counts,
+        is_empty_vsp_failure=is_empty_vsp_failure,
+        is_unstarted_named_root=is_unstarted_named_root,
     )
     await _verify_tables(connection, policy, candidate_by_field)
     return (
@@ -1129,9 +1176,20 @@ async def _locked_transition_candidate(
         header["status"],
         is_empty_vsp_failure,
         has_changed_header_owner,
-        metadata.get("error"),
+        _json(header["publication_metadata_json"]).get("error"),
         raw_candidate,
         is_unstarted_named_root,
+        header_owner_run_id,
+    )
+
+
+def _failed_ancestor_run_ids(run_rows, ancestor_run_ids):
+    return sorted(
+        run_record["run_id"]
+        for run_record in run_rows
+        if run_record["run_id"] in ancestor_run_ids
+        and run_record["status"] == "failed"
+        and run_record["finished_at"] is not None
     )
 
 
@@ -1144,10 +1202,10 @@ async def _verify_transition_run(
     has_changed_header_owner,
     is_empty_vsp_failure=False,
     expected_failure_error=None,
+    header_owner_run_id=None,
 ):
     """Require the exact latest stopped run and no active same-root run."""
-    root_run_id = identity_by_field["acquisition_root_run_id"]
-    failed_run_id = identity_by_field["failed_run_id"]
+    root_run_id, failed_run_id = identity_by_field["acquisition_root_run_id"], identity_by_field["failed_run_id"]
     is_vsp_artifact_failure = is_empty_vsp_failure and not has_changed_header_owner and failed_run_id != root_run_id
     is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error in _RETAINED_VSP_CAPTURE_ERRORS
     directory = import_module("process.provider_directory_fhir")
@@ -1157,8 +1215,15 @@ async def _verify_transition_run(
     _verify_transition_run_rows(run_rows, run_ids, root_run_id, failed_run_id, source_ids)
     is_postal_start_failure = _is_postal_start_failure(run_rows[0], expected_failure_error)
     ancestor_run_ids = _transition_run_ancestors(run_rows, root_run_id, failed_run_id)
-    if has_changed_header_owner:
+    failed_ancestor_run_ids = _failed_ancestor_run_ids(run_rows, ancestor_run_ids)
+    is_pre_takeover_postal = False
+    if has_changed_header_owner and is_empty_vsp_failure:
         _verify_rearmed_vsp_child(run_rows, root_run_id)
+    elif has_changed_header_owner:
+        _verify_pre_takeover_postal_retry(
+            directory, run_rows, ancestor_run_ids, failed_ancestor_run_ids, header_owner_run_id
+        )
+        is_pre_takeover_postal = True
     elif is_retained_vsp_failure:
         _require(
             len(run_rows) == len(ancestor_run_ids)
@@ -1173,21 +1238,41 @@ async def _verify_transition_run(
     return {
         "lineage_run_ids": sorted(run_ids),
         "ancestor_run_ids": ancestor_run_ids,
-        "failed_ancestor_run_ids": sorted(
-            run_record["run_id"]
-            for run_record in run_rows
-            if run_record["run_id"] in ancestor_run_ids
-            and run_record["status"] == "failed"
-            and run_record["finished_at"] is not None
-        ),
+        "failed_ancestor_run_ids": failed_ancestor_run_ids,
+        "header_owner_run_id": header_owner_run_id if is_pre_takeover_postal else failed_run_id,
         "status": run_rows[0]["status"],
         "is_empty_vsp_failure": is_empty_vsp_failure,
         "is_postal_start_failure": is_postal_start_failure,
-        "is_stopped_postal_scan": _is_stopped_postal_scan(directory, run_rows, ancestor_run_ids),
+        "is_stopped_postal_scan": is_pre_takeover_postal
+        or _is_stopped_postal_scan(directory, run_rows, ancestor_run_ids),
         "pending_highmark_resources": _transition_pending_resources(run_rows[0])
         if is_highmark_companion_source
         else (),
     }
+
+
+def _verify_pre_takeover_postal_retry(directory, runs, ancestor_ids, failed_ancestor_ids, header_owner_run_id):
+    """Allow transition when a postal retry failed before mutating the header or checkpoints."""
+    leaf = runs[0]
+    endpoint = directory.UHC_PROVIDER_DIRECTORY_BASE
+    parent = next((run for run in runs if run["run_id"] == header_owner_run_id), None)
+    _require(
+        header_owner_run_id is not None
+        and header_owner_run_id == leaf.get("retry_of_run_id")
+        and header_owner_run_id in failed_ancestor_ids
+        and parent is not None
+        and _has_postal_stop_result(directory, parent)
+        and leaf.get("postal_error_code") in ("import_failed", "import_interrupted")
+        and len(runs) == len(ancestor_ids)
+        and all(
+            run["status"] == "failed"
+            and run["finished_at"] is not None
+            and run.get("postal_endpoint_scope") == endpoint
+            and run.get("postal_reset_disabled") is True
+            for run in runs
+        ),
+        "transition_run_changed",
+    )
 
 
 def _transition_pending_resources(run):
@@ -1720,7 +1805,10 @@ def _valid_postal_transition_leaf(directory, source_record, resource_type, ident
 
 
 def _conversion_checkpoint_owner(candidate, checkpoints, identity, run_evidence):
-    """Preserve unanimous ancestor checkpoint ownership when compact conversion interrupted before intake."""
+    """Preserve verified ancestor ownership for pre-takeover retries or interrupted compact conversion."""
+    header_owner = run_evidence.get("header_owner_run_id")
+    if header_owner is not None and header_owner != identity["failed_run_id"]:
+        return header_owner
     conversion = candidate.get("payload_conversion")
     if type(conversion) is dict and conversion.get("state") == "copying" and checkpoints:
         owners = {checkpoint["owner_run_id"] for checkpoint in checkpoints}
@@ -2111,6 +2199,7 @@ async def _verify_stopped_candidate(
         failure_error,
         raw_candidate,
         is_unstarted_named_root,
+        header_owner_run_id,
     ) = locked_candidate
     run_evidence_by_field = await _verify_transition_run(
         connection,
@@ -2120,6 +2209,7 @@ async def _verify_stopped_candidate(
         has_changed_header_owner=has_changed_header_owner,
         is_empty_vsp_failure=is_empty_vsp_failure,
         expected_failure_error=failure_error,
+        header_owner_run_id=header_owner_run_id,
     )
     if verified_preflight is not None:
         _validate_transition_preflight(
@@ -2202,7 +2292,7 @@ async def transition_isolated_loading_candidate_storage(
         expected_resource_counts,
         manifest_replay=manifest_replay,
     )
-    candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate, _ = locked_candidate
+    candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate, _, _ = locked_candidate
     run_evidence_by_field, transitions = await _verify_stopped_candidate(
         connection,
         policy,

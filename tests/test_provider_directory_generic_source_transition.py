@@ -483,6 +483,69 @@ async def test_stopped_postal_scan_preserves_ancestor_plan_owner_during_compact_
 
 
 @pytest.mark.asyncio
+async def test_pre_takeover_postal_retry_keeps_parent_owner(case):
+    counts = _attach_interrupted_postal_scan(case)
+    case.runs[1]["postal_error_code"] = "import_interrupted"
+    case.runs[0].update(
+        postal_error_code="import_failed",
+        error_message="provider_directory_generic_source_isolated_relation_override_changed",
+    )
+    case.header["import_run_id"] = ROOT
+    for checkpoint in case.checkpoints:
+        checkpoint["owner_run_id"] = ROOT
+
+    identity_by_field = {
+        "dataset_id": DATASET,
+        "endpoint_id": ENDPOINT,
+        "acquisition_root_run_id": ROOT,
+        "failed_run_id": FAILED,
+    }
+    preflight = await storage.preflight_isolated_loading_candidate_storage(
+        case.connection,
+        policy=case.policy,
+        identity_by_field=identity_by_field,
+        old_storage=case.old,
+        new_storage=case.new,
+        expected_resource_counts=counts,
+    )
+    transition = await storage.transition_isolated_loading_candidate_storage(
+        case.connection,
+        policy=case.policy,
+        identity_by_field=identity_by_field,
+        old_storage=case.old,
+        new_storage=case.new,
+        expected_resource_counts=counts,
+        verified_preflight=preflight,
+    )
+
+    assert transition["rows"] == sum(counts.values())
+    assert transition["lineage_run_ids"] == sorted([ROOT, FAILED])
+    assert case.header["import_run_id"] == ROOT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["parent_not_stopped", "wrong_checkpoint_owner", "non_parent_header_owner"])
+async def test_pre_takeover_postal_retry_failure_rejects_unproven_owner_or_parent(case, drift):
+    counts = _attach_interrupted_postal_scan(case)
+    case.runs[1]["postal_error_code"] = "import_interrupted"
+    case.runs[0].update(postal_error_code="import_failed", error_message="startup_failure")
+    case.header["import_run_id"] = ROOT
+    for checkpoint in case.checkpoints:
+        checkpoint["owner_run_id"] = ROOT
+    match drift:
+        case "parent_not_stopped":
+            case.runs[1].update(postal_error_code="import_failed", error_message="unexpected_error")
+        case "wrong_checkpoint_owner":
+            case.checkpoints[0]["owner_run_id"] = FAILED
+        case "non_parent_header_owner":
+            case.header["import_run_id"] = "run_" + "f" * 32
+
+    with pytest.raises(GenericCandidateError, match="transition_run_changed|transition_checkpoint_changed"):
+        await _transition(case, counts)
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("with_conversion,owner", [(True, "run_" + "f" * 32), (False, ROOT)])
 async def test_stopped_postal_scan_rejects_unproven_checkpoint_owner(case, with_conversion, owner):
     counts = _attach_interrupted_postal_scan(case)
