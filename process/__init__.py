@@ -422,7 +422,8 @@ class MRF_finish:
         int(os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS") else 1
     )
     queue_read_limit = max_jobs
-    job_timeout = 14400
+    # Network identity, address receipts and the plan search summary exceeded four hours on a full import.
+    job_timeout = int(os.environ.get("HLTHPRT_MRF_FINISH_JOB_TIMEOUT") or 43200)
     burst = True
     queue_name = "arq:MRF_finish"
     redis_settings = build_redis_settings()

@@ -563,3 +563,33 @@ async def test_new_run_purges_other_runs_including_locked_jobs():
     }
     assert "mrf:run:run_old:pending_work" in redis.deleted_keys
     assert not any("run_new" in key for key in redis.deleted_keys)
+
+
+@pytest.mark.asyncio
+async def test_parser_job_retries_transient_connect_timeout(monkeypatch):
+    """A parser job retries a database connect timeout instead of leaving work no worker will run."""
+    monkeypatch.delenv("HLTHPRT_CONTROL_RUN_ID", raising=False)
+
+    async def process_provider(_ctx, _task):
+        raise TimeoutError
+
+    guarded_job = process_initial._current_mrf_run_job(process_provider)
+
+    with pytest.raises(process_initial.Retry):
+        await guarded_job({"job_try": 1}, {})
+    with pytest.raises(TimeoutError):
+        await guarded_job({"job_try": 3}, {})
+
+
+@pytest.mark.asyncio
+async def test_finalizer_does_not_retry_transient_timeout(monkeypatch):
+    """The finalizer is not re-run from the start on a timeout."""
+    monkeypatch.delenv("HLTHPRT_CONTROL_RUN_ID", raising=False)
+
+    async def publish_initial_generation(_ctx, _task):
+        raise TimeoutError
+
+    guarded_job = process_initial._current_mrf_run_job(publish_initial_generation)
+
+    with pytest.raises(TimeoutError):
+        await guarded_job({"job_try": 1}, {})
