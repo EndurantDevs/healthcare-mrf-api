@@ -12340,8 +12340,8 @@ def test_artifact_target_dependencies_fail_before_an_unsafe_target_build():
         )
 
 
-def test_linked_proof_families_do_not_claim_complete_root_dependencies():
-    partial_role_dataset = _artifact_dataset(
+def test_overlay_accepts_linked_families_only_when_the_sealed_proof_covers_them():
+    proven_linked_dataset = _artifact_dataset(
         selected_resources=("PractitionerRole",),
         retained_resources=(
             "Location",
@@ -12350,22 +12350,29 @@ def test_linked_proof_families_do_not_claim_complete_root_dependencies():
             "PractitionerRole",
         ),
     )
+    unproven_location_dataset = _artifact_dataset(
+        selected_resources=("PractitionerRole",),
+        retained_resources=("Practitioner", "PractitionerRole"),
+    )
     healthcare_service_dataset = _artifact_dataset(
         selected_resources=("HealthcareService",),
         retained_resources=("HealthcareService", "Location"),
     )
 
+    assert importer._artifact_target_dependency_violation("address_overlay", proven_linked_dataset) is None
     assert importer._artifact_target_dependency_violation(
         "address_overlay",
-        partial_role_dataset,
+        unproven_location_dataset,
     ).startswith("address_overlay:source_a:")
-    assert (
-        importer._artifact_target_dependency_violation(
-            "address_overlay",
-            healthcare_service_dataset,
-        )
-        is None
-    )
+    assert importer._artifact_target_dependency_violation("address_overlay", healthcare_service_dataset) is None
+    # Other targets still require complete root families.
+    assert importer._artifact_target_dependency_violation(
+        "corroboration",
+        _artifact_dataset(
+            selected_resources=("InsurancePlan", "PractitionerRole"),
+            retained_resources=("InsurancePlan", "Location", "PractitionerRole"),
+        ),
+    ).startswith("corroboration:source_a:")
 
 
 @pytest.mark.parametrize(
