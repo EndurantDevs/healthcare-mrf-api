@@ -36,6 +36,7 @@ def parse_fhir_catalog_query(document, kind):
         "group_id",
         "company_search",
         "plan_search",
+        "include_stats",
     }
     if kind == "list":
         fields |= {"limit", "offset"}

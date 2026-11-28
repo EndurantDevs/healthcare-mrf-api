@@ -77,8 +77,8 @@ async def _validated_slices(connection, copy_target, address_source, candidate, 
     return report, slices
 
 
-async def _prepare_address_search(connection, copy_target, offices, slices, control_schema):
-    """Prepare custom hydration indexes and the optional exact search projection."""
+async def _prepare_address_search(connection, copy_target, offices, slices, control_schema, *, candidate=None):
+    """Prepare custom hydration indexes, exact search projection and independent network statistics."""
     if offices.custom is not None:
         from process.network_membership_serving_indexes import (
             _build_serving_indexes,
@@ -99,7 +99,44 @@ async def _prepare_address_search(connection, copy_target, offices, slices, cont
         offices.custom,
     )
     geo_search = await prepare_network_geo_search(connection, copy_target, layout)
-    return edge_artifacts, geo_search
+    network_stats = None
+    if geo_search is not None and candidate is not None and is_independent_network_candidate(candidate):
+        from process.network_stats import prepare_network_stats
+
+        network_stats = await prepare_network_stats(connection, copy_target, layout)
+    return edge_artifacts, geo_search, network_stats
+
+
+async def _serving_readiness_document(
+    connection,
+    copy_target,
+    candidate,
+    scope,
+    artifact,
+    search_outputs,
+    physical,
+    control_schema,
+):
+    edge_artifacts, geo_search, network_stats = search_outputs
+    has_typed_memberships = is_typed_candidate(candidate)
+    return {
+        "component": COMPONENT,
+        "readiness_revision": 1,
+        "ready": True,
+        "scope": scope,
+        "index_profile": "compact_membership",
+        "index_definition_revision": 2,
+        "index_definition_sha256": await compact_index_digest(connection, copy_target.schema_name, candidate=candidate),
+        "address_artifact": artifact,
+        "edge_artifacts": edge_artifacts,
+        "slice_ref_sha256": await compact_slice_ref_digest(
+            connection, copy_target.schema_name, include_reuse_keys=has_typed_memberships
+        ),
+        **({"slice_ref_revision": 2} if has_typed_memberships else {}),
+        **({"geo_search": geo_search, "city_search": True, "network_search": True} if geo_search is not None else {}),
+        **({"network_stats": network_stats} if network_stats is not None else {}),
+        **await independent_network_storage_metadata(connection, candidate, physical, control_schema=control_schema),
+    }
 
 
 async def prepare_compact_network_readiness(
@@ -126,27 +163,21 @@ async def prepare_compact_network_readiness(
     report, slices = await _validated_slices(
         connection, copy_target, address_source, candidate, control_schema, offices
     )
-    edge_artifacts, geo_search = await _prepare_address_search(connection, copy_target, offices, slices, control_schema)
+    search_outputs = await _prepare_address_search(
+        connection, copy_target, offices, slices, control_schema, candidate=candidate
+    )
     scope = _scope_report(candidate, address_source)
     canonical_readiness_by_field = _slice_readiness(scope, report, slices)
-    has_typed_memberships = is_typed_candidate(candidate)
-    serving_readiness_by_field = {
-        "component": COMPONENT,
-        "readiness_revision": 1,
-        "ready": True,
-        "scope": scope,
-        "index_profile": "compact_membership",
-        "index_definition_revision": 2,
-        "index_definition_sha256": await compact_index_digest(connection, copy_target.schema_name, candidate=candidate),
-        "address_artifact": artifact,
-        "edge_artifacts": edge_artifacts,
-        "slice_ref_sha256": await compact_slice_ref_digest(
-            connection, copy_target.schema_name, include_reuse_keys=has_typed_memberships
-        ),
-        **({"slice_ref_revision": 2} if has_typed_memberships else {}),
-        **({"geo_search": geo_search, "city_search": True, "network_search": True} if geo_search is not None else {}),
-        **await independent_network_storage_metadata(connection, candidate, physical, control_schema=control_schema),
-    }
+    serving_readiness_by_field = await _serving_readiness_document(
+        connection,
+        copy_target,
+        candidate,
+        scope,
+        artifact,
+        search_outputs,
+        physical,
+        control_schema,
+    )
     await connection.execute(
         f"UPDATE {_identifier(control_schema)}.network_membership_candidate "
         "SET state='ready',index_ready=true,validation_json=$2::jsonb WHERE candidate_id=$1",

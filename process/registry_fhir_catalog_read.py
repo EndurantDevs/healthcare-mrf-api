@@ -99,8 +99,11 @@ class FHIRCatalogQuery:
     relationship_offset: int = 0
     binding_offset: int = 0
     continuation_scope_sha256: str | None = None
+    include_stats: bool | None = None
 
     def __post_init__(self):
+        if self.include_stats is not None and type(self.include_stats) is not bool:
+            _invalid("request_invalid")
         RegistryNetworkCatalogQuery(
             self.limit, self.offset, self.generation_id, self.search, self.archived, self.source, self.benefit_code
         )
@@ -320,15 +323,28 @@ def _nested_document(document, validator, offset):
 
 
 def _network_item(document, query):
+    from process.network_stats_contract import validate_network_stats_summary_document
     from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_company_records
 
-    _object(document, _NETWORK_FIELDS | ({"source_companies"} if "source_companies" in document else set()))
+    is_stats_allowed = query.include_stats is True or (query.include_stats is None and "network_stats" in document)
+    optional_fields = ({"source_companies"} if "source_companies" in document else set()) | (
+        {"network_stats"} if is_stats_allowed else set()
+    )
+    _object(document, _NETWORK_FIELDS | optional_fields)
     if "source_companies" in document:
         validate_fhir_catalog_source_company_records(document["source_companies"])
+    if is_stats_allowed:
+        if document["network_stats"] is None and query.include_stats is not True:
+            _invalid()
+        if document["network_stats"] is not None:
+            try:
+                validate_network_stats_summary_document(document["network_stats"])
+            except ValueError:
+                _invalid()
     legacy_by_field = {
         key: entry
         for key, entry in document.items()
-        if key not in {"matching_relationships", "source_bindings", "source_companies"}
+        if key not in {"matching_relationships", "source_bindings", "source_companies", "network_stats"}
     }
     catalog_network_document({**legacy_by_field, "companies": [], "source_bindings": []})
     _nested_document(document["matching_relationships"], _relationship_document, query.relationship_offset)
@@ -606,7 +622,7 @@ WITH source_companies AS MATERIALIZED (
    'source_bindings',jsonb_build_object('total',bindings.total,'offset',$17::integer,
      'limit',5,'items',bindings.documents,'next_offset',
        CASE WHEN $17+jsonb_array_length(bindings.documents)<bindings.total
-         THEN $17+jsonb_array_length(bindings.documents) END)) AS document
+         THEN $17+jsonb_array_length(bindings.documents) END)){network_stats_projection} AS document
  FROM page
 {relationships} CROSS JOIN LATERAL (
    SELECT (SELECT count(*) FROM {control}.registry_fhir_catalog_binding binding
@@ -707,10 +723,39 @@ _SUMMARY_RELATIONSHIPS_SQL = r""" CROSS JOIN LATERAL (
 """
 
 
-def _catalog_page_statement(snapshot, manifest, *, summary=""):
+_ZERO_NETWORK_STATS_SQL = (
+    "jsonb_build_object('total_npi_count',0,'office_npi_count',0,'provider_only_npi_count',0,"
+    "'individual_npi_count',0,'organization_npi_count',0,'unique_address_count',0,'unique_location_count',0,"
+    "'state_count',0,'states','[]'::jsonb,'core_state_count',0,'core_states','[]'::jsonb,"
+    "'county_count',0,'zip5_count',0)"
+)
+
+
+def _network_stats_projection_sql(layout, *, include_stats=None):
+    if include_stats is False:
+        return ""
+    if layout is None or layout.network_stats_schema is None:
+        return " || jsonb_build_object('network_stats',NULL)" if include_stats is True else ""
+    from process.network_stats_contract import SUMMARY_TABLE
+
+    stats_rel = storage_identifier(layout.network_stats_schema) + "." + storage_identifier(SUMMARY_TABLE)
+    return (
+        f" || jsonb_build_object('network_stats',coalesce((SELECT jsonb_build_object("
+        f"'total_npi_count',st.total_npi_count,'office_npi_count',st.office_npi_count,"
+        f"'provider_only_npi_count',st.provider_only_npi_count,'individual_npi_count',st.individual_npi_count,"
+        f"'organization_npi_count',st.organization_npi_count,'unique_address_count',st.unique_address_count,"
+        f"'unique_location_count',st.unique_location_count,'state_count',st.state_count,'states',to_jsonb(st.states),"
+        f"'core_state_count',st.core_state_count,'core_states',to_jsonb(st.core_states),"
+        f"'county_count',st.county_count,'zip5_count',st.zip5_count) "
+        f"FROM ONLY {stats_rel} st WHERE st.network_id=page.network_id),{_ZERO_NETWORK_STATS_SQL}))"
+    )
+
+
+def _catalog_page_statement(snapshot, manifest, *, summary="", include_stats=None):
     """summary is "" for the grouped read, "company" for a summary without plan_search, "plan" with it."""
     parameters = ()
     directory_available = "false"
+    layout = None
     if manifest is not None:
         layout = manifest.compact_layout
         if layout is not None:
@@ -727,6 +772,7 @@ def _catalog_page_statement(snapshot, manifest, *, summary=""):
             directory_available = _DIRECTORY_AVAILABLE_SQL.format(
                 candidate=storage_identifier(manifest.schema_name), addresses=addresses
             )
+    stats_projection = _network_stats_projection_sql(layout, include_stats=include_stats)
     control = storage_identifier(snapshot["schema_name"])
     edge_networks, relationships, label_edges = (
         (_SUMMARY_EDGE_NETWORKS_SQL, _SUMMARY_RELATIONSHIPS_SQL, "company_keys")
@@ -738,6 +784,7 @@ def _catalog_page_statement(snapshot, manifest, *, summary=""):
         _PAGE_SQL.format(
             control=control,
             directory_available=directory_available,
+            network_stats_projection=stats_projection,
             edge_networks=edge_networks.format(control=control, plan_filter=plan_filter, plan_networks=plan_networks),
             relationships=relationships.format(control=control, grouped=_GROUPED_RELATIONSHIPS_SQL),
             label_edges=label_edges,
@@ -872,7 +919,9 @@ async def read_fhir_catalog(
         summary = await _network_summary(connection, snapshot["schema_name"])
         if query.plan_search is not None and summary != "plan":
             summary = ""
-        sql, address_parameters = _catalog_page_statement(snapshot, manifest, summary=summary)
+        sql, address_parameters = _catalog_page_statement(
+            snapshot, manifest, summary=summary, include_stats=query.include_stats
+        )
         entry = await connection.fetchrow(
             sql,
             *(

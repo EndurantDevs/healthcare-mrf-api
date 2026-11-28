@@ -122,6 +122,10 @@ def published_network_layout(candidate, *, retained_base_name=None):
         bind_compact_geo_search(layout, CompactAddressRelation(schema, search["table_name"]))
         object.__setattr__(layout, "_city_search", serving.get("city_search") is True)
         object.__setattr__(layout, "_network_search", serving.get("network_search") is True)
+    if type(serving.get("network_stats")) is dict:
+        from process.network_compact_layout import bind_compact_network_stats
+
+        bind_compact_network_stats(layout, schema)
     return layout
 
 
