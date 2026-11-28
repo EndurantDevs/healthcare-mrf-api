@@ -244,11 +244,11 @@ async def _independent_native_work(db, target):
     return '"independent_facts"'
 
 
-@pytest.mark.parametrize("select_bucket", [False, True])
-async def test_native_facts_keep_all_evidence_at_page_boundary(slice_db, select_bucket):
+@pytest.mark.parametrize(("select_bucket", "bindings_verified"), [(False, False), (True, False), (False, True)])
+async def test_native_facts_keep_all_evidence_at_page_boundary(slice_db, select_bucket, bindings_verified):
     db = slice_db
-    target = await _candidate(db, [(7, 0), (42, 1), (99, 2)])
-    namespace = '"' + target.schema_name + '"'
+    copy_target = await _candidate(db, [(7, 0), (42, 1), (99, 2)])
+    namespace = '"' + copy_target.schema_name + '"'
     async with db.connection.transaction():
         await db.connection.execute(f"CREATE INDEX ON {namespace}.network_membership({ORDER})")
         await db.connection.execute(f"""INSERT INTO {namespace}.network_membership
@@ -260,8 +260,14 @@ async def test_native_facts_keep_all_evidence_at_page_boundary(slice_db, select_
             await db.connection.execute("""CREATE TEMP TABLE changed_buckets ON COMMIT DROP AS
                 SELECT 42 AS network_id,get_byte(sha256(convert_to('office-b','UTF8')),0)&63 AS office_bucket""")
             affected = '"changed_buckets"'
+        # A verified full pass groups everything in one statement and must count exactly what the pages count.
         counts = await build_matched_facts(
-            db.connection, namespace, '"' + db.source_schema + '".retained_addresses', '"source_facts"', affected
+            db.connection,
+            namespace,
+            '"' + db.source_schema + '".retained_addresses',
+            '"source_facts"',
+            affected,
+            bindings_verified=bindings_verified,
         )
         assert counts["invalid_memberships"] == (0 if select_bucket else 1)
         assert counts["invalid_location_keys"] == 0
