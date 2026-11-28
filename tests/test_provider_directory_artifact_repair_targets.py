@@ -18,6 +18,7 @@ def fence(resources=None):
         selected_resources=selected_datasets,
         expected_resources=selected_datasets,
         recorded_expected_resources=selected_datasets,
+        artifact_resources=selected_datasets,
     )
     return SimpleNamespace(datasets=(dataset,))
 

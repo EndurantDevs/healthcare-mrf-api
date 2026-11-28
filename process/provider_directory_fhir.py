@@ -18209,23 +18209,23 @@ def _artifact_target_dependency_violation(
     artifact_target: str,
     dataset: ProviderDirectoryArtifactDataset,
 ) -> str | None:
-    """Return one missing artifact dependency or None when not applicable."""
+    """Return one missing dependency; roots decide applicability, the overlay may use sealed-proof linked families."""
     alternatives = PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES[artifact_target]
-    selected_resources = set(dataset.selected_resources)
-    if artifact_target == "corroboration" and "InsurancePlan" not in selected_resources:
+    resources = set(dataset.selected_resources)
+    covered = set(dataset.artifact_resources) if artifact_target == "address_overlay" else resources
+    if artifact_target == "corroboration" and "InsurancePlan" not in resources:
         return None
-    if not selected_resources.intersection(set().union(*alternatives)):
+    if not resources.intersection(set().union(*alternatives)):
         return None
-    if any(alternative.issubset(selected_resources) for alternative in alternatives):
+    if any(alternative.issubset(covered) for alternative in alternatives):
         return None
-    required_alternatives = "|".join(",".join(sorted(alternative)) for alternative in alternatives)
     return ":".join(
         (
             artifact_target,
             dataset.source_id,
             dataset.endpoint_id,
             dataset.dataset_id,
-            required_alternatives,
+            "|".join(",".join(sorted(alternative)) for alternative in alternatives),
         )
     )
 
