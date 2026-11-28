@@ -13,13 +13,15 @@ import pytest
 from sqlalchemy import Index, MetaData, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from db import nppes_evidence_callable_contract as callable_contract
 from db.migration_nppes_evidence_candidates import upgrade_nppes_evidence_candidates
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import nppes_public_evidence_storage as storage
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_source_acquisition_custody as acquisition
 from process import provider_directory_source_cohort_custody as cohort
-from process.nppes_public_evidence_control_custody import adopt_nppes_control_custody
+from process.nppes_public_evidence_catalog import assert_nppes_candidate_catalog
+from process.plan_release_storage_provision import _GRANTEES_SQL
 from process.provider_directory_cms_control_custody import _RIGHTS as control_rights
 from tests.cms_control_privileges_support import grant_cms_origin_metadata_read_privileges
 from tests.cms_npd_admission_postgres_support import (
@@ -349,6 +351,60 @@ async def _retire_cohort_intake_guards(driver, policy):
         f"EXECUTE FUNCTION {storage_relation(policy.schema, cohort._HEADER_GUARD)}()"
     )
     await driver.execute(f"ALTER TABLE {header} ENABLE ALWAYS TRIGGER pd_uhc_flex_npi_cohort_guard")
+
+
+_NPPES_CONTROL_TABLES = (
+    "public_evidence_nppes_registry_storage",
+    "public_evidence_nppes_registry_admission",
+    "public_evidence_nppes_registry_admission_seal",
+    "public_evidence_nppes_registry_chain_admission",
+    "public_evidence_nppes_registry_chain_admission_seal",
+    "public_evidence_nppes_registry_chain_archive",
+)
+_NPPES_ARCHIVE_GUARD = "public_evidence_nppes_registry_admission_integrity_guard"
+
+
+async def adopt_nppes_control_custody(connection, schema, policy, *, migration_role, namespace_owner_role):
+    """Operator stand-in: hand the NPPES admission controls to the Source Owner with plain DCL."""
+    owner = storage_identifier(policy.owner_role)
+    async with connection.transaction():
+        await connection.execute(
+            "LOCK TABLE "
+            + ",".join(storage_relation(schema, table) for table in sorted(_NPPES_CONTROL_TABLES))
+            + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+        )
+        admission = storage_relation(schema, _NPPES_CONTROL_TABLES[1])
+        if await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass($1) AND tgname=$2)",
+            admission,
+            _NPPES_ARCHIVE_GUARD,
+        ):
+            for table in _NPPES_CONTROL_TABLES:
+                relation = storage_relation(schema, table)
+                await connection.execute(f"ALTER TABLE {relation} OWNER TO {owner}")
+                oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", relation)
+                for grant in await connection.fetch(_GRANTEES_SQL, oid):
+                    principal = "PUBLIC" if grant["grantee"] == 0 else storage_identifier(grant["rolname"])
+                    column = grant["column_name"]
+                    privileges = f"ALL PRIVILEGES ({storage_identifier(column)})" if column else "ALL PRIVILEGES"
+                    await connection.execute(f"REVOKE {privileges} ON TABLE {relation} FROM {principal} CASCADE")
+                runtime = ",".join(storage_identifier(role) for role in policy.runtime_roles)
+                await connection.execute(f"GRANT SELECT ON TABLE {relation} TO {runtime}")
+            for name in callable_contract.expected_nppes_callable_bodies(schema):
+                if name == callable_contract.IMMUTABLE:
+                    continue
+                signature = storage_relation(schema, name) + "()"
+                await connection.execute(f"ALTER FUNCTION {signature} OWNER TO {owner}")
+                for grant in await connection.fetch(
+                    "SELECT a.grantee,r.rolname FROM pg_proc p "
+                    "CROSS JOIN LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a "
+                    "LEFT JOIN pg_roles r ON r.oid=a.grantee WHERE p.oid=to_regprocedure($1)",
+                    signature,
+                ):
+                    principal = "PUBLIC" if grant["grantee"] == 0 else storage_identifier(grant["rolname"])
+                    await connection.execute(f"REVOKE EXECUTE ON FUNCTION {signature} FROM {principal} CASCADE")
+            await connection.execute(f"DROP TRIGGER {storage_identifier(_NPPES_ARCHIVE_GUARD)} ON {admission}")
+        await assert_nppes_candidate_catalog(connection, schema, policy)
 
 
 async def _provision_native_controls(component, *, native_inputs=False, metadata_read_roles=()):

@@ -196,18 +196,9 @@ async def _admit(
 
 
 async def _publish_candidate(database, schema, candidate, prepared, cancel_check):
-    from process.nppes_isolated_catalog import issued_isolated_nppes_catalog
-
-    if issued_isolated_nppes_catalog() is not None:
+    async with source_policy.source_transaction(database):
         await _candidate_catalog(database, schema)
-        state = await storage.publish_nppes_evidence_candidate(database, candidate, prepared, cancel_check=cancel_check)
-    else:
-        async with source_policy.source_transaction(database):
-            await _candidate_catalog(database, schema)
-            state = await storage.publish_nppes_evidence_candidate(
-                database, candidate, prepared, cancel_check=cancel_check
-            )
-    return state
+        return await storage.publish_nppes_evidence_candidate(database, candidate, prepared, cancel_check=cancel_check)
 
 
 async def _flush_candidate(database, candidate, buffers, *, cancel_check, progress):

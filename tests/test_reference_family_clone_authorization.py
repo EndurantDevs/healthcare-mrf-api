@@ -37,7 +37,6 @@ async def test_clone_authorization_follows_snapshot_import_and_precedes_create(m
     ownership = object()
     capture = SimpleNamespace(
         postgres_snapshot="00000003-00000001-1",
-        canonical_source_fence=None,
         frozen_source_projection=None,
         manifest=SimpleNamespace(importer_id="cms-doctors", source_capture_contract=None, as_dict=lambda: {}),
     )

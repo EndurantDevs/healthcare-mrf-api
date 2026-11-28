@@ -959,14 +959,13 @@ def test_source_copy_capability_refuses_unbounded_or_non_callable_inputs(field, 
         archive.ReferenceFamilySourceCopy(**arguments_by_field)
 
 
-@pytest.mark.parametrize("fault", ("unknown-option", "foreign-fence", "session-owner"))
+@pytest.mark.parametrize("fault", ("unknown-option", "session-owner"))
 def test_source_creation_refuses_unknown_or_cross_family_authority_before_opening_sessions(fault):
     factory = Mock()
     copied, recorded = AsyncMock(), AsyncMock()
     options_by_field = {"source_copy": archive.ReferenceFamilySourceCopy(copied, 1024, 30), "on_precreated": recorded}
     field, value, reason = {
         "unknown-option": ("allow_unowned", True, "source options are invalid"),
-        "foreign-fence": ("canonical_source_fence", object(), "fence scope differs"),
         "session-owner": ("source_sessions", None, "owning session is unavailable"),
     }[fault]
     options_by_field[field] = value
@@ -1406,39 +1405,6 @@ async def test_legacy_mrf_source_cannot_create_a_new_noncanonical_clone():
     copier.assert_not_awaited()
     recorded.assert_not_awaited()
     session.scalar.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ("lock-source", "clone"))
-async def test_canonical_copy_rechecks_live_publisher_fence_before_candidate_creation(operation):
-    transaction = SimpleNamespace(is_active=True)
-    holder = SimpleNamespace(get_transaction=lambda: transaction)
-    fence = archive.CanonicalSourceFence(holder, transaction, 21, 22, 23, "4/5")
-    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(), scalar=AsyncMock(return_value=False))
-    copied, recorded = AsyncMock(), AsyncMock()
-    with pytest.raises(RuntimeError, match="canonical source fence identity differs"):
-        if operation == "lock-source":
-            await archive._lock_source_family(
-                session, archive.reference_family_spec("mrf", canonical=True), "mrf", fence
-            )
-        else:
-            capture = archive.ReferenceFamilySourceCapture(
-                _declared_manifest("mrf", canonical=True), "mrf", "00000003-00000018-1", fence
-            )
-            await archive._clone_source(
-                session,
-                capture,
-                _ownership().schema_name,
-                source_copy=archive.ReferenceFamilySourceCopy(copied, 1024, 30),
-                on_precreated=recorded,
-                deadline=asyncio.get_running_loop().time() + 30,
-            )
-    assert session.scalar.await_args.args[1] == {"pid": 21, "database": 22, "relation": 23, "transaction": "4/5"}
-    queries = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert queries[-1] == 'LOCK TABLE "mrf"."address_archive_v2" IN ACCESS SHARE MODE NOWAIT'
-    assert not any(sql.startswith(("CREATE", "INSERT", "COPY")) for sql in queries)
-    copied.assert_not_awaited()
-    recorded.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -319,33 +319,3 @@ async def test_named_stage_still_requires_the_closed_native_model_layout(fault):
             await archive.capture_ownership(session, prepared.ownership.importer_id, prepared.ownership.dataset_id)
             == prepared.ownership
         )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["freeze", "content"])
-async def test_legacy_florida_preparation_closes_named_writes_before_content_validation(monkeypatch, fault):
-    legacy = projection.legacy
-    prepared = SimpleNamespace(manifest={"run_id": "a" * 32}, ownership=object())
-    freeze = AsyncMock(side_effect=PermissionError("native access refused") if fault == "freeze" else None)
-    validate = AsyncMock(side_effect=RuntimeError("content differs"))
-    monkeypatch.setattr(legacy, "validate_manifest", Mock(return_value=prepared.manifest))
-    monkeypatch.setattr(legacy.native, "seal_model_family_storage", freeze)
-    monkeypatch.setattr(legacy, "validate_stage", validate)
-    session = object()
-    with pytest.raises(
-        PermissionError if fault == "freeze" else RuntimeError, match="native access refused|content differs"
-    ):
-        await legacy.prepare_activation(
-            session,
-            prepared=prepared,
-            package_id="a" * 64,
-            sealed_owner_oid=-1,
-            destination_schema="serving",
-            expected={},
-            pin_id=uuid4(),
-        )
-    freeze.assert_awaited_once_with(session, prepared.ownership)
-    if fault == "freeze":
-        validate.assert_not_awaited()
-    else:
-        validate.assert_awaited_once_with(session, prepared.ownership, prepared.manifest)

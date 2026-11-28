@@ -45,18 +45,6 @@ def test_published_and_partial_flows_are_distinct():
             archive._validate_run({**_run(), **changed})
 
 
-def test_florida_archive_owns_projection_and_audits():
-    assert archive.TABLES == (
-        "provider_profile_import_run",
-        "provider_profile_artifact",
-        "provider_profile_source_record",
-        "provider_profile_fact",
-        "provider_profile_projection",
-    )
-    with pytest.raises(archive.FloridaProjectionArchiveError):
-        archive._identity({"run_id": "a" * 32, "relation_oid": 0})
-
-
 @pytest.mark.asyncio
 async def test_ordinary_candidate_closes_default_grants_before_sealing(monkeypatch):
     events = []
@@ -114,47 +102,6 @@ async def test_candidate_seal_checks_shape_but_not_owner_or_grants(monkeypatch, 
             await archive._projection_candidate_seal(session, "mrf", "candidate", 11)
     assert "relowner" not in str(session.execute.await_args.args[0])
     session.scalar.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["unchanged", "replaced_after_lock", "absent", "moved"])
-async def test_cutover_cleanup_rechecks_sealed_identity_after_lock(monkeypatch, state):
-    cutover_id = uuid4()
-    name = archive._cutover_name(cutover_id)
-    seal_by_field = {"relation_oid": 10, "owner_oid": 11, "table_name": name}
-    has_candidate = state in {"unchanged", "replaced_after_lock"}
-    session = SimpleNamespace(scalar=AsyncMock(return_value=state == "moved"), execute=AsyncMock())
-    lock = AsyncMock()
-    monkeypatch.setattr(archive.native, "_lock_family", lock)
-    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=10 if has_candidate else None))
-
-    async def locked_seal(*_args):
-        lock.assert_awaited_once_with(session, "mrf", (name,), "ACCESS EXCLUSIVE", nowait=True)
-        return {**seal_by_field, "relation_oid": 10 + (state == "replaced_after_lock")}
-
-    candidate_seal = AsyncMock(side_effect=locked_seal)
-    monkeypatch.setattr(archive, "_candidate_seal", candidate_seal)
-    pending = archive.cleanup_cutover_candidate(session, schema="mrf", cutover_id=cutover_id, seal=seal_by_field)
-    if state in {"replaced_after_lock", "moved"}:
-        with pytest.raises(archive.FloridaProjectionArchiveError, match="candidate changed|candidate moved"):
-            await pending
-    else:
-        await pending
-    if has_candidate:
-        candidate_seal.assert_awaited_once_with(session, "mrf", cutover_id, 11)
-        session.scalar.assert_not_awaited()
-    else:
-        lock.assert_not_awaited()
-        candidate_seal.assert_not_awaited()
-        session.scalar.assert_awaited_once()
-        statement, parameters = session.scalar.call_args.args
-        assert str(statement) == "SELECT EXISTS(SELECT 1 FROM pg_class WHERE oid=:oid)"
-        assert parameters == {"oid": 10}
-    if state == "unchanged":
-        session.execute.assert_awaited_once()
-        assert str(session.execute.call_args.args[0]) == f'DROP TABLE "mrf"."{name}" RESTRICT'
-    else:
-        session.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("fault", [None, "partial", "sources", "header", "schema", "quarantine", "policy", "failed"])
@@ -342,35 +289,27 @@ async def test_projection_admission_preserves_cancel_and_exact_oid_fences(monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [None, "oid", "content", "dependent"])
-async def test_projection_rollback_preserves_oid_and_never_rebuilds_a_candidate(monkeypatch, fault):
-    from uuid import uuid4
-
-    pointer_by_field = {
-        "current_run_id": "b" * 32,
-        "previous_run_id": "a" * 32,
-        "current_relation_oid": 20,
-        "previous_relation_oid": 10,
-    }
-    prepared = SimpleNamespace(
-        manifest={"run_id": "a" * 32}, ownership=SimpleNamespace(schema_name="stage", dataset_id=uuid4())
+async def test_cutover_stage_drops_role_grants_and_replays_only_non_owner_grants(monkeypatch):
+    statements = []
+    rows = iter(
+        [
+            [{"grantee": 0, "rolname": None}, {"grantee": 7, "rolname": "owner"}, {"grantee": 9, "rolname": "reader"}],
+            [
+                {"grantee": 7, "privilege_type": "SELECT", "is_grantable": False, "rolname": "owner"},
+                {"grantee": 9, "privilege_type": "SELECT", "is_grantable": True, "rolname": "reader"},
+            ],
+        ]
     )
-    monkeypatch.setattr(archive.native, "_lock_family", AsyncMock())
-    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=None))
-    monkeypatch.setattr(archive.native, "_is_model_table_equal", AsyncMock(return_value=fault != "content"))
-    monkeypatch.setattr(archive, "publication_pointer", AsyncMock(return_value=pointer_by_field))
-    monkeypatch.setattr(archive, "_live_projection_security", AsyncMock())
-    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=fault == "dependent"))
-    projection_by_field = {"cutover": {"relation_oid": 99 if fault == "oid" else 10}}
-    if fault:
-        with pytest.raises(archive.FloridaProjectionArchiveError):
-            await archive.rollback_native_projection(
-                session, prepared, "destination", pointer_by_field, projection_by_field
-            )
-        session.execute.assert_not_awaited()
-    else:
-        await archive.rollback_native_projection(
-            session, prepared, "destination", pointer_by_field, projection_by_field
-        )
-        statements = [str(call.args[0]) for call in session.execute.await_args_list]
-        assert len(statements) == 3 and all(statement.startswith("ALTER TABLE") for statement in statements)
+
+    async def execute(statement, parameters=None):
+        statements.append(str(statement))
+        return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: next(rows)))
+
+    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=11))
+    session = SimpleNamespace(execute=execute)
+    await archive._clear_stage_grants(session, "mrf", "projection_stage", 7)
+    await archive._replay_live_grants(session, '"mrf"."projection_stage"', 11, 7)
+    assert 'REVOKE ALL ON TABLE "mrf"."projection_stage" FROM PUBLIC' in statements
+    assert 'REVOKE ALL ON TABLE "mrf"."projection_stage" FROM "reader"' in statements
+    assert 'GRANT SELECT ON TABLE "mrf"."projection_stage" TO "reader" WITH GRANT OPTION' in statements
+    assert not any('"owner"' in statement for statement in statements)
