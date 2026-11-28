@@ -143,7 +143,7 @@ def _detail_key(card):
     return identity_by_field
 
 
-def _check_coordinates(card, center, radius):
+def _check_coordinates(card, center, radius, *, capped=False):
     latitude = card.get("latitude")
     longitude = card.get("longitude")
     reported = card.get("distance")
@@ -152,8 +152,11 @@ def _check_coordinates(card, center, radius):
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180 and reported >= 0):
         raise ValueError("guardian_card_position_invalid")
     distance = distance_miles(*center, latitude, longitude)
-    if distance > radius * 1.01 + 0.1 or abs(reported - distance) > 0.1 + distance * 0.01:
-        raise ValueError("guardian_search_center_mismatch")
+    if distance <= radius * 1.01 + 0.1 and abs(reported - distance) <= 0.1 + distance * 0.01:
+        return latitude, longitude
+    if capped and max(distance, reported) * 1.01 + 0.1 < radius:
+        return None, None
+    raise ValueError("guardian_search_center_mismatch")
 
 
 def _delegated_destination(result):
@@ -263,18 +266,18 @@ def _name(card, field):
     return text if type(text) is str and 3 <= len(text) <= 200 and text.isprintable() else None
 
 
-def _observe(capture, scope, cards, center, radius):
+def _observe(capture, scope, cards, center, radius, *, capped=False):
     observations = []
     detail_keys = []
     for card in cards:
         key = _detail_key(card)
-        _check_coordinates(card, center, radius)
+        latitude, longitude = _check_coordinates(card, center, radius, capped=capped)
         detail_keys.append(key)
         observations.append(
             (
                 canonical_json(key),
-                card["latitude"],
-                card["longitude"],
+                latitude,
+                longitude,
                 _name(card, "ddsPracticeName"),
                 _name(card, "ddsLastName"),
             )
@@ -282,6 +285,12 @@ def _observe(capture, scope, cards, center, radius):
     distinct_keys = {row[0] for row in observations}
     if len(distinct_keys) != len(detail_keys):
         raise ValueError("guardian_search_duplicate_card")
+    unlocated_keys = [key for key, lat, *_ in observations if lat is None]
+    if unlocated_keys:
+        # Independent sites must corroborate the center before accepting an inconsistent display distance.
+        sites = {(lat, lon) for _, lat, lon, *_ in observations if lat is not None}
+        if len(sites) < 3 or len(unlocated_keys) >= len(sites) or capture.has_located_key(scope, unlocated_keys):
+            raise ValueError("guardian_search_center_mismatch")
     capture.enqueue_details(detail_keys)
     capture.observe(scope, observations)
     return distinct_keys
@@ -305,7 +314,7 @@ async def _sweep(capture, region, selector, tile, request, counts_by_outcome):
         capture.record_delegation(query, window_parts, search_page)
         return
     count, cards = search_page
-    keys = _observe(capture, scope, cards, tile.center, radius)
+    keys = _observe(capture, scope, cards, tile.center, radius, capped=len(cards) < count)
     if len(cards) == count:
         capture.add_circle(scope, tile.center, (radius - 0.1) / 1.01)
         return
@@ -443,7 +452,7 @@ class DenseWindow:
             if any(name.casefold() not in str(card.get(source_name) or "").casefold() for card in cards):
                 raise ValueError("guardian_search_name_filter_mismatch")
         scope = self.cells[0]
-        extra = _observe(capture, scope, cards, center, RADII[0])
+        extra = _observe(capture, scope, cards, center, RADII[0], capped=len(cards) < reported)
         if center == self.center and (filters or qualifier):
             self.keys.update(extra)
             capture.record_gap(self.cells, "unresolved_result_cap", self.total, self.keys, self.parent_span)

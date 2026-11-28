@@ -290,6 +290,47 @@ def test_redirect_and_truncated_counts_fail_closed():
         sweep._check_coordinates(_card(latitude=41.0), (40.0, -80.0), 2)
 
 
+async def test_capped_search_retains_unlocated_card_without_using_it_in_other_windows(capture, monkeypatch):
+    center = (40.0, -80.0)
+    sites = [
+        {**_card(str(index), *sweep._offset(center, east, north)), "distance": 1.0}
+        for index, (east, north) in enumerate(((1, 0), (0, 1), (-1, 0)))
+    ]
+    suspect_card_map = {**_card("different", *sweep._offset(center, 0, 1.5)), "distance": 1.0}
+    cards = [*sites, suspect_card_map]
+    tile = GeoTile(39.999, 40.001, -80.001, -79.999)
+    region = sweep.SearchRegion("PA", "00001", tile)
+    selector = ("PLAN-A", "")
+    scope = canonical_json([region.state, region.zip_code, *selector])
+    monkeypatch.setattr(sweep, "_CARD_LIMIT", len(cards))
+    page_map = {"redirect": False, "providers": cards, "totalResults": len(cards) + 1}
+    await sweep._sweep(capture, region, selector, tile, AsyncMock(return_value=page_map), {"capped": 0})
+    assert capture.has_gaps() and not capture.covers_tile(scope, center, 0.1)
+    keys = {canonical_json(sweep._detail_key(card)) for card in cards}
+    assert len(keys) == 4 and capture.is_count_reconciled(scope, center, 10, keys, 4)
+    assert capture.is_count_reconciled(scope, center, 10, set(), 3)
+    assert not capture.is_count_reconciled(scope, center, 10, set(), 4)
+    assert len(capture.detail_batch("", 10)) == 4
+    updated_card_map = {**suspect_card_map, "distance": 1.5}
+    sweep._observe(capture, scope, [updated_card_map], center, 10)
+    assert sweep._observe(capture, scope, cards, center, 10, capped=True) == keys
+    assert len(capture.detail_batch("", 10)) == 4
+    assert capture.is_count_reconciled(scope, center, 10, set(), 3)
+
+    for unconfirmed in (
+        [suspect_card_map],
+        [*sites[:2], suspect_card_map],
+        [*sites, {**suspect_card_map, "distance": 10.0}],
+    ):
+        with pytest.raises(ValueError, match="center_mismatch"):
+            sweep._observe(capture, "another", unconfirmed, center, 10, capped=True)
+    with pytest.raises(ValueError, match="center_mismatch"):
+        sweep._observe(capture, "another", cards, center, 10)
+    sweep._observe(capture, "another", [updated_card_map], center, 10)
+    with pytest.raises(ValueError, match="center_mismatch"):
+        sweep._observe(capture, "another", cards, center, 10, capped=True)
+
+
 async def test_unresolved_cap_records_gap(capture):
     tile = GeoTile(39.9999, 40.0001, -80.0001, -79.9999)
     cards = [_card(str(n)) for n in range(150)]
