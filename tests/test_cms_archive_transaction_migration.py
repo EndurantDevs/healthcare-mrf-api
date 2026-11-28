@@ -3,12 +3,11 @@
 
 import importlib.util
 import re
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-from process.provider_directory_cms_callable_custody import _body_digest
 
 _VERSIONS = Path(__file__).parents[1] / "alembic/versions"
 
@@ -19,6 +18,92 @@ def _load(prefix):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def body_digest(body, schema):
+    """Digest one function body with its schema name masked, as the revisions pin it."""
+    canonical = body.replace('"' + schema + '"', '"__schema__"').replace("'" + schema + "'", "'__schema__'")
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _migration_functions(*, named=True):
+    path = Path(__file__).parents[1] / "alembic/versions/20260930100000_cms_npd_serving_receipt.py"
+    spec = importlib.util.spec_from_file_location("serving_receipt_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    statements = []
+    migration.op = SimpleNamespace(execute=statements.append)
+    for name in (
+        "_create_native_readers",
+        "_create_table",
+        "_create_archive_check",
+        "_create_result_check",
+        "_create_current_check",
+        "_create_snapshot_check",
+        "_create_insert_guard",
+        "_create_fresh_guard",
+        "_create_native_transition_guards",
+        "_create_source_transition_guards",
+        "_create_truncate_guards",
+    ):
+        getattr(migration, name)('"snapshot_schema"')
+    function_by_name = {}
+    for statement in statements:
+        match = re.search(
+            r'CREATE FUNCTION "snapshot_schema"\.(cms_serving_\w+)\((.*?)\) RETURNS (\w+)\s+'
+            r"LANGUAGE (\w+)(.*?)AS \$\$(.*)\$\$",
+            statement,
+            re.S,
+        )
+        if match:
+            name, arguments, returns, language, options, body = match.groups()
+            args = tuple(tuple(arg.strip().split()) for arg in arguments.split(",")) if arguments else ()
+            function_by_name[name] = (args, returns, language, "s" if "STABLE" in options else "v", body)
+    repair_path = path.with_name("20261016030000_cms_source_guard_argument_types.py")
+    repair_spec = importlib.util.spec_from_file_location("source_guard_argument_types", repair_path)
+    repair = importlib.util.module_from_spec(repair_spec)
+    repair_spec.loader.exec_module(repair)
+    old_call, new_call = repair._calls("snapshot_schema")
+    for name, previous_hash, next_hash in repair._CONTRACTS:
+        *attributes, body = function_by_name[name]
+        assert body_digest(body, "snapshot_schema") == previous_hash
+        assert body.count(old_call) == 1
+        replacement = body.replace(old_call, new_call)
+        assert body_digest(replacement, "snapshot_schema") == next_hash
+        function_by_name[name] = (*attributes, replacement)
+    _repair_archive_body(path, function_by_name)
+    if named:
+        _apply_named_function_bodies(function_by_name)
+    return function_by_name
+
+
+def _apply_named_function_bodies(function_by_name):
+    named = _load("20261114190000")
+    for name, pairs in named._replacements("snapshot_schema").items():
+        if name not in function_by_name:
+            continue
+        *attributes, body = function_by_name[name]
+        for pair in pairs:
+            previous, current = pair[:2]
+            assert body.count(previous) == (pair[2] if len(pair) == 3 else 1)
+            body = body.replace(previous, current)
+        function_by_name[name] = (*attributes, body)
+
+
+def _repair_archive_body(path, function_by_name):
+    archive_path = path.with_name("20261019130000_cms_archive_transaction_guard.py")
+    archive_spec = importlib.util.spec_from_file_location("archive_transaction_guard", archive_path)
+    archive_guard = importlib.util.module_from_spec(archive_spec)
+    archive_spec.loader.exec_module(archive_guard)
+    name = "cms_serving_archive_result_matches"
+    *attributes, body = function_by_name[name]
+    contract = next(item for item in archive_guard._CONTRACTS if item[0] == name)
+    assert body_digest(body, "snapshot_schema") == contract[1]
+    for previous, current in archive_guard._replacements("snapshot_schema")[name]:
+        assert body.count(previous) == 1
+        body = body.replace(previous, current)
+    assert body_digest(body, "snapshot_schema") == contract[2]
+    function_by_name[name] = (*attributes, body)
 
 
 def _historical_bodies():
@@ -51,11 +136,11 @@ def test_forward_repair_matches_authentic_historical_body_and_exact_new_contract
         .replace("'snapshot_schema'", f"'{schema}'")
     )
     contract = next(item for item in migration._CONTRACTS if item[0] == name)
-    assert _body_digest(body, schema) == contract[1]
+    assert body_digest(body, schema) == contract[1]
     for previous, current in migration._replacements(schema)[name]:
         assert body.count(previous) == 1
         body = body.replace(previous, current)
-    assert _body_digest(body, schema) == contract[2]
+    assert body_digest(body, schema) == contract[2]
     if name == "cms_serving_archive_result_matches":
         assert "xmin" not in body and "pg_locks" not in body
         assert "mutation_xid=pg_current_xact_id()" in body

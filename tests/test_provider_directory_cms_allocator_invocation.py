@@ -10,13 +10,7 @@ import pytest
 
 from db import migration_cms_snapshot_allocator as migration
 from db.plan_release_storage import storage_relation
-from process import provider_directory_cms_callable_custody as callables
-from process import provider_directory_cms_transition_routines as transition
-from process import provider_directory_generic_source_release_checks as checks
-from process import provider_directory_source_callable_custody as source
-from tests.test_provider_directory_cms_callee_custody import _catalog_rows, _original_allocation_pins
-from tests.test_provider_directory_cms_transition_routines import _raw
-from tests.test_provider_directory_generic_source_release_checks import legacy_function_rows
+from tests.test_cms_archive_transaction_migration import body_digest
 
 _NAME = "prepare_pd_generic_dataset_storage"
 
@@ -28,7 +22,7 @@ def _bodies(schema):
 @pytest.mark.parametrize("schema", ["source_schema", "alternate_catalog", "Mixed_Catalog23"])
 def test_bound_variant_adds_only_source_fixed_invocation_before_all_existing_branches(schema):
     original, previous, bound = _bodies(schema)
-    assert callables._body_digest(original, schema) == migration.ORIGINAL_ALLOCATOR_SHA256
+    assert body_digest(original, schema) == migration.ORIGINAL_ALLOCATOR_SHA256
     start, tail = bound.split("BEGIN\n", 1)
     invocation, separator, unchanged = tail.partition("    END IF;\n")
     assert separator and start + "BEGIN\n" + unchanged == previous
@@ -66,68 +60,6 @@ def test_unknown_constructor_never_becomes_approved_authority(monkeypatch, damag
     monkeypatch.setattr(migration, "candidate_functions", lambda schema: rendered.replace(old, new, 1))
     with pytest.raises(RuntimeError, match="predecessor_changed|source_template_changed"):
         migration.bound_cms_allocator_body("source_schema")
-
-
-def _row(monkeypatch, schema="source_schema"):
-    row = next(row for row in legacy_function_rows(monkeypatch) if row["definition"]["proname"] == _NAME)
-    row["definition"]["prosrc"] = migration.allocator_bodies(schema)[0]
-    return row
-
-
-@pytest.mark.parametrize("version", [0, 1, 2])
-def test_release_and_transition_consumers_share_exact_approved_variants(monkeypatch, version):
-    row = _row(monkeypatch)
-    row["definition"]["prosrc"] = _bodies("source_schema")[version]
-    before = deepcopy(row)
-    checks._require_native_function(
-        row["definition"], checks._LEGACY_FUNCTIONS[_NAME + "()"], row["language"], "source_schema", 201, {105}
-    )
-    transition.require_cms_transition_routine_definitions(
-        [_raw(row, "source_schema", 201)],
-        catalog_schema="source_schema",
-        catalog_schema_oid=201,
-        preparation_schema="preparation_schema",
-    )
-    assert row == before
-    assert not source._is_approved_body(row["definition"], "source_schema", "f" * 64)
-
-
-@pytest.mark.parametrize("fault", ["body", "owner", "settings", "security", "type", "name", "default", "language"])
-def test_bound_variant_preserves_all_other_native_refusals(monkeypatch, fault):
-    row = _row(monkeypatch)
-    definition = row["definition"]
-    definition["prosrc"] = migration.bound_cms_allocator_body("source_schema")
-    key, value = {
-        "body": ("prosrc", definition["prosrc"] + "\n-- changed"),
-        "owner": ("proowner", "999"),
-        "settings": ("proconfig", ["search_path=public"]),
-        "security": ("prosecdef", False),
-        "type": ("prorettype", "2278"),
-        "name": ("proname", "different_allocator"),
-        "default": ("pronargdefaults", 1),
-        "language": ("language", "sql"),
-    }[fault]
-    (row if fault == "language" else definition)[key] = value
-    with pytest.raises(ValueError):
-        checks._require_native_function(
-            definition, checks._LEGACY_FUNCTIONS[_NAME + "()"], row["language"], "source_schema", 201, {105}
-        )
-
-
-@pytest.mark.parametrize("version", [0, 1, 2])
-def test_optional_allocation_keeps_whole_authenticated_pin_and_fixed_frontier(monkeypatch, version):
-    rows = _catalog_rows("snapshot_schema")
-    row = _row(monkeypatch, "snapshot_schema")
-    row["definition"].update(oid="999", pronamespace="42")
-    row["definition"]["prosrc"] = _bodies("snapshot_schema")[version]
-    row["signature"] = storage_relation("snapshot_schema", _NAME) + "()"
-    rows.append(row)
-    pins = _original_allocation_pins(rows)
-    assert len(callables._cms_callee_contracts()) == 32
-    assert len(callables.require_original_cms_allocation_callees(rows, **pins)) == len(rows)
-    row["definition"]["prosrc"] += "\n-- post-authentication drift"
-    with pytest.raises(ValueError, match="original_allocation_pin_changed"):
-        callables.require_original_cms_allocation_callees(rows, **pins)
 
 
 @pytest.fixture

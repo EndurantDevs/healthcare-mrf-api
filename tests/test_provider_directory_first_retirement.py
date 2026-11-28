@@ -35,9 +35,9 @@ def test_rewritten_retirement_routines_keep_source_custody(renderer):
         "proconfig": ["search_path=pg_catalog", *(["TimeZone=UTC"] if "SET TimeZone = 'UTC'" in sql else [])],
         "proowner": 100,
     }
-    custody._require_function(routine_by_field, schema, 100)
+    custody._require_function(routine_by_field, schema)
     with pytest.raises(custody.FHIRSourceCustodyError):
-        custody._require_function(routine_by_field | {"proconfig": ["search_path=public"]}, schema, 100)
+        custody._require_function(routine_by_field | {"proconfig": ["search_path=public"]}, schema)
 
 
 @pytest.mark.parametrize("index", [0, 1])
@@ -57,13 +57,13 @@ def test_owner_lineage_routine_variants_preserve_exact_source_custody(index):
             "proowner": 100,
             "proconfig": ["search_path=pg_catalog", *(["TimeZone=UTC"] if index == 0 else [])],
         }
-        custody._require_function(routine_by_field, schema, 100)
+        custody._require_function(routine_by_field, schema)
         for mutation in (
             {"prosecdef": False},
             {"proconfig": ["search_path=public"]},
         ):
             with pytest.raises(custody.FHIRSourceCustodyError):
-                custody._require_function(routine_by_field | mutation, schema, 100)
+                custody._require_function(routine_by_field | mutation, schema)
 
 
 @pytest.mark.asyncio

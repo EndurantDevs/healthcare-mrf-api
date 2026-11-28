@@ -16,7 +16,9 @@ from tests.test_ptg_membership_projection import PARAMS
 
 def _session(*, row=None, rows=None, scalar=None):
     result = SimpleNamespace(first=lambda: row, all=lambda: rows, mappings=lambda: SimpleNamespace(one=lambda: row))
-    return SimpleNamespace(execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value=scalar))
+    return SimpleNamespace(
+        execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value=scalar), in_transaction=lambda: True
+    )
 
 
 @pytest.mark.asyncio
@@ -187,13 +189,11 @@ async def test_absent_retirement_holds_existing_fences_but_never_drops_or_delete
     from process.ptg_parts import ptg2_lifecycle_lock as lifecycle
 
     session = _session()
-    owner, fence, lock, locate = AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock(return_value=None)
-    monkeypatch.setattr(storage.native, "protected_publisher_owner", owner)
+    fence, lock, locate = AsyncMock(), AsyncMock(), AsyncMock(return_value=None)
     monkeypatch.setattr(lifecycle, "acquire_ptg2_lifecycle_lock", fence)
     monkeypatch.setattr(storage, "lock_identity", lock)
     monkeypatch.setattr(storage, "locate", locate)
     assert await storage.retire_unreferenced(session, PARAMS) is False
-    owner.assert_awaited_once_with(session)
     fence.assert_awaited_once_with(session)
     lock.assert_awaited_once_with(session, PARAMS)
     locate.assert_awaited_once_with(session, PARAMS)

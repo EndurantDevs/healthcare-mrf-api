@@ -327,7 +327,7 @@ async def retire_unreferenced(session, identity):
     from api.ptg2_serving import PTG2_SCHEMA
     from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 
-    await native.protected_publisher_owner(session)
+    native._require_transaction(session)
     await acquire_ptg2_lifecycle_lock(session)
     await lock_identity(session, identity)
     found = await locate(session, identity)

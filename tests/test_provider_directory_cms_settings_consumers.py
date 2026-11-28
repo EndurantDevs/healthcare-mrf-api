@@ -9,16 +9,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import network_fhir_source_custody as reader
-from process import provider_directory_cms_callable_custody as callables
 from process import provider_directory_import_run_guards as run_guards
-from process import provider_directory_source_callable_custody as source
 from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
-from tests.test_provider_directory_cms_allocation_guard_contracts import original_guards as original_guards
-from tests.test_provider_directory_cms_callee_custody import _catalog_rows, _verify
-from tests.test_provider_directory_cms_transition_routines import _extra_rows, _raw
-from tests.test_provider_directory_cms_transition_routines import _verify as verify_transition
 from tests.test_provider_directory_import_run_guards import _migration_statements
-from tests.test_provider_directory_source_callable_custody import _retirement_entry
 
 _SCHEMA = "snapshot_schema"
 _BAD_SETTINGS = (
@@ -34,35 +27,6 @@ def _harden(row):
     definition["proconfig"] = approved_cms_routine_settings(definition["proconfig"])[1]
 
 
-def test_full_fixed32_uses_exact_settings_without_changing_bodies_or_frontier():
-    rows = _catalog_rows(_SCHEMA)
-    before = deepcopy(rows)
-    for row in rows:
-        _harden(row)
-    assert _verify(rows) and len(rows) == len(callables._cms_callee_contracts()) == 32
-    for old, new in zip(before, rows, strict=True):
-        assert old == {**new, "definition": {**new["definition"], "proconfig": old["definition"]["proconfig"]}}
-
-
-def test_complete_existing_frontier_and_invokers_accept_only_the_exact_successor(original_guards, monkeypatch):
-    rows = [_raw(row) for row in original_guards] + _extra_rows(monkeypatch)
-    for row in rows:
-        _harden(row["native"])
-    assert verify_transition(rows) is None
-    damaged = deepcopy(rows)
-    damaged[0]["native"]["definition"]["prosrc"] += "\n"
-    with pytest.raises(ValueError, match="definition_changed"):
-        verify_transition(damaged)
-
-
-@pytest.mark.parametrize("settings", _BAD_SETTINGS)
-def test_shared_source_definition_refuses_near_miss_settings(settings):
-    row = _retirement_entry()
-    row["definition"]["proconfig"] = settings
-    with pytest.raises(ValueError, match="definition_changed"):
-        source._require_definition(row, source._CONTRACTS[row["signature"]], "sample", 201, source._TYPE_OIDS, "sample")
-
-
 @pytest.mark.parametrize("name", tuple(reader._REACHABLE_FUNCTIONS))
 def test_retained_reader_keeps_complete_contract_with_exact_settings_successor(name):
     language, volatility, definer, settings = reader._REACHABLE_FUNCTIONS[name]
@@ -75,10 +39,10 @@ def test_retained_reader_keeps_complete_contract_with_exact_settings_successor(n
         prosecdef=definer,
         proconfig=approved_cms_routine_settings(legacy)[1],
     )
-    assert reader._require_function(function_by_field, _SCHEMA, 105) is None
+    assert reader._require_function(function_by_field, _SCHEMA) is None
     for field, value in (("prosecdef", not definer), ("proconfig", _BAD_SETTINGS[0])):
         with pytest.raises(reader.FHIRSourceCustodyError):
-            reader._require_function({**function_by_field, field: value}, _SCHEMA, 105)
+            reader._require_function({**function_by_field, field: value}, _SCHEMA)
 
 
 def _run_catalog():

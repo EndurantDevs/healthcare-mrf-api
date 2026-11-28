@@ -10,22 +10,20 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from db.plan_release_storage import storage_identifier, storage_relation
-from process import provider_directory_cms_callable_custody as callables
 from tests.cms_native_layout_postgres_support import _reader
-from tests.test_provider_directory_cms_replay_resolution_postgres import _attacker_locks, _header
-from tests.test_provider_directory_cms_terminal_guard_resolution_postgres import (
-    _PREPARATION_SCHEMA,
+from tests.cms_terminal_guard_postgres_support import (
     _assert_properties,
     _hooks,
     _routines,
     _upgrade_guards,
 )
-from tests.test_provider_directory_cms_terminal_guard_resolution_postgres import (
+from tests.cms_terminal_guard_postgres_support import (
     core_layout as core_layout,
 )
-from tests.test_provider_directory_cms_terminal_guard_resolution_postgres import (
+from tests.cms_terminal_guard_postgres_support import (
     native_layout as native_layout,
 )
+from tests.test_provider_directory_cms_replay_resolution_postgres import _attacker_locks, _header
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 _TARGETS = {
@@ -145,12 +143,6 @@ async def test_late_creator_preserves_guard_binding(native_layout, target, kind)
             async with _reader(admin, readonly=False, isolation="READ COMMITTED") as (_, session, driver):
                 await _upgrade_guards(session, before, (True, True), retirement_typed=True, cms_parent=True)
                 checked = await _routines(driver)
-                callables.require_cms_terminal_guard_resolution(
-                    checked,
-                    catalog_schema="mrf",
-                    catalog_schema_oid=await driver.fetchval("SELECT 'mrf'::regnamespace::oid::bigint"),
-                    preparation_schema=_PREPARATION_SCHEMA,
-                )
                 await _late_overload(creator, target, kind, key)
                 assert await _routines(driver) == checked
                 await _invoke(driver, target, kind, key)

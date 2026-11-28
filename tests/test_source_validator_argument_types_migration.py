@@ -255,3 +255,12 @@ def test_constructor_escape_is_not_part_of_native_body(filename, renderer, optio
     assert body == raw.replace(r"\:1", ":1")
     contract = next(entry for entry in _migration()._CONTRACTS if entry[0] == name)
     assert _digest(body) == contract[-2] and _digest(raw) != contract[-2]
+
+
+@pytest.mark.parametrize("schema", ["snapshot_schema", "Mixed_Catalog"])
+def test_later_disposition_migrations_retain_same_checkpoint_constructor(schema):
+    terminal = _load("20260810010000_provider_directory_reviewed_subset_terminal_disposition.py")
+    direct = _load("20260810110000_provider_directory_reviewed_subset_direct_v4_disposition.py")
+    latest = _load("20260811120000_provider_directory_reviewed_subset_v5_http410_disposition.py")
+    assert terminal._checkpoint_guard_sql(schema) == direct._terminal()._checkpoint_guard_sql(schema)
+    assert terminal._checkpoint_guard_sql(schema) == latest._direct()._terminal()._checkpoint_guard_sql(schema)

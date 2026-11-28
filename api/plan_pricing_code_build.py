@@ -585,7 +585,6 @@ async def build_in_session(
     existing = await locate(session, identity, allow_stale_provider=True)
     if existing is not None:
         return receipt(existing)
-    await native.protected_publisher_owner(session)
     ownership = await native.precreate_model_family_stage(session, SPEC, uuid4())
     state = _CodeBuildState(hashlib.sha256(), audit=audit, phase_timings=phase_timings)
     await _create_stage_tables(session)

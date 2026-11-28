@@ -236,29 +236,6 @@ async def test_cms_raw_handoff_rejects_missing_family_or_premature_graph(harness
 
 
 @pytest.mark.asyncio
-async def test_cms_frozen_validation_keeps_raw_content_and_protected_custody_checks(harness, monkeypatch):
-    handoff = await _cms_detached(harness, monkeypatch)
-    frozen = AsyncMock(return_value=dict(dataset_hash="a" * 64, resource_count=16))
-    monkeypatch.setattr(completion, "_validate_frozen_source_handoff", frozen)
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        fetch=AsyncMock(
-            return_value=[dict(resource_type=kind, count=2) for _, kind in cms_handoff.cms_npd_source.RESOURCE_FILES]
-        ),
-        fetchval=AsyncMock(return_value=False),
-    )
-    directory = object()
-    result = await completion.validate_frozen_cms_source_handoff(
-        connection,
-        directory,
-        handoff,
-        protected_owner_role="protected_owner",
-    )
-    frozen.assert_awaited_once_with(connection, directory, handoff, protected_owner_role="protected_owner")
-    assert result["resource_count"] == 16 and result["source_release"] == _identity()["metadata"]["source_release"]
-
-
-@pytest.mark.asyncio
 async def test_isolated_cms_staging_defers_global_evidence_but_keeps_content_checks(monkeypatch):
     monkeypatch.setattr(cms, "_is_isolated_intake", lambda: True)
     counts_by_family = {kind: 2 for _, kind in cms_handoff.cms_npd_source.RESOURCE_FILES}

@@ -422,37 +422,48 @@ async def original_source_transaction(database, *, isolation):
         assert component.database._transaction_binding() is None
 
 
+EPOCH_GUARD_FUNCTIONS = (
+    "guard_cms_npd_relationship_receipt_insert",
+    "guard_cms_npd_relationship_receipt_mutation",
+    "guard_cms_npd_relationship_truncate",
+    "guard_cms_npd_serving_coverage",
+    "guard_cms_npd_covered_truncate",
+)
+
+
 async def _provision_cms_epoch_controls(component):
-    """Use the real administrator cut and prove ordinary runtime writers are closed."""
+    """Give the Source Owner both CMS epoch controls and their guard functions, as the administrator."""
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
+    from db.plan_release_storage import storage_identifier, storage_relation
+    from process.plan_release_storage_provision import _close_relation_grants
     from process.provider_directory_projection_stage import _copy_driver
-    from process.provider_directory_source_cms_epoch_control import (
-        EPOCH_CONTROL_ROOTS,
-        provision_source_cms_epoch_controls,
-    )
-    from tests.provider_directory_source_postgres_support import verify_native_source_profile
+    from process.provider_directory_source_cms_epoch_control import EPOCH_CONTROL_ROOTS
 
-    async def writers(connection, policy):
-        assert policy == component.policy
-        assert not await connection.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_class c,pg_roles r WHERE c.relnamespace=$1::regnamespace "
-            "AND c.relname=ANY($2::text[]) AND r.rolname=ANY($3::text[]) AND "
-            "(has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR "
-            "has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')))",
-            component.policy.schema,
-            list(EPOCH_CONTROL_ROOTS),
-            list(component.policy.runtime_roles),
-        )
-
+    policy = component.policy
     async with async_sessionmaker(component.admin_engine)() as session, session.begin():
         assert await session.scalar(text("SELECT current_user=session_user"))
-        await provision_source_cms_epoch_controls(
-            await _copy_driver(session),
-            component.policy,
-            verify_role_profile=verify_native_source_profile,
-            verify_writer_closure=writers,
-        )
+        driver = await _copy_driver(session)
+        for root in EPOCH_CONTROL_ROOTS:
+            relation = storage_relation(policy.schema, root)
+            oid = await driver.fetchval("SELECT to_regclass($1)::oid::bigint", relation)
+            relation_by_field = {"nspname": policy.schema, "relname": root, "oid": oid}
+            await _close_relation_grants(driver, relation_by_field, policy.owner_role, policy.runtime_roles)
+            for column in await driver.fetch(
+                "SELECT DISTINCT a.attname,g.grantee,r.rolname FROM pg_attribute a "
+                "CROSS JOIN LATERAL aclexplode(a.attacl) g LEFT JOIN pg_roles r ON r.oid=g.grantee "
+                "WHERE a.attrelid=$1::oid ORDER BY a.attname,g.grantee",
+                oid,
+            ):
+                principal = "PUBLIC" if column["grantee"] == 0 else storage_identifier(column["rolname"])
+                await driver.execute(
+                    f"REVOKE ALL PRIVILEGES ({storage_identifier(column['attname'])}) ON TABLE {relation} "
+                    f"FROM {principal} CASCADE"
+                )
+        for name in EPOCH_GUARD_FUNCTIONS:
+            await driver.execute(
+                f"ALTER FUNCTION {storage_relation(policy.schema, name)}() OWNER TO {storage_identifier(policy.owner_role)}"
+            )
 
 
 async def run_protected_admission(database, monkeypatch, run_id, directory, receipt, client):

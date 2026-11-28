@@ -1144,7 +1144,7 @@ async def test_sealed_rotation_failure_never_overwrites_predecessor(monkeypatch,
         "rename": "rename failed",
     }
     with pytest.raises(RuntimeError, match=reasons_by_fault[fault]):
-        await adoption._swap_sealed_stage_table("mrf", live, stage, 52, serving_generation=None)
+        await adoption._swap_sealed_stage_table("mrf", live, stage, serving_generation=None)
     assert status.await_count == int(fault == "rename")
     assert scalar.await_count == {"transaction": 0, "stage": 2, "collision": 3, "rename": 2}[fault]
     assert not any(query.startswith("ALTER") for query in queries)

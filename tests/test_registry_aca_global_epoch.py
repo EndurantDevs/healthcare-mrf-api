@@ -187,7 +187,6 @@ async def test_accounted_epoch_requires_the_same_clone_proof_and_publication(mon
 async def test_global_admission_stamps_only_after_validation_and_native_custody(monkeypatch):
     prepared, validation = await _global_prepared(monkeypatch)
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=None), execute=AsyncMock())
-    monkeypatch.setattr(global_epoch, "protected_publisher_owner", AsyncMock(return_value=13))
     activation = AsyncMock(return_value=validation)
     native = AsyncMock()
     connection = SimpleNamespace(execute=AsyncMock())
@@ -214,7 +213,6 @@ async def test_global_admission_failure_never_writes_stamp(monkeypatch, failure)
         scalar=AsyncMock(return_value=None if failure == "stamp_io" else "foreign"),
         execute=AsyncMock(),
     )
-    monkeypatch.setattr(global_epoch, "protected_publisher_owner", AsyncMock(return_value=13))
     activation, native = AsyncMock(return_value=validation), AsyncMock()
     if failure == "validation":
         activation.side_effect = ValueError("invalid clone")
@@ -252,7 +250,6 @@ async def test_global_comment_preserves_json_and_original_physical_transaction(m
     label = "import:7 O'Reilly\\folder café"
     prepared, validation = await _global_prepared(monkeypatch, import_id=label)
     session, connection = _comment_session(kind)
-    monkeypatch.setattr(global_epoch, "protected_publisher_owner", AsyncMock(return_value=13))
     monkeypatch.setattr(global_epoch, "prepare_reference_family_activation", AsyncMock(return_value=validation))
 
     async def custody(original, epoch):

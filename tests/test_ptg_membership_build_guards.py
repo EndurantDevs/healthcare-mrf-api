@@ -260,7 +260,7 @@ async def test_reader_grants_derive_from_exact_source_relation_with_bounded_inve
 
 @pytest.mark.asyncio
 async def test_source_drift_after_candidate_validation_prevents_seal(monkeypatch):
-    session = SimpleNamespace(execute=AsyncMock())
+    session = SimpleNamespace(execute=AsyncMock(), in_transaction=lambda: True)
     tables, root = object(), V4GraphRoot(19, "pattern_v1", b"a" * 32)
     resolve = AsyncMock(side_effect=[(tables, root, PARAMS), (tables, root, PARAMS | {"code": "99214"})])
     monkeypatch.setattr(build, "source_identity", resolve)
@@ -272,7 +272,6 @@ async def test_source_drift_after_candidate_validation_prevents_seal(monkeypatch
     monkeypatch.setattr(build, "_copy_code", AsyncMock(return_value=([], (), 0)))
     monkeypatch.setattr(build, "_copy_code_factor", AsyncMock(return_value=dict(edge_count=0)))
     monkeypatch.setattr(build, "enqueue_live_progress", Mock())
-    monkeypatch.setattr(build.native, "protected_publisher_owner", AsyncMock(return_value=101))
     monkeypatch.setattr(
         build.native, "precreate_model_family_stage", AsyncMock(return_value=SimpleNamespace(schema_name="synthetic"))
     )

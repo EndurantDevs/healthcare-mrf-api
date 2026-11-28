@@ -525,7 +525,7 @@ async def _require_protected_cutover(db_schema, swaps, context):
         raise RuntimeError("legacy address rotation cannot replace a protected snapshot")
 
 
-async def _swap_sealed_stage_table(db_schema, live_cls, stage_cls, owner_oid=None, *, serving_generation=...):
+async def _swap_sealed_stage_table(db_schema, live_cls, stage_cls, *, serving_generation=...):
     """Rotate immutable named tables without overwriting a retained generation."""
     from process import entity_address_publication_permissions as permissions
     from process.native_publication_read_access import preserve_publication_reads

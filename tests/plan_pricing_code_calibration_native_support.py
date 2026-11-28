@@ -81,7 +81,6 @@ def _install_native_transport(db, monkeypatch):
     async def inputs(session, params, state_by_field):
         # The established fixture supplies the source/release identity; native
         # Publisher custody, stage writes, comparisons and cleanup stay genuine.
-        await calibration.native.protected_publisher_owner(session)
         captured, bindings = await build.resolve_inputs(session, None, ("CPT", "27447"), scope=_scope())
         state_by_field.update(
             identity=captured, publication_before=await calibration._publication_state(session, captured)

@@ -1,11 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native terminal guard prerequisite; no complete writer or creator-safety claim."""
+"""Native CMS guard layout and routine snapshots shared by the typed-guard PostgreSQL tests."""
 
-from contextlib import nullcontext
+import json
 from types import SimpleNamespace
 from uuid import uuid4
 
-import pytest
 import pytest_asyncio
 
 from db import migration_cms_replay_resolution as replay
@@ -16,16 +15,20 @@ from db.migration_generic_source_candidates import (
     upgrade_generic_source_canonical_copy_guard,
 )
 from db.plan_release_storage import storage_identifier
-from process import provider_directory_cms_callable_custody as callables
-from process import provider_directory_cms_preparation_custody as custody
 from tests.cms_native_layout_postgres_support import _reader
 from tests.cms_native_layout_postgres_support import native_layout as core_layout
 from tests.test_provider_dataset_candidates_postgres import _prepare_copy_guard_catalog
 
-pytestmark = pytest.mark.asyncio(loop_scope="module")
 _NAMES = ("guard_pd_generic_dataset_finalization", replay.GUARD)
 _ALL_NAMES = (*_NAMES, *retirement.ORIGINAL_SHA256, terminal.GUARD, "guard_pd_dataset_candidate_parent")
 _PREPARATION_SCHEMA = "mrf"
+_ROUTINES_SQL = """SELECT p.oid::bigint,jsonb_build_object('definition',to_jsonb(p),'language',to_jsonb(l),
+ 'namespace',jsonb_build_array(n.oid::bigint,n.nspname,n.nspowner::bigint,n.nspacl::text),
+ 'body',pg_catalog.pg_get_functiondef(p.oid),
+ 'dependencies',COALESCE((SELECT jsonb_agg(to_jsonb(d) ORDER BY d.refclassid,d.refobjid,d.refobjsubid,d.deptype)
+ FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid),'[]'::jsonb))::text
+ AS native FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+ JOIN pg_catalog.pg_language l ON l.oid=p.prolang WHERE p.oid=ANY($1::oid[]) ORDER BY p.oid"""
 
 
 async def _generic_copy_baseline(admin, roles):
@@ -88,10 +91,8 @@ async def _routines(connection):
         "WHERE pronamespace='mrf'::regnamespace AND proname=ANY($1::text[])",
         list(_ALL_NAMES),
     )
-    return [
-        dict(oid=routine["oid"], native=custody._decoded(routine["native"]))
-        for routine in await connection.fetch(custody._ROUTINES_SQL, [], oids)
-    ]
+    rows = await connection.fetch(_ROUTINES_SQL, oids)
+    return [dict(oid=row["oid"], native=json.loads(row["native"])) for row in rows]
 
 
 async def _hooks(connection):
@@ -155,95 +156,3 @@ def _assert_properties(before, routines):
         assert {key: value for key, value in routine["native"]["definition"].items() if key != "prosrc"} == {
             key: value for key, value in original["definition"].items() if key != "prosrc"
         }
-
-
-@pytest.mark.parametrize("generic_typed,replay_typed", [(False, False), (True, False), (False, True), (True, True)])
-@pytest.mark.parametrize("retirement_typed", [False, True])
-@pytest.mark.parametrize("terminal_typed", [False, True])
-async def test_native_requires_hardened_frontier(
-    native_layout, generic_typed, replay_typed, retirement_typed, terminal_typed
-):
-    """Old/mixed states refuse; checked replacements preserve properties and hooks."""
-    admin = native_layout
-    before, hooks = await _routines(admin), await _hooks(admin)
-    try:
-        async with _reader(admin, readonly=False, isolation="READ COMMITTED") as (_, session, driver):
-            namespace = await driver.fetchval("SELECT 'mrf'::regnamespace::oid::bigint")
-            await _upgrade_guards(
-                session, before, (generic_typed, replay_typed), retirement_typed, terminal_typed=terminal_typed
-            )
-            routines = await _routines(driver)
-            expectation = (
-                nullcontext()
-                if generic_typed and replay_typed and retirement_typed and terminal_typed
-                else pytest.raises(ValueError, match="terminal_guard_resolution_required")
-            )
-            with expectation:
-                callables.require_cms_terminal_guard_resolution(
-                    routines,
-                    catalog_schema="mrf",
-                    catalog_schema_oid=namespace,
-                    preparation_schema=_PREPARATION_SCHEMA,
-                )
-            assert await _hooks(driver) == hooks
-            _assert_properties(before, routines)
-    finally:
-        for routine in before:
-            await admin.execute(routine["native"]["body"])
-        assert await _routines(admin) == before and await _hooks(admin) == hooks
-
-
-async def test_native_generic_parent_refuses_the_cms_terminal(native_layout):
-    """Typed legacy guards alone do not establish the CMS statement guard."""
-    admin = native_layout
-    before, hooks = await _routines(admin), await _hooks(admin)
-    try:
-        async with _reader(admin, readonly=False, isolation="READ COMMITTED") as (_, session, driver):
-            await _upgrade_guards(session, before, (True, True), True, cms_parent=False)
-            routines = await _routines(driver)
-            with pytest.raises(ValueError, match="terminal_guard_resolution_required"):
-                callables.require_cms_terminal_guard_resolution(
-                    routines,
-                    catalog_schema="mrf",
-                    catalog_schema_oid=await driver.fetchval("SELECT 'mrf'::regnamespace::oid::bigint"),
-                    preparation_schema=_PREPARATION_SCHEMA,
-                )
-            _assert_properties(before, routines)
-            assert await _hooks(driver) == hooks
-    finally:
-        for routine in before:
-            await admin.execute(routine["native"]["body"])
-        assert await _routines(admin) == before and await _hooks(admin) == hooks
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "provider_directory_terminal_root_retirement_valid",
-        "provider_directory_terminal_root_retirement_v2_valid",
-        "guard_provider_directory_terminal_root_retirement_run",
-    ],
-)
-async def test_native_requires_every_typed_retirement_body(native_layout, name):
-    """The remaining legacy proof/run dispatchers cannot pass a mixed frontier."""
-    admin = native_layout
-    before, hooks = await _routines(admin), await _hooks(admin)
-    try:
-        async with _reader(admin, readonly=False, isolation="READ COMMITTED") as (_, session, driver):
-            await _upgrade_guards(session, before, (True, True), True)
-            original = next(routine for routine in before if routine["native"]["definition"]["proname"] == name)
-            await driver.execute(original["native"]["body"])
-            routines = await _routines(driver)
-            with pytest.raises(ValueError, match="terminal_guard_resolution_required"):
-                callables.require_cms_terminal_guard_resolution(
-                    routines,
-                    catalog_schema="mrf",
-                    catalog_schema_oid=await driver.fetchval("SELECT 'mrf'::regnamespace::oid::bigint"),
-                    preparation_schema=_PREPARATION_SCHEMA,
-                )
-            _assert_properties(before, routines)
-            assert await _hooks(driver) == hooks
-    finally:
-        for routine in before:
-            await admin.execute(routine["native"]["body"])
-        assert await _routines(admin) == before and await _hooks(admin) == hooks

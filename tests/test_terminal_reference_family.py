@@ -13,7 +13,6 @@ from process import reference_family_archive as archive
 @pytest.fixture(autouse=True)
 def _native_catalog_boundary(monkeypatch):
     """Database actor/catalog qualification is a separate native boundary, never inferred by these host fixtures."""
-    monkeypatch.setattr(archive, "protected_publisher_owner", AsyncMock(return_value=70))
     monkeypatch.setattr(archive, "require_native_read_catalog", AsyncMock())
     monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=101))
 

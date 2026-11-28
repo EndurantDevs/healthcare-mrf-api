@@ -849,7 +849,7 @@ async def _persist_nucc_stage(session, stage, *, reservation):
         raise native.ReferenceFamilyArchiveError("NUCC native stage reservation changed")
 
 
-async def _require_nucc_native_builder(session, *, expected_owner_oid=None):
+async def _require_nucc_native_builder(session):
     """Keep the configured namespace policy; PostgreSQL enforces actual candidate writes."""
     from process import reference_family_archive as native
 

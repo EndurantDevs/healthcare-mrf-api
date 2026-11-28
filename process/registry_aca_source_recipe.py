@@ -28,7 +28,6 @@ from process.reference_family_archive import (
     _source_metadata,
     mrf_publication_digest,
     prepare_reference_family_activation,
-    protected_publisher_owner,
     reference_family_profile_contract,
     reference_family_stage_schema,
 )
@@ -183,14 +182,12 @@ async def admit_registry_aca_source_recipe(session, prepared, *, runtime_roles):
     """
     if not session.in_transaction():
         _invalid()
-    owner_oid = await protected_publisher_owner(session)
     validation = await prepare_reference_family_activation(
         session,
         ownership=prepared.ownership,
         manifest=prepared.manifest,
         package_id=hashlib.sha256(_canonical_json(prepared.manifest.as_dict())).hexdigest(),
         profile_contract=reference_family_profile_contract(prepared.manifest),
-        sealed_owner_oid=owner_oid,
     )
     recipe = _recipe(prepared, validation, runtime_roles)
     await _require_archive(await native_driver(session), recipe.source_pin)
@@ -485,14 +482,12 @@ async def admit_registry_aca_source_batch(session, prepared, *, runtime_roles):
     if not session.in_transaction():
         _invalid()
     scopes = _batch_descriptors(dict(prepared.manifest.source_metadata), runtime_roles)
-    owner_oid = await protected_publisher_owner(session)
     validation = await prepare_reference_family_activation(
         session,
         ownership=prepared.ownership,
         manifest=prepared.manifest,
         package_id=hashlib.sha256(_canonical_json(prepared.manifest.as_dict())).hexdigest(),
         profile_contract=reference_family_profile_contract(prepared.manifest),
-        sealed_owner_oid=owner_oid,
     )
     recipes = _batch_recipes(prepared, validation, runtime_roles)
     await _require_native_archive(await native_driver(session), prepared, validation, runtime_roles)

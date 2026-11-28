@@ -734,13 +734,6 @@ def _publisher_session(proof):
 
 
 @pytest.mark.asyncio
-async def test_publisher_preparation_requires_caller_transaction():
-    session = SimpleNamespace(in_transaction=lambda: False)
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="caller transaction"):
-        await archive.protected_publisher_owner(session)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("configured_owner", ["native_owner", "bad-role"])
 async def test_isolated_model_creation_uses_configured_role_before_native_ddl(monkeypatch, configured_owner):
     from process import source_profile_result_pins as pins
@@ -1615,11 +1608,11 @@ async def test_selected_canonical_projection_requires_authenticator_before_catal
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(), execute=AsyncMock())
     context = (
         archive.selected_canonical_archive(
-            session, schema_name="mrf", owner_oid=43, selected_relations={}, authenticate_inventory=None
+            session, schema_name="mrf", selected_relations={}, authenticate_inventory=None
         )
         if operation == "canonical"
         else archive.selected_mrf_canonical_archive(
-            session, schema_name="mrf", owner_oid=43, selected_relation={}, authenticate_inventory=None
+            session, schema_name="mrf", selected_relation={}, authenticate_inventory=None
         )
     )
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="publisher authority differs"):

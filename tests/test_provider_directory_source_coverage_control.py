@@ -67,7 +67,7 @@ async def test_fixed_control_retains_native_fk_and_both_original_guard_contracts
     assert receipt["oid"] == 42 and receipt["owner"] == 17
     assert len(receipt["layout"]) == len(receipt["guards"]) == len(receipt["acl"]) == 64
     assert catalog.guard_check.call_count == 2
-    assert {call.args[3] for call in catalog.guard_check.call_args_list} == set(control._GUARDS)
+    assert {call.args[2] for call in catalog.guard_check.call_args_list} == set(control._GUARDS)
     assert any(call.args[0] == control._NATIVE_SQL for call in catalog.native.fetchval.await_args_list)
 
 

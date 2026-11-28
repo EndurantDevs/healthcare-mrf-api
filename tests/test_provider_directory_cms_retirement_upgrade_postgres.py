@@ -11,9 +11,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from db import migration_cms_retirement_resolution as migration
 from tests.test_provider_directory_cms_retirement_resolution_postgres import (
-    _check_consumers,
-)
-from tests.test_provider_directory_cms_retirement_resolution_postgres import (
     _snapshots as _raw_snapshots,
 )
 from tests.test_provider_directory_cms_retirement_resolution_postgres import (
@@ -85,7 +82,6 @@ async def test_native_installer_is_repeatable_and_preserves_complete_original_id
             assert first[name]["prosrc"] == migration.retirement_resolution_bodies(scenario.schema_name)[name][1]
             for field in ("identity", "hooks", "dependencies", "description"):
                 assert first[name][field] == original[field]
-        await _check_consumers(driver, scenario.schema_name)
     assert await _snapshots(scenario.connection, scenario.schema_name) == before
 
 
@@ -123,7 +119,6 @@ async def test_native_savepoint_restores_two_actual_replacements_without_ending_
         assert caught.value is failure and len(executed_statements) == 2 and connection.in_transaction()
         assert await _snapshots(driver, scenario.schema_name) == before
         await _upgrade(connection, scenario.schema_name, _pins(before))
-        await _check_consumers(driver, scenario.schema_name)
     assert await _snapshots(scenario.connection, scenario.schema_name) == before
 
 

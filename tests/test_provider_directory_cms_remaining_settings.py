@@ -1,11 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Remaining exact settings consumers preserve ordinary guard contracts."""
 
+import re
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql.asyncpg import dialect
 
 from process import provider_directory_cms_receipt_guard as receipt
 from process import provider_directory_output_snapshot_journal as journal
@@ -13,8 +16,39 @@ from process import provider_directory_profile_initial_guards as initial
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from tests.test_cms_archive_transaction_migration import _load as _load_historical_migration
 from tests.test_cms_native_input_named_revision_migration import _migration as _named_revision_migration
-from tests.test_provider_directory_cms_callee_custody import _parse_statements
 from tests.test_provider_directory_output_snapshot_journal import _capability, _plan
+
+
+def _parse_statements(statements, schema):
+    function_by_name = {}
+    pattern = re.compile(
+        rf'CREATE(?: OR REPLACE)? FUNCTION "{schema}"\."?(\w+)"?\((.*?)\)\s+'
+        r"RETURNS\s+(\w+(?:\[\])?)\s+LANGUAGE\s+(\w+)(.*?)AS (\$\w*\$)(.*?)\6",
+        re.S,
+    )
+    for statement in statements:
+        compiled = text(statement).compile(dialect=dialect())
+        assert not compiled.params
+        matches = pattern.findall(str(compiled))
+        assert matches
+        for name, arguments, returns, language, options, _tag, body in matches:
+            args = tuple(tuple(arg.strip().split()) for arg in arguments.split(",")) if arguments.strip() else ()
+            settings = re.findall(r"\bSET\s+(\w+)\s*=\s*('[^']*'|[a-z_]+)(?=\s|$)", options)
+            assert len(settings) == len(re.findall(r"\bSET\b", options))
+            function_by_name[name] = (
+                args,
+                returns,
+                (),
+                language,
+                "i" if "IMMUTABLE" in options else "s" if "STABLE" in options else "v",
+                "STRICT" in options,
+                "s" if "PARALLEL SAFE" in options else "u",
+                "SECURITY DEFINER" in options,
+                [setting + "=" + value.strip("'") for setting, value in settings] or None,
+                body,
+            )
+    return function_by_name
+
 
 _OLD = ["search_path=pg_catalog"]
 _NEW = ["search_path=pg_catalog, pg_temp"]

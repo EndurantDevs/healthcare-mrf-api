@@ -8,12 +8,9 @@ this fixture; none of their guards is represented by a permissive stub.
 
 from db import migration_cms_noncurrent_seal as migration
 from db.plan_release_storage import storage_identifier, storage_relation
-from process import provider_directory_source_callable_custody as custody
-from process.provider_directory_source_control_privileges import METADATA_FUNCTIONS
 
 
 async def _install_metadata_functions(connection, schema, owner_role, renderers):
-    metadata_names = {signature.split("(", 1)[0] for signature in METADATA_FUNCTIONS}
     for render in renderers:
         sql = render(schema)
         name = sql.split("FUNCTION ", 1)[1].split("(", 1)[0]
@@ -31,11 +28,6 @@ async def _install_metadata_functions(connection, schema, owner_role, renderers)
         await connection.execute(f"ALTER FUNCTION {signature} OWNER TO {storage_identifier(owner_role)}")
         await connection.execute(f"ALTER FUNCTION {signature} SECURITY DEFINER")
         await connection.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
-        body = await connection.fetchval("SELECT prosrc FROM pg_catalog.pg_proc WHERE oid=$1::regprocedure", signature)
-        function_name = name.rsplit(".", 1)[1].strip('"')
-        if function_name in metadata_names:
-            expected = next(spec for key, spec in custody._CONTRACTS.items() if key.split("(", 1)[0] == function_name)
-            assert custody._body_digest(body, schema) == expected[-1]
 
 
 async def install_native_header_guards(connection, schema, *, owner_role):

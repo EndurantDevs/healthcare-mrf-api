@@ -516,8 +516,7 @@ async def test_origin_metadata_fragment_refuses_implicit_or_source_recipients_be
 
 
 def _compiled_current_read_closure():
-    from tests.test_cms_archive_transaction_migration import _load
-    from tests.test_provider_directory_cms_callable_custody import _migration_functions
+    from tests.test_cms_archive_transaction_migration import _load, _migration_functions
 
     functions = _migration_functions()
     migration = _load("20261116090000")

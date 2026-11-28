@@ -335,19 +335,6 @@ def _writer_rights(root, columns, *, history=False, loading=False):
     return tables, by_right
 
 
-def _require_acquisition_scope(expression, scope_values):
-    from process.provider_directory_source_cohort_custody import _simple_check
-
-    comparison = (
-        "false"
-        if not scope_values
-        else "acquisition_id='" + scope_values[0] + "'"
-        if len(scope_values) == 1
-        else "acquisition_id=anyarray[" + ",".join("'" + value + "'" for value in scope_values) + "]"
-    )
-    _require(_simple_check(expression) == "check" + comparison, "scope_expression_changed")
-
-
 def _require_dataset_relationships(plan, schema):
     from db.migration_provider_dataset_online import _expected_bulk_relationships
 

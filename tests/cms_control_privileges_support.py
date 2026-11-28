@@ -3,7 +3,7 @@
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
-from process.provider_directory_source_control_privileges import grant_npi_generation_read
+from process.provider_directory_source_control_privileges import ADMISSION_GRANTS, SOURCE_CONTROL_READS
 
 IMPORT_RUN_SELECT = (
     "run_id",
@@ -439,3 +439,75 @@ async def grant_cms_control_read_privileges(connection, policy):
     )
     for statement in statements:
         await connection.execute(statement)
+
+
+_CONTROL_READ_COLUMNS = {
+    "provider_directory_source": "source_id,endpoint_id,metadata_json",
+    "provider_directory_api_endpoint": "endpoint_id",
+}
+_DISPOSITION_RIGHTS = (
+    "SELECT(dataset_id,endpoint_id,acquisition_root_run_id,vector_sha256,prior_status,observed_at),"
+    "INSERT(dataset_id,endpoint_id,acquisition_root_run_id,vector_sha256,prior_status,dataset_hash)"
+)
+_METADATA_FUNCTIONS = (
+    "provider_directory_endpoint_dataset_admission_metadata_sha256(jsonb,smallint,text,text,character varying[])",
+    "provider_directory_subset_canonical_sha256(jsonb)",
+    "provider_directory_subset_completion_proof_pair_valid(jsonb,text)",
+    "provider_directory_subset_completion_proof_shape_valid(jsonb,text,bigint)",
+    "provider_directory_subset_content_proof_valid(jsonb,text,text,text,jsonb,jsonb,text,bigint,jsonb,jsonb)",
+)
+
+
+async def grant_source_admission_controls(connection, policy):
+    """Grant the fixed control reads, row-lock columns and header-proof validators to the Source Owner."""
+    owner = storage_identifier(policy.owner_role)
+    for root, privileges in ADMISSION_GRANTS:
+        await connection.execute(f"GRANT {privileges} ON {storage_relation(policy.schema, root)} TO {owner}")
+    for root in SOURCE_CONTROL_READS:
+        # Mirror the table and column ACL entries that the original provisioning wrote.
+        await connection.execute(
+            f"GRANT SELECT,SELECT({_CONTROL_READ_COLUMNS[root]}) ON {storage_relation(policy.schema, root)} TO {owner}"
+        )
+    await connection.execute(
+        f"GRANT {_DISPOSITION_RIGHTS} ON "
+        f"{storage_relation(policy.schema, 'provider_directory_cms_npd_stale_candidate')} TO {owner}"
+    )
+    for signature in _METADATA_FUNCTIONS:
+        name, _, arguments = signature.partition("(")
+        await connection.execute(
+            f"GRANT EXECUTE ON FUNCTION {storage_relation(policy.schema, name)}({arguments} TO {owner}"
+        )
+    await _grant_address_artifact_revision(connection, policy)
+    await grant_npi_generation_read(connection, policy)
+
+
+async def _grant_address_artifact_revision(connection, policy):
+    """Maintain installed logical artifact revisions through the configured Source Owner."""
+    installed = await connection.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class relation "
+        "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND relation.relname='address_alias_artifact_state_v1')",
+        policy.schema,
+    )
+    if installed:
+        await connection.execute(
+            "GRANT SELECT(artifact_name,generation,updated_at),INSERT(artifact_name,generation,updated_at),"
+            "UPDATE(generation,updated_at) ON "
+            f"{storage_relation(policy.schema, 'address_alias_artifact_state_v1')} "
+            f"TO {storage_identifier(policy.owner_role)}"
+        )
+
+
+async def grant_npi_generation_read(connection, policy):
+    """Read installed canonical NPI origin metadata through the configured Source Owner."""
+    installed = await connection.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class relation "
+        "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND relation.relname='npi_result_generation')",
+        policy.schema,
+    )
+    if installed:
+        await connection.execute(
+            "GRANT SELECT(origin_lineage_id,origin_generation) ON "
+            f"{storage_relation(policy.schema, 'npi_result_generation')} TO {storage_identifier(policy.owner_role)}"
+        )

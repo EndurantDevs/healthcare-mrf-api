@@ -172,5 +172,5 @@ async def _guards(connection, policy, oid):
             and guard["provolatile"] == "v",
             "coverage_function_owner_changed",
         )
-        _require_guard(guard, policy.schema, guard["proowner"], guard["tgname"], _GUARDS[guard["tgname"]])
+        _require_guard(guard, policy.schema, guard["tgname"], _GUARDS[guard["tgname"]])
     return [dict(guard) for guard in guards]

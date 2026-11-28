@@ -202,7 +202,6 @@ async def test_one_source_budget_survives_both_factors_and_refuses_before_seal(m
     monkeypatch.setattr(build, "locate", AsyncMock(return_value=None))
     monkeypatch.setattr(build, "_authenticate_root", AsyncMock(return_value=100))
     monkeypatch.setattr(build, "_copy_code", AsyncMock(return_value=([], (), 100)))
-    monkeypatch.setattr(build.native, "protected_publisher_owner", AsyncMock())
     monkeypatch.setattr(build.native, "precreate_model_family_stage", AsyncMock())
     budgets = []
 
@@ -218,7 +217,7 @@ async def test_one_source_budget_survives_both_factors_and_refuses_before_seal(m
     seal = AsyncMock()
     monkeypatch.setattr(build, "seal", seal)
     with pytest.raises(RegistryPTGGraphReadError, match="graph_budget"):
-        await build.build_in_session(object(), **PARAMS)
+        await build.build_in_session(SimpleNamespace(in_transaction=lambda: True), **PARAMS)
     assert len(budgets) == 2 and budgets[0] is budgets[1]
     assert budgets[0].read_bytes == 600
     seal.assert_not_awaited()

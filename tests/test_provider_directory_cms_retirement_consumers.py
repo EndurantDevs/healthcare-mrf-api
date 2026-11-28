@@ -2,7 +2,6 @@
 """Typed retirement successors retain every existing identity and custody check."""
 
 import re
-from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -10,12 +9,8 @@ import pytest
 
 from db.migration_cms_retirement_resolution import ORIGINAL_SHA256, retirement_resolution_bodies
 from process import network_fhir_source_custody as reader
-from process import provider_directory_cms_callable_custody as callables
 from process import provider_directory_import_run_guards as import_guards
-from process import provider_directory_source_callable_custody as source
 from process import provider_directory_terminal_root_retirement_controls as controls
-from tests.test_provider_directory_cms_allocation_guard_contracts import original_guards as original_guards
-from tests.test_provider_directory_cms_callee_custody import _catalog_rows, _original_allocation_pins, _verify
 
 _SCHEMA = "snapshot_schema"
 _PAIRS = retirement_resolution_bodies(_SCHEMA)
@@ -37,63 +32,6 @@ def test_import_run_successor_still_requires_the_frozen_predecessor(monkeypatch)
     assert not import_guards._is_approved_source(name, _PAIRS[name][1], _SCHEMA)
 
 
-@pytest.mark.parametrize("name", ORIGINAL_SHA256)
-@pytest.mark.parametrize("version", [0, 1])
-def test_shared_definition_comparison_accepts_only_reviewed_body_pairs(name, version):
-    definition_by_field = dict(proname=name, prosrc=_PAIRS[name][version])
-    assert source._is_approved_body(definition_by_field, _SCHEMA, ORIGINAL_SHA256[name])
-    definition_by_field["prosrc"] += "\nRETURN NULL;"
-    assert not source._is_approved_body(definition_by_field, _SCHEMA, ORIGINAL_SHA256[name])
-
-
-@pytest.mark.parametrize("name", ORIGINAL_SHA256)
-def test_successor_requires_exact_predecessor_contract(name):
-    definition_by_field = dict(proname=name, prosrc=_PAIRS[name][1])
-    assert not source._is_approved_body(definition_by_field, _SCHEMA, "f" * 64)
-    definition_by_field["proname"] = "unreviewed_helper"
-    assert not source._is_approved_body(definition_by_field, _SCHEMA, ORIGINAL_SHA256[name])
-
-
-def _typed_frontier():
-    rows = _catalog_rows(_SCHEMA)
-    for row in rows:
-        name = row["definition"]["proname"]
-        if name in _EVIDENCE_NAMES:
-            row["definition"]["prosrc"] = _PAIRS[name][1]
-    return rows
-
-
-def test_fixed32_cms_checkers_share_exact_successor_recognition():
-    rows = _typed_frontier()
-    before = deepcopy(rows)
-    assert len(_verify(rows)) == 32
-    assert rows == before and len(callables._cms_callee_contracts()) == 32
-
-
-@pytest.mark.parametrize("name", _EVIDENCE_NAMES)
-@pytest.mark.parametrize("field", ["prosrc", "proconfig", "proargtypes", "prosecdef", "provolatile", "language"])
-def test_native_attributes_still_refuse_after_fingerprint_is_rebound(name, field):
-    rows = _typed_frontier()
-    row = next(entry for entry in rows if entry["definition"]["proname"] == name)
-    if field == "language":
-        row[field] = "plpgsql"
-    else:
-        row["definition"][field] = "unreviewed"
-    with pytest.raises(ValueError, match="definition_changed"):
-        _verify(rows)
-
-
-def test_original_allocation_parent_keeps_all_other_pins(original_guards):
-    name = "guard_provider_directory_terminal_root_retirement_parent"
-    row = next(entry for entry in original_guards if entry["definition"]["proname"] == name)
-    row["definition"]["prosrc"] = _PAIRS[name][1]
-    pins = _original_allocation_pins(original_guards)
-    assert len(callables.require_original_cms_allocation_callees(original_guards, **pins)) == 41
-    row["definition"]["proconfig"] = ["search_path=public"]
-    with pytest.raises(ValueError, match="definition_changed"):
-        callables.require_original_cms_allocation_callees(original_guards, **_original_allocation_pins(original_guards))
-
-
 @pytest.mark.parametrize("name", [name for name in ORIGINAL_SHA256 if name in reader._REACHABLE_FUNCTIONS])
 def test_retained_reader_accepts_typed_bodies_and_keeps_settings(name):
     expected = reader._REACHABLE_FUNCTIONS[name]
@@ -106,9 +44,9 @@ def test_retained_reader_accepts_typed_bodies_and_keeps_settings(name):
         prosecdef=expected[2],
         proconfig=list(expected[3]) if expected[3] is not None else None,
     )
-    reader._require_function(entry_by_field, _SCHEMA, 105)
+    reader._require_function(entry_by_field, _SCHEMA)
     with pytest.raises(reader.FHIRSourceCustodyError):
-        reader._require_function({**entry_by_field, "proconfig": ["search_path=public"]}, _SCHEMA, 105)
+        reader._require_function({**entry_by_field, "proconfig": ["search_path=public"]}, _SCHEMA)
 
 
 @pytest.mark.asyncio

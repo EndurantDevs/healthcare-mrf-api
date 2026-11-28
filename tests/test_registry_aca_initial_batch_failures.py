@@ -152,16 +152,13 @@ async def test_coverage_reader_accepts_driver_json_and_refuses_nonlist_results(e
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["admit", "require"])
-async def test_batch_stamp_requires_the_callers_original_transaction(monkeypatch, operation):
+async def test_batch_stamp_requires_the_callers_original_transaction(operation):
     session = SimpleNamespace(in_transaction=lambda: False, scalar=AsyncMock())
-    owner = AsyncMock()
-    monkeypatch.setattr(producer, "protected_publisher_owner", owner)
     function = (
         producer.admit_registry_aca_source_batch if operation == "admit" else producer.require_registry_aca_source_batch
     )
     with pytest.raises(ValueError, match="registry_aca_source_recipe_invalid"):
         await function(session, object(), runtime_roles=fixtures._ROLES)
-    owner.assert_not_awaited()
     session.scalar.assert_not_awaited()
 
 
@@ -170,7 +167,6 @@ async def test_batch_stamp_requires_the_callers_original_transaction(monkeypatch
 async def test_admission_cannot_replace_drifted_evidence_or_a_foreign_stamp(monkeypatch, damage):
     prepared, validation = await fixtures._batch_prepared(monkeypatch)
     session, connection = fixtures._comment_session("native_facade")
-    monkeypatch.setattr(producer, "protected_publisher_owner", AsyncMock(return_value=13))
     monkeypatch.setattr(producer, "prepare_reference_family_activation", AsyncMock(return_value=validation))
     native = AsyncMock()
     monkeypatch.setattr(producer, "_require_native_archive", native)

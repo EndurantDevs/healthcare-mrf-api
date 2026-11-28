@@ -148,37 +148,3 @@ async def require_cms_control_model_layout(database, model, schema):
     _require_model_columns(model, [dict(row._mapping if hasattr(row, "_mapping") else row) for row in rows])
     indexes = await database.all(_INDEX_SQL, relation=table)
     _require_model_indexes(model, [dict(row._mapping if hasattr(row, "_mapping") else row) for row in indexes])
-
-
-# Exact post-repair source graph, plus two unchanged historical control callables.
-
-
-async def _require_native_foreign_functions(connection, hook_oids):
-    _require(
-        await connection.fetchval(
-            "SELECT count(*)=cardinality($1::oid[]) AND COALESCE(bool_and(p.pronamespace='pg_catalog'::regnamespace "
-            "AND l.lanname='internal' AND NOT p.prosecdef "
-            "AND p.prosrc=p.proname AND p.proname=ANY($2::text[])),true) "
-            "FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang WHERE p.oid=ANY($1::oid[])",
-            sorted(hook_oids),
-            [
-                "RI_FKey_" + name
-                for name in (
-                    "check_ins",
-                    "check_upd",
-                    "noaction_del",
-                    "noaction_upd",
-                    "restrict_del",
-                    "restrict_upd",
-                    "cascade_del",
-                    "cascade_upd",
-                    "setnull_del",
-                    "setnull_upd",
-                    "setdefault_del",
-                    "setdefault_upd",
-                )
-            ],
-        )
-        is True,
-        "native_foreign_function_changed",
-    )

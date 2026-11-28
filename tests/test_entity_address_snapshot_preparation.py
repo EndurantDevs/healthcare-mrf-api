@@ -174,7 +174,7 @@ def test_v2_loaded_custody_requires_exact_original_eight_oid_inventory(mutation)
         "inventory": inventory_by_field,
         "inventory_sha256": preparation._digest(inventory_by_field),
     }
-    preparation._require_loaded_inventory(proof_by_field, owner, 31)
+    preparation._require_loaded_inventory(proof_by_field, owner)
     if mutation == "builder_owner":
         proof_by_field["state"] = "loading"
     elif mutation == "schema_oid":
@@ -184,7 +184,7 @@ def test_v2_loaded_custody_requires_exact_original_eight_oid_inventory(mutation)
     else:
         proof_by_field["inventory_sha256"] = "b" * 64
     with pytest.raises(preparation.EntityAddressSnapshotDestinationError):
-        preparation._require_loaded_inventory(proof_by_field, owner, 31)
+        preparation._require_loaded_inventory(proof_by_field, owner)
 
 
 async def test_loaded_preparation_refuses_frozen_input_before_candidate_writes(monkeypatch):

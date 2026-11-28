@@ -385,7 +385,7 @@ async def build_in_session(session, *, source_key, snapshot_id, code_system, cod
     """Build or adopt one complete source/code family within the caller transaction."""
     params_by_name = dict(source_key=source_key, snapshot_id=snapshot_id, code_system=code_system, code=code)
     validate_params(params_by_name)
-    await native.protected_publisher_owner(session)
+    native._require_transaction(session)
     tables, root, identity = await source_identity(session, **params_by_name)
     await lock_identity(session, identity)
     found = await locate(session, identity)

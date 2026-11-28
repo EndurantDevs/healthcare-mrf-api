@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Current acquisition shape stays read-only and rejects ambiguous storage."""
 
-import json
 import re
 from copy import deepcopy
 from types import SimpleNamespace
@@ -156,24 +155,6 @@ def test_expected_expression_table_rejects_a_caller_supplied_model():
     model = SimpleNamespace(__tablename__=custody.ACQUISITION_ROOTS[0])
     with pytest.raises(ValueError, match="model_required"):
         custody._expression_table_sql(model, "expected_checks", "snapshot_schema")
-
-
-@pytest.mark.parametrize("values", [[], ["pdrga_" + "1" * 48], ["pdrga_" + "1" * 48, "pdrga_" + "2" * 48]])
-def test_native_history_scope_requires_complete_exact_safe_bound(values):
-    expression = (
-        "false"
-        if not values
-        else (
-            f"acquisition_id::text = '{values[0]}'::text"
-            if len(values) == 1
-            else "acquisition_id::text = ANY (ARRAY[" + ",".join("'" + value + "'::text" for value in values) + "])"
-        )
-    )
-    from db.migration_expression_adoption import _normalized_expression
-
-    custody._require_acquisition_scope(_normalized_expression("CHECK (" + expression + ")"), values)
-    with pytest.raises(ValueError, match="scope_expression_changed"):
-        custody._require_acquisition_scope("checktrue", values)
 
 
 _PRAC_WORK = "pd_uhc_flex_practitioner_work_guard"

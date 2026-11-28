@@ -101,7 +101,7 @@ async def _legacy_hooks(session, schema, relation_name):
 
 
 async def require_geo_storage(
-    session, *, schema_name, relation_name=ROOT, expected_oid=None, legacy=False, native_policy=None, is_incumbent=False
+    session, *, schema_name, relation_name=ROOT, legacy=False, native_policy=None, is_incumbent=False
 ):
     """Validate the declared fixed model and complete native storage shape."""
     from process.mrf_address_publication import require_native_read_catalog
@@ -176,9 +176,7 @@ async def _retained_geo_catalog(session, schema, oid, owner):
     return receipt, profile
 
 
-async def capture_geo_retained_cut(
-    session, *, schema_name, expected_relation_oid=None, expected_relfilenode=None, manifest
-):
+async def capture_geo_retained_cut(session, *, schema_name, manifest):
     """Validate the declared retained heap and complete data without old physical coordinates."""
     from process import reference_family_archive as archive
     from process.entity_address_snapshot_receipt import _projected_row_identity
@@ -328,7 +326,7 @@ async def capture_geo_predecessor(session, schema, pairs):
     require(tuple(name for name, _oid in pairs) == (ROOT,), "family_changed")
     oid = pairs[0][1]
     if oid is not None:
-        await require_geo_storage(session, schema_name=schema, expected_oid=oid, is_incumbent=True)
+        await require_geo_storage(session, schema_name=schema, is_incumbent=True)
     authority = await generation.read_reference_family_result_generation_authority(
         session,
         importer_id="geo",

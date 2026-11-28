@@ -455,7 +455,6 @@ async def test_abandonment_authenticates_never_published_attempt_before_cleanup(
 @pytest.mark.parametrize("status", ["canceling", "failed"])
 async def test_abandonment_writes_exact_terminal_receipt_without_touching_publication(monkeypatch, importer, status):
     handoff = native_handoff(importer)
-    monkeypatch.setattr(archive.native, "protected_publisher_owner", AsyncMock(return_value=41))
     monkeypatch.setattr(archive, "_require_native_abandonment", AsyncMock(return_value={"status": status}))
     drop = AsyncMock()
     monkeypatch.setattr(archive, "_drop_native_projection_candidate", drop)
@@ -698,7 +697,6 @@ async def test_ordinary_completion_borrows_caller_session_only_after_publication
     source_run_dict["source_manifest"]["max_providers"] = 1 if bounded else None
     monkeypatch.setattr(archive, "_native_source_run", AsyncMock(return_value=source_run_dict))
     monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=301))
-    monkeypatch.setattr(archive.native, "protected_publisher_owner", AsyncMock(return_value=41))
     events = []
     completion = SimpleNamespace(
         _finish_source=AsyncMock(side_effect=lambda *args: events.append("finish") or {"published": True}),
@@ -802,7 +800,6 @@ async def test_retained_rollback_requires_origin_seal_and_exact_storage_before_p
         "current_run_id": "c" * 32 if fault == "pointer" else "b" * 32,
         "previous_run_id": manifest["run_id"],
     }
-    monkeypatch.setattr(archive.native, "protected_publisher_owner", AsyncMock(return_value=41))
     monkeypatch.setattr(archive, "_source_lock", AsyncMock())
     monkeypatch.setattr(archive, "_pointer", AsyncMock(return_value=pointer_dict))
     monkeypatch.setattr(archive, "require_pin_guards", AsyncMock())
@@ -1043,7 +1040,6 @@ async def test_original_producer_and_capture_branches_share_same_publication_con
     copy = archive.native.ReferenceFamilySourceCopy(AsyncMock(), 1000, 30)
     for name in ("_source_lock", "require_pin_guards", "_record_native_custody"):
         monkeypatch.setattr(archive, name, AsyncMock())
-    monkeypatch.setattr(archive.native, "protected_publisher_owner", AsyncMock(return_value=41))
     monkeypatch.setattr(archive.native, "_lock_family", AsyncMock())
     monkeypatch.setattr(archive, "require_native_handoff", AsyncMock(return_value=handoff))
     monkeypatch.setattr(archive, "_pointer", AsyncMock(return_value=handoff["expected"]))
@@ -1190,7 +1186,6 @@ async def test_retained_projection_rollback_authenticates_capture_and_publishes_
     receipt_dict["validation_sha256"] = archive._digest(receipt_dict)
     pin_records = adoption_pins(manifest, receipt_dict)
     pointer_dict = {"current_run_id": "b" * 32, "previous_run_id": manifest["run_id"], "previous_relation_oid": 301}
-    monkeypatch.setattr(archive.native, "protected_publisher_owner", AsyncMock(return_value=41))
     for name in ("_source_lock", "require_pin_guards", "verify_ownership", "_require_stage_topology"):
         monkeypatch.setattr(archive, name, AsyncMock())
     monkeypatch.setattr(archive, "_pointer", AsyncMock(return_value=pointer_dict))

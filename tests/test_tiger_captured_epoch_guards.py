@@ -141,7 +141,7 @@ async def test_graph_retains_nested_qualified_edges():
 async def test_source_admission_uses_native_recursive_lock_and_complete_graph(empty):
     rows = _graph_rows()[:2] if empty else _graph_rows()
     session = _session(rows)
-    assert await captured.has_attested_inherited_tiger_source_capture(session, owner_oid=90) is not empty
+    assert await captured.has_attested_inherited_tiger_source_capture(session) is not empty
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert statements.index('LOCK TABLE "tiger"."zip_state", "tiger"."zcta5" IN SHARE MODE') < statements.index(
         captured._GRAPH_SQL
@@ -161,7 +161,7 @@ async def test_native_source_lock_denial_propagates_before_capture():
 async def test_source_admission_requires_caller_transaction_before_catalog_reads():
     session = _session(_graph_rows(), active=False)
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="caller transaction"):
-        await captured.has_attested_inherited_tiger_source_capture(session, owner_oid=90)
+        await captured.has_attested_inherited_tiger_source_capture(session)
     session.execute.assert_not_awaited()
     assert all(str(call.args[0]).startswith("SHOW ") for call in session.scalar.await_args_list)
 

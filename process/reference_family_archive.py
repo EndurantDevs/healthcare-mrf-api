@@ -2922,17 +2922,6 @@ async def _require_nucc_native_location(session, handoff, run):
         raise ReferenceFamilyArchiveError("NUCC native source or location differs")
 
 
-async def protected_publisher_owner(session):
-    """Authenticate the existing native protected owner without selecting an importer."""
-    from process.entity_address_snapshot_preparation import EntityAddressSnapshotDestinationError, _publisher_authority
-
-    _require_transaction(session)
-    try:
-        return await _publisher_authority(session)
-    except EntityAddressSnapshotDestinationError as error:
-        raise ReferenceFamilyArchiveError("native protected publisher is unavailable") from error
-
-
 async def require_nucc_native_handoff(session, value):
     """Recheck persisted attempt, source contract, marker and exact physical stage."""
     handoff = validate_nucc_native_handoff(value)
@@ -4368,7 +4357,7 @@ async def _merge_mrf_canonical_address(session, ownership, destination_schema, a
     await session.execute(text(f"DROP TABLE {stage} RESTRICT"))
 
 
-def _selected_canonical_sources(inventories, selected_relations, owner_oid):
+def _selected_canonical_sources(inventories, selected_relations):
     """Resolve only complete protected native families selected by the existing role pins."""
     from process.mrf_address_publication import CANONICAL_POLICIES
     from process.npi_result_archive import npi_archive_names
@@ -4380,7 +4369,7 @@ def _selected_canonical_sources(inventories, selected_relations, owner_oid):
     relations, contributions = [], {}
     for importer in sorted(inventories):
         family = _selected_canonical_relations(
-            inventories[importer], selected_relations[importer], owner_oid, expected_names_by_importer[importer]
+            inventories[importer], selected_relations[importer], expected_names_by_importer[importer]
         )
         relations.extend(family)
         contribution = next(
@@ -4390,7 +4379,7 @@ def _selected_canonical_sources(inventories, selected_relations, owner_oid):
     return relations, contributions
 
 
-def _selected_canonical_relations(inventory, selected, owner_oid, expected_names):
+def _selected_canonical_relations(inventory, selected, expected_names):
     """Bind the complete named family to its admitted logical Address role."""
     relations = inventory["relations"]
     if (
@@ -4408,7 +4397,7 @@ def _selected_canonical_relations(inventory, selected, owner_oid, expected_names
 
 
 @asynccontextmanager
-async def selected_mrf_canonical_archive(session, *, schema_name, owner_oid, selected_relation, authenticate_inventory):
+async def selected_mrf_canonical_archive(session, *, schema_name, selected_relation, authenticate_inventory):
     """Validate an authenticated auxiliary's future coverage without publishing canonical data.
 
     The callback rechecks the complete protected selected family in this owning
@@ -4426,7 +4415,7 @@ async def selected_mrf_canonical_archive(session, *, schema_name, owner_oid, sel
         # Only the authenticating callback may select an already-installed MRF.
         yield None
         return
-    relations = _selected_mrf_relations(inventory, selected_relation, owner_oid)
+    relations = _selected_mrf_relations(inventory, selected_relation)
     await session.execute(
         text(
             "LOCK TABLE "
@@ -4436,7 +4425,7 @@ async def selected_mrf_canonical_archive(session, *, schema_name, owner_oid, sel
             + " IN ACCESS SHARE MODE NOWAIT"
         )
     )
-    await _require_selected_mrf_catalog(session, relations, owner_oid)
+    await _require_selected_mrf_catalog(session, relations)
     auxiliary = next(relation for relation in relations if relation["relation_name"] == STAGE_TABLE)
     stage = f"{_quoted(auxiliary['schema_name'])}.{_quoted(STAGE_TABLE)}"
     await _validate_mrf_canonical_address_merge(session, stage, archive)
@@ -4471,16 +4460,14 @@ def _mrf_archive_projection_sql(stage, archive):
     )
 
 
-def _selected_mrf_relations(inventory, selected_relation, owner_oid):
+def _selected_mrf_relations(inventory, selected_relation):
     return sorted(
-        _selected_canonical_relations(
-            inventory, selected_relation, owner_oid, reference_family_spec("mrf").archive_names
-        ),
+        _selected_canonical_relations(inventory, selected_relation, reference_family_spec("mrf").archive_names),
         key=lambda entry: (entry["schema_name"], entry["relation_name"]),
     )
 
 
-async def _require_selected_mrf_catalog(session, relations, owner_oid):
+async def _require_selected_mrf_catalog(session, relations):
     """Check complete named heap/index shape after reader locks, without ACL identity checks."""
     for relation in relations:
         name = f"{_quoted(_schema_name(relation['schema_name']))}.{_quoted(relation['relation_name'])}"

@@ -32,8 +32,6 @@ async def test_retained_geo_clone_is_writable_until_copy_and_validation(monkeypa
     from db.models import GeoZipLookup
 
     monkeypatch.setattr(geo, "is_source_geo_active", lambda _importer: False)
-    protected = AsyncMock()
-    monkeypatch.setattr(archive, "protected_publisher_owner", protected)
     create, capture, seal = AsyncMock(), AsyncMock(return_value="owned"), AsyncMock()
     monkeypatch.setattr(archive, "_create_model_family", create)
     monkeypatch.setattr(archive, "_capture_model_family_ownership", capture)
@@ -45,7 +43,6 @@ async def test_retained_geo_clone_is_writable_until_copy_and_validation(monkeypa
     assert await geo.create_model_family_export_clone(session, spec, schema) == "owned"
     create.assert_awaited_once_with(session, spec, schema, create_indexes=False, ordinary_heaps=True)
     capture.assert_awaited_once_with(session, spec, UUID(int=3))
-    protected.assert_not_awaited()
     seal.assert_not_awaited()
     writer.assert_not_awaited()
 
@@ -183,8 +180,6 @@ async def retained_geo(monkeypatch):
     cut = await storage.capture_geo_retained_cut(
         session,
         schema_name="retained_geo",
-        expected_relation_oid="old edition",
-        expected_relfilenode=None,
         manifest=manifest,
     )
     return SimpleNamespace(

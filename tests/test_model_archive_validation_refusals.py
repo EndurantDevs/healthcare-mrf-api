@@ -188,8 +188,7 @@ def _selected_family_view(monkeypatch, kind, failure):
         events.append("authenticate")
         return inventory if kind == "mrf" else {"mrf": inventory}
 
-    async def check_catalog(_session, relations, owner):
-        assert owner == 53
+    async def check_catalog(_session, relations):
         assert {relation_entry["relation_name"] for relation_entry in relations} == set(names)
         assert relations == sorted(
             relations, key=lambda relation_entry: (relation_entry["schema_name"], relation_entry["relation_name"])
@@ -209,13 +208,12 @@ def _selected_family_view(monkeypatch, kind, failure):
     monkeypatch.setattr(address, "require_canonical_output_base", base)
     context = (
         archive.selected_mrf_canonical_archive(
-            session, schema_name="mrf", owner_oid=53, selected_relation=selected, authenticate_inventory=authenticate
+            session, schema_name="mrf", selected_relation=selected, authenticate_inventory=authenticate
         )
         if kind == "mrf"
         else archive.selected_canonical_archive(
             session,
             schema_name="mrf",
-            owner_oid=53,
             selected_relations={"mrf": selected},
             authenticate_inventory=authenticate,
             authenticate_base=AsyncMock(return_value={}) if failure == "base" else None,
@@ -261,7 +259,7 @@ async def test_installed_mrf_requires_authenticating_callback_and_only_locks_arc
     session = _session()
     authenticate = AsyncMock(return_value=None)
     async with archive.selected_mrf_canonical_archive(
-        session, schema_name="mrf", owner_oid=53, selected_relation={}, authenticate_inventory=authenticate
+        session, schema_name="mrf", selected_relation={}, authenticate_inventory=authenticate
     ) as view:
         assert view is None
     authenticate.assert_awaited_once_with(session)
@@ -295,9 +293,9 @@ def test_selected_family_keeps_names_complete_and_old_coordinates_opaque(kind, c
         )
         inventory["relations"][0][field] = "opaque copied edition"
     operation = lambda: (
-        archive._selected_mrf_relations(inventory, selected, None)
+        archive._selected_mrf_relations(inventory, selected)
         if kind == "mrf"
-        else archive._selected_canonical_relations(inventory, selected, None, names)
+        else archive._selected_canonical_relations(inventory, selected, names)
     )
     if change in {"missing", "extra", "schema"}:
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="complete family|role identity"):
@@ -329,9 +327,9 @@ async def test_locked_catalog_checks_named_shape_and_native_read_permissions(cha
         with pytest.raises(
             (archive.ReferenceFamilyArchiveError, PermissionError), match="locked catalog|SELECT denied"
         ):
-            await archive._require_selected_mrf_catalog(session, relations, None)
+            await archive._require_selected_mrf_catalog(session, relations)
     else:
-        await archive._require_selected_mrf_catalog(session, relations, None)
+        await archive._require_selected_mrf_catalog(session, relations)
         assert session.scalar.await_count == 2
     query, parameters = session.scalar.await_args_list[0].args
     assert parameters == {"relation": f'"{relations[0]["schema_name"]}"."{relations[0]["relation_name"]}"'}

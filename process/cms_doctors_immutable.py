@@ -35,9 +35,7 @@ def _require(condition, code):
 
 
 @asynccontextmanager
-async def protected_reference_family_publication(
-    session, *, importer_id, schema_name, expected_owner_oid=None, roles=None
-):
+async def protected_reference_family_publication(session, *, importer_id, schema_name, roles=None):
     """Keep the existing atomic cutover scope, using configured names for administrative DCL."""
     from process.provider_directory_generic_source_policy import _PUBLISHER, _require_active_source_session
     from process.reference_family_archive import model_family_roles

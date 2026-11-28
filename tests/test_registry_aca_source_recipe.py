@@ -200,8 +200,7 @@ async def test_admission_orders_native_validation_custody_and_durable_stamp(monk
     prepared, validation = await _prepared(monkeypatch)
     call_order_list = []
 
-    async def activation(*_args, **kwargs):
-        assert kwargs["sealed_owner_oid"] == 13
+    async def activation(*_args, **_kwargs):
         call_order_list.append("validation")
         return validation
 
@@ -212,7 +211,6 @@ async def test_admission_orders_native_validation_custody_and_durable_stamp(monk
         call_order_list.append("custody")
 
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=None), execute=AsyncMock())
-    monkeypatch.setattr(producer, "protected_publisher_owner", AsyncMock(return_value=13))
     monkeypatch.setattr(producer, "prepare_reference_family_activation", activation)
     monkeypatch.setattr(producer, "native_driver", AsyncMock(return_value=connection))
     monkeypatch.setattr(producer, "_require_archive", custody)
@@ -237,7 +235,6 @@ async def test_admission_failure_never_records_receipt(monkeypatch, failure):
         scalar=AsyncMock(return_value=None if failure == "stamp_io" else "unrelated-comment"),
         execute=AsyncMock(),
     )
-    monkeypatch.setattr(producer, "protected_publisher_owner", AsyncMock(return_value=13))
     gate = AsyncMock(return_value=validation)
     custody = AsyncMock()
     if failure == "validation":
@@ -363,7 +360,6 @@ async def test_recipe_comment_preserves_json_and_original_physical_transaction(m
     metadata["network_membership"]["source_id"] = metadata["network_bindings"]["source_id"] = label
     prepared, validation = await _prepared(monkeypatch, metadata=metadata)
     session, connection = _comment_session(kind)
-    monkeypatch.setattr(producer, "protected_publisher_owner", AsyncMock(return_value=13))
     monkeypatch.setattr(producer, "prepare_reference_family_activation", AsyncMock(return_value=validation))
     custody = AsyncMock()
     monkeypatch.setattr(producer, "_require_archive", custody)
@@ -555,7 +551,6 @@ async def test_batch_descriptor_failures_cannot_admit_partial_scopes(monkeypatch
 async def test_batch_stamp_is_whole_and_singleton_requires_explicit_selector(monkeypatch, count):
     prepared, validation = await _batch_prepared(monkeypatch, _batch_scopes()[:count])
     session, connection = _comment_session("native_facade")
-    monkeypatch.setattr(producer, "protected_publisher_owner", AsyncMock(return_value=13))
     monkeypatch.setattr(producer, "prepare_reference_family_activation", AsyncMock(return_value=validation))
     native = AsyncMock()
     monkeypatch.setattr(producer, "_require_native_archive", native)
@@ -993,7 +988,6 @@ async def test_batch_unicode_ids_require_the_canonical_admitted_stamp(monkeypatc
         scope["network_bindings"]["source_id"] = source_id
     prepared, validation = await _batch_prepared(monkeypatch, scopes)
     session, _connection = _comment_session("native_facade")
-    monkeypatch.setattr(producer, "protected_publisher_owner", AsyncMock(return_value=13))
     monkeypatch.setattr(producer, "prepare_reference_family_activation", AsyncMock(return_value=validation))
     native = AsyncMock()
     monkeypatch.setattr(producer, "_require_native_archive", native)
