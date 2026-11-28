@@ -79,8 +79,26 @@ def _optional_relations(source):
     return source
 
 
-def _refresh(identity, transform):
-    """Replace an existing body; PostgreSQL retains its signature and grants."""
+def _is_relations_current(source):
+    """True when no stored relation id remains and the optional relations are checked by name."""
+    return _optional_relations(source) == source and any(
+        _present(table) in source for table in ("source_bulk_landing", "legacy_copy_origin")
+    )
+
+
+def _is_index_current(source):
+    """True when index checks read relations by name and no longer compare owners."""
+    return (
+        "c.relowner=heap.relowner" not in source and "resolve_custom_import_snapshot_relations(f.family_id)" in source
+    )
+
+
+def _refresh(identity, transform, *, current=None):
+    """Replace an existing body; PostgreSQL retains its signature and grants.
+
+    ``current`` recognizes a body that already holds this step's result, such as one
+    copied from a database that applied it. That body is left as it is.
+    """
     installed = (
         op.get_bind()
         .execute(
@@ -93,10 +111,17 @@ def _refresh(identity, transform):
     )
     if installed is None:
         raise RuntimeError("custom_import_snapshot_names_function_missing")
+    if current is not None and current(installed.prosrc):
+        return
     updated = transform(installed.prosrc)
     if updated == installed.prosrc:
         raise RuntimeError("custom_import_snapshot_names_function_unchanged")
     op.execute(text(_replace(installed.definition, installed.prosrc, updated)))
+
+
+def _install(identity, body):
+    """Install a rendered body; an identical installed body is already current."""
+    _refresh(identity, lambda _source: body, current=lambda source: source == body)
 
 
 def _create_body(source, *, allow_new=False):
@@ -147,11 +172,11 @@ def _refresh_storage(schema):
         "freeze_custom_import_snapshot_family": (_AUTHORITY, _freeze_body(storage._FREEZE_BODY)),
     }
     for name, (arguments, body) in definition_by_name.items():
-        rendered = " " + storage._sql(schema, storage._body(schema, body)) + " "
-        _refresh(f"{quoted}.{name}({arguments})", lambda _source, value=rendered: value)
+        _install(f"{quoted}.{name}({arguments})", " " + storage._sql(schema, storage._body(schema, body)) + " ")
     _refresh(
         f"{quoted}.resolve_custom_import_generation_snapshot(bigint,bigint,bigint,bigint)",
         _optional_relations,
+        current=_is_relations_current,
     )
 
 
@@ -350,7 +375,7 @@ def _refresh_writers(schema):
         bulk, storage, schema, body
     )
     for name, body in definition_by_name.items():
-        _refresh(f"{quoted}.{name}(bigint)", lambda _source, value=body: value)
+        _install(f"{quoted}.{name}(bigint)", body)
     _refresh(f"{quoted}.resolve_custom_import_source_batch_snapshot(uuid)", _batch_body)
     _refresh(
         f"{quoted}.source_set_finalize(uuid,integer[])",
@@ -494,8 +519,11 @@ def upgrade():
         _refresh(
             f"{quoted}.{name}(bigint,text)",
             lambda source: _index_body(source.replace(quoted, "__CONTROL__")).replace("__CONTROL__", quoted),
+            current=_is_index_current,
         )
-    _refresh(f"{quoted}.verify_custom_import_snapshot_structure(bigint)", _optional_relations)
+    _refresh(
+        f"{quoted}.verify_custom_import_snapshot_structure(bigint)", _optional_relations, current=_is_relations_current
+    )
     build_verifier = f"{quoted}.verify_custom_import_build_structure(bigint)"
     verifier_body = op.get_bind().scalar(
         text("SELECT prosrc FROM pg_proc WHERE oid=to_regprocedure(:identity)"), {"identity": build_verifier}

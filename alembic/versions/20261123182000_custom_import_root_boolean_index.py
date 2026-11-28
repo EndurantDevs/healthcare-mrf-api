@@ -62,8 +62,13 @@ def _body(names, source, schema, *, enabled):
 def _install(*, enabled):
     names = _names()
     schema = names._storage()._quote(_schema())
+    current = (lambda source: "'root_boolean_true_v1'" in source) if enabled else None
     for name in ("prepare_custom_import_snapshot_indexes", "verify_custom_import_snapshot_indexes"):
-        names._refresh(f"{schema}.{name}(bigint,text)", lambda source: _body(names, source, schema, enabled=enabled))
+        names._refresh(
+            f"{schema}.{name}(bigint,text)",
+            lambda source: _body(names, source, schema, enabled=enabled),
+            current=current,
+        )
 
 
 def upgrade():

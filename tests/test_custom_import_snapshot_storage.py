@@ -155,7 +155,9 @@ def test_names_refresh_covers_existing_and_future_writers_without_physical_colum
     migration = _names_migration()
     body_by_identity = {}
     monkeypatch.setattr(
-        migration, "_refresh", lambda identity, transform: body_by_identity.setdefault(identity, transform("old"))
+        migration,
+        "_refresh",
+        lambda identity, transform, **_options: body_by_identity.setdefault(identity, transform("old")),
     )
     migration._refresh_storage("synthetic_schema")
     bulk = migration._previous("20261005040000_custom_import_bulk_snapshot_writers")
@@ -225,7 +227,7 @@ def test_names_storage_refresh_preserves_retired_read_guards_and_native_locks(mo
     monkeypatch.setattr(
         migration,
         "_refresh",
-        lambda target, transform: body_by_identity.setdefault(
+        lambda target, transform, **_options: body_by_identity.setdefault(
             target, transform(installed if target == identity else "old")
         ),
     )
@@ -312,7 +314,7 @@ def test_names_refresh_migrates_each_registered_bulk_and_legacy_writer(monkeypat
     monkeypatch.setattr(
         migration,
         "_refresh",
-        lambda identity, transform: body_by_identity.setdefault(
+        lambda identity, transform, **_options: body_by_identity.setdefault(
             identity, transform(source_by_identity.get(identity, "old"))
         ),
     )
@@ -361,7 +363,9 @@ def test_names_migration_is_forward_only_and_drops_only_physical_registry_fields
     monkeypatch.setattr(names, "_check_remaining_references", lambda _schema: None)
     body_by_identity = {}
     monkeypatch.setattr(
-        names, "_refresh", lambda identity, transform: body_by_identity.setdefault(identity, transform("old"))
+        names,
+        "_refresh",
+        lambda identity, transform, **_options: body_by_identity.setdefault(identity, transform("old")),
     )
     monkeypatch.setattr(migration.op, "create_check_constraint", lambda *args, **kwargs: None)
     monkeypatch.setattr(migration.op, "drop_column", lambda table, column, **_kwargs: drops.append((table, column)))
