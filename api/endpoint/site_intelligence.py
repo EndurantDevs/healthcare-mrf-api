@@ -187,21 +187,28 @@ def _radius_zip_overlap_sql():
             ST_SetSRID(ST_Point(:lng, :lat), 4326)::geography,
             :radius_meters
           ) AS geom
+        ),
+        matched AS (
+          SELECT
+            z.zcta5ce::text AS zip_code,
+            ST_Transform(z.the_geom, 4326)::geography AS zcta_geog,
+            c.geom AS circle_geog
+          FROM tiger.zcta5 AS z
+          CROSS JOIN circle AS c
+          WHERE z.the_geom && ST_Transform(c.geom::geometry, 4269)
+            AND ST_Intersects(ST_Transform(z.the_geom, 4326)::geography, c.geom)
         )
         SELECT
-          z.zcta5ce::text AS zip_code,
+          zip_code,
           GREATEST(
             0.0,
             LEAST(
               1.0,
-              ST_Area(
-                ST_Intersection(z.the_geom::geography, c.geom)
-              ) / NULLIF(ST_Area(z.the_geom::geography), 0)
+              ST_Area(ST_Intersection(zcta_geog, circle_geog))
+              / NULLIF(ST_Area(zcta_geog), 0)
             )
           ) AS overlap_weight
-        FROM tiger.zcta5 AS z
-        CROSS JOIN circle AS c
-        WHERE ST_Intersects(z.the_geom::geography, c.geom)
+        FROM matched
         """
     )
 

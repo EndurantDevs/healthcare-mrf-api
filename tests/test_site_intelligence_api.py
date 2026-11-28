@@ -280,3 +280,11 @@ async def test_site_intelligence_target_scripts_gates_recommendation(monkeypatch
     assert response_payload["recommendation"]["final_decision"] != "Recommend"
     if response_payload["recommendation"]["base_decision"] == "Recommend":
         assert response_payload["recommendation"]["target_adjusted"] is True
+
+
+def test_radius_zip_overlap_sql_uses_wgs84(site_intel_module):
+    """Verify radius ZIP overlap query transforms NAD83 ZCTA geometries and uses the GiST prefilter."""
+    overlap_sql = site_intel_module._radius_zip_overlap_sql().text
+    assert "ST_Transform(z.the_geom, 4326)::geography" in overlap_sql
+    assert "z.the_geom::geography" not in overlap_sql
+    assert "z.the_geom && ST_Transform(c.geom::geometry, 4269)" in overlap_sql
