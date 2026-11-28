@@ -89,7 +89,7 @@ async def _insert_matched_page(
 
 
 async def build_matched_facts(connection, schema, addresses, work, affected, *, bindings_verified=False):
-    """Count every duplicate in indexed inclusive ranges; aggregate only one key page."""
+    """Count every duplicate once; incremental or unverified passes aggregate one indexed key page at a time."""
     membership = schema + ".network_membership"
     await require_order_index(connection, membership)
     await require_not_null_keys(connection, membership)
@@ -98,6 +98,39 @@ async def build_matched_facts(connection, schema, addresses, work, affected, *, 
       UNIQUE NULLS NOT DISTINCT(network_id,office_bucket,location_key)) ON COMMIT DROP""")
     await connection.execute(f'CREATE TEMP TABLE {locations}(location_key text COLLATE "C" PRIMARY KEY) ON COMMIT DROP')
     tables = (membership, schema + ".provider_location_binding", addresses, work, locations)
+    if affected is None and bindings_verified:
+        await _accumulate_in_one_pass(connection, tables)
+    else:
+        await _accumulate_page_by_page(connection, tables, affected, bindings_verified)
+    accounting_by_field = dict(
+        await connection.fetchrow(f"""SELECT COALESCE(sum(membership_rows),0)::bigint AS membership_rows,
+      COALESCE(sum(membership_rows) FILTER(WHERE network_id IS NULL OR network_id<=0 OR location_key IS NULL),0)::bigint AS invalid_memberships,
+      COALESCE(sum(membership_rows) FILTER(WHERE length(location_key) NOT BETWEEN 1 AND 64),0)::bigint AS invalid_location_keys,
+      count(*) FILTER(WHERE location_key IS NOT NULL) AS distinct_memberships,
+      (SELECT count(*) FROM {locations}) AS matched_locations FROM {work}""")
+    )
+    await connection.execute(f"DROP TABLE {locations}")
+    await connection.execute(f"ANALYZE {work}")
+    return accounting_by_field
+
+
+async def _accumulate_in_one_pass(connection, tables):
+    """Group every membership once; verified bindings need no address probe or page boundaries."""
+    membership, bindings, _, work, locations = tables
+    # One merge join over the two key-ordered indexes replaces thousands of paged nested-loop probes.
+    await connection.execute(f"""INSERT INTO {work}
+      SELECT m.network_id,b.location_key::text COLLATE "C",
+        (get_byte(sha256(convert_to(b.location_key,'UTF8')),0)&63)::integer,count(*)::bigint
+      FROM {membership} m LEFT JOIN {bindings} b
+        ON (b.provider_system,b.provider_id,b.location_id)=(m.provider_system,m.provider_id,m.location_id)
+      GROUP BY 1,2,3""")
+    await connection.execute(
+        f"INSERT INTO {locations} SELECT DISTINCT location_key FROM {work} WHERE location_key IS NOT NULL"
+    )
+
+
+async def _accumulate_page_by_page(connection, tables, affected, bindings_verified):
+    membership = tables[0]
     statements_by_condition = {}
     after = None
     while (
@@ -115,16 +148,6 @@ async def build_matched_facts(connection, schema, addresses, work, affected, *, 
             bindings_verified=bindings_verified,
         )
         after = upper_keys
-    accounting_by_field = dict(
-        await connection.fetchrow(f"""SELECT COALESCE(sum(membership_rows),0)::bigint AS membership_rows,
-      COALESCE(sum(membership_rows) FILTER(WHERE network_id IS NULL OR network_id<=0 OR location_key IS NULL),0)::bigint AS invalid_memberships,
-      COALESCE(sum(membership_rows) FILTER(WHERE length(location_key) NOT BETWEEN 1 AND 64),0)::bigint AS invalid_location_keys,
-      count(*) FILTER(WHERE location_key IS NOT NULL) AS distinct_memberships,
-      (SELECT count(*) FROM {locations}) AS matched_locations FROM {work}""")
-    )
-    await connection.execute(f"DROP TABLE {locations}")
-    await connection.execute(f"ANALYZE {work}")
-    return accounting_by_field
 
 
 def require_complete_facts(accounting_by_field, candidate, affected):
