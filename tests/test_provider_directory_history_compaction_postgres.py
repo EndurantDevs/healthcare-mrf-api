@@ -10,7 +10,6 @@ import pytest
 
 from db.migration_provider_directory_dataset_candidates import TABLES
 from process import provider_directory_history_compaction_cutover as cutover_module
-from process.provider_directory_cms_preparation_policy import _histories
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_generic_source_provision import _retained_empty_dataset_histories
 from process.provider_directory_history_compaction import (
@@ -162,16 +161,13 @@ async def _assert_downstream_checks(context, schema_name, roles_by_kind):
     connection, schema = context.connection, context.schema
     plan = await connection.fetchval(f"SELECT plan FROM {schema}.pd_dataset_migration_plan WHERE singleton")
     parsed_plan = json.loads(plan) if type(plan) is str else plan
-    root_entries = await connection.fetch(
-        """SELECT c.oid::bigint, c.relname
-        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname=$1 AND c.relname=ANY($2::text[])""",
+    histories = ["pd_dataset_history_" + str(parsed_plan["tables"][root]["original_oid"]) for root in TABLES]
+    assert await connection.fetchval(
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind='r'",
         schema_name,
-        list(TABLES),
-    )
-    roots_by_name = {root_entry["relname"]: dict(root_entry) for root_entry in root_entries}
-    histories = await _histories(connection, schema_name, parsed_plan, roots_by_name)
-    assert len(histories) == len(TABLES)
+        histories,
+    ) == len(TABLES)
     assert await require_native_retirement_controls(_DatabaseAdapter(connection)) == set(TABLES[:5])
     policy = GenericSourcePolicy(
         schema=schema_name,

@@ -450,33 +450,6 @@ def _require_cms_callee_body(entry_by_field, spec, schema, namespace):
     )
 
 
-def _require_cms_proof_acl(entry_by_field, namespace_owner, source_actors):
-    """Check finite, source-verified proof caller ACLs after exact body validation."""
-    from process.provider_directory_cms_proof_contract import CMS_PROOF_DEFINERS
-
-    definition = entry_by_field["definition"]
-    _require(
-        definition["proname"] in CMS_PROOF_DEFINERS
-        and int(definition["proowner"]) == namespace_owner
-        and type(source_actors) is frozenset
-        and all(type(oid) is int and oid > 0 and oid != namespace_owner for oid in source_actors),
-        "proof_source_required",
-    )
-    edges = set(map(tuple, entry_by_field["acl"]))
-    _require(
-        len(edges) == len(entry_by_field["acl"])
-        and (namespace_owner, namespace_owner, "EXECUTE", False) in edges
-        and all(
-            grantee in source_actors | {namespace_owner}
-            and grantor == namespace_owner
-            and right == "EXECUTE"
-            and grantable is False
-            for grantee, grantor, right, grantable in edges
-        ),
-        "acl_changed",
-    )
-
-
 def _require_cms_callee_entry(entry_by_field, spec, schema, namespace, source_roles, allocator):
     from process.provider_directory_generic_source_release_checks import _require_allocator_guard_acl
     from process.provider_directory_source_callable_custody import _require_acl as require_source_acl

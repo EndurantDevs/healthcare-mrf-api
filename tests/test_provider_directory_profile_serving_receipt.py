@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from db.cms_registry_source_pair_slot import COLUMN, INDEX_NAME, NATIVE_CHECK_SQL
 from process import provider_directory_profile_serving_receipt as continuity
 from tests.provider_directory_profile_execution_test_support import _wal_tracker_admission
 
@@ -47,3 +48,40 @@ async def test_receipt_projection_reserves_explicit_pool_and_combined_data(monke
         importer._reserve_provider_directory_profile_wal_budget.assert_awaited_once_with(
             admission, metadata_wal_bytes=wal + admission.geometry.postgres_block_size_bytes
         )
+
+
+def _registry_slot_catalog():
+    slot_by_field = dict(
+        attname=COLUMN, atttypid=3802, atttypmod=-1, default_expression="", attnotnull=False, attgenerated=""
+    )
+    index_by_field = dict(
+        index_name=INDEX_NAME,
+        indkey="0",
+        index_expressions="registry_source_pair_json ->> 'capture_id'::text",
+        index_predicate="registry_source_pair_json IS NOT NULL",
+        indisunique=True,
+        indisprimary=False,
+        indisexclusion=False,
+        indimmediate=True,
+    )
+    return (
+        [dict(attname="receipt_id"), slot_by_field],
+        [dict(index_name="primary"), index_by_field],
+        ["CHECK (true)", NATIVE_CHECK_SQL],
+    )
+
+
+@pytest.mark.parametrize("drift", [None, ("attribute", "attnotnull", True), ("index", "indisprimary", True)])
+def test_registry_slot_is_set_aside_only_in_its_exact_native_shape(drift):
+    attributes, indexes, checks = _registry_slot_catalog()
+    if drift is None:
+        assert continuity._without_registry_slot(attributes, indexes, checks) == (
+            attributes[:1],
+            indexes[:1],
+            checks[:1],
+        )
+        return
+    kind, field, value = drift
+    (attributes if kind == "attribute" else indexes)[-1][field] = value
+    with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
+        continuity._without_registry_slot(attributes, indexes, checks)

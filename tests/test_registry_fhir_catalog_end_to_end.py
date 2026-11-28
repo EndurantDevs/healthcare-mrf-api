@@ -251,7 +251,7 @@ async def _first_import(case, tmp_path):
 def _observe_origin_metadata_cut(monkeypatch):
     """Keep grant setup and savepoint rollback from changing committed receipt data."""
     # The named fixture calls the production grant directly, so observe it where it is defined.
-    from process import provider_directory_cms_control_privileges as fixture
+    from tests import cms_control_privileges_support as fixture
 
     original = fixture.grant_cms_origin_metadata_read_privileges
     cuts = []
@@ -282,7 +282,7 @@ def _observe_origin_metadata_cut(monkeypatch):
 @pytest.mark.parametrize("failure", [False, True])
 async def test_origin_metadata_cut_observer_rolls_back_before_final_call(monkeypatch, failure):
     """Only observer ordering is doubled; this establishes no native grant authority."""
-    from process import provider_directory_cms_control_privileges as fixture
+    from tests import cms_control_privileges_support as fixture
 
     grant_by_field = {"configured": True}
     grant = AsyncMock(side_effect=RuntimeError("grant refused") if failure else None, return_value=grant_by_field)

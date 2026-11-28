@@ -309,7 +309,7 @@ async def _source_native_control_catalog(connection):
 
 async def prepare_source_native_inputs(component, monkeypatch, tmp_path, source_commit, *, metadata_read_roles=()):
     """Finish genuine native prerequisites before the protected Source cut closes writers."""
-    from process.provider_directory_cms_control_privileges import cms_origin_metadata_read_roles
+    from tests.cms_control_privileges_support import cms_origin_metadata_read_roles
 
     assert component.policy.schema == "mrf" and not source.fhir.db._transaction_binding()
     if metadata_read_roles:
@@ -333,7 +333,7 @@ async def prepare_source_native_inputs(component, monkeypatch, tmp_path, source_
             await connection.execute(text(f'GRANT USAGE ON SCHEMA "{namespace}" TO {owner}'))
             rights = "SELECT" if name == "alembic_version" else "SELECT,MAINTAIN"
             await connection.execute(text(f'GRANT {rights} ON TABLE "{namespace}"."{name}" TO {owner}'))
-        from process.provider_directory_cms_control_privileges import grant_cms_control_privileges
+        from tests.cms_control_privileges_support import grant_cms_control_privileges
 
         raw = await connection.get_raw_connection()
         await grant_cms_control_privileges(raw.driver_connection, component.policy)
@@ -428,7 +428,7 @@ async def _register_source_catalog(database, monkeypatch, register_source, fhir)
 async def _require_named_native_controls(component, metadata_read_roles):
     """Use configured native roles and the current counter's semantic guard contract."""
     from process import provider_directory_cms_native_registration as registration
-    from process.provider_directory_cms_control_privileges import grant_cms_origin_metadata_read_privileges
+    from tests.cms_control_privileges_support import grant_cms_origin_metadata_read_privileges
 
     component.factory._require_current_policy()
     assert component.factory._native_input_producer is not None
@@ -467,7 +467,7 @@ async def _grant_profile_controls(database, policy):
             await connection.execute(text(f'GRANT {rights} ON "{policy.schema}"."{name}" TO "{policy.owner_role}"'))
         for name in addresses.RELATION_NAMES:
             await connection.execute(text(f'GRANT SELECT ON "{policy.schema}"."{name}" TO "{policy.owner_role}"'))
-        from process.provider_directory_cms_control_privileges import grant_cms_control_privileges
+        from tests.cms_control_privileges_support import grant_cms_control_privileges
 
         raw = await connection.get_raw_connection()
         await grant_cms_control_privileges(raw.driver_connection, policy)
@@ -508,8 +508,8 @@ async def _grant_profile_controls(database, policy):
 async def _grant_profile_read_protocol(connection, driver, policy):
     """Grant only fixed mutable selection fences and existing readonly entry points."""
     from db.plan_release_storage import storage_identifier
-    from process.provider_directory_cms_control_privileges import READ_COLUMN_GRANTS, grant_cms_control_read_privileges
     from process.provider_directory_dataset_scoped_publication import LEGACY_READY_FUNCTION, ROOTED_READY_FUNCTION
+    from tests.cms_control_privileges_support import READ_COLUMN_GRANTS, grant_cms_control_read_privileges
 
     for name in selection_snapshot.UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS:
         await connection.execute(text(f'GRANT SELECT,MAINTAIN ON "{policy.schema}"."{name}" TO "{policy.owner_role}"'))

@@ -288,8 +288,8 @@ def _parent_transaction_fixture(driver, transactions):
 @pytest.mark.parametrize("failure", [None, "epoch", "controls", "metadata", "cancel"])
 async def test_native_control_setup_propagates_refusal(monkeypatch, failure):
     """Configured DCL and data validation finish before exposing synthetic producer identity."""
-    from process.provider_directory_cms_control_privileges import grant_cms_origin_metadata_read_privileges
     from tests import nppes_candidate_postgres_support as support
+    from tests.cms_control_privileges_support import grant_cms_origin_metadata_read_privileges
 
     events, transactions = [], []
     driver = object()

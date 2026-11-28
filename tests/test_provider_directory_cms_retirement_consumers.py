@@ -11,13 +11,11 @@ import pytest
 from db.migration_cms_retirement_resolution import ORIGINAL_SHA256, retirement_resolution_bodies
 from process import network_fhir_source_custody as reader
 from process import provider_directory_cms_callable_custody as callables
-from process import provider_directory_cms_callee_inventory as inventory
 from process import provider_directory_import_run_guards as import_guards
 from process import provider_directory_source_callable_custody as source
 from process import provider_directory_terminal_root_retirement_controls as controls
 from tests.test_provider_directory_cms_allocation_guard_contracts import original_guards as original_guards
 from tests.test_provider_directory_cms_callee_custody import _catalog_rows, _original_allocation_pins, _verify
-from tests.test_provider_directory_cms_callee_inventory import _arguments
 
 _SCHEMA = "snapshot_schema"
 _PAIRS = retirement_resolution_bodies(_SCHEMA)
@@ -68,7 +66,7 @@ def _typed_frontier():
 def test_fixed32_cms_checkers_share_exact_successor_recognition():
     rows = _typed_frontier()
     before = deepcopy(rows)
-    assert _verify(rows) == inventory.require_cms_callee_inventory(rows, **_arguments(rows))
+    assert len(_verify(rows)) == 32
     assert rows == before and len(callables._cms_callee_contracts()) == 32
 
 
@@ -82,7 +80,7 @@ def test_native_attributes_still_refuse_after_fingerprint_is_rebound(name, field
     else:
         row["definition"][field] = "unreviewed"
     with pytest.raises(ValueError, match="definition_changed"):
-        inventory.require_cms_callee_inventory(rows, **_arguments(rows))
+        _verify(rows)
 
 
 def test_original_allocation_parent_keeps_all_other_pins(original_guards):

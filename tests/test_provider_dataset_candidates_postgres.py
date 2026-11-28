@@ -13,7 +13,6 @@ from sqlalchemy.exc import DBAPIError
 from db.migration_generic_source_candidates import (
     upgrade_generic_source_candidates,
     upgrade_generic_source_canonical_copy_guard,
-    verify_generic_source_canonical_copy_guard,
 )
 from db.migration_provider_directory_dataset_candidates import TABLES
 from db.migration_provider_directory_terminal_root_retirement_guards import (
@@ -529,13 +528,6 @@ async def _candidate_triggers(context):
     )
 
 
-async def _verify_copy_guard(context, *, require_cms=False):
-    async with context.connection.transaction(readonly=True):
-        await verify_generic_source_canonical_copy_guard(
-            context.connection, context.schema_name, preparation_schema=context.schema_name, require_cms=require_cms
-        )
-
-
 async def _assert_copy_guard_drift_refusals(context, roles, after):
     """Reject altered readers, triggers, session role and guard body."""
     await context.connection.execute(
@@ -543,8 +535,6 @@ async def _assert_copy_guard_drift_refusals(context, roles, after):
     )
     with pytest.raises(RuntimeError, match="preparation_reader_required"):
         await _update_canonical_copy_guard(context)
-    with pytest.raises(RuntimeError, match="preparation_reader_required"):
-        await _verify_copy_guard(context)
     await context.connection.execute(
         f"GRANT SELECT(publication) ON {context.schema}.preparation TO {quoted(roles['owner'])}"
     )
@@ -553,28 +543,14 @@ async def _assert_copy_guard_drift_refusals(context, roles, after):
     )
     with pytest.raises(RuntimeError, match="statement_guards_required"):
         await _update_canonical_copy_guard(context)
-    with pytest.raises(RuntimeError, match="statement_guards_required"):
-        await _verify_copy_guard(context)
     await context.connection.execute(
         f"ALTER TABLE {context.schema}.{TABLES[2]} ENABLE TRIGGER a_pd_candidate_update_old"
     )
     assert await _candidate_guard_metadata(context) == after
-    async with context.connection.transaction():
-        await context.connection.execute("SET LOCAL session_replication_role=replica")
-        with pytest.raises(RuntimeError, match="statement_guards_required"):
-            await verify_generic_source_canonical_copy_guard(
-                context.connection, context.schema_name, preparation_schema=context.schema_name
-            )
-    with pytest.raises(RuntimeError, match="guard_transaction_required"):
-        await verify_generic_source_canonical_copy_guard(
-            context.connection, context.schema_name, preparation_schema=context.schema_name
-        )
     await context.connection.execute(after["definition"].replace("RETURN NULL;", "RETURN NULL; -- unexpected body", 1))
     changed = await _candidate_guard_metadata(context)
     with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
         await _update_canonical_copy_guard(context)
-    with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
-        await _verify_copy_guard(context)
     assert await _candidate_guard_metadata(context) == changed
 
 
@@ -595,27 +571,16 @@ async def test_canonical_copy_guard_update_preserves_native_identity_and_refuses
         await context.connection.execute(f"GRANT EXECUTE ON FUNCTION {function} TO {quoted(roles['generic'])}")
         before, triggers = await _candidate_guard_metadata(context), await _candidate_triggers(context)
         with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
-            await _verify_copy_guard(context)
-        with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
             await _update_canonical_copy_guard(context, include_cms=True)
         async with context.connection.transaction():
             await context.connection.fetchval(f"SELECT count(*) FROM {context.schema}.{TABLES[0]}")
             await _update_canonical_copy_guard(context)
         if include_cms:
             await _update_canonical_copy_guard(context, include_cms=True)
-            await _verify_copy_guard(context, require_cms=True)
-        else:
-            with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
-                await _verify_copy_guard(context, require_cms=True)
         after = await _candidate_guard_metadata(context)
         assert after["identity"] == before["identity"] and after["description"] == before["description"]
         assert after["prosrc"] != before["prosrc"]
         assert await _candidate_triggers(context) == triggers
-        async with context.connection.transaction(readonly=True):
-            await context.connection.execute(f"SET LOCAL ROLE {quoted(roles['generic'])}")
-            await verify_generic_source_canonical_copy_guard(
-                context.connection, context.schema_name, preparation_schema=context.schema_name
-            )
         await _update_canonical_copy_guard(context)
         assert await _candidate_guard_metadata(context) == after
         await _assert_copy_guard_drift_refusals(context, roles, after)
@@ -950,10 +915,8 @@ async def test_cms_guard_upgrade_rollback(monkeypatch):
                 raise RuntimeError("synthetic_outer_rollback")
         assert await _candidate_guard_metadata(context) == before
         assert await _candidate_triggers(context) == triggers
-        with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
-            await _verify_copy_guard(context, require_cms=True)
         await _update_canonical_copy_guard(context, include_cms=True)
-        await _verify_copy_guard(context, require_cms=True)
+        assert (await _candidate_guard_metadata(context))["prosrc"] != before["prosrc"]
 
 
 @pytest.mark.asyncio
