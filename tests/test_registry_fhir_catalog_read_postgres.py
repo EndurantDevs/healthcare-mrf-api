@@ -174,8 +174,8 @@ async def _read(fixture, query=None, policy=None, network_id=None, *, control_sc
     """Read through the grouped and the summarized statement and require the same page."""
     await _summarize(fixture)
     pages = []
-    for summarized in (False, True):
-        catalog._NETWORK_COMPANY_SCHEMAS[fixture.metadata] = summarized
+    for summary in ("", "plan"):
+        catalog._NETWORK_COMPANY_SCHEMAS[fixture.metadata] = summary
         async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
             pages.append(
                 await catalog.read_fhir_catalog(
@@ -1030,3 +1030,34 @@ async def test_summary_first_relationships_merge_across_keys(catalog_database):
     relationships = {network["network_id"]: network["matching_relationships"] for network in listed["items"]}[8]
     assert relationships["total"] == 10 and relationships["next_offset"] == 5
     assert [entry["relationship_id"] for entry in relationships["items"]] == [f"{n + 16:064x}" for n in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_summary_lookup_follows_the_stored_columns(catalog_database):
+    """A summary built before plan_search joined its key serves company reads; plan filters and search stay grouped."""
+    fixture = catalog_database
+    namespace = '"' + fixture.metadata + '"'
+
+    async def lookup():
+        catalog._NETWORK_COMPANY_SCHEMAS.clear()
+        return await catalog._network_summary(fixture.connection, fixture.metadata)
+
+    async def read(query):
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            return await catalog.read_fhir_catalog(
+                fixture.connection, query, excluded_network_ids=(), control_schema="sample_control"
+            )
+
+    assert await lookup() == ""
+    queries = (
+        catalog.FHIRCatalogQuery(company_search="Example Insurance"),
+        catalog.FHIRCatalogQuery(plan_search="Gold"),
+        catalog.FHIRCatalogQuery(search="Gold"),
+    )
+    grouped_pages = [await read(query) for query in queries]
+    await _summarize(fixture)
+    assert await lookup() == "plan"
+    await fixture.connection.execute(f"ALTER TABLE {namespace}.{NETWORK_COMPANY_TABLE} DROP COLUMN plan_search")
+    assert await lookup() == "company"
+    assert [await read(query) for query in queries] == grouped_pages
+    assert grouped_pages[1]["total"] > 0 and grouped_pages[2]["total"] > 0

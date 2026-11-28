@@ -748,9 +748,10 @@ def test_page_sql_guards_search_materialized_ctes_when_unfiltered():
     assert "AND ($7::text IS NOT NULL OR $10::text IS NOT NULL)" in catalog._PAGE_SQL
 
 
-@pytest.mark.parametrize("summarized", [False, True])
-def test_page_sql_reads_filtered_networks_by_index(summarized):
-    sql, _ = catalog._catalog_page_statement({"schema_name": "sample_metadata"}, None, summarized=summarized)
+@pytest.mark.parametrize("summary", ["", "company", "plan"])
+def test_page_sql_reads_filtered_networks_by_index(summary):
+    summarized = bool(summary)
+    sql, _ = catalog._catalog_page_statement({"schema_name": "sample_metadata"}, None, summary=summary)
     edge_networks = sql.split("edge_networks AS MATERIALIZED (")[1].split("), visible_edges")[0]
     assert "$5::uuid IS NOT NULL OR $6::uuid IS NOT NULL OR $7::text IS NOT NULL" in edge_networks
     # A label disjunction here would hide the company trigram index from the planner.
@@ -761,16 +762,29 @@ def test_page_sql_reads_filtered_networks_by_index(summarized):
     # Shared documents, redaction and nested offsets keep the grouped read for that page row.
     assert "GROUP BY network_id,visible_document" in sql
     assert ("WHERE NOT summary.exact" in sql) is summarized
+    # Plan filters read the summary only when its key holds plan_search.
+    assert ("summary.plan_search LIKE $8" in sql) is (summary == "plan")
+    assert ("EXISTS(SELECT 1 FROM company_keys edge" in sql) is summarized
+    # Text search matches summary keys only when they also hold plan_search.
+    assert ("JOIN searched_edges searched" in sql) is (summary != "plan")
+    assert ("summary.company_search LIKE $10" in sql) is (summary == "plan")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exists", "plan_search", "summarized"),
-    [(True, None, True), (True, "Gold Plan", False), (False, None, False)],
+    ("stored", "plan_search", "summary"),
+    [
+        ("plan", None, "plan"),
+        ("plan", "Gold Plan", "plan"),
+        ("company", None, "company"),
+        ("company", "Gold Plan", ""),
+        ("", None, ""),
+        (None, None, ""),
+    ],
 )
-async def test_summary_statement_needs_the_table_and_no_plan_filter(page_boundary, exists, plan_search, summarized):
+async def test_summary_statement_matches_the_stored_summary(page_boundary, stored, plan_search, summary):
     connection, _, _ = page_boundary
-    connection.fetchval.side_effect = lambda sql, *args: exists if "to_regclass" in sql else True
+    connection.fetchval.side_effect = lambda sql, *args: stored if "to_regclass" in sql else True
     for _ in range(2):
         await catalog.read_fhir_catalog(
             connection,
@@ -779,10 +793,11 @@ async def test_summary_statement_needs_the_table_and_no_plan_filter(page_boundar
             control_schema="sample_control",
         )
         sql = connection.fetchrow.call_args.args[0]
-        assert ('"sample_metadata".registry_fhir_catalog_network_company' in sql) is summarized
+        assert ('"sample_metadata".registry_fhir_catalog_network_company' in sql) is bool(summary)
+        assert ("summary.plan_search LIKE $8" in sql) is (summary == "plan")
     lookups = [call for call in connection.fetchval.call_args_list if "to_regclass" in call.args[0]]
-    # One lookup per published schema; a plan filter never needs it.
-    assert len(lookups) == (0 if plan_search else 1)
+    # One lookup per published schema.
+    assert len(lookups) == 1
 
 
 @pytest.mark.asyncio
