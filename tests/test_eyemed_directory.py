@@ -155,6 +155,74 @@ async def test_rejects_unrecognized_or_defaulted_search_without_egress_on_retry(
         assert db.execute("SELECT count(*) FROM resource WHERE family='Location'").fetchone() == (0,)
 
 
+def named_empty_search():
+    return search("1") | {"networkId": None, "networkSetId": None, "defaultedNetworkId": None, "message": ""}
+
+
+@pytest.mark.asyncio
+async def test_resume_accepts_retained_named_empty_reply_once(tmp_path):
+    path = tmp_path / "capture.sqlite3"
+    scope = eyemed.SearchPlan(tmp_path, ("00001",), 1, 2)
+    raw = encode(named_empty_search())
+    with sqlite3.connect(path) as db:
+        capture = eyemed.EyeMedCapture(db, scope, False)
+
+        async def initial_request(path, _payload):
+            capture.reserve()
+            return encode(catalog("1")) if path == "networks" else raw
+
+        await capture.reply("", "", initial_request)
+        await capture.reply("1", "00001", initial_request)
+        assert db.execute("SELECT done FROM reply WHERE network='1'").fetchone() == (0,)
+
+    with sqlite3.connect(path) as db:
+        capture = eyemed.EyeMedCapture(db, scope, True)
+        capture.accept_search = Mock(wraps=capture.accept_search)
+        request = AsyncMock(side_effect=AssertionError("unexpected request"))
+        for _ in range(2):
+            proof = await capture.collect(request, AsyncMock(), AsyncMock())
+            assert proof["windows_by_network"] == proof["publisher_prv001_null_network_empty_by_network"] == {"1": 1}
+            assert proof["publisher_prv002_by_network"] == proof["rejected_zips_by_network"] == {}
+            assert proof["site_memberships"] == proof["clinician_site_memberships"] == {}
+            assert proof["publisher_refresh_dates"] == [
+                {"network_id": "1", "last_refreshed_date": "11/01/2025", "windows": 1}
+            ]
+            assert proof["origin_requests"] == 2
+        capture.accept_search.assert_called_once_with(raw, "1", "00001", "Network 1")
+        request.assert_not_awaited()
+        assert db.execute("SELECT done FROM reply WHERE network='1'").fetchone() == (4,)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        *({field: [site()]} for field in eyemed.LOCATION_ARRAYS),
+        {"networkId": "2"},
+        {"networkSetId": "2"},
+        {"defaultedNetworkId": "2"},
+        {"networkName": "Network 2"},
+        {"networkName": " Network 1 "},
+        {"defaultInd": True},
+        {"defaultInd": 0},
+        {"message": "other"},
+        {"messageCode": "unknown"},
+    ],
+)
+def test_unbound_search_rejects_rows_and_conflicting_metadata(overrides):
+    with pytest.raises(ValueError):
+        list(eyemed._locations(named_empty_search() | overrides, "1", "Network 1"))
+
+
+@pytest.mark.parametrize(
+    "field", [*eyemed.LOCATION_ARRAYS, "networkId", "networkSetId", "defaultedNetworkId", "message", "defaultInd"]
+)
+def test_unbound_search_requires_explicit_empty_metadata(field):
+    payload = named_empty_search()
+    del payload[field]
+    with pytest.raises(ValueError):
+        list(eyemed._locations(payload, "1", "Network 1"))
+
+
 @pytest.mark.asyncio
 async def test_selected_source_import_requires_proxy_and_writes_fhir_memberships(tmp_path, monkeypatch):
     source_by_field = {

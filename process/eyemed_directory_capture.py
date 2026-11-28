@@ -133,15 +133,21 @@ def _payload(code, zip_code):
 def _locations(payload_by_field, code, name):
     if not isinstance(payload_by_field, dict) or payload_by_field.get("messageCode") != "PRV001":
         raise ValueError("eyemed_directory_search_invalid")
-    if (
-        payload_by_field.get("networkId") != code
-        or _text(payload_by_field, "networkName") != name
-        or payload_by_field.get("defaultInd") is not False
-    ):
+    if _text(payload_by_field, "networkName") != name or payload_by_field.get("defaultInd") is not False:
         raise ValueError("eyemed_directory_network_mismatch")
     arrays = [payload_by_field.get(field) for field in LOCATION_ARRAYS]
     if not all(isinstance(items, list) for items in arrays):
         raise ValueError("eyemed_directory_location_list_invalid")
+    if payload_by_field.get("networkId") != code and (
+        any(arrays)
+        or payload_by_field.get("networkName") != name
+        or payload_by_field.get("message") != ""
+        or not all(
+            field in payload_by_field and payload_by_field[field] is None
+            for field in ("networkId", "networkSetId", "defaultedNetworkId")
+        )
+    ):
+        raise ValueError("eyemed_directory_network_mismatch")
     for items in arrays:
         yield from items
 
@@ -243,8 +249,9 @@ class EyeMedCapture:
             refreshed = payload_by_field.get("lastRefreshedDate")
             if refreshed is not None and (type(refreshed) is not str or len(refreshed) > 64):
                 raise ValueError("eyemed_directory_refresh_date_invalid")
+            status = 4 if payload_by_field["networkId"] is None else 1
             self.db.execute(
-                "UPDATE reply SET done=1,refreshed=? WHERE network=? AND zip=?", (refreshed, code, zip_code)
+                "UPDATE reply SET done=?,refreshed=? WHERE network=? AND zip=?", (status, refreshed, code, zip_code)
             )
 
     def iter_resources(self):
@@ -290,7 +297,7 @@ class EyeMedCapture:
                     accepted = self.db.execute(
                         "SELECT done FROM reply WHERE network=? AND zip=?", (code, zip_code)
                     ).fetchone()
-                    if accepted not in {(1,), (2,), (3,)}:
+                    if accepted not in {(1,), (2,), (3,), (4,)}:
                         raw = await self.reply(code, zip_code, request)
                         self.accept_search(raw, code, zip_code, networks_by_id[code]["name"])
                     windows_by_network[code] += 1
@@ -335,7 +342,7 @@ class EyeMedCapture:
             "publisher_refresh_dates": [
                 {"network_id": code, "last_refreshed_date": date, "windows": count}
                 for code, date, count in self.db.execute(
-                    "SELECT network, refreshed, count(*) FROM reply WHERE done=1 GROUP BY network,refreshed ORDER BY network,refreshed"
+                    "SELECT network, refreshed, count(*) FROM reply WHERE done IN (1,4) GROUP BY network,refreshed ORDER BY network,refreshed"
                 )
             ],
             "rejected_zips_by_network": dict(
@@ -352,6 +359,9 @@ class EyeMedCapture:
                 self.db.execute(
                     "SELECT network, count(*) FROM resource WHERE family='PractitionerRole' GROUP BY network"
                 )
+            ),
+            "publisher_prv001_null_network_empty_by_network": dict(
+                self.db.execute("SELECT network,count(*) FROM reply WHERE done=4 GROUP BY network")
             ),
             "publisher_prv002_by_network": dict(
                 self.db.execute("SELECT network,count(*) FROM reply WHERE done=2 GROUP BY network")

@@ -184,6 +184,10 @@ async def _publish_sites(fixture, copy_targets, journal, roles):
     )
     await fixture.seal_candidate(copy_target)
     async with fixture.execution_connection.transaction(isolation="repeatable_read"):
+        # Finish fixture setup after a transient exclusive lock clears on the shared metadata table.
+        await fixture.execution_connection.execute(
+            "LOCK TABLE ONLY hp_snapshot_retention.preparation IN ACCESS SHARE MODE", timeout=5
+        )
         await publish_network_candidate(
             fixture.execution_connection,
             copy_target,
