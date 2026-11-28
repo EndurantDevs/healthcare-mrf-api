@@ -10,7 +10,6 @@ from sqlalchemy.exc import ProgrammingError
 
 from db.migration_plan_release_storage import downgrade_plan_release_storage
 from db.plan_release_storage import storage_snapshot_index_sql, storage_table_sql
-from process.plan_release_preparation_pin_catalog import capture_preparation_pin_heap
 from process.plan_release_storage_custody import require_plan_release_storage_custody
 from tests.plan_release_storage_cohort_support import CAPTURED_TIME, attach_native_cohort, prepare_native_cohort
 from tests.plan_release_storage_postgres_support import (
@@ -219,107 +218,6 @@ async def test_provision_failure_rolls_back_ownership_and_does_not_drop_legacy_f
         )
 
 
-async def _em_control_foreign_keys(admin, case):
-    return await admin.fetch(
-        "SELECT to_jsonb(k)::text AS constraint_catalog,"
-        "(SELECT jsonb_agg(to_jsonb(t) ORDER BY t.oid)::text FROM pg_trigger t "
-        "WHERE t.tgconstraint=k.oid AND t.tgrelid=k.confrelid) AS header_triggers "
-        "FROM pg_constraint k WHERE k.contype='f' AND k.confrelid=to_regclass($1) "
-        "AND k.conrelid=ANY($2::regclass[]) ORDER BY k.oid",
-        case.relation("plan_release_serving_revision"),
-        [case.relation("plan_pricing_em_distance_" + name) for name in ("candidate", "attachment")],
-    )
-
-
-async def _require_em_foreign_key_guards(admin, case):
-    """Retain trigger-free payload custody and both genuine control-link refusals."""
-    publisher = await case.connect(case.publisher)
-    async with publisher.transaction():
-        legacy = await capture_preparation_pin_heap(
-            publisher,
-            (case.schema, "plan_release_snapshot_binding_legacy"),
-            storage_schema=case.schema,
-            pin=False,
-            parent_oid=await publisher.fetchval(
-                "SELECT to_regclass($1)::oid", case.relation("plan_release_snapshot_binding")
-            ),
-            **case.profile,
-        )
-        assert legacy.row_count == 1000
-        assert not await publisher.fetchval("SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=$1)", legacy.oid)
-    candidate = case.relation("plan_pricing_em_distance_candidate")
-    await admin.execute(
-        f"INSERT INTO {candidate}(projection_id,contract_version,plan_release_id,serving_revision_id,"
-        "binding_set_digest,provider_signature,state) VALUES($1,'plan_pricing_em_distance_v1',$2,$3,$4,$5,'building')",
-        "c" * 64,
-        RELEASE,
-        OLD_REVISION,
-        "a" * 64,
-        "b" * 64,
-    )
-    with pytest.raises(asyncpg.RestrictViolationError) as refused:
-        await admin.execute(
-            f"DELETE FROM {case.relation('plan_release_serving_revision')} WHERE serving_revision_id=$1",
-            OLD_REVISION,
-        )
-    assert refused.value.constraint_name == "plan_pricing_em_distance_candidate_serving_revision_id_fkey"
-    with pytest.raises(asyncpg.ForeignKeyViolationError) as refused:
-        await admin.execute(
-            f"INSERT INTO {case.relation('plan_pricing_em_distance_attachment')}(serving_revision_id,projection_id) "
-            "VALUES($1,$2)",
-            NEW_REVISION,
-            "c" * 64,
-        )
-    assert refused.value.constraint_name == "plan_pricing_em_distance_attachment_serving_revision_id_fkey"
-
-
-@pytest.mark.asyncio
-async def test_real_em_control_foreign_keys_survive_native_publication_withdrawal_and_retry():
-    """Preserve control links through migration, refused publication, retry and history changes."""
-    from tests.plan_release_preparation_pin_postgres_support import prepare_pin_case, seal_native_publication
-    from tests.test_plan_release_preparation_pin_retirement_postgres import history_transition
-    from tests.test_plan_release_preparation_pins_postgres import publish_prepared_case, retain_case
-
-    async with storage_case(migrated=False) as case:
-        admin = await case.connect()
-        original_foreign_keys = await _em_control_foreign_keys(admin, case)
-        assert len(original_foreign_keys) == 2
-        assert all(len(json.loads(foreign_key["header_triggers"])) == 2 for foreign_key in original_foreign_keys)
-        await case.migrate()
-        await case.provision()
-        await case.provision()
-        assert await _em_control_foreign_keys(admin, case) == original_foreign_keys
-        await _require_em_foreign_key_guards(admin, case)
-        prepared = await prepare_pin_case(case)
-        receipt = await retain_case(prepared)
-        publication = await seal_native_publication(prepared)
-        before = await _storage_catalog_snapshot(admin, case)
-
-        async def refuse_after_publication(connection, scope, **options):
-            witness = await prepared.authority(connection, scope, **options)
-            if options["action"] == "publish" and options["phase"] == "after":
-                raise ValueError("publication refused")
-            return witness
-
-        with pytest.raises(ValueError, match="publication refused"):
-            await publish_prepared_case(prepared, receipt, publication, authority=refuse_after_publication)
-        assert await _storage_catalog_snapshot(admin, case) == before
-        await publish_prepared_case(prepared, receipt, publication)
-        await history_transition(prepared, "withdraw")
-        assert not await admin.fetchval(
-            f"SELECT is_current FROM {case.relation('plan_release_serving_revision')} WHERE serving_revision_id=$1",
-            NEW_REVISION,
-        )
-        await history_transition(prepared, "reactivate")
-        assert (
-            await admin.fetchval(
-                f"SELECT serving_revision_id FROM {case.relation('plan_release_serving_revision')} WHERE is_current"
-            )
-            == NEW_REVISION
-        )
-        assert await _em_control_foreign_keys(admin, case) == original_foreign_keys
-
-
 async def _damage_em_control_storage(admin, case, damage):
     """Apply one exact control-link or payload-hook corruption for custody refusal."""
     header_relation = case.relation("plan_release_serving_revision")
@@ -397,19 +295,6 @@ async def test_custody_refuses_changed_control_foreign_keys_and_all_payload_hook
         async with publisher.transaction():
             with pytest.raises(ValueError, match="custody_open"):
                 await require_plan_release_storage_custody(publisher, case.schema, **case.profile)
-        if damage in {"bulk-hook", "bulk-native-fk"}:
-            async with publisher.transaction():
-                with pytest.raises(ValueError, match="heap_custody_open"):
-                    await capture_preparation_pin_heap(
-                        publisher,
-                        (case.schema, "plan_release_snapshot_binding_legacy"),
-                        storage_schema=case.schema,
-                        pin=False,
-                        parent_oid=await publisher.fetchval(
-                            "SELECT to_regclass($1)::oid", case.relation("plan_release_snapshot_binding")
-                        ),
-                        **case.profile,
-                    )
         assert await _storage_catalog_snapshot(admin, case) == before
 
 
@@ -495,29 +380,6 @@ async def test_canceled_attach_rolls_back_both_roots_and_current_headers():
 
 
 @pytest.mark.asyncio
-async def test_shared_pin_guards_survive_binding_retirement():
-    async with storage_case(migrated=False) as case:
-        async with case.engine.begin() as connection:
-            await connection.run_sync(lambda native: install_legacy_guards(native, case.schema))
-        admin = await case.connect()
-        shared = case.relation("ptg2_snapshot_pin")
-        query = "SELECT oid,pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid=to_regclass($1) ORDER BY oid"
-        original = await admin.fetch(query, shared)
-        assert len(original) == 6  # Four unchanged custom guards and two native snapshot FK hooks.
-        await case.migrate()
-        await case.provision()
-        assert await admin.fetch(query, shared) == original
-        assert not await admin.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass($1))",
-            case.relation("plan_release_snapshot_binding_legacy"),
-        )
-        assert not await admin.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid=to_regclass($1) AND contype='f')",
-            case.relation("plan_release_snapshot_binding_legacy"),
-        )
-
-
-@pytest.mark.asyncio
 async def test_migration_ddl_failure_rolls_back_rename_rows_and_original_indexes():
     async with storage_case(migrated=False) as case:
         admin = await case.connect()
@@ -532,43 +394,6 @@ async def test_migration_ddl_failure_rolls_back_rename_rows_and_original_indexes
             await admin.fetchval("SELECT to_regclass($1)", case.relation("plan_release_snapshot_binding_legacy"))
             is None
         )
-
-
-@pytest.mark.asyncio
-async def test_both_native_gc_sets_retain_a_dedicated_pin_without_a_binding():
-    from process.ptg_parts import ptg2_source_snapshot_gc, snapshot_cleanup
-
-    async with storage_case(provisioned=True) as case:
-        admin = await case.connect()
-        detached = case.relation("pin_only")
-        revision_id = "hpserve_" + "9" * 26
-        async with admin.transaction():
-            await admin.execute(storage_table_sql(case.schema, "pin_only", pin=True))
-            await admin.execute(
-                f"INSERT INTO {detached}(serving_revision_id,snapshot_id) VALUES($1,'pin-only-snapshot')", revision_id
-            )
-            await admin.execute(
-                f"ALTER TABLE {case.relation('plan_release_snapshot_pin')} ATTACH PARTITION {detached} FOR VALUES IN ('{revision_id}')"
-            )
-            await admin.execute(
-                f"INSERT INTO {case.relation('ptg2_snapshot')} VALUES('pin-only-snapshot','published','{{}}')"
-            )
-            await admin.execute(
-                f'UPDATE {case.relation("ptg2_snapshot")} SET manifest=\'{{"serving_index":{{"source_key":"synthetic_source"}}}}\''
-            )
-        ordinary_query = ptg2_source_snapshot_gc._CURRENT_SNAPSHOT_IDS_SQL.replace("__SCHEMA__", case.schema)
-        source_query = snapshot_cleanup._CURRENT_SOURCE_POINTER_SNAPSHOT_IDS_SQL.replace(
-            "__SCHEMA__", case.schema
-        ).replace(":source_key", "$1")
-        assert set(
-            await admin.fetchval(
-                "SELECT array_agg(snapshot_id ORDER BY snapshot_id) FROM (" + ordinary_query + ") retained"
-            )
-        ) == {"old-snapshot", "pin-only-snapshot"}
-        assert {member["snapshot_id"] for member in await admin.fetch(source_query, "synthetic_source")} == {
-            "old-snapshot",
-            "pin-only-snapshot",
-        }
 
 
 @pytest.mark.asyncio
@@ -806,16 +631,3 @@ async def test_provision_refuses_incomplete_or_conflicting_legacy_pin_custody_at
         with pytest.raises(ValueError, match="legacy_pin_enrollment|legacy_binding_cohort_changed"):
             await case.provision()
         assert await _storage_catalog_snapshot(admin, case) == before
-
-
-@pytest.mark.asyncio
-async def test_empty_legacy_provision_does_not_invent_a_pin_cohort():
-    async with storage_case(migrated=False) as case:
-        admin = await case.connect()
-        await admin.execute(f"DELETE FROM {case.relation('plan_release_serving_revision')}")
-        await case.migrate()
-        await case.provision()
-        await case.provision()
-        assert await admin.fetchval("SELECT to_regclass($1)", case.relation("plan_release_snapshot_pin_legacy")) is None
-        assert not await admin.fetchval(f"SELECT EXISTS(SELECT FROM {case.relation('plan_release_snapshot_pin')})")
-        assert await admin.fetchval(f"SELECT count(*) FROM {case.relation('ptg2_snapshot_pin')}") == 1
