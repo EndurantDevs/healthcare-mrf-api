@@ -150,6 +150,17 @@ class GuardianCapture:
                 ((scope, *row) for row in observations),
             )
 
+    def has_located_key(self, scope, keys):
+        """Check whether earlier coverage could rely on one of these positions."""
+        return (
+            self.db.execute(
+                "SELECT 1 FROM observation WHERE scope=? AND payload IN (SELECT value FROM json_each(?)) "
+                "AND lat IS NOT NULL LIMIT 1",
+                (scope, canonical_json(keys)),
+            ).fetchone()
+            is not None
+        )
+
     def is_count_reconciled(self, scope, center, radius, keys, total):
         """Count only unambiguous same-selector identities safely inside this actual search circle."""
         lat, lon = center
