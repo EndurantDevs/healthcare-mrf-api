@@ -3,6 +3,7 @@
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from itertools import batched, islice
 from pathlib import Path
@@ -10,7 +11,7 @@ from urllib.parse import urlsplit
 
 from process.delta_dental_directory_capture import _capture_parallel
 from process.guardian_directory_geography import JURISDICTIONS, validate_region_coverage
-from process.guardian_directory_normalization import normalize_guardian_detail
+from process.guardian_directory_normalization import GuardianDetailDataError, normalize_guardian_detail
 from process.vsp_directory_contract import canonical_json
 from process.vsp_directory_geometry import GeoTile, distance_miles
 from process.vsp_directory_http import strict_json
@@ -192,7 +193,7 @@ def _search_result(result):
         or type(count) is not int
         or count < 0
         or type(cards) is not list
-        or len(cards) != min(count, _CARD_LIMIT)
+        or len(cards) > _CARD_LIMIT
     ):
         raise ValueError("guardian_search_count_mismatch")
     return count, cards
@@ -236,14 +237,21 @@ async def _run_limited(items, limit, request, operation):
         continue
 
 
-async def _capture_details(capture, request, cancel_check, progress, limit=1):
+async def _capture_details(capture, request, cancel_check, progress, limit=1, *, after="", one_batch=False):
+    """Project pending details in bounded key order and return the cursor for the next region."""
+    errors_by_reason = Counter()
+
     async def project_detail(row, guarded_request):
         """Commit the normalized detail under its unique publisher request key."""
         await cancel_check()
         key = row[0]
         fields = strict_json(key)
         detail = await guarded_request("detail", fields)
-        resources = _validated_detail(fields, detail)
+        try:
+            resources = _validated_detail(fields, detail)
+        except GuardianDetailDataError as error:
+            errors_by_reason[str(error)] += 1
+            return
         capture.project(
             key,
             resources,
@@ -251,13 +259,20 @@ async def _capture_details(capture, request, cancel_check, progress, limit=1):
             and str(detail.get("npi") or "").strip().casefold() not in {"", "no information available"},
         )
 
-    after = ""
-    completed = capture.projected_count()
-    while batch := capture.detail_batch(after, 100):
+    batch = capture.detail_batch(after, 100)
+    if not batch and after and one_batch:
+        batch = capture.detail_batch("", 100)
+    completed = capture.projected_count() if batch else 0
+    while batch:
+        prior_issues = errors_by_reason.total()
         await _run_limited(batch, limit, request, project_detail)
         after = batch[-1][0]
-        completed += len(batch)
-        await progress({"guardian_details_completed": completed})
+        completed += len(batch) - (errors_by_reason.total() - prior_issues)
+        await progress({"guardian_details_completed": completed, "guardian_detail_issues": dict(errors_by_reason)})
+        if one_batch:
+            return after
+        batch = capture.detail_batch(after, 100)
+    return ""
 
 
 def _name(card, field):
@@ -265,29 +280,30 @@ def _name(card, field):
     return text if type(text) is str and 3 <= len(text) <= 200 and text.isprintable() else None
 
 
-def _observe(capture, scope, cards, center, radius):
+def _observe(capture, scope, cards, center, radius, *, admit_positions=True):
     """Retain direct identities even when the page cannot support geographic extrapolation."""
-    observations = []
-    detail_keys = []
+    observations_by_key = {}
+    fields_by_key = {}
+    occurrences = Counter()
     for card in cards:
-        key = _detail_key(card)
-        latitude, longitude = _check_coordinates(card, center, radius)
-        detail_keys.append(key)
-        observations.append(
-            (
-                canonical_json(key),
-                latitude,
-                longitude,
-                _name(card, "ddsPracticeName"),
-                _name(card, "ddsLastName"),
-            )
-        )
-    distinct_keys = {row[0] for row in observations}
-    if len(distinct_keys) != len(detail_keys):
-        raise ValueError("guardian_search_duplicate_card")
-    capture.enqueue_details(detail_keys)
-    capture.observe(scope, observations)
-    return distinct_keys, capture.has_locations_for_all_keys(scope, distinct_keys)
+        fields = _detail_key(card)
+        key = canonical_json(fields)
+        fields_by_key[key] = fields
+        occurrences[key] += 1
+        position = _check_coordinates(card, center, radius)
+        office, dentist = _name(card, "ddsPracticeName"), _name(card, "ddsLastName")
+        if key in observations_by_key:
+            _, lat, lon, prior_office, prior_dentist = observations_by_key[key]
+            if (lat, lon) != position:
+                position = (None, None)
+            office = office if office == prior_office else None
+            dentist = dentist if dentist == prior_dentist else None
+        observations_by_key[key] = (key, *position, office, dentist)
+    capture.enqueue_details(fields_by_key.values())
+    if not admit_positions:
+        return occurrences, False
+    capture.observe(scope, observations_by_key.values())
+    return occurrences, len(occurrences) == len(cards) and capture.has_locations_for_all_keys(scope, occurrences)
 
 
 def _observed_span(cards, radius):
@@ -315,7 +331,11 @@ async def _sweep(capture, region, selector, tile, request, counts_by_outcome):
         capture.record_delegation(query, window_parts, search_page)
         return
     count, cards = search_page
-    keys, located = _observe(capture, scope, cards, tile.center, radius)
+    has_consistent_count = len(cards) == min(count, _CARD_LIMIT)
+    keys, located = _observe(capture, scope, cards, tile.center, radius, admit_positions=has_consistent_count)
+    if not has_consistent_count:
+        capture.record_gap(window_parts, "search_cardinality_mismatch", count, keys, _observed_span(cards, radius))
+        return
     if len(cards) == count:
         if located:
             capture.add_circle(scope, tile.center, (radius - 0.1) / 1.01)
@@ -342,7 +362,7 @@ async def _sweep(capture, region, selector, tile, request, counts_by_outcome):
 
 
 async def capture_directory(capture, plan, request, cancel_check, progress):
-    """Acquire every selected scope and expose details only after checking outstanding gaps."""
+    """Acquire selected scopes and known details before deciding whether the edition can be published."""
     counts_by_outcome = {"capped": 0, "covered_by_prior_circle": 0, "reconciled_to_total": 0}
 
     async def sweep_selector(selector, guarded_request):
@@ -350,9 +370,13 @@ async def capture_directory(capture, plan, request, cancel_check, progress):
         await cancel_check()
         await _sweep(capture, region, selector, region.tile, guarded_request, counts_by_outcome)
 
+    detail_cursor = ""
     while True:
         capture.coverage_invalidated = False
         for region in plan.regions:
+            detail_cursor = await _capture_details(
+                capture, request, cancel_check, progress, plan.max_concurrency, after=detail_cursor, one_batch=True
+            )
             await _run_limited(plan.selectors, plan.max_concurrency, request, sweep_selector)
             await progress(
                 {"guardian_search": dict(counts_by_outcome), "jurisdiction": region.state, **capture.progress()}
@@ -360,9 +384,11 @@ async def capture_directory(capture, plan, request, cancel_check, progress):
         await _reconcile_gaps(capture, request, cancel_check, progress, counts_by_outcome, plan.max_concurrency)
         if not capture.coverage_invalidated:
             break
+    await _capture_details(capture, request, cancel_check, progress, plan.max_concurrency)
     if capture.has_gaps():
         raise ValueError("guardian_directory_coverage_incomplete")
-    await _capture_details(capture, request, cancel_check, progress, plan.max_concurrency)
+    if capture.detail_batch("", 1):
+        raise ValueError("guardian_detail_coverage_incomplete")
     return {
         "coverage_scope": "guardian_first_party_configured_jurisdiction_bounds",
         "jurisdictions": sorted(JURISDICTIONS),
@@ -400,10 +426,15 @@ def _neighbor_centers(center):
 def _is_gap_closed(capture, window_parts, count, keys, reason):
     scope, bounds = window_parts
     tile = GeoTile(*bounds)
-    if len(keys) > count:
+    observed = keys.total()
+    if observed > count:
         return False
-    if reason == "direct_only_result_cap" or not capture.has_locations_for_all_keys(scope, keys):
-        if len(keys) == count:
+    if (
+        observed != len(keys)
+        or reason == "direct_only_result_cap"
+        or not capture.has_locations_for_all_keys(scope, keys)
+    ):
+        if observed == count:
             capture.clear_gap(window_parts)
             return True
         return False
@@ -447,7 +478,7 @@ class DenseWindow:
     region: SearchRegion
     selector: tuple
     total: int
-    keys: set
+    keys: Counter
     parent_span: float
     reason: str = "unresolved_result_cap"
 
@@ -467,22 +498,28 @@ class DenseWindow:
             capture.record_delegation(query, self.cells, page)
             return 0.0
         reported, cards = page
+        scope = self.cells[0]
+        is_usable = len(cards) == min(reported, _CARD_LIMIT)
         if qualifier:
             field, name = qualifier
             source_name = "ddsPracticeName" if field == "officeName" else "ddsLastName"
-            if any(name.casefold() not in str(card.get(source_name) or "").casefold() for card in cards):
-                raise ValueError("guardian_search_name_filter_mismatch")
-        scope = self.cells[0]
-        extra, located = _observe(capture, scope, cards, center, RADII[0])
+            is_usable = is_usable and all(
+                isinstance(card, dict) and name.casefold() in str(card.get(source_name) or "").casefold()
+                for card in cards
+            )
+        extra, located = _observe(capture, scope, cards, center, RADII[0], admit_positions=is_usable)
+        if not is_usable:
+            return RADII[0]
         if center == self.center and (filters or qualifier):
-            self.keys.update(extra)
+            # Overlapping filters prove at most the largest simultaneous multiplicity for each detail key.
+            self.keys |= extra
             capture.record_gap(self.cells, self.reason, self.total, self.keys, self.parent_span)
         elif not (filters or qualifier) and located and len(cards) == reported:
             capture.add_circle(scope, center, (RADII[0] - 0.1) / 1.01)
         return RADII[0] if len(cards) == reported else _observed_span(cards, RADII[0])
 
     def is_closed(self, capture):
-        """Require a previously complete circle or the parent's exact distinct card total."""
+        """Require a trusted covering circle or reconcile the parent's own reported occurrences."""
         return _is_gap_closed(capture, self.cells, self.total, self.keys, self.reason)
 
 

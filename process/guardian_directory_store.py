@@ -251,17 +251,18 @@ class GuardianCapture:
     def record_gap(self, window, reason, count, keys, observed_span):
         """Store an unresolved cell and its direct publisher evidence."""
         window_key = canonical_json(window)
+        occurrences = Counter(keys)
         with self.db:
             prior = self.db.execute("SELECT keys,reason,reported FROM gap WHERE window=?", (window_key,)).fetchone()
             if prior:
                 if prior[2] != count:
                     raise ValueError("guardian_search_count_mismatch")
-                keys = keys.union(strict_json(prior[0]))
+                occurrences |= Counter(strict_json(prior[0]))
                 if prior[1] == "direct_only_result_cap":
                     reason = prior[1]
             self.db.execute(
                 "INSERT OR REPLACE INTO gap VALUES (?,?,?,?,?,?)",
-                (window_key, window[0], reason, count, canonical_json(sorted(keys)), observed_span),
+                (window_key, window[0], reason, count, canonical_json(sorted(occurrences.elements())), observed_span),
             )
 
     def gap_scopes(self):
@@ -282,7 +283,7 @@ class GuardianCapture:
             (scope, after),
         ).fetchall():
             for window, count, keys, observed_span, reason in rows:
-                yield strict_json(window), count, set(strict_json(keys)), observed_span, reason
+                yield strict_json(window), count, Counter(strict_json(keys)), observed_span, reason
             after = rows[-1][0]
 
     def progress(self):
