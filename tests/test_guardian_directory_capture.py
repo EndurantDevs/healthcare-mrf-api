@@ -286,8 +286,7 @@ def test_redirect_and_truncated_counts_fail_closed():
     ]:
         with pytest.raises(ValueError):
             sweep._search_result(record)
-    with pytest.raises(ValueError, match="center_mismatch"):
-        sweep._check_coordinates(_card(latitude=41.0), (40.0, -80.0), 2)
+    assert sweep._check_coordinates(_card(latitude=41.0), (40.0, -80.0), 2) == (None, None)
 
 
 async def test_capped_search_retains_unlocated_card_without_using_it_in_other_windows(capture, monkeypatch):
@@ -312,23 +311,120 @@ async def test_capped_search_retains_unlocated_card_without_using_it_in_other_wi
     assert not capture.is_count_reconciled(scope, center, 10, set(), 4)
     assert len(capture.detail_batch("", 10)) == 4
     updated_card_map = {**suspect_card_map, "distance": 1.5}
-    sweep._observe(capture, scope, [updated_card_map], center, 10)
-    assert sweep._observe(capture, scope, cards, center, 10, capped=True) == keys
+    assert not sweep._observe(capture, scope, [updated_card_map], center, 10)[1]
+    assert sweep._observe(capture, scope, cards, center, 10) == (keys, False)
     assert len(capture.detail_batch("", 10)) == 4
     assert capture.is_count_reconciled(scope, center, 10, set(), 3)
 
-    for unconfirmed in (
-        [suspect_card_map],
-        [*sites[:2], suspect_card_map],
-        [*sites, {**suspect_card_map, "distance": 10.0}],
-    ):
-        with pytest.raises(ValueError, match="center_mismatch"):
-            sweep._observe(capture, "another", unconfirmed, center, 10, capped=True)
-    with pytest.raises(ValueError, match="center_mismatch"):
-        sweep._observe(capture, "another", cards, center, 10)
+    capture.add_circle("another", center, 2)
     sweep._observe(capture, "another", [updated_card_map], center, 10)
-    with pytest.raises(ValueError, match="center_mismatch"):
-        sweep._observe(capture, "another", cards, center, 10, capped=True)
+    assert sweep._observe(capture, "another", cards, center, 10) == (keys, False)
+    assert capture.coverage_invalidated and not capture.covers_tile("another", center, 0.1)
+
+
+@pytest.mark.parametrize("distance", [None, "unknown", -1, 500, 10**400])
+async def test_unlocated_site_is_exact_only_and_next_window_runs(capture, distance):
+    tile = GeoTile(39.999, 40.001, -80.001, -79.999)
+    region = sweep.SearchRegion("PA", "00001", tile)
+    selector = ("PLAN-A", "")
+    cards = [{**_card(str(number)), "distance": distance} for number in range(5)]
+    page_map = {"providers": cards, "totalResults": len(cards), "redirect": False}
+    request = AsyncMock(return_value=page_map)
+    for window in (tile, tile.split()[0]):
+        await sweep._sweep(capture, region, selector, window, request, {})
+    assert request.await_count == 2 and not capture.has_gaps()
+    assert len(capture.detail_batch("", 10)) == len(cards)
+    assert not capture.db.execute("SELECT 1 FROM circle").fetchone()
+    assert not capture.db.execute("SELECT 1 FROM observation WHERE lat IS NOT NULL").fetchone()
+
+
+async def test_capped_unlocated_site_requires_direct_union(capture, monkeypatch):
+    tile = GeoTile(39.999, 40.001, -80.001, -79.999)
+    region = sweep.SearchRegion("PA", "00001", tile)
+    selector = ("PLAN-A", "")
+    scope = canonical_json([region.state, region.zip_code, *selector])
+    monkeypatch.setattr(sweep, "_CARD_LIMIT", 2)
+    cards = [{**_card(str(number)), "latitude": None} for number in range(3)]
+    page_map = {"providers": cards[:2], "totalResults": 3, "redirect": False}
+    await sweep._sweep(capture, region, selector, tile, AsyncMock(return_value=page_map), {"capped": 0})
+    window, count, keys, span, reason = next(capture.gap_batches(scope))
+    target = sweep.DenseWindow(window, region, selector, count, keys, span, reason)
+    sweep._observe(capture, scope, [_card("2")], tile.center, 2)
+    assert reason == "direct_only_result_cap" and not target.is_closed(capture)
+    capture.add_circle(scope, tile.center, 2)
+    assert not target.is_closed(capture)
+    assert not sweep._is_gap_closed(capture, window, count, keys | {"extra", "another"}, reason)
+    capture.db.execute("DELETE FROM circle")
+    direct_page_map = {"providers": cards[2:], "totalResults": 1, "redirect": False}
+    await target.probe(capture, AsyncMock(return_value=direct_page_map), tile.center, {"specialties": ["Specialty"]})
+    assert target.is_closed(capture) and not capture.has_gaps()
+    assert len(capture.detail_batch("", 10)) == 3
+    assert not capture.covers_tile(scope, tile.center, 0.1)
+    capture.record_gap(window, reason, count, keys | {"extra", "another"}, span)
+    capture.record_gap(window, "unresolved_result_cap", count, keys, span)
+    window, count, retained_keys, _, reason = next(capture.gap_batches(scope))
+    assert reason == "direct_only_result_cap" and len(retained_keys) > count
+    assert not sweep._is_gap_closed(capture, window, count, retained_keys, reason)
+
+
+def test_legacy_geographic_shortcuts_rebuild_from_retained_responses(capture):
+    capture.reserve("search", "request")
+    capture.retain("search", "request", b"{}")
+    capture.add_circle("scope", (40, -80), 2)
+    capture.record_gap(["scope", [0, 1, 0, 1]], "unresolved_result_cap", 2, {"one"}, 0)
+    capture.db.execute("PRAGMA user_version=0")
+
+    def interrupt_version(action, name, value, *unused):
+        if action == sqlite3.SQLITE_PRAGMA and name == "user_version" and value is not None:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    capture.db.set_authorizer(interrupt_version)
+    with pytest.raises(sqlite3.DatabaseError):
+        GuardianCapture(capture.db, "edition", 100, fresh=False)
+    capture.db.set_authorizer(None)
+    assert capture.covers_tile("scope", (40, -80), 0.1) and capture.has_gaps()
+    restored = GuardianCapture(capture.db, "edition", 100, fresh=False)
+    assert restored.attempt_count() == 1 and restored.lookup("search", "request") == b"{}"
+    assert not restored.covers_tile("scope", (40, -80), 0.1) and restored.has_gaps()
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_revoked_positions_revisit_previously_skipped_tiles(capture, monkeypatch, interrupted):
+    first = sweep.SearchRegion("PA", "00001", GeoTile(39.999, 40.001, -80.001, -79.999))
+    second = sweep.SearchRegion("PA", "00001", GeoTile(40.999, 41.001, -80.001, -79.999))
+    selector = ("PLAN-A", "")
+    scope = canonical_json([first.state, first.zip_code, *selector])
+    plan = sweep.SearchPlan(None, (first, second), 1.0, 100, "edition", (selector,))
+    sweep._observe(capture, scope, [_card()], first.tile.center, 2)
+    capture.add_circle(scope, first.tile.center, 2)
+    origin_centers = []
+    monkeypatch.setattr(sweep, "_capture_details", AsyncMock())
+
+    async def request(kind, query):
+        key = canonical_json(query)
+        if retained := capture.lookup(kind, key):
+            return json.loads(retained)
+        lat = query["searchParams"]["latitude"]
+        origin_centers.append(lat)
+        card = _card() if lat == 40 else {**_card(), "distance": None}
+        page_map = {"providers": [card], "totalResults": 1, "redirect": False}
+        capture.reserve(kind, key)
+        capture.retain(kind, key, canonical_json(page_map).encode())
+        return page_map
+
+    async def stop_after_conflict(_counts):
+        if interrupted and capture.coverage_invalidated:
+            raise RuntimeError("interrupted")
+
+    if interrupted:
+        with pytest.raises(RuntimeError, match="interrupted"):
+            await sweep.capture_directory(capture, plan, request, AsyncMock(), stop_after_conflict)
+        capture = GuardianCapture(capture.db, "edition", 100, fresh=False)
+        assert not capture.covers_tile(scope, first.tile.center, 0.1)
+    await sweep.capture_directory(capture, plan, request, AsyncMock(), AsyncMock())
+    assert origin_centers == [41, 40] and capture.attempt_count() == 2
+    assert not capture.is_count_reconciled(scope, first.tile.center, 2, set(), 1)
 
 
 async def test_unresolved_cap_records_gap(capture):
@@ -380,7 +476,7 @@ async def test_capped_specialty_union(capture):
     scope = canonical_json(["PA", "00001", "PLAN-A", ""])
     window_parts = [scope, tile.bounds]
     cards = [_card(str(i)) for i in range(151)]
-    keys = sweep._observe(capture, scope, cards[:150], tile.center, 2)
+    keys, _ = sweep._observe(capture, scope, cards[:150], tile.center, 2)
     capture.record_gap(window_parts, "unresolved_result_cap", 151, keys, 0.0)
 
     async def fetch(kind, payload):
@@ -521,7 +617,7 @@ async def test_boundary_name_requires_original_scope(capture):
     selector = ("PLAN-A", "synthetic")
     scope = canonical_json([region.state, region.zip_code, *selector])
     window_parts = [scope, tile.bounds]
-    keys = sweep._observe(capture, scope, [_card()], center, 2)
+    keys, _ = sweep._observe(capture, scope, [_card()], center, 2)
     lat, lon = sweep._offset(center, 1.95, 0)
     row_map = {**_card("002", lat, lon), "ddsPracticeName": "Example Office", "ddsLastName": "Example"}
     sweep._observe(capture, scope, [row_map], (lat, lon), 2)

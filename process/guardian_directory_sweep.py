@@ -143,20 +143,19 @@ def _detail_key(card):
     return identity_by_field
 
 
-def _check_coordinates(card, center, radius, *, capped=False):
+def _check_coordinates(card, center, radius):
     latitude = card.get("latitude")
     longitude = card.get("longitude")
     reported = card.get("distance")
-    if not all(type(x) in (float, int) and math.isfinite(x) for x in (latitude, longitude, reported)):
-        raise ValueError("guardian_card_position_invalid")
-    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180 and reported >= 0):
-        raise ValueError("guardian_card_position_invalid")
-    distance = distance_miles(*center, latitude, longitude)
-    if distance <= radius * 1.01 + 0.1 and abs(reported - distance) <= 0.1 + distance * 0.01:
-        return latitude, longitude
-    if capped and max(distance, reported) * 1.01 + 0.1 < radius:
+    if not all(type(value) in (float, int) for value in (latitude, longitude, reported)):
         return None, None
-    raise ValueError("guardian_search_center_mismatch")
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180 and reported >= 0):
+        return None, None
+    distance = distance_miles(*center, latitude, longitude)
+    tolerance = 0.1 + distance * 0.01
+    if distance <= radius * 1.01 + 0.1 and distance - tolerance <= reported <= distance + tolerance:
+        return latitude, longitude
+    return None, None
 
 
 def _delegated_destination(result):
@@ -266,12 +265,13 @@ def _name(card, field):
     return text if type(text) is str and 3 <= len(text) <= 200 and text.isprintable() else None
 
 
-def _observe(capture, scope, cards, center, radius, *, capped=False):
+def _observe(capture, scope, cards, center, radius):
+    """Retain direct identities even when the page cannot support geographic extrapolation."""
     observations = []
     detail_keys = []
     for card in cards:
         key = _detail_key(card)
-        latitude, longitude = _check_coordinates(card, center, radius, capped=capped)
+        latitude, longitude = _check_coordinates(card, center, radius)
         detail_keys.append(key)
         observations.append(
             (
@@ -285,15 +285,16 @@ def _observe(capture, scope, cards, center, radius, *, capped=False):
     distinct_keys = {row[0] for row in observations}
     if len(distinct_keys) != len(detail_keys):
         raise ValueError("guardian_search_duplicate_card")
-    unlocated_keys = [key for key, lat, *_ in observations if lat is None]
-    if unlocated_keys:
-        # Independent sites must corroborate the center before accepting an inconsistent display distance.
-        sites = {(lat, lon) for _, lat, lon, *_ in observations if lat is not None}
-        if len(sites) < 3 or len(unlocated_keys) >= len(sites) or capture.has_located_key(scope, unlocated_keys):
-            raise ValueError("guardian_search_center_mismatch")
     capture.enqueue_details(detail_keys)
     capture.observe(scope, observations)
-    return distinct_keys
+    return distinct_keys, capture.has_locations_for_all_keys(scope, distinct_keys)
+
+
+def _observed_span(cards, radius):
+    """Use available display distances only for prioritizing other probes."""
+    distances = (card.get("distance") for card in cards)
+    valid_distances = (d for d in distances if type(d) in (int, float) and 0 <= d <= radius)
+    return max(valid_distances, default=radius)
 
 
 async def _sweep(capture, region, selector, tile, request, counts_by_outcome):
@@ -314,21 +315,27 @@ async def _sweep(capture, region, selector, tile, request, counts_by_outcome):
         capture.record_delegation(query, window_parts, search_page)
         return
     count, cards = search_page
-    keys = _observe(capture, scope, cards, tile.center, radius, capped=len(cards) < count)
+    keys, located = _observe(capture, scope, cards, tile.center, radius)
     if len(cards) == count:
-        capture.add_circle(scope, tile.center, (radius - 0.1) / 1.01)
+        if located:
+            capture.add_circle(scope, tile.center, (radius - 0.1) / 1.01)
         return
     counts_by_outcome["capped"] += 1
-    if capture.is_count_reconciled(scope, tile.center, radius, keys, count):
+    if located and capture.is_count_reconciled(scope, tile.center, radius, keys, count):
         capture.add_circle(scope, tile.center, (radius - 0.1) / 1.01)
         counts_by_outcome["reconciled_to_total"] += 1
         return
     if radius == RADII[0] or tile.depth == 24:
-        capture.record_gap(window_parts, "unresolved_result_cap", count, keys, max(card["distance"] for card in cards))
+        reason = "unresolved_result_cap" if located else "direct_only_result_cap"
+        capture.record_gap(window_parts, reason, count, keys, _observed_span(cards, radius))
         return
     for child in tile.split():
         await _sweep(capture, region, selector, child, request, counts_by_outcome)
-        if capture.is_count_reconciled(scope, tile.center, radius, keys, count):
+        if (
+            located
+            and capture.has_locations_for_all_keys(scope, keys)
+            and capture.is_count_reconciled(scope, tile.center, radius, keys, count)
+        ):
             capture.add_circle(scope, tile.center, (radius - 0.1) / 1.01)
             counts_by_outcome["reconciled_to_total"] += 1
             break
@@ -343,10 +350,16 @@ async def capture_directory(capture, plan, request, cancel_check, progress):
         await cancel_check()
         await _sweep(capture, region, selector, region.tile, guarded_request, counts_by_outcome)
 
-    for region in plan.regions:
-        await _run_limited(plan.selectors, plan.max_concurrency, request, sweep_selector)
-        await progress({"guardian_search": dict(counts_by_outcome), "jurisdiction": region.state, **capture.progress()})
-    await _reconcile_gaps(capture, request, cancel_check, progress, counts_by_outcome, plan.max_concurrency)
+    while True:
+        capture.coverage_invalidated = False
+        for region in plan.regions:
+            await _run_limited(plan.selectors, plan.max_concurrency, request, sweep_selector)
+            await progress(
+                {"guardian_search": dict(counts_by_outcome), "jurisdiction": region.state, **capture.progress()}
+            )
+        await _reconcile_gaps(capture, request, cancel_check, progress, counts_by_outcome, plan.max_concurrency)
+        if not capture.coverage_invalidated:
+            break
     if capture.has_gaps():
         raise ValueError("guardian_directory_coverage_incomplete")
     await _capture_details(capture, request, cancel_check, progress, plan.max_concurrency)
@@ -384,9 +397,16 @@ def _neighbor_centers(center):
             yield _offset(center, distance * math.sin(bearing), distance * math.cos(bearing))
 
 
-def _is_gap_closed(capture, window_parts, count, keys):
+def _is_gap_closed(capture, window_parts, count, keys, reason):
     scope, bounds = window_parts
     tile = GeoTile(*bounds)
+    if len(keys) > count:
+        return False
+    if reason == "direct_only_result_cap" or not capture.has_locations_for_all_keys(scope, keys):
+        if len(keys) == count:
+            capture.clear_gap(window_parts)
+            return True
+        return False
     if capture.is_count_reconciled(scope, tile.center, RADII[0], keys, count):
         capture.add_circle(scope, tile.center, (RADII[0] - 0.1) / 1.01)
     if capture.covers_tile(scope, tile.center, _extent(tile)):
@@ -429,6 +449,7 @@ class DenseWindow:
     total: int
     keys: set
     parent_span: float
+    reason: str = "unresolved_result_cap"
 
     @property
     def center(self):
@@ -452,24 +473,24 @@ class DenseWindow:
             if any(name.casefold() not in str(card.get(source_name) or "").casefold() for card in cards):
                 raise ValueError("guardian_search_name_filter_mismatch")
         scope = self.cells[0]
-        extra = _observe(capture, scope, cards, center, RADII[0], capped=len(cards) < reported)
+        extra, located = _observe(capture, scope, cards, center, RADII[0])
         if center == self.center and (filters or qualifier):
             self.keys.update(extra)
-            capture.record_gap(self.cells, "unresolved_result_cap", self.total, self.keys, self.parent_span)
-        elif len(cards) == reported:
+            capture.record_gap(self.cells, self.reason, self.total, self.keys, self.parent_span)
+        elif not (filters or qualifier) and located and len(cards) == reported:
             capture.add_circle(scope, center, (RADII[0] - 0.1) / 1.01)
-        return RADII[0] if len(cards) == reported else max(card["distance"] for card in cards)
+        return RADII[0] if len(cards) == reported else _observed_span(cards, RADII[0])
 
     def is_closed(self, capture):
         """Require a previously complete circle or the parent's exact distinct card total."""
-        return _is_gap_closed(capture, self.cells, self.total, self.keys)
+        return _is_gap_closed(capture, self.cells, self.total, self.keys, self.reason)
 
 
-async def _can_reconcile_gap(capture, window_parts, count, keys, request, parent_span):
+async def _can_reconcile_gap(capture, window_parts, count, keys, request, parent_span, reason):
     scope, bounds = window_parts
     state, location, plan_type, client = strict_json(scope)
     region = SearchRegion(state, location, GeoTile(*bounds))
-    target = DenseWindow(window_parts, region, (plan_type, client), count, keys, parent_span)
+    target = DenseWindow(window_parts, region, (plan_type, client), count, keys, parent_span, reason)
     span_by_center = {target.center: parent_span}
     for point in islice(_neighbor_centers(target.center), 0, 8, 2):
         span_by_center[point] = await target.probe(capture, request, point, {})
@@ -500,11 +521,13 @@ async def _reconcile_gaps(capture, request, cancel_check, progress, counts_by_ou
 
     async def reconcile_scope(scope, guarded_request):
         """Finish neighboring cells in one scope before starting competing refinements."""
-        for window_parts, count, keys, parent_span in capture.gap_batches(scope):
+        for window_parts, count, keys, parent_span, reason in capture.gap_batches(scope):
             await cancel_check()
-            is_resolved = _is_gap_closed(capture, window_parts, count, keys)
+            is_resolved = _is_gap_closed(capture, window_parts, count, keys, reason)
             if not is_resolved and refine:
-                is_resolved = await _can_reconcile_gap(capture, window_parts, count, keys, guarded_request, parent_span)
+                is_resolved = await _can_reconcile_gap(
+                    capture, window_parts, count, keys, guarded_request, parent_span, reason
+                )
             if is_resolved:
                 counts_by_outcome["reconciled_to_total"] += 1
 
