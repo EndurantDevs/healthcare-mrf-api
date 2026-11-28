@@ -88,7 +88,9 @@ def test_named_migration_keeps_the_existing_counter_body_and_statement_trigger_p
     )
     assert "CREATE TRIGGER" not in sql and "DROP TRIGGER" not in sql
     assert "to_regclass" not in sql and "pg_class" not in sql and "pg_roles" not in sql
-    assert "DROP COLUMN relation_oids" in sql
+    assert "DROP COLUMN IF EXISTS relation_oids" in sql
+    assert "ADD COLUMN IF NOT EXISTS serving_schema" in sql
+    assert "DROP CONSTRAINT IF EXISTS npi_result_generation_shape_check" in sql
     assert statements[1].compile().params == {"schema": "serving", "names": list(generation.RELATION_NAMES)}
     assert "serving_relation_names IS NOT NULL" in sql
     assert "canonical_publication_generation BETWEEN 1 AND 9007199254740991" in sql
