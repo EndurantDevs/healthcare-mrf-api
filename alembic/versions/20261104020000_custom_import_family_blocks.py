@@ -100,6 +100,30 @@ def _compact_relation_locks(procedure_sql, schema):
     )
 
 
+# A dump and restore re-deparses array casts, so constraints are compared without casts or grouping.
+_SHAPE_SQL = """
+SELECT array_agg(format('%s %s %s', attname, format_type(atttypid, atttypmod), attnotnull) ORDER BY attnum),
+       (SELECT array_agg(definition ORDER BY definition) FROM (
+          SELECT regexp_replace(pg_get_constraintdef(oid), '::(character varying|text)(\\[\\])?|[() ]', '', 'g')
+          FROM pg_catalog.pg_constraint WHERE conrelid=CAST(:relation AS regclass)) AS constraints(definition))
+FROM pg_catalog.pg_attribute WHERE attrelid=CAST(:relation AS regclass) AND attnum>0 AND NOT attisdropped
+"""
+
+
+def _create_layout(connection, storage, schema):
+    """Create the layout table, or keep an identical one copied from a database that applied it."""
+    existing = f"{storage._quote(schema)}.custom_import_family_block_layout"
+    if connection.scalar(text("SELECT to_regclass(:name)"), {"name": existing}) is None:
+        op.execute(storage._sql(schema, _DDL[0]))
+        return
+    op.execute(storage._sql("pg_temp", _DDL[0]))
+    expected = "pg_temp.custom_import_family_block_layout"
+    shapes = [tuple(connection.execute(text(_SHAPE_SQL), {"relation": name}).one()) for name in (existing, expected)]
+    op.execute(f"DROP TABLE {expected}")
+    if shapes[0] != shapes[1]:
+        raise RuntimeError("custom_import_family_blocks_layout_mismatch")
+
+
 def upgrade():
     """Create compact metadata and preserve the existing read entrypoint and grants."""
     schema = _schema()
@@ -107,7 +131,7 @@ def upgrade():
     quoted = storage._quote(schema)
     connection = op.get_bind()
     op.execute("SET LOCAL lock_timeout='100ms'")
-    op.execute(storage._sql(schema, _DDL[0]))
+    _create_layout(connection, storage, schema)
     owner = connection.execute(
         text("SELECT pg_catalog.pg_get_userbyid(relowner) FROM pg_catalog.pg_class WHERE oid=to_regclass(:name)"),
         {"name": f"{quoted}.custom_import_snapshot_family"},
@@ -135,7 +159,11 @@ def upgrade():
         ("resolve_custom_import_generation_snapshot", "bigint,bigint,bigint,bigint"),
         ("lock_custom_import_snapshot_finality", names._FINALITY),
     ):
-        names._refresh(f"{quoted}.{name}({arguments})", lambda body: _compact_relation_locks(body, schema))
+        names._refresh(
+            f"{quoted}.{name}({arguments})",
+            lambda body: _compact_relation_locks(body, schema),
+            current=lambda body: "custom_import_family_block_layout" in body,
+        )
 
 
 def downgrade():
