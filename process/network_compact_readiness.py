@@ -169,7 +169,9 @@ def _require_index_paths(indexes, candidate):
     if candidate is not None:
         from process.network_geo_search import geo_search_receipt, require_geo_search_index_records
         from process.network_stats_contract import (
+            STATS_GIN_INDEX_PATHS,
             STATS_INDEX_PATHS,
+            has_network_stats_state_gin,
             network_stats_receipt,
             require_network_stats_index_records,
         )
@@ -183,6 +185,21 @@ def _require_index_paths(indexes, candidate):
         if stats_descriptor is not None:
             require_network_stats_index_records(named_indexes, stats_descriptor)
             required_paths.extend(STATS_INDEX_PATHS)
+            if has_network_stats_state_gin(stats_descriptor):
+                for gin_table, gin_columns in STATS_GIN_INDEX_PATHS:
+                    _require(
+                        any(
+                            index_record["table_name"] == gin_table
+                            and index_record["columns"] == gin_columns
+                            and index_record["indnkeyatts"] == index_record["indnatts"] == len(gin_columns)
+                            and index_record["amname"] == "gin"
+                            and index_record["no_predicate"] is True
+                            and index_record["no_expressions"] is True
+                            and index_record["indisprimary"] is False
+                            and index_record["indisunique"] is False
+                            for index_record in indexes
+                        )
+                    )
         if source_inventory_heaps(candidate):
             required_paths.extend(_inventory_indexes())
     for table, columns, primary, unique in required_paths:

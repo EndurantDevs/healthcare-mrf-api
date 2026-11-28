@@ -1034,6 +1034,32 @@ paths:
           schema:
             type: number
           description: Maximum in-network individual maximum out-of-pocket
+        - name: network_state
+          in: query
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 60
+            items:
+              type: string
+              pattern: '^[A-Z0-9]{2,8}$'
+          style: form
+          explode: false
+          description: Repeatable or comma-separated list of operating states for the plan's canonical network
+        - name: network_state_mode
+          in: query
+          schema:
+            type: string
+            enum: [any, all]
+            default: any
+          description: Optional match mode across network_state values (any overlap or all contained; defaults to any)
+        - name: network_state_scope
+          in: query
+          schema:
+            type: string
+            enum: [any, core]
+            default: any
+          description: Optional network footprint scope to match against (any office state or core_states; defaults to any)
       responses:
         '200':
           description: Paginated plan search payload

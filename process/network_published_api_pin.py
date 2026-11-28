@@ -124,8 +124,12 @@ def published_network_layout(candidate, *, retained_base_name=None):
         object.__setattr__(layout, "_network_search", serving.get("network_search") is True)
     if type(serving.get("network_stats")) is dict:
         from process.network_compact_layout import bind_compact_network_stats
+        from process.network_stats_contract import SUMMARY_TABLE
 
-        bind_compact_network_stats(layout, schema)
+        raw_indexes = serving["network_stats"].get("indexes") or ()
+        present_names = {entry.get("name") for entry in raw_indexes if type(entry) is dict}
+        has_gin = {f"{SUMMARY_TABLE}_states_gin_idx", f"{SUMMARY_TABLE}_core_states_gin_idx"} <= present_names
+        bind_compact_network_stats(layout, schema, state_gin=has_gin)
     return layout
 
 

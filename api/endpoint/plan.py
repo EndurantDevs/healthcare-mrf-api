@@ -35,6 +35,11 @@ from db.models import (
     PlanSearchSummary,
 )
 from db.tiger_models import ZipState
+from process.plan_network_state_filter import (
+    PlanNetworkStatsUnavailable,
+    parse_plan_network_state_params,
+    resolve_plan_network_state_clause,
+)
 
 plan_table = Plan.__table__
 plan_attributes_table = PlanAttributes.__table__
@@ -716,6 +721,10 @@ async def find_a_plan(request):
     plan_id_filter = (args.get("plan_id") or "").strip()
     query_text = (args.get("q") or "").strip()
     state = (args.get("state") or "").strip().upper()
+    args.get("network_state")
+    args.get("network_state_mode")
+    args.get("network_state_scope")
+    network_states, network_state_mode, network_state_scope = parse_plan_network_state_params(args)
 
     boolean_filter_by_name = {
         "has_adult_dental": _parse_bool(args.get("has_adult_dental"), "has_adult_dental"),
@@ -802,6 +811,26 @@ async def find_a_plan(request):
     if state:
         plan_filters.append(plan_table.c.state == state)
         _append_filter(filters_by_name, "state", state)
+
+    if network_states:
+        _append_filter(filters_by_name, "network_state", list(network_states))
+        _append_filter(filters_by_name, "network_state_mode", network_state_mode)
+        _append_filter(filters_by_name, "network_state_scope", network_state_scope)
+        try:
+            plan_filters.append(
+                await resolve_plan_network_state_clause(
+                    session,
+                    states=network_states,
+                    state_mode=network_state_mode,
+                    state_scope=network_state_scope,
+                    plan_table=plan_table,
+                    plan_network_tier_table=plan_network_tier_table,
+                )
+            )
+        except PlanNetworkStatsUnavailable as exc:
+            raise sanic.exceptions.ServiceUnavailable(
+                "Precomputed network statistics are unavailable for the current serving generation."
+            ) from exc
 
     if year is not None:
         plan_filters.append(plan_table.c.year == year)

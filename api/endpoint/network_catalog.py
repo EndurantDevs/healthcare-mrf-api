@@ -519,7 +519,7 @@ async def _catalog_response(request, kind):
 
 def _catalog_reader_error(error, kind, visibility, scope, *, enriched=False):
     code = str(error)
-    if code == "registry_network_catalog_stats_unavailable":
+    if code == "registry_network_catalog_stats_unavailable" and kind == "stats":
         return response.json(
             {"error": {"code": "network_stats_unavailable"}},
             status=404,
