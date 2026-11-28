@@ -210,6 +210,18 @@ def source_relation_sql(catalog_schema, table_name, editions=(), *, columns, onl
     if table_name == HEADER:
         endpoints = ",".join(_literal(edition.endpoint_id) for edition in editions)
         predicate += f" AND NOT (is_current AND endpoint_id IN ({endpoints}))"
+        # A current legacy header whose every source now serves from a named edition was superseded by that edition.
+        edition_sources = _literal(
+            json.dumps(sorted({source_id for edition in editions for source_id in edition.source_ids}))
+        )
+        # The bounded summary first: a full publication document can be hundreds of megabytes.
+        legacy_sources = (
+            "coalesce(publication_metadata_summary_json->'source_ids',publication_metadata_json::jsonb->'source_ids')"
+        )
+        predicate += (
+            f" AND NOT coalesce(is_current AND jsonb_typeof({legacy_sources})='array'"
+            f" AND {legacy_sources}<>'[]'::jsonb AND {legacy_sources}<@{edition_sources}::jsonb,false)"
+        )
     selects = [f"SELECT {projection} FROM {relation} WHERE {predicate}"]
     selects.extend(
         f"SELECT {projection} FROM {storage_relation(edition.schema_name, table_name)} "

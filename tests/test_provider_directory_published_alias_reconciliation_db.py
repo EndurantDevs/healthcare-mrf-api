@@ -318,3 +318,90 @@ async def test_real_postgres_address_followup_reads_edition_only_dataset(
                     f"DELETE FROM {POINTER_SCHEMA}.{POINTER_TABLE} WHERE catalog_schema = :catalog_schema;",
                     catalog_schema=schema,
                 )
+
+
+async def _install_legacy_current_dataset(database, schema: str, dataset_id: str, endpoint_id: str, source_ids) -> None:
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
+        "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
+        "status, is_current, published_at, publication_metadata_json"
+        ") VALUES (:dataset_id, :endpoint_id, 'run-legacy', 'root-legacy', :published_status, true, now(), "
+        "CAST(:metadata AS json));",
+        dataset_id=dataset_id,
+        endpoint_id=endpoint_id,
+        published_status=importer.ENDPOINT_DATASET_PUBLISHED,
+        metadata=json.dumps({"selected_resources": ["Location"], "source_ids": source_ids}),
+    )
+
+
+async def _published_current_datasets(database, schema: str, editions) -> list[str]:
+    from process.provider_directory_named_edition import address_source_relations
+
+    header = address_source_relations(schema, editions)[1]
+    rows = await database.all(
+        f"SELECT dataset_id FROM {header} AS header WHERE is_current AND status = :published",
+        published=importer.ENDPOINT_DATASET_PUBLISHED,
+    )
+    return sorted(row._mapping["dataset_id"] for row in rows)
+
+
+async def _assert_shared_dataset_fence(schema: str) -> None:
+    await entity_address_unified._assert_current_provider_directory_dataset(
+        schema,
+        source_id="source_primary",
+        expected_dataset_id="dataset_shared",
+        expected_root_run_id="root-shared",
+    )
+
+
+async def _drop_named_edition(database, schema: str, edition: str, is_pointer_created: bool) -> None:
+    from process.provider_directory_named_edition import POINTER_SCHEMA, POINTER_TABLE
+
+    await database.status(f"DROP SCHEMA IF EXISTS {edition} CASCADE;")
+    if is_pointer_created:
+        await database.status(f"DROP SCHEMA IF EXISTS {POINTER_SCHEMA} CASCADE;")
+    else:
+        await database.status(
+            f"DELETE FROM {POINTER_SCHEMA}.{POINTER_TABLE} WHERE catalog_schema = :catalog_schema;",
+            catalog_schema=schema,
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_named_edition_hides_only_fully_served_legacy_datasets(monkeypatch):
+    """A legacy header left current on an old endpoint is hidden only when the edition serves all its sources."""
+
+    from process.provider_directory_named_edition import selected_editions
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(entity_address_unified, "db", database)
+        edition, is_pointer_created = await _move_current_dataset_to_named_edition(database, schema)
+        try:
+            await _install_legacy_current_dataset(
+                database, schema, "dataset_retired", "endpoint_unpublished", ["source_primary"]
+            )
+            await _install_legacy_current_dataset(
+                database, schema, "dataset_outside", "endpoint_repoint", ["source_outside"]
+            )
+            editions = await selected_editions(importer)
+            assert await _published_current_datasets(database, schema, editions) == [
+                "dataset_outside",
+                "dataset_shared",
+            ]
+            await _assert_shared_dataset_fence(schema)
+
+            # A legacy dataset that also serves a source outside the edition stays visible to that source.
+            await database.status(
+                f"UPDATE {schema}.provider_directory_endpoint_dataset "
+                "SET publication_metadata_json = CAST(:metadata AS json) WHERE dataset_id = 'dataset_retired';",
+                metadata=json.dumps({"source_ids": ["source_primary", "source_outside"]}),
+            )
+            assert await _published_current_datasets(database, schema, editions) == [
+                "dataset_outside",
+                "dataset_retired",
+                "dataset_shared",
+            ]
+            with pytest.raises(RuntimeError, match="dataset fence changed"):
+                await _assert_shared_dataset_fence(schema)
+        finally:
+            await _drop_named_edition(database, schema, edition, is_pointer_created)
