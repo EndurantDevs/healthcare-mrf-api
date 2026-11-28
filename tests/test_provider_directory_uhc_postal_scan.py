@@ -265,6 +265,57 @@ def test_optum_checkpoint_scope_binds_location_plan(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_optum_retained_retry_resolves_legacy_pre_zip_plan_checkpoint_scope(monkeypatch):
+    source_by_field = {**SOURCE, "endpoint_id": "ep_optum"}
+    monkeypatch.setattr(uhc_scan, "_location_zip_digest", lambda: "plan-v2")
+    legacy_hash = importer._pagination_checkpoint_scope_identity(
+        source_by_field, [SOURCE["source_id"]], include_location_zip_plan=False
+    )[1]
+    current_context = importer._resource_group_pagination_checkpoint_context(
+        [source_by_field],
+        run_id="run_child",
+        retry_of_run_id="run_parent",
+        pagination_root_run_id="run_root",
+        is_checkpointing_enabled=True,
+        allow_retained_pagination_reset=False,
+    )
+    assert current_context is not None and current_context.source_scope_hash != legacy_hash
+
+    async def lookup(context, endpoint_id, selected_resources):
+        assert endpoint_id == "ep_optum"
+        assert selected_resources == ("InsurancePlan", "Location")
+        return "pdds_retained" if context.source_scope_hash == legacy_hash else None
+
+    monkeypatch.setattr(importer, "_checkpoint_candidate_dataset_id", lookup)
+    resolved = await uhc_scan.resolve_retained_checkpoint_context(
+        importer, [source_by_field], ["Location", "InsurancePlan"], current_context
+    )
+    assert resolved is not None and resolved.source_scope_hash == legacy_hash
+
+    fresh_context = importer._resource_group_pagination_checkpoint_context(
+        [source_by_field],
+        run_id="run_fresh",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+        is_checkpointing_enabled=True,
+    )
+    assert (
+        await uhc_scan.resolve_retained_checkpoint_context(
+            importer, [source_by_field], ["Location", "InsurancePlan"], fresh_context
+        )
+        == fresh_context
+    )
+
+    monkeypatch.setattr(importer, "_checkpoint_candidate_dataset_id", AsyncMock(return_value=None))
+    assert (
+        await uhc_scan.resolve_retained_checkpoint_context(
+            importer, [source_by_field], ["Location", "InsurancePlan"], current_context
+        )
+        == current_context
+    )
+
+
+@pytest.mark.asyncio
 async def test_optum_zip_plan_replay_and_targeted_filter(monkeypatch):
     monkeypatch.setattr(uhc_scan, "location_zip_codes", lambda: ("00926", "11372"))
     lookup = AsyncMock(return_value=[("99999",)])

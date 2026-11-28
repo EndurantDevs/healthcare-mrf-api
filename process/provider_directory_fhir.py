@@ -56445,8 +56445,7 @@ def _pagination_checkpoint_strategy_version(
 
 
 def _pagination_checkpoint_scope_identity(
-    source_record: dict[str, Any],
-    source_ids: list[str],
+    source_record: dict[str, Any], source_ids: list[str], *, include_location_zip_plan: bool = True
 ) -> tuple[str, str] | None:
     """Return the endpoint strategy/source identity shared by root retries."""
     canonical_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
@@ -56478,8 +56477,10 @@ def _pagination_checkpoint_scope_identity(
         "source_ids": sorted(set(source_ids)),
         "resource_group": _resource_import_group_key(source_record),
     }
-    if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE and (
-        zip_plan := uhc_scan.location_plan_identity(sys.modules[__name__], source_record)
+    if (
+        include_location_zip_plan
+        and canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE
+        and (zip_plan := uhc_scan.location_plan_identity(sys.modules[__name__], source_record))
     ):
         scope_payload_dict["location_zip_plan"] = zip_plan
     if _source_metadata(source_record).get("provider_directory_network_snapshot") is not None:
@@ -64453,6 +64454,9 @@ async def _prepare_resource_import_source_group(
         allow_retained_pagination_reset=allow_retained_pagination_reset,
     )
     dataset_resources = _endpoint_dataset_selected_resources(source_records, resources)
+    checkpoint_context = await uhc_scan.resolve_retained_checkpoint_context(
+        sys.modules[__name__], source_records, dataset_resources, checkpoint_context
+    )
     candidate = await _prepare_endpoint_dataset_candidate(
         source_records,
         dataset_resources,
@@ -64494,12 +64498,8 @@ def _resource_group_pagination_checkpoint_context(
     if not is_checkpointing_enabled:
         return None
     source_id_values = sorted(source_record["source_id"] for source_record in source_records)
-    checkpoint_source_record = _scoped_partition_source_record(
-        source_records,
-        source_id_values,
-    )
     return _pagination_checkpoint_context(
-        checkpoint_source_record,
+        _scoped_partition_source_record(source_records, source_id_values),
         source_id_values,
         run_id=run_id,
         retry_of_run_id=retry_of_run_id,
