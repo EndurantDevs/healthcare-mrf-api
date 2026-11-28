@@ -159,7 +159,7 @@ async def import_group(
             )
             if written != proof["resource_counts"]:
                 raise RuntimeError(f"{adapter.PREFIX}_candidate_counts_changed")
-    await cancel_check()
+            await cancel_check()
     return _capture_results(adapter, written, proof)
 
 
@@ -182,7 +182,7 @@ def _capture_results(adapter, written, proof):
         family: {
             "sources_attempted": 1,
             "sources_completed": 1,
-            "sources_empty": 0,
+            "sources_empty": int(count == 0),
             "collection_complete_sources": 1,
             "rows_fetched": count,
         }

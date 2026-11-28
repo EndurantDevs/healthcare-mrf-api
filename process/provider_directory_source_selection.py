@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from process import eyemed_directory_integration as eyemed_directory
+from process import guardian_directory_integration as guardian_directory
 from process import nomi_directory_integration as nomi_directory
 from process import provider_directory_bcbs_minnesota as bcbs_minnesota
 from process import provider_directory_generic_source_policy as source_policy
@@ -450,7 +451,7 @@ def probe_flush_every():
         return 50
 
 
-LOCATOR_ADAPTERS = (nomi_directory, eyemed_directory)
+LOCATOR_ADAPTERS = (nomi_directory, eyemed_directory, guardian_directory)
 DIRECTORY_SOURCE_IDS = frozenset(a.SOURCE_ID for a in (vsp_directory, *LOCATOR_ADAPTERS))
 DIRECTORY_FETCH_MODES = frozenset(a.TRANSPORT for a in (vsp_directory, *LOCATOR_ADAPTERS))
 

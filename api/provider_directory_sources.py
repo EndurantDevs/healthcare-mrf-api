@@ -15,6 +15,7 @@ from api.provider_directory_rooted_fhir_publication import (
 )
 from api.provider_directory_source_worker import has_fresh_source_route, is_delta_route_available
 from process import eyemed_directory_integration as eyemed_directory
+from process import guardian_directory_integration as guardian_directory
 from process import nomi_directory_integration as nomi_directory
 from process import provider_directory_profile as profile_artifact
 from process.delta_dental_directory_json import SOURCE_ENDPOINT as DELTA_DENTAL_ENDPOINT
@@ -173,6 +174,12 @@ def _append_locator_sources(catalog_items):
             "nomi-health",
             "Nomi Health",
             "Provider and facility results are scoped to the configured group and searches.",
+        ),
+        (
+            guardian_directory,
+            "guardian",
+            "Guardian Dental",
+            "Employer dental directory. Membership comes from provider and facility details.",
         ),
         (
             eyemed_directory,
