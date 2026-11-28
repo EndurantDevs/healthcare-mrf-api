@@ -91,6 +91,16 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
     ("get", "/registry/manage/{kind}/{record_id}/history"): {"limit", "offset"},
     ("get", "/registry/publication/approved-companies"): {"limit", "offset", "approved_revision"},
     ("get", "/registry/serving/manifest"): {"network_generation"},
+    ("get", "/registry/serving/networks/stats"): {
+        "network_ids",
+        "network_generation",
+        "include_states",
+        "include_specialties",
+        "include_state_specialties",
+        "state",
+        "specialty_kind",
+        "specialty_key",
+    },
     ("get", "/plan/network/id/{checksum}"): {"network_ids", "network_generation"},
     ("get", "/registry/serving/providers"): {
         "network_ids",

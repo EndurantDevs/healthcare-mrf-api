@@ -9236,6 +9236,75 @@ paths:
               schema: {$ref: '#/components/schemas/RegistryNetworkCatalogError'}
         '503':
           $ref: '#/components/responses/RegistryNetworkCatalogUnavailable'
+  /registry/serving/catalog/stats:
+    post:
+      operationId: readRegistryNetworkCatalogStats
+      summary: Read precomputed network statistics under the caller policy
+      description: Requires trusted control authorization and a closed policy envelope.
+        Returns verified precomputed summary, state, specialty and state-by-specialty
+        statistics for explicit canonical network IDs in the pinned serving generation.
+        Excluded or unknown network IDs and generations without precomputed statistics
+        return 404. Query strings are refused.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - oneOf:
+                - $ref: '#/components/schemas/RegistryNetworkCatalogPolicyEnvelope'
+                - $ref: '#/components/schemas/RegistryCatalogPolicyEnvelopeV2'
+              - type: object
+                properties:
+                  query:
+                    type: object
+                    additionalProperties: false
+                    required:
+                    - network_ids
+                    properties:
+                      network_ids:
+                        type: array
+                        minItems: 1
+                        maxItems: 100
+                        uniqueItems: true
+                        items: {type: integer, format: int32, minimum: 1, maximum: 2147483647}
+                      network_generation:
+                        type: string
+                        pattern: ^[1-9][0-9]{0,18}$
+                      include_states: {type: boolean, default: true}
+                      include_specialties: {type: boolean}
+                      include_state_specialties: {type: boolean}
+                      state:
+                        oneOf:
+                        - {type: string, minLength: 2, maxLength: 512}
+                        - {type: array, minItems: 1, maxItems: 60, items: {type: string, pattern: '^[A-Z0-9]{2,8}$'}}
+                      specialty_kind: {type: string, enum: [rollup, classification, taxonomy]}
+                      specialty_key:
+                        oneOf:
+                        - {type: string, minLength: 1, maxLength: 2048}
+                        - {type: array, minItems: 1, maxItems: 50, items: {type: string, minLength: 1, maxLength: 256}}
+      responses:
+        '200':
+          description: Policy-authorized precomputed network statistics in the pinned generation.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+            X-Network-Access-Scope: {$ref: '#/components/headers/RegistryNetworkAccessScope'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryNetworkCatalogStatsResponse'
+        '400':
+          $ref: '#/components/responses/RegistryNetworkCatalogInvalid'
+        '403':
+          $ref: '#/components/responses/RegistryNetworkCatalogForbidden'
+        '404':
+          $ref: '#/components/responses/RegistryNetworkCatalogNotFound'
+        '503':
+          $ref: '#/components/responses/RegistryNetworkCatalogUnavailable'
   /registry/serving/manifest:
     get:
       operationId: readRegistryServingManifest
@@ -9299,6 +9368,72 @@ paths:
       description: Pins the current generation or an explicit eligible retained generation.
         Does not return physical schema names or substitute legacy data when canonical
         state is unavailable.
+  /registry/serving/networks/stats:
+    get:
+      operationId: readRegistryServingNetworkStats
+      summary: Read precomputed network statistics from a serving generation
+      description: Requires canonical integer network IDs and trusted control authorization.
+        Reads verified precomputed summary, state, specialty and state-by-specialty
+        statistics from the current or explicitly pinned serving generation without querying
+        control-plane catalog tables; requested IDs with no summary row in the pinned
+        generation (including unknown or empty network IDs) return the zero-count summary.
+        The complete raw query string, including parameter names, separators, commas and
+        percent-encoding, must not exceed 2048 characters.
+        Returns 404 when the selected generation does not publish precomputed statistics.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      parameters:
+      - $ref: '#/components/parameters/RegistryNetworkIds'
+      - $ref: '#/components/parameters/RegistryNetworkGeneration'
+      - name: include_states
+        in: query
+        required: false
+        schema: {type: boolean, default: true}
+      - name: include_specialties
+        in: query
+        required: false
+        schema: {type: boolean}
+      - name: include_state_specialties
+        in: query
+        required: false
+        schema: {type: boolean}
+      - name: state
+        in: query
+        required: false
+        schema: {type: string, minLength: 2, maxLength: 512}
+      - name: specialty_kind
+        in: query
+        required: false
+        schema: {type: string, enum: [rollup, classification, taxonomy]}
+      - name: specialty_key
+        in: query
+        required: false
+        schema: {type: string, minLength: 1, maxLength: 2048}
+      responses:
+        '200':
+          description: Precomputed network statistics in the pinned generation.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+            X-Network-Generation: {$ref: '#/components/headers/RegistryNetworkGeneration'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryServingNetworkStatsResponse'
+        '400':
+          $ref: '#/components/responses/RegistryInvalidRequest'
+        '403':
+          $ref: '#/components/responses/RegistryControlDenied'
+        '404':
+          description: Selected serving generation does not publish precomputed statistics.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryControlFailure'
+        '503':
+          $ref: '#/components/responses/RegistryUnavailable'
   /registry/serving/providers:
     get:
       operationId: listRegistryNetworkProviders
@@ -20163,3 +20298,151 @@ components:
               type: string
               minLength: 1
               maxLength: 128
+    RegistryNetworkStatsSummary:
+      type: object
+      additionalProperties: false
+      required:
+      - total_npi_count
+      - office_npi_count
+      - provider_only_npi_count
+      - individual_npi_count
+      - organization_npi_count
+      - unique_address_count
+      - unique_location_count
+      - state_count
+      - states
+      - core_state_count
+      - core_states
+      - county_count
+      - zip5_count
+      properties:
+        total_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        office_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        provider_only_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        individual_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        organization_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_address_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_location_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        state_count: {type: integer, format: int32, minimum: 0, maximum: 128}
+        states: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, pattern: '^[A-Z0-9]{2,8}$'}}
+        core_state_count: {type: integer, format: int32, minimum: 0, maximum: 128}
+        core_states: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, pattern: '^[A-Z0-9]{2,8}$'}}
+        county_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        zip5_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+    RegistryNetworkStatsStateEntry:
+      type: object
+      additionalProperties: false
+      required:
+      - state_code
+      - is_core_state
+      - office_npi_count
+      - individual_npi_count
+      - organization_npi_count
+      - unique_address_count
+      - unique_location_count
+      - county_count
+      - zip5_count
+      properties:
+        state_code: {type: string, pattern: '^[A-Z0-9]{2,8}$'}
+        is_core_state: {type: boolean}
+        office_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        individual_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        organization_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_address_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_location_count: {type: integer, format: int32, minimum: 1, maximum: 2147483647}
+        county_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        zip5_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+    RegistryNetworkStatsSpecialtyEntry:
+      type: object
+      additionalProperties: false
+      required:
+      - specialty_kind
+      - specialty_key
+      - display_name
+      - total_npi_count
+      - office_npi_count
+      - primary_office_npi_count
+      - unique_address_count
+      - unique_location_count
+      - state_count
+      properties:
+        specialty_kind: {type: string, enum: [rollup, classification, taxonomy]}
+        specialty_key: {type: string, minLength: 1, maxLength: 256}
+        display_name: {type: string, minLength: 1, maxLength: 512}
+        total_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        office_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        primary_office_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_address_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_location_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        state_count: {type: integer, format: int32, minimum: 0, maximum: 128}
+    RegistryNetworkStatsStateSpecialtyEntry:
+      type: object
+      additionalProperties: false
+      required:
+      - state_code
+      - specialty_kind
+      - specialty_key
+      - display_name
+      - office_npi_count
+      - primary_office_npi_count
+      - unique_address_count
+      - unique_location_count
+      properties:
+        state_code: {type: string, pattern: '^[A-Z0-9]{2,8}$'}
+        specialty_kind: {type: string, enum: [rollup, classification, taxonomy]}
+        specialty_key: {type: string, minLength: 1, maxLength: 256}
+        display_name: {type: string, minLength: 1, maxLength: 512}
+        office_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        primary_office_npi_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_address_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        unique_location_count: {type: integer, format: int32, minimum: 1, maximum: 2147483647}
+    RegistryNetworkStatsItem:
+      type: object
+      additionalProperties: false
+      required:
+      - network_id
+      - summary
+      properties:
+        network_id: {type: integer, format: int32, minimum: 1, maximum: 2147483647}
+        summary: {$ref: '#/components/schemas/RegistryNetworkStatsSummary'}
+        states_breakdown:
+          type: array
+          items: {$ref: '#/components/schemas/RegistryNetworkStatsStateEntry'}
+        specialties:
+          type: array
+          items: {$ref: '#/components/schemas/RegistryNetworkStatsSpecialtyEntry'}
+        state_specialties:
+          type: array
+          items: {$ref: '#/components/schemas/RegistryNetworkStatsStateSpecialtyEntry'}
+    RegistryServingNetworkStatsResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - generation_id
+      - items
+      properties:
+        generation_id: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: {$ref: '#/components/schemas/RegistryNetworkStatsItem'}
+    RegistryNetworkCatalogStatsResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - client_id
+      - policy_revision
+      - generation
+      - approved_custom_revision
+      - items
+      properties:
+        client_id: {type: string, minLength: 1, maxLength: 64}
+        policy_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        generation: {type: string, pattern: '^[1-9][0-9]{0,18}$'}
+        approved_custom_revision: {type: string, pattern: '^(0|[1-9][0-9]{0,18})$'}
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: {$ref: '#/components/schemas/RegistryNetworkStatsItem'}

@@ -34,11 +34,13 @@ def compact_serving_heaps(candidate):
         receipt is not None and receipt.custom_pair_count or carriers is not None and carriers.materialized_address_rows
     )
     from process.network_geo_search import TABLE, geo_search_receipt
+    from process.network_stats_contract import STATS_TABLES, network_stats_receipt
 
     return (
         SLICE_HEAPS
         | ({"entity_address_unified"} if has_rows else set())
         | ({TABLE} if geo_search_receipt(candidate) is not None else set())
+        | (STATS_TABLES if network_stats_receipt(candidate) is not None else set())
     )
 
 
@@ -78,8 +80,10 @@ def compact_readiness(candidate, report, scope):
     _require(serving.get("index_profile") == "compact_membership")
     has_named_compact_index_proof(serving)
     from process.network_geo_search import geo_search_receipt
+    from process.network_stats_contract import network_stats_receipt
 
     geo_search_receipt(candidate)
+    network_stats_receipt(candidate)
     _require(
         type(serving.get("index_definition_sha256")) is str
         and re.fullmatch(r"[0-9a-f]{64}", serving["index_definition_sha256"]) is not None
@@ -157,22 +161,28 @@ async def compact_index_digest(connection, schema_name, *, candidate=None):
 
 
 def _require_index_paths(indexes, candidate):
-    if candidate is not None:
-        from process.network_geo_search import geo_search_receipt, require_geo_search_index_records
-
-        search = geo_search_receipt(candidate)
-        if search is not None:
-            require_geo_search_index_records(
-                [{**index_record, "name": index_record["index_name"]} for index_record in indexes], search
-            )
     required_paths = [
         ("network_slice_ref", ["network_id", "office_bucket"], True, True),
         ("network_office_edge", ["slice_id", "location_key"], True, True),
         ("network_office_edge", ["location_key", "slice_id"], False, False),
     ]
     if candidate is not None:
+        from process.network_geo_search import geo_search_receipt, require_geo_search_index_records
+        from process.network_stats_contract import (
+            STATS_INDEX_PATHS,
+            network_stats_receipt,
+            require_network_stats_index_records,
+        )
         from process.registry_source_inventory_reference import source_inventory_heaps
 
+        named_indexes = [{**index_record, "name": index_record["index_name"]} for index_record in indexes]
+        search = geo_search_receipt(candidate)
+        if search is not None:
+            require_geo_search_index_records(named_indexes, search)
+        stats_descriptor = network_stats_receipt(candidate)
+        if stats_descriptor is not None:
+            require_network_stats_index_records(named_indexes, stats_descriptor)
+            required_paths.extend(STATS_INDEX_PATHS)
         if source_inventory_heaps(candidate):
             required_paths.extend(_inventory_indexes())
     for table, columns, primary, unique in required_paths:

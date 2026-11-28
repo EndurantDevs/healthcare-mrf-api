@@ -77,6 +77,11 @@ class CompactNetworkLayout:
         """Use the network id index only when the candidate published it."""
         return self.geo_search if getattr(self, "_network_search", False) else None
 
+    @property
+    def network_stats_schema(self):
+        """Return the verified candidate schema owning precomputed network_stats tables."""
+        return getattr(self, "_network_stats_schema", None)
+
     def __post_init__(self):
         if (
             type(self.ref_map) is not CompactAddressRelation
@@ -120,9 +125,24 @@ def bind_compact_geo_search(layout, relation, *, sources=None):
     return layout
 
 
+def bind_compact_network_stats(layout, schema_name):
+    """Attach the candidate schema owning precomputed network_stats tables."""
+    if type(layout) is not CompactNetworkLayout:
+        raise ValueError("Compact layout is required")
+    if layout.network_stats_schema is not None and layout.network_stats_schema != schema_name:
+        raise ValueError("Compact network stats schema is already bound")
+    if schema_name is not None:
+        compact_identifier(schema_name)
+        if schema_name != layout.ref_map.schema_name:
+            raise ValueError("Compact network stats schema differs from its candidate")
+        object.__setattr__(layout, "_network_stats_schema", schema_name)
+    return layout
+
+
 def bind_compact_geo_search_candidate(layout, candidate):
     """Bind an optional receipt after the caller authenticates candidate custody."""
     from process.network_geo_search import geo_search_receipt, geo_search_relation
+    from process.network_stats_contract import network_stats_schema
 
     search = geo_search_receipt(candidate)
     bound = bind_compact_geo_search(
@@ -134,4 +154,4 @@ def bind_compact_geo_search_candidate(layout, candidate):
             validation = json.loads(validation)
         object.__setattr__(bound, "_city_search", validation["serving_readiness"].get("city_search") is True)
         object.__setattr__(bound, "_network_search", validation["serving_readiness"].get("network_search") is True)
-    return bound
+    return bind_compact_network_stats(bound, network_stats_schema(candidate))

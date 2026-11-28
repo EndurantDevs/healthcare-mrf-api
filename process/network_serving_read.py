@@ -65,6 +65,12 @@ class PinnedNetworkServingManifest:
 
                 bind_compact_geo_search(layout, layout.geo_search)
                 relations.append(layout.geo_search)
+            if layout.network_stats_schema is not None:
+                from process.network_compact_layout import bind_compact_network_stats
+                from process.network_stats_contract import network_stats_relations
+
+                bind_compact_network_stats(layout, layout.network_stats_schema)
+                relations.extend(network_stats_relations(layout.network_stats_schema))
         for relation in relations:
             CompactAddressRelation.__post_init__(relation)
         if len(set(relations)) != len(relations):

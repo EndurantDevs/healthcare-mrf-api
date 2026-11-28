@@ -54,6 +54,7 @@ _CATALOG_PATHS = {
     "/api/v1/registry/serving/catalog",
     "/api/v1/registry/serving/catalog/detail",
     "/api/v1/registry/serving/catalog/legacy",
+    "/api/v1/registry/serving/catalog/stats",
     "/api/v1/registry/serving/organizations",
     "/api/v1/registry/serving/organizations/detail",
     "/api/v1/registry/serving/providers/plans",
@@ -280,6 +281,10 @@ def _query_selector(query_by_field, kind):
         return parse_fhir_catalog_query(query_by_field, kind)
     if kind == "directory":
         return parse_managed_directory_query(query_by_field), None
+    if kind == "stats":
+        from process.network_stats_read import parse_network_stats_post_query
+
+        return parse_network_stats_post_query(query_by_field)
     if kind == "autocomplete":
         return _autocomplete_selector(query_by_field)
     if kind.startswith("provider-"):
@@ -360,6 +365,30 @@ async def _read_catalog_page(driver, kind, selector, generation, excluded, optio
         return await read_fhir_catalog(
             driver, selector.query, excluded_network_ids=excluded, network_id=selector.network_id, **options
         )
+    if kind == "stats":
+        from db.registry_schema import registry_schema
+        from process.network_stats_read import (
+            NetworkStatsDenied,
+            NetworkStatsRequestInvalid,
+            NetworkStatsUnavailable,
+            read_network_stats,
+        )
+
+        try:
+            stats_entries = await read_network_stats(
+                driver, manifest, selector, excluded_network_ids=excluded, control_schema=registry_schema()
+            )
+        except NetworkStatsDenied:
+            raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied") from None
+        except NetworkStatsUnavailable:
+            raise RegistryNetworkCatalogError("registry_network_catalog_stats_unavailable") from None
+        except NetworkStatsRequestInvalid:
+            raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid") from None
+        return {
+            "generation": str(manifest.generation_id),
+            "approved_custom_revision": str(manifest.approved_custom_revision),
+            "items": stats_entries,
+        }
     if kind == "autocomplete":
         return await read_registry_network_autocomplete(
             driver, selector, excluded_network_ids=excluded, manifest=manifest
@@ -490,6 +519,12 @@ async def _catalog_response(request, kind):
 
 def _catalog_reader_error(error, kind, visibility, scope, *, enriched=False):
     code = str(error)
+    if code == "registry_network_catalog_stats_unavailable":
+        return response.json(
+            {"error": {"code": "network_stats_unavailable"}},
+            status=404,
+            headers=_HEADERS | ({"X-Network-Access-Scope": scope} if visibility is not None and scope else {}),
+        )
     if code == "registry_network_catalog_source_changed" and (
         enriched
         or kind == "directory"
@@ -535,6 +570,12 @@ async def network_catalog_detail(request):
 async def network_catalog_legacy(request):
     """Resolve one exact source-scoped legacy identity without canonical guessing."""
     return await _catalog_response(request, "legacy")
+
+
+@blueprint.post("/catalog/stats")
+async def network_catalog_stats(request):
+    """Return policy-authorized precomputed network statistics for explicit network IDs."""
+    return await _catalog_response(request, "stats")
 
 
 @blueprint.post("/organizations")

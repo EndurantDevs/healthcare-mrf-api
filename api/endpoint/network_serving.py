@@ -10,6 +10,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from api.control_auth import require_registry_auth
 from api.network_serving_read_context import bind_network_request_reader, network_serving_read_context
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
+from process.network_stats_read import (
+    NetworkStatsRequestInvalid,
+    NetworkStatsUnavailable,
+    parse_network_stats_http_query,
+    read_network_stats,
+)
 
 blueprint = Blueprint("network_serving", url_prefix="/registry/serving", version=1)
 _HEADERS = {"Cache-Control": "private, no-store"}
@@ -63,5 +69,43 @@ async def serving_manifest(request):
             identity_by_name,
             headers=_HEADERS | {"X-Network-Generation": str(manifest.generation_id)},
         )
+    except NetworkServingReadUnavailable, asyncpg.PostgresError, SQLAlchemyError:
+        return _error(503)
+
+
+@blueprint.get("/networks/stats", ignore_body=False)
+async def serving_network_stats(request):
+    """Return precomputed per-network statistics from a pinned G8+ generation.
+
+    Operates strictly on the immutable serving schema without control-plane catalog joins;
+    absent or empty network IDs receive the zero-count summary.
+    """
+    require_registry_auth(request)
+    try:
+        stats_query = parse_network_stats_http_query(request)
+    except NetworkStatsRequestInvalid, ValueError:
+        return _error(400)
+    try:
+        session = await bind_network_request_reader(request)
+        async with network_serving_read_context(session) as driver:
+            manifest = await resolve_network_serving_manifest(
+                driver, generation_id=stats_query.generation_id, api_read=True
+            )
+            stats_entries = await read_network_stats(driver, manifest, stats_query)
+        return response.json(
+            {
+                "generation_id": manifest.generation_id,
+                "items": stats_entries,
+            },
+            headers=_HEADERS | {"X-Network-Generation": str(manifest.generation_id)},
+        )
+    except NetworkStatsUnavailable:
+        return response.json(
+            {"error": {"code": "network_stats_unavailable"}},
+            status=404,
+            headers=_HEADERS | {"X-Network-Generation": str(manifest.generation_id)},
+        )
+    except NetworkStatsRequestInvalid:
+        return _error(400)
     except NetworkServingReadUnavailable, asyncpg.PostgresError, SQLAlchemyError:
         return _error(503)
